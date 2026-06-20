@@ -28,6 +28,16 @@ const (
 	ExecutorLocal  ExecutorKind = "local"
 )
 
+// Valid reports whether k is a recognized ExecutorKind.
+func (k ExecutorKind) Valid() bool {
+	switch k {
+	case ExecutorLambda, ExecutorECS, ExecutorLocal:
+		return true
+	default:
+		return false
+	}
+}
+
 // RunOn is the host kind a job declares it may run on. Its string values are
 // the stable wire form persisted on jobs rows.
 type RunOn string
@@ -38,6 +48,16 @@ const (
 	RunOnECS    RunOn = "ecs"
 	RunOnEither RunOn = "either"
 )
+
+// Valid reports whether r is a recognized RunOn.
+func (r RunOn) Valid() bool {
+	switch r {
+	case RunOnLambda, RunOnECS, RunOnEither:
+		return true
+	default:
+		return false
+	}
+}
 
 // ErrorClass classifies a worker error. Permanent and validation errors stop
 // retrying; transient and timeout errors are retried.
@@ -50,6 +70,16 @@ const (
 	ErrorValidation ErrorClass = "validation"
 	ErrorTimeout    ErrorClass = "timeout"
 )
+
+// Valid reports whether c is a recognized ErrorClass.
+func (c ErrorClass) Valid() bool {
+	switch c {
+	case ErrorTransient, ErrorPermanent, ErrorValidation, ErrorTimeout:
+		return true
+	default:
+		return false
+	}
+}
 
 // JobState is a job's lifecycle state. Its string values are the stable wire
 // form persisted on jobs rows.
@@ -66,6 +96,17 @@ const (
 	StateDiscarded JobState = "discarded"
 )
 
+// Valid reports whether s is a recognized JobState.
+func (s JobState) Valid() bool {
+	switch s {
+	case StateAvailable, StateRunning, StateRetryable, StateScheduled,
+		StateSucceeded, StateCancelled, StateDiscarded:
+		return true
+	default:
+		return false
+	}
+}
+
 // RunOutcome is the outcome of a single job attempt. Its string values are the
 // stable wire form persisted on job_runs rows.
 type RunOutcome string
@@ -80,6 +121,17 @@ const (
 	OutcomeTimeout   RunOutcome = "timeout"
 	OutcomeCrashed   RunOutcome = "crashed"
 )
+
+// Valid reports whether o is a recognized RunOutcome.
+func (o RunOutcome) Valid() bool {
+	switch o {
+	case OutcomeStarted, OutcomeSuccess, OutcomeError, OutcomeSnooze,
+		OutcomeCancelled, OutcomeTimeout, OutcomeCrashed:
+		return true
+	default:
+		return false
+	}
+}
 
 // Args is any JSON-serializable struct passed to a worker.
 type Args any

@@ -18,9 +18,12 @@ func Models() []any {
 	return []any{&jobRow{}, &jobRunRow{}, &jobPeriodicRow{}}
 }
 
-// Migrate brings up the three job tables (jobs, job_runs, job_periodics) and the
-// partial/unique indexes GORM AutoMigrate cannot express. It supports both
-// consumption modes:
+// Migrate is the single source of truth for the job schema: it brings up the
+// three job tables (jobs, job_runs, job_periodics) — with their NOT-NULL
+// constraints, column defaults, and the jobs soft-delete column — plus the
+// partial/unique indexes GORM AutoMigrate cannot express. A host installs the
+// schema by calling Migrate(db) and nothing else. It supports both consumption
+// modes:
 //
 //   - standalone: call it against a bare SQLite or PostgreSQL database and the
 //     runtime stands up its own schema with no external migration tooling.
@@ -64,6 +67,9 @@ func Migrate(db *gorm.DB) error {
 //     — follow-up/DAG lookup.
 //   - jobs_running_leased  (leased_until) WHERE state = 'running'
 //     — stuck-lease / orphan-recovery sweep.
+//   - idx_jobs_deleted_at   (deleted_at) WHERE deleted_at IS NOT NULL
+//     — soft-delete restore/audit lookups; a partial index a struct tag cannot
+//     express, so it lives here rather than on jobRow.DeletedAt.
 //   - job_runs_job_attempt UNIQUE (job_id, attempt) — one audit row per attempt.
 //   - idx_job_periodics_slug UNIQUE (slug) — one schedule per slug.
 //
@@ -77,6 +83,7 @@ func reconcileIndexDDL(dialect string) ([]string, error) {
 		`CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (queue, run_on, priority, scheduled_at) WHERE state IN ('available', 'retryable', 'scheduled')`,
 		`CREATE INDEX IF NOT EXISTS jobs_parent ON jobs (parent_job_id) WHERE parent_job_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS jobs_running_leased ON jobs (leased_until) WHERE state = 'running'`,
+		`CREATE INDEX IF NOT EXISTS idx_jobs_deleted_at ON jobs (deleted_at) WHERE deleted_at IS NOT NULL`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS job_runs_job_attempt ON job_runs (job_id, attempt)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_job_periodics_slug ON job_periodics (slug)`,
 	}

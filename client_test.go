@@ -56,6 +56,43 @@ func TestInsertUniqueKeyCollisionReturnsErrAlreadyEnqueued(t *testing.T) {
 	require.ErrorIs(t, err, ErrAlreadyEnqueued)
 }
 
+func TestEnqueueArbitraryKindWritesAvailableRowWithDefaults(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	c := NewClient(db)
+
+	id, err := Enqueue(context.Background(), c, "seed.kind", []byte(`{"k":"v"}`), InsertOpts{})
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+
+	var row jobRow
+	require.NoError(t, db.Where("id = ?", id).First(&row).Error)
+	assert.Equal(t, "seed.kind", row.Kind)
+	assert.Equal(t, string(StateAvailable), row.State)
+	assert.Equal(t, defaultQueue, row.Queue)
+	assert.Equal(t, defaultPriority, row.Priority)
+	assert.Equal(t, defaultMaxAttempts, row.MaxAttempts)
+	assert.JSONEq(t, `{"k":"v"}`, string(row.Args))
+}
+
+func TestEnqueueHonorsUniqueKeyAndQueueOpts(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	c := NewClient(db)
+
+	id, err := Enqueue(context.Background(), c, "seed.kind", []byte(`{}`), InsertOpts{UniqueKey: "uk-1", Queue: "custom"})
+	require.NoError(t, err)
+
+	var row jobRow
+	require.NoError(t, db.Where("id = ?", id).First(&row).Error)
+	require.NotNil(t, row.UniqueKey)
+	assert.Equal(t, "uk-1", *row.UniqueKey)
+	assert.Equal(t, "custom", row.Queue)
+
+	_, err = Enqueue(context.Background(), c, "seed.kind", []byte(`{}`), InsertOpts{UniqueKey: "uk-1"})
+	require.ErrorIs(t, err, ErrAlreadyEnqueued)
+}
+
 func TestInsertTxOverrideWritesOnSuppliedConnection(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)

@@ -1,6 +1,35 @@
 package flywheel
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrValidation is the sentinel every lifecycle validation failure wraps, so a
+// caller can branch on errors.Is(err, ErrValidation) without depending on a
+// host validation package. The runtime owns its own validation seam — it never
+// imports a foundation/base-model error type.
+var ErrValidation = errors.New("flywheel: validation failed")
+
+// ValidationError is a single field's validation failure raised by a row's
+// lifecycle hook (BeforeCreate/BeforeSave). It unwraps to ErrValidation.
+type ValidationError struct {
+	Field   string
+	Message string
+}
+
+// Error renders the field and message.
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("flywheel: %s %s", e.Field, e.Message)
+}
+
+// Unwrap exposes ErrValidation for errors.Is.
+func (e *ValidationError) Unwrap() error { return ErrValidation }
+
+// newValidationError builds a ValidationError for field with message msg.
+func newValidationError(field, msg string) error {
+	return &ValidationError{Field: field, Message: msg}
+}
 
 // ErrAlreadyEnqueued is returned by Insert when a job with the same unique_key
 // already exists. Callers compare it with errors.Is and treat the work as
