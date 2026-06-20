@@ -125,19 +125,26 @@ func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time
 	}
 }
 
-// defaultBackoff is the fallback retry delay when the Runner supplied none.
-func defaultBackoff(attempt int) time.Duration {
+// expBackoff is the exponential retry ladder shared by the Runner's
+// configurable backoff and the driver's fallback: base, doubling once per
+// attempt past the first, capped at maxDelay.
+func expBackoff(base, maxDelay time.Duration, attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
 	}
-	d := time.Second
+	delay := base
 	for range attempt - 1 {
-		d *= 2
-		if d >= time.Minute {
-			return time.Minute
+		delay *= 2
+		if delay >= maxDelay {
+			return maxDelay
 		}
 	}
-	return d
+	return delay
+}
+
+// defaultBackoff is the fallback retry delay when the Runner supplied none.
+func defaultBackoff(attempt int) time.Duration {
+	return expBackoff(time.Second, time.Minute, attempt)
 }
 
 // runOnValues is the set of run_on values an executor of the given kind may
