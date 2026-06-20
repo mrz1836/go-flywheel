@@ -54,6 +54,16 @@ func Insert[A Args](ctx context.Context, c *Client, args A, opts InsertOpts) (st
 	return c.insert(ctx, namer.Kind(), payload, opts)
 }
 
+// Enqueue writes one available job of an arbitrary kind from a pre-marshaled
+// JSON payload, with no registered worker required. It is the host seed seam:
+// fixtures and inspection hosts create real jobs through the same insert core as
+// Insert — honoring opts (UniqueKey/Queue/Priority/…) and the row's lifecycle
+// defaults — without touching flywheel's unexported row structs. A unique_key
+// collision returns ErrAlreadyEnqueued.
+func Enqueue(ctx context.Context, c *Client, kind string, args []byte, opts InsertOpts) (string, error) {
+	return c.insert(ctx, kind, args, opts)
+}
+
 // insert is the non-generic enqueue core shared by Insert and the Scheduler. It
 // writes one jobs row, honoring opts, and maps a unique_key collision to
 // ErrAlreadyEnqueued.
