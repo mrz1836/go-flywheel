@@ -282,17 +282,7 @@ func (r *Runner) classify(entry registryEntry, workErr error, raw RawJob) error 
 
 // backoff is the exponential retry delay with ±25% jitter.
 func (r *Runner) backoff(attempt int) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
-	delay := r.cfg.RetryBackoffBase
-	for range attempt - 1 {
-		delay *= 2
-		if delay >= maxRetryBackoff {
-			delay = maxRetryBackoff
-			break
-		}
-	}
+	delay := expBackoff(r.cfg.RetryBackoffBase, maxRetryBackoff, attempt)
 	jitter := (1.0 - backoffJitterSpread/2) + rand.Float64()*backoffJitterSpread //nolint:gosec // jitter, not security
 	return time.Duration(float64(delay) * jitter)
 }

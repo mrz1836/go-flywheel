@@ -60,6 +60,18 @@ func NonTerminalStates() []JobState {
 	return []JobState{StateAvailable, StateRunning, StateRetryable, StateScheduled}
 }
 
+// nonTerminalStateStrings returns NonTerminalStates as the []string a GORM
+// "state IN ?" clause binds against, so the inspection queries share one
+// conversion instead of each re-deriving it.
+func nonTerminalStateStrings() []string {
+	states := NonTerminalStates()
+	out := make([]string, len(states))
+	for i, s := range states {
+		out[i] = string(s)
+	}
+	return out
+}
+
 // ListRunsParams configures a ListRuns page. Before is a created_at cursor (zero
 // means newest); Limit caps the rows returned. A host that wants a has-more
 // sentinel passes Limit+1 and trims the extra row itself.
@@ -139,14 +151,9 @@ func Overview(ctx context.Context, db *gorm.DB, p OverviewParams) (JobsOverview,
 // host uses it to answer "is there already an in-flight job of this kind for
 // some subject?" by inspecting the returned args.
 func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsView, error) {
-	terminalScoped := NonTerminalStates()
-	states := make([]string, len(terminalScoped))
-	for i, s := range terminalScoped {
-		states[i] = string(s)
-	}
 	var rows []jobRow
 	err := db.WithContext(ctx).
-		Where("kind = ? AND state IN ?", kind, states).
+		Where("kind = ? AND state IN ?", kind, nonTerminalStateStrings()).
 		Find(&rows).Error
 	if err != nil {
 		return nil, fmt.Errorf("flywheel: list active by kind: %w", err)
@@ -176,13 +183,8 @@ func CountRuns(ctx context.Context, db *gorm.DB) (int64, error) {
 // reading through db (soft-deleted excluded). It is the inspection seam for
 // "pending work remaining" telemetry.
 func CountActiveJobs(ctx context.Context, db *gorm.DB) (int64, error) {
-	terminalScoped := NonTerminalStates()
-	states := make([]string, len(terminalScoped))
-	for i, s := range terminalScoped {
-		states[i] = string(s)
-	}
 	var n int64
-	if err := db.WithContext(ctx).Model(&jobRow{}).Where("state IN ?", states).Count(&n).Error; err != nil {
+	if err := db.WithContext(ctx).Model(&jobRow{}).Where("state IN ?", nonTerminalStateStrings()).Count(&n).Error; err != nil {
 		return 0, fmt.Errorf("flywheel: count active jobs: %w", err)
 	}
 	return n, nil
