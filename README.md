@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🚀&nbsp;&nbsp;go-flywheel
+# 🎡&nbsp;&nbsp;go-flywheel
 
-**Durable, Postgres- and SQLite-backed job runtime for Go**
+**Durable, Postgres - and SQLite-backed job runtime for Go**
 
 <br/>
 
