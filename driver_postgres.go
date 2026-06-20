@@ -43,6 +43,7 @@ func (d *postgresDriver) Dequeue(
 WITH claimed AS (
     SELECT id FROM jobs
     WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
       AND scheduled_at <= ?
       AND queue IN ?
       %s
