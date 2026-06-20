@@ -164,3 +164,79 @@ func TestOverviewExcludesSoftDeleted(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, view.Total)
 }
+
+func TestNonTerminalStatesExcludesTerminal(t *testing.T) {
+	t.Parallel()
+	states := NonTerminalStates()
+	for _, s := range states {
+		require.True(t, s.Valid())
+	}
+	set := map[JobState]bool{}
+	for _, s := range states {
+		set[s] = true
+	}
+	for _, terminal := range []JobState{StateSucceeded, StateCancelled, StateDiscarded} {
+		assert.False(t, set[terminal], "terminal state %q must not be non-terminal", terminal)
+	}
+	for _, active := range []JobState{StateAvailable, StateRunning, StateRetryable, StateScheduled} {
+		assert.True(t, set[active], "active state %q must be non-terminal", active)
+	}
+}
+
+func TestListActiveByKindReturnsNonTerminalWithArgs(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	seedJob(t, db, jobRow{ID: "a1", Kind: "investigate", State: string(StateAvailable), Args: datatypes.JSON(`{"person_id":"p1"}`)})
+	seedJob(t, db, jobRow{ID: "a2", Kind: "investigate", State: string(StateRunning), Args: datatypes.JSON(`{"person_id":"p2"}`)})
+	// Terminal job of the same kind must be excluded.
+	seedJob(t, db, jobRow{ID: "a3", Kind: "investigate", State: string(StateSucceeded), Args: datatypes.JSON(`{"person_id":"p3"}`)})
+	// Different kind must be excluded.
+	seedJob(t, db, jobRow{ID: "b1", Kind: "other", State: string(StateAvailable)})
+
+	views, err := ListActiveByKind(context.Background(), db, "investigate")
+	require.NoError(t, err)
+	require.Len(t, views, 2)
+	got := map[string]string{}
+	for _, v := range views {
+		assert.Equal(t, "investigate", v.Kind)
+		got[v.ID] = string(v.Args)
+	}
+	assert.JSONEq(t, `{"person_id":"p1"}`, got["a1"])
+	assert.JSONEq(t, `{"person_id":"p2"}`, got["a2"])
+}
+
+func TestListActiveByKindExcludesSoftDeleted(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	seedJob(t, db, jobRow{ID: "d1", Kind: "investigate", State: string(StateAvailable)})
+	require.NoError(t, db.Where("id = ?", "d1").Delete(&jobRow{}).Error)
+
+	views, err := ListActiveByKind(context.Background(), db, "investigate")
+	require.NoError(t, err)
+	assert.Empty(t, views)
+}
+
+func TestCountRunsCountsEveryAttempt(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	base := time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC)
+	seedRun(t, db, jobRunRow{ID: "cr1", JobID: "j", Attempt: 1, ExecutorKind: string(ExecutorLocal), ExecutorID: "e", Outcome: string(OutcomeStarted), StartedAt: base, CreatedAt: base})
+	seedRun(t, db, jobRunRow{ID: "cr2", JobID: "j", Attempt: 2, ExecutorKind: string(ExecutorLocal), ExecutorID: "e", Outcome: string(OutcomeSuccess), StartedAt: base, CreatedAt: base})
+
+	n, err := CountRuns(context.Background(), db)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, n)
+}
+
+func TestCountActiveJobsCountsOnlyNonTerminal(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	seedJob(t, db, jobRow{ID: "ca1", Kind: "k", State: string(StateAvailable)})
+	seedJob(t, db, jobRow{ID: "ca2", Kind: "k", State: string(StateRunning)})
+	seedJob(t, db, jobRow{ID: "ca3", Kind: "k", State: string(StateSucceeded)})
+	seedJob(t, db, jobRow{ID: "ca4", Kind: "k", State: string(StateDiscarded)})
+
+	n, err := CountActiveJobs(context.Background(), db)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, n)
+}

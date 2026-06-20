@@ -41,6 +41,25 @@ type JobsOverview struct {
 	Total         int            `json:"total"`
 }
 
+// JobArgsView is a host-internal read projection that carries a job's raw args
+// payload so a host can match jobs on their typed arguments without binding to
+// the unexported row. Unlike JobView it is not a wire contract — it exists so a
+// host (e.g. a "do I already have an active job for this subject?" lookup) can
+// inspect args server-side.
+type JobArgsView struct {
+	ID   string
+	Kind string
+	Args []byte
+}
+
+// NonTerminalStates returns the job states from which a job may still progress.
+// The terminal states (succeeded, cancelled, discarded) are excluded. A host
+// uses it to scope "still in flight" queries without re-deriving the runtime's
+// state vocabulary.
+func NonTerminalStates() []JobState {
+	return []JobState{StateAvailable, StateRunning, StateRetryable, StateScheduled}
+}
+
 // ListRunsParams configures a ListRuns page. Before is a created_at cursor (zero
 // means newest); Limit caps the rows returned. A host that wants a has-more
 // sentinel passes Limit+1 and trims the extra row itself.
@@ -113,6 +132,60 @@ func Overview(ctx context.Context, db *gorm.DB, p OverviewParams) (JobsOverview,
 		total += row.N
 	}
 	return JobsOverview{CountsByState: counts, Total: total}, nil
+}
+
+// ListActiveByKind returns the non-terminal jobs of the given kind, each with
+// its raw args payload, reading through db. Soft-deleted jobs are excluded. A
+// host uses it to answer "is there already an in-flight job of this kind for
+// some subject?" by inspecting the returned args.
+func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsView, error) {
+	terminalScoped := NonTerminalStates()
+	states := make([]string, len(terminalScoped))
+	for i, s := range terminalScoped {
+		states[i] = string(s)
+	}
+	var rows []jobRow
+	err := db.WithContext(ctx).
+		Where("kind = ? AND state IN ?", kind, states).
+		Find(&rows).Error
+	if err != nil {
+		return nil, fmt.Errorf("flywheel: list active by kind: %w", err)
+	}
+	views := make([]JobArgsView, len(rows))
+	for i := range rows {
+		views[i] = JobArgsView{
+			ID:   rows[i].ID,
+			Kind: rows[i].Kind,
+			Args: []byte(rows[i].Args),
+		}
+	}
+	return views, nil
+}
+
+// CountRuns returns the total number of recorded job attempts (job_runs rows),
+// reading through db. It is the inspection seam for run-throughput telemetry.
+func CountRuns(ctx context.Context, db *gorm.DB) (int64, error) {
+	var n int64
+	if err := db.WithContext(ctx).Model(&jobRunRow{}).Count(&n).Error; err != nil {
+		return 0, fmt.Errorf("flywheel: count runs: %w", err)
+	}
+	return n, nil
+}
+
+// CountActiveJobs returns how many jobs are still in a non-terminal state,
+// reading through db (soft-deleted excluded). It is the inspection seam for
+// "pending work remaining" telemetry.
+func CountActiveJobs(ctx context.Context, db *gorm.DB) (int64, error) {
+	terminalScoped := NonTerminalStates()
+	states := make([]string, len(terminalScoped))
+	for i, s := range terminalScoped {
+		states[i] = string(s)
+	}
+	var n int64
+	if err := db.WithContext(ctx).Model(&jobRow{}).Where("state IN ?", states).Count(&n).Error; err != nil {
+		return 0, fmt.Errorf("flywheel: count active jobs: %w", err)
+	}
+	return n, nil
 }
 
 // jobViewFromRow projects an unexported jobRow into the public JobView.
