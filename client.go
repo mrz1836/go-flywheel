@@ -102,6 +102,10 @@ func (c *Client) insert(ctx context.Context, kind string, payload []byte, opts I
 		uk := opts.UniqueKey
 		row.UniqueKey = &uk
 	}
+	if opts.UniqueActiveKey != "" {
+		uak := opts.UniqueActiveKey
+		row.UniqueActiveKey = &uak
+	}
 	if opts.Timeout > 0 {
 		ms := int(opts.Timeout.Milliseconds())
 		row.TimeoutMs = &ms

@@ -222,13 +222,22 @@ type FollowUp struct {
 
 // InsertOpts configures a single Insert.
 type InsertOpts struct {
-	Queue         string
-	UniqueKey     string
-	ScheduleAt    *time.Time
-	Parent        *string
-	Priority      int
-	ExecutorClass ExecutorClass
-	MaxAttempts   int
+	Queue string
+	// UniqueKey enforces idempotency forever: an insert collides with any job
+	// that ever carried the same key, terminal or not. Use it for "enqueue this
+	// exact unit of work at most once, ever".
+	UniqueKey string
+	// UniqueActiveKey enforces idempotency only while a job is active (available,
+	// running, retryable, or scheduled): an insert collides only with a still-live
+	// job carrying the same key, and the key frees up once that job reaches a
+	// terminal state. Use it for "at most one in-flight job for this subject",
+	// where a later run is expected once the current one finishes.
+	UniqueActiveKey string
+	ScheduleAt      *time.Time
+	Parent          *string
+	Priority        int
+	ExecutorClass   ExecutorClass
+	MaxAttempts     int
 	// Timeout, when > 0, bounds this job's worker execution: the Runner cancels
 	// the worker's ctx after it elapses. It overrides the worker's Timeouter and
 	// the runner's DefaultTimeout.

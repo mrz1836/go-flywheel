@@ -21,6 +21,7 @@ var (
 	migrateTables  = []string{"jobs", "job_runs", "job_periodics"}
 	migrateIndexes = []string{
 		"jobs_unique_key",
+		"jobs_unique_active_key",
 		"jobs_ready",
 		"jobs_parent",
 		"jobs_running_leased",

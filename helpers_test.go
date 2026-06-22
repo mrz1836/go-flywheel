@@ -24,6 +24,7 @@ var dbSeq atomic.Uint64
 //nolint:gochecknoglobals // shared DDL fixtures applied across tests
 var jobsPartialIndexes = []string{
 	`CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_key ON jobs (unique_key) WHERE unique_key IS NOT NULL`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_active_key ON jobs (unique_active_key) WHERE unique_active_key IS NOT NULL AND state IN ('available', 'running', 'retryable', 'scheduled')`,
 }
 
 // newDB builds a fresh in-memory SQLite DB and migrates the jobs-runtime row

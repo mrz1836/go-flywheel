@@ -65,6 +65,11 @@ func Migrate(db *gorm.DB) error {
 //   - jobs_unique_key      UNIQUE (unique_key) WHERE unique_key IS NOT NULL
 //     — correctness: enforces enqueue idempotency (a duplicate unique_key insert
 //     is rejected by the database, surfacing as ErrDuplicateKey).
+//   - jobs_unique_active_key UNIQUE (unique_active_key) WHERE unique_active_key IS
+//     NOT NULL AND state IN ('available','running','retryable','scheduled')
+//     — correctness: enforces "at most one active job per key". Unlike
+//     jobs_unique_key the constraint is scoped to live states, so the key frees
+//     up once the job reaches a terminal state and the same key can enqueue again.
 //   - jobs_ready           (queue, executor_class, priority, scheduled_at) WHERE
 //     state IN ('available','retryable','scheduled') — the claim hot path.
 //   - jobs_parent          (parent_job_id) WHERE parent_job_id IS NOT NULL
@@ -84,6 +89,7 @@ func Migrate(db *gorm.DB) error {
 func reconcileIndexDDL(dialect string) ([]string, error) {
 	ddl := []string{
 		`CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_key ON jobs (unique_key) WHERE unique_key IS NOT NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_active_key ON jobs (unique_active_key) WHERE unique_active_key IS NOT NULL AND state IN ('available', 'running', 'retryable', 'scheduled')`,
 		`CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (queue, executor_class, priority, scheduled_at) WHERE state IN ('available', 'retryable', 'scheduled')`,
 		`CREATE INDEX IF NOT EXISTS jobs_parent ON jobs (parent_job_id) WHERE parent_job_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS jobs_running_leased ON jobs (leased_until) WHERE state = 'running'`,
