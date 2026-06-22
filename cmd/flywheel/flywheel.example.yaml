@@ -1,0 +1,50 @@
+# flywheel.yaml — local job runtime configuration.
+#
+# Run with:  flywheel serve --config flywheel.yaml
+# Validate:  flywheel doctor --config flywheel.yaml
+
+db:
+  # Exactly one datastore. The SQLite path is the zero-ops default for a local
+  # Mac daemon; set a postgres DSN instead to share a queue across machines.
+  sqlite: ~/.local/state/flywheel/flywheel.db
+  # postgres: postgres://flywheel:flywheel@localhost:5432/flywheel?sslmode=disable
+
+runtime:
+  queues: [default, periodic] # logical queues this node claims from
+  concurrency: 1 # SQLite is single-writer (keep 1); Postgres may raise it
+  lease: 30s # visibility timeout on a claimed job
+  poll_interval: 250ms # pause between empty polls
+  # env_allowlist: [PATH, HOME, SHELL, LANG, TMPDIR]  # host env exec jobs inherit
+
+log:
+  level: info # debug | info | warn | error
+  format: text # text | json
+
+# Declarative cron replacement. Each entry becomes a durable, retried, audited
+# periodic job — strictly better than crontab (history, backfill, overlap
+# protection). Use exactly one of `cron` or `every`.
+schedules:
+  - slug: openclaw-nightly
+    every: 24h
+    queue: periodic
+    worker: exec
+    exec:
+      command: /usr/local/bin/openclaw
+      args: ["maintenance", "run"]
+      timeout_seconds: 600
+
+  - slug: hermes-hourly-sync
+    cron: "0 * * * *" # standard 5-field cron
+    queue: periodic
+    worker: exec
+    exec:
+      command: /opt/hermes/bin/sync.sh # a shell script works the same as a binary
+
+  - slug: gateway-healthcheck
+    every: 1m
+    worker: http
+    http:
+      method: GET
+      url: https://gateway.internal/healthz
+      timeout_seconds: 10
+      success_status: [200, 204]

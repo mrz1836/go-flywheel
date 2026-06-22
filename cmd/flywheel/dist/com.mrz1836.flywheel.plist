@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  flywheel LaunchAgent — runs `flywheel serve` as a per-user background daemon.
+
+  Install (replace USERNAME with your account):
+    cp dist/com.mrz1836.flywheel.plist ~/Library/LaunchAgents/
+    # edit the paths below to your username, then:
+    launchctl load   ~/Library/LaunchAgents/com.mrz1836.flywheel.plist   # start
+    launchctl unload ~/Library/LaunchAgents/com.mrz1836.flywheel.plist   # stop (drains cleanly)
+
+  `flywheel serve` traps SIGTERM (launchctl's stop signal) and drains in-flight
+  jobs within ExitTimeOut before exit. KeepAlive restarts it on crash.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mrz1836.flywheel</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/flywheel</string>
+        <string>serve</string>
+        <string>--config</string>
+        <string>/Users/USERNAME/.config/flywheel/flywheel.yaml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/USERNAME</string>
+
+    <!-- A LaunchAgent inherits almost no environment; set the PATH that exec
+         jobs need so a bare command name resolves (cron's classic foot-gun). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/USERNAME/.local/state/flywheel/flywheel.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/USERNAME/.local/state/flywheel/flywheel.err.log</string>
+
+    <!-- Give in-flight jobs time to drain on `launchctl unload` before SIGKILL. -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+</dict>
+</plist>
