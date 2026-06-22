@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
@@ -127,13 +126,28 @@ func TestWrapByMessageForeignKeyAndDefault(t *testing.T) {
 
 func TestWrapSqliteErrorForeignKeyAndDefault(t *testing.T) {
 	t.Parallel()
-	fk := sqlite3.Error{Code: sqlite3.ErrConstraint, ExtendedCode: sqlite3.ErrConstraintForeignKey}
-	ok, wrapped := wrapSqliteError(fk)
+	// modernc's *sqlite.Error has unexported fields, so the FK and unmapped-
+	// constraint branches are exercised against real violations. Pinning a single
+	// connection keeps PRAGMA foreign_keys = ON in effect for the inserts.
+	db := newDB(t)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+
+	require.NoError(t, db.Exec(`PRAGMA foreign_keys = ON`).Error)
+	require.NoError(t, db.Exec(`CREATE TABLE parent (id integer primary key)`).Error)
+	require.NoError(t, db.Exec(`CREATE TABLE child (id integer primary key, pid integer REFERENCES parent(id))`).Error)
+
+	fkErr := db.Exec(`INSERT INTO child (id, pid) VALUES (1, 999)`).Error
+	require.Error(t, fkErr)
+	ok, wrapped := wrapSqliteError(fkErr)
 	require.True(t, ok)
 	assert.ErrorIs(t, wrapped, ErrForeignKey)
 
-	other := sqlite3.Error{Code: sqlite3.ErrConstraint, ExtendedCode: sqlite3.ErrConstraintCheck}
-	ok, wrapped = wrapSqliteError(other)
+	require.NoError(t, db.Exec(`CREATE TABLE chk (n integer CHECK (n > 0))`).Error)
+	chkErr := db.Exec(`INSERT INTO chk (n) VALUES (-1)`).Error
+	require.Error(t, chkErr)
+	ok, wrapped = wrapSqliteError(chkErr)
 	require.True(t, ok)
 	assert.ErrorIs(t, wrapped, ErrDatabaseError, "an unmapped constraint falls back to ErrDatabaseError")
 }

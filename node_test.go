@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -23,7 +23,7 @@ import (
 // errors. Migrate stands up the full schema.
 func newWALFileDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := "file:" + t.TempDir() + "/flywheel.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate&_synchronous=NORMAL"
+	dsn := "file:" + t.TempDir() + "/flywheel.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	require.NoError(t, err)
 	t.Cleanup(func() {

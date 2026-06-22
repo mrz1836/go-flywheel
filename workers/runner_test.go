@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/glebarez/sqlite"
 	flywheel "github.com/mrz1836/go-flywheel"
 	"github.com/mrz1836/go-flywheel/workers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )

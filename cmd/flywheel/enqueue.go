@@ -48,7 +48,7 @@ func newEnqueueCmd(configPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), id)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), id)
 			return nil
 		},
 	}

@@ -17,16 +17,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	flywheel "github.com/mrz1836/go-flywheel"
 	"github.com/mrz1836/go-flywheel/workers"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	db, err := gorm.Open(sqlite.Open("file:flywheel-cron.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open("file:flywheel-cron.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate"), &gorm.Config{})
 	if err != nil {
 		logger.Error("open db", "error", err)
 		os.Exit(1)

@@ -8,8 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/glebarez/sqlite"
 	flywheel "github.com/mrz1836/go-flywheel"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
