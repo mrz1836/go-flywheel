@@ -150,3 +150,47 @@ func TestCancelJobMissingReturnsErrJobNotFound(t *testing.T) {
 	db := newDB(t)
 	require.ErrorIs(t, CancelJob(context.Background(), db, "nope"), ErrJobNotFound)
 }
+
+func TestSetPeriodicActiveToggles(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+
+	require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{Slug: "p", Kind: "k", Every: time.Minute, Active: true}))
+
+	require.NoError(t, SetPeriodicActive(ctx, db, "p", false))
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	require.Len(t, views, 1)
+	assert.False(t, views[0].Active, "the schedule is deactivated but preserved")
+
+	require.NoError(t, SetPeriodicActive(ctx, db, "p", true))
+	views, err = ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	assert.True(t, views[0].Active, "the schedule is reactivated")
+}
+
+func TestSetPeriodicActiveMissingReturnsErrPeriodicNotFound(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	require.ErrorIs(t, SetPeriodicActive(context.Background(), db, "nope", false), ErrPeriodicNotFound)
+}
+
+func TestDeletePeriodicRemoves(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+
+	require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{Slug: "p", Kind: "k", Every: time.Minute, Active: true}))
+	require.NoError(t, DeletePeriodic(ctx, db, "p"))
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	assert.Empty(t, views, "the schedule is removed")
+}
+
+func TestDeletePeriodicMissingReturnsErrPeriodicNotFound(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	require.ErrorIs(t, DeletePeriodic(context.Background(), db, "nope"), ErrPeriodicNotFound)
+}

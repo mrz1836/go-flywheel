@@ -175,6 +175,42 @@ func scheduleChanged(existing jobPeriodicRow, spec PeriodicSpec) bool {
 	return existing.CronExpr == nil || *existing.CronExpr != spec.Cron
 }
 
+// SetPeriodicActive toggles a periodic definition's active flag by slug without
+// touching its schedule or next_run_at cursor. Deactivating preserves the row —
+// it stays inspectable — but stops it firing; reactivating resumes it on the
+// existing cadence. It is the writer behind a declarative reconcile's
+// orphan-disable and the CLI's enable/disable, and returns ErrPeriodicNotFound
+// when no definition has the slug.
+func SetPeriodicActive(ctx context.Context, db *gorm.DB, slug string, active bool) error {
+	now := ClockFrom(ctx).Now(ctx)
+	res := db.WithContext(ctx).Model(&jobPeriodicRow{}).Where("slug = ?", slug).Updates(map[string]any{
+		"is_active":  active,
+		"updated_at": now,
+	})
+	if res.Error != nil {
+		return fmt.Errorf("flywheel: set periodic %q active: %w", slug, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrPeriodicNotFound
+	}
+	return nil
+}
+
+// DeletePeriodic removes a periodic definition by slug. Jobs it already enqueued
+// are untouched — only the schedule that would produce new ones is removed. It is
+// the writer behind `flywheel schedule rm`, idiomatic with UpsertPeriodic, and
+// returns ErrPeriodicNotFound when no definition has the slug.
+func DeletePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
+	res := db.WithContext(ctx).Where("slug = ?", slug).Delete(&jobPeriodicRow{})
+	if res.Error != nil {
+		return fmt.Errorf("flywheel: delete periodic %q: %w", slug, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrPeriodicNotFound
+	}
+	return nil
+}
+
 // PeriodicView is the public read projection of a periodic definition.
 type PeriodicView struct {
 	Slug            string     `json:"slug"`

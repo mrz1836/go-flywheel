@@ -47,6 +47,31 @@ func TestReconcileSchedulesUpsertsAndIsIdempotent(t *testing.T) {
 	assert.Len(t, views, 2)
 }
 
+func TestReconcileSchedulesDisablesOrphans(t *testing.T) {
+	t.Parallel()
+	db := newCLITestDB(t)
+	ctx := context.Background()
+
+	both := &Config{Schedules: []ScheduleEntry{
+		{Slug: "a", Worker: "exec", Every: Duration(time.Minute), Exec: &execSpec{Command: "true"}},
+		{Slug: "b", Worker: "exec", Every: Duration(time.Minute), Exec: &execSpec{Command: "true"}},
+	}}
+	require.NoError(t, reconcileSchedules(ctx, db, both))
+
+	// Drop b from the config; a declarative reconcile must deactivate it.
+	onlyA := &Config{Schedules: []ScheduleEntry{both.Schedules[0]}}
+	require.NoError(t, reconcileSchedules(ctx, db, onlyA))
+
+	views, err := flywheel.ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	active := map[string]bool{}
+	for _, v := range views {
+		active[v.Slug] = v.Active
+	}
+	assert.True(t, active["a"], "a stays active")
+	assert.False(t, active["b"], "b is deactivated when removed from the config")
+}
+
 func TestBuildRegistryRegistersExecAndHTTP(t *testing.T) {
 	t.Parallel()
 	// A duplicate registration panics, so registering the same kinds again proves

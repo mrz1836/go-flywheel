@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"text/tabwriter"
@@ -8,12 +9,19 @@ import (
 
 	flywheel "github.com/mrz1836/go-flywheel"
 	"github.com/spf13/cobra"
+	"gorm.io/gorm"
 )
 
-// newScheduleCmd builds the `flywheel schedule` group: ls, add.
+// newScheduleCmd builds the `flywheel schedule` group: ls, add, rm, enable, disable.
 func newScheduleCmd(configPath *string) *cobra.Command {
-	cmd := &cobra.Command{Use: "schedule", Short: "Inspect and add periodic schedules"}
-	cmd.AddCommand(newScheduleLsCmd(configPath), newScheduleAddCmd(configPath))
+	cmd := &cobra.Command{Use: "schedule", Short: "Inspect and manage periodic schedules"}
+	cmd.AddCommand(
+		newScheduleLsCmd(configPath),
+		newScheduleAddCmd(configPath),
+		newScheduleRmCmd(configPath),
+		newScheduleEnableCmd(configPath),
+		newScheduleDisableCmd(configPath),
+	)
 	return cmd
 }
 
@@ -39,13 +47,13 @@ func newScheduleLsCmd(configPath *string) *cobra.Command {
 				return writeJSON(cmd.OutOrStdout(), views)
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
-			fmt.Fprintln(tw, "SLUG\tKIND\tSCHEDULE\tACTIVE\tNEXT RUN")
+			_, _ = fmt.Fprintln(tw, "SLUG\tKIND\tSCHEDULE\tACTIVE\tNEXT RUN")
 			for _, v := range views {
 				schedule := v.Cron
 				if schedule == "" {
 					schedule = fmt.Sprintf("every %ds", v.IntervalSeconds)
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%t\t%s\n", v.Slug, v.Kind, schedule, v.Active, v.NextRunAt.Format("2006-01-02 15:04:05"))
+				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%t\t%s\n", v.Slug, v.Kind, schedule, v.Active, v.NextRunAt.Format("2006-01-02 15:04:05"))
 			}
 			return tw.Flush()
 		},
@@ -95,7 +103,7 @@ func newScheduleAddCmd(configPath *string) *cobra.Command {
 			}); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "scheduled %s (%s)\n", slug, kind)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "scheduled %s (%s)\n", slug, kind)
 			return nil
 		},
 	}
@@ -104,4 +112,66 @@ func newScheduleAddCmd(configPath *string) *cobra.Command {
 	cmd.Flags().StringVar(&args, "args", "{}", "JSON args template fired on each run")
 	cmd.Flags().StringVar(&queue, "queue", "", "queue (default: periodic)")
 	return cmd
+}
+
+// newScheduleRmCmd removes a periodic schedule by slug.
+func newScheduleRmCmd(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "rm <slug>",
+		Short: "Remove a periodic schedule",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return mutateSchedule(cmd, *configPath, args[0], flywheel.DeletePeriodic, "removed")
+		},
+	}
+}
+
+// newScheduleEnableCmd reactivates a periodic schedule by slug.
+func newScheduleEnableCmd(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "enable <slug>",
+		Short: "Reactivate a periodic schedule",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return mutateSchedule(cmd, *configPath, args[0], setPeriodicActive(true), "enabled")
+		},
+	}
+}
+
+// newScheduleDisableCmd deactivates a periodic schedule by slug — it is preserved
+// (and inspectable) but stops firing.
+func newScheduleDisableCmd(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "disable <slug>",
+		Short: "Deactivate a periodic schedule (preserved, but stops firing)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return mutateSchedule(cmd, *configPath, args[0], setPeriodicActive(false), "disabled")
+		},
+	}
+}
+
+// setPeriodicActive adapts SetPeriodicActive to the slug-mutator shape so the
+// enable/disable commands share mutateSchedule.
+func setPeriodicActive(active bool) func(context.Context, *gorm.DB, string) error {
+	return func(ctx context.Context, db *gorm.DB, slug string) error {
+		return flywheel.SetPeriodicActive(ctx, db, slug, active)
+	}
+}
+
+// mutateSchedule runs a schedule mutator (rm/enable/disable) on slug and reports
+// the result, mirroring jobs.go's mutateJob.
+func mutateSchedule(
+	cmd *cobra.Command, configPath, slug string, mutate func(context.Context, *gorm.DB, string) error, verb string,
+) error {
+	_, db, _, err := loadAndOpen(configPath)
+	if err != nil {
+		return err
+	}
+	defer closeDB(db)
+	if err := mutate(cmd.Context(), db, slug); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", verb, slug)
+	return nil
 }
