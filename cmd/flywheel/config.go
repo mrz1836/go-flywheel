@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Duration is a time.Duration that unmarshals from a YAML string like "30s" or
-// "24h", so flywheel.yaml can use human-readable durations.
+// Duration is a time.Duration that unmarshals from a YAML string like "30s",
+// "24h", or "14d", so flywheel.yaml can use human-readable durations.
 type Duration time.Duration
 
 // UnmarshalYAML parses a duration string into d.
@@ -22,7 +23,7 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	if s == "" {
 		return nil
 	}
-	parsed, err := time.ParseDuration(s)
+	parsed, err := parseHumanDuration(s)
 	if err != nil {
 		return fmt.Errorf("invalid duration %q: %w", s, err)
 	}
@@ -32,6 +33,25 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 
 // Std returns the underlying time.Duration.
 func (d Duration) Std() time.Duration { return time.Duration(d) }
+
+// parseHumanDuration parses a Go duration, additionally accepting a trailing
+// `d` (days) or `w` (weeks) — units time.ParseDuration lacks — so config files
+// and flags can say "14d" or "2w" for retention windows.
+func parseHumanDuration(s string) (time.Duration, error) {
+	if n := len(s); n >= 2 {
+		switch unit := s[n-1]; unit {
+		case 'd', 'w':
+			if days, err := strconv.Atoi(s[:n-1]); err == nil {
+				per := 24 * time.Hour
+				if unit == 'w' {
+					per = 7 * 24 * time.Hour
+				}
+				return time.Duration(days) * per, nil
+			}
+		}
+	}
+	return time.ParseDuration(s)
+}
 
 // Config is the flywheel.yaml schema: which database to use, how the runtime
 // behaves, how to log, and the declarative schedules (the cron replacement).
@@ -56,6 +76,10 @@ type RuntimeConfig struct {
 	Lease            Duration `yaml:"lease"`
 	PollInterval     Duration `yaml:"poll_interval"`
 	RetryBackoffBase Duration `yaml:"retry_backoff_base"`
+	// Retention, when > 0, enables the daemon's retention sweep in `serve`:
+	// terminal jobs (and their runs) finalized longer ago than this are pruned on
+	// a cadence. Zero (the default) disables it — nothing is ever deleted.
+	Retention Duration `yaml:"retention"`
 	// EnvAllowlist names the host environment variables exec jobs inherit. Nil
 	// uses the ExecWorker default (PATH, HOME, SHELL, LANG, TMPDIR).
 	EnvAllowlist []string `yaml:"env_allowlist"`

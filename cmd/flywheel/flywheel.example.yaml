@@ -14,6 +14,7 @@ runtime:
   concurrency: 1 # SQLite is single-writer (keep 1); Postgres may raise it
   lease: 30s # visibility timeout on a claimed job
   poll_interval: 250ms # pause between empty polls
+  # retention: 14d  # prune finished jobs (and their runs) older than this; unset = keep forever
   # env_allowlist: [PATH, HOME, SHELL, LANG, TMPDIR]  # host env exec jobs inherit
 
 log:
