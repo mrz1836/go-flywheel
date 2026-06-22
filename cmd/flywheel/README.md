@@ -14,8 +14,9 @@ It is a **nested Go module** (its own `go.mod`) so the heavier CLI dependencies
 go install github.com/mrz1836/go-flywheel/cmd/flywheel@latest
 ```
 
-Requires CGO (SQLite via `mattn/go-sqlite3`); macOS has the toolchain via the
-Xcode Command Line Tools.
+No CGO or C toolchain required — SQLite is the pure-Go `modernc` driver, so the
+binary cross-compiles to every platform. You can also grab a prebuilt binary
+from the releases page, or self-update an existing install with `flywheel update`.
 
 ## Quick start
 

@@ -14,9 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// runRoot executes the root command with args, capturing combined output.
+// runRoot executes the root command with args, capturing combined output. A nil
+// update nudge keeps the command tree network-free in tests.
 func runRoot(ctx context.Context, args ...string) (string, error) {
-	root := newRootCmd()
+	root := newRootCmd(nil)
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
@@ -91,6 +92,71 @@ func TestCLIScheduleAddAndList(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out, "nightly")
 	assert.Contains(t, out, "0 2 * * *")
+}
+
+func TestCLIScheduleDisableEnableRm(t *testing.T) {
+	t.Parallel()
+	cfg := writeCLIConfig(t, t.TempDir(), "")
+	ctx := context.Background()
+	_, err := runRoot(ctx, "--config", cfg, "migrate")
+	require.NoError(t, err)
+
+	_, err = runRoot(ctx, "--config", cfg, "schedule", "add", "job1", "exec", "--every", "1m", "--args", `{"command":"true"}`)
+	require.NoError(t, err)
+
+	out, err := runRoot(ctx, "--config", cfg, "schedule", "disable", "job1")
+	require.NoError(t, err)
+	assert.Contains(t, out, "disabled job1")
+	out, err = runRoot(ctx, "--config", cfg, "schedule", "ls", "--json")
+	require.NoError(t, err)
+	assert.Contains(t, out, `"active": false`)
+
+	out, err = runRoot(ctx, "--config", cfg, "schedule", "enable", "job1")
+	require.NoError(t, err)
+	assert.Contains(t, out, "enabled job1")
+	out, err = runRoot(ctx, "--config", cfg, "schedule", "ls", "--json")
+	require.NoError(t, err)
+	assert.Contains(t, out, `"active": true`)
+
+	out, err = runRoot(ctx, "--config", cfg, "schedule", "rm", "job1")
+	require.NoError(t, err)
+	assert.Contains(t, out, "removed job1")
+	out, err = runRoot(ctx, "--config", cfg, "schedule", "ls", "--json")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "job1")
+
+	// A missing slug is an error, not a silent success.
+	_, err = runRoot(ctx, "--config", cfg, "schedule", "rm", "ghost")
+	require.Error(t, err)
+}
+
+func TestCLIPruneDeletesOldFinishedJobs(t *testing.T) {
+	t.Parallel()
+	cfg := writeCLIConfig(t, t.TempDir(), "")
+	ctx := context.Background()
+	_, err := runRoot(ctx, "--config", cfg, "migrate")
+	require.NoError(t, err)
+
+	// Seed one old terminal job directly into the daemon's database.
+	loaded, err := LoadConfig(cfg)
+	require.NoError(t, err)
+	db, _, err := openDB(loaded)
+	require.NoError(t, err)
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	require.NoError(t, db.Exec(
+		`INSERT INTO jobs(id, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, finalized_at, executor_class, tags, created_at, updated_at, metadata)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		"old-done", "exec", "default", "{}", 100, "succeeded", 1, 25, old, old, "", "[]", old, old, "{}",
+	).Error)
+	closeDB(db)
+
+	out, err := runRoot(ctx, "--config", cfg, "prune", "--older-than", "14d")
+	require.NoError(t, err)
+	assert.Contains(t, out, "pruned 1")
+
+	out, err = runRoot(ctx, "--config", cfg, "jobs", "ls", "--json")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "old-done", "the old finished job is pruned")
 }
 
 func TestCLIServeProcessesEnqueuedAndScheduledJobs(t *testing.T) {
