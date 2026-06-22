@@ -277,7 +277,13 @@ func (d *baseDriver) Finalize(
 ) error {
 	plan := planFinalize(raw, result, workErr, finishedAt)
 
-	err := d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	// A recorded outcome must survive shutdown: a drain or cancel that cancels ctx
+	// mid-finalize would otherwise roll back the worker's result. WithoutCancel
+	// detaches the finalize transaction from ctx's cancellation while preserving
+	// its values, so the clock and request id InsertChild reads still resolve.
+	txCtx := context.WithoutCancel(ctx)
+
+	err := d.db.WithContext(txCtx).Transaction(func(tx *gorm.DB) error {
 		var stub jobRunRow
 		if err := tx.Model(&jobRunRow{}).
 			Select("started_at").Where("id = ?", runID).First(&stub).Error; err != nil {
@@ -285,15 +291,22 @@ func (d *baseDriver) Finalize(
 		}
 		durationMs := int(finishedAt.Sub(stub.StartedAt).Milliseconds())
 
-		if err := tx.Model(&jobRow{}).Where("id = ?", raw.ID).
-			Updates(jobFinalizeUpdate(plan, finishedAt)).Error; err != nil {
-			return fmt.Errorf("jobs: advance job state: %w", err)
+		// Scope the state advance to the claim this attempt still holds. A
+		// concurrent CancelJob or a lease-sweep reclaim moves the job out of
+		// running and supersedes this finalize, so the UPDATE matches no row. We
+		// honor that — no state advance, no follow-up enqueue — but still write the
+		// job_runs audit row so the attempt is not lost, then return nil.
+		res := tx.Model(&jobRow{}).Where("id = ? AND state = ?", raw.ID, string(StateRunning)).
+			Updates(jobFinalizeUpdate(plan, finishedAt))
+		if res.Error != nil {
+			return fmt.Errorf("jobs: advance job state: %w", res.Error)
 		}
+		superseded := res.RowsAffected == 0
 
 		enqueued := 0
-		if plan.followUps {
+		if plan.followUps && !superseded {
 			var followErr error
-			if enqueued, followErr = d.insertFollowUps(ctx, tx, result.FollowUps, raw.ID); followErr != nil {
+			if enqueued, followErr = d.insertFollowUps(txCtx, tx, result.FollowUps, raw.ID); followErr != nil {
 				return followErr
 			}
 		}
