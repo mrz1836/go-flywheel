@@ -86,12 +86,17 @@ func buildRegistry(cfg *Config) *flywheel.Registry {
 	return reg
 }
 
-// reconcileSchedules upserts every flywheel.yaml schedule into job_periodics, so
-// declaring a schedule in config is all it takes to run it durably. It is
-// idempotent: unchanged entries keep their cadence cursor across restarts.
+// reconcileSchedules makes flywheel.yaml the declarative source of truth for
+// schedules: it upserts every config schedule into job_periodics, then disables
+// any active definition the config no longer names. Removing a schedule from the
+// file therefore stops it firing on the next serve, while preserving its row (and
+// history) for inspection. It is idempotent: unchanged entries keep their cadence
+// cursor across restarts.
 func reconcileSchedules(ctx context.Context, db *gorm.DB, cfg *Config) error {
+	configured := make(map[string]bool, len(cfg.Schedules))
 	for i := range cfg.Schedules {
 		s := cfg.Schedules[i]
+		configured[s.Slug] = true
 		args, err := s.argsTemplate()
 		if err != nil {
 			return fmt.Errorf("schedule %q: marshal args: %w", s.Slug, err)
@@ -106,6 +111,18 @@ func reconcileSchedules(ctx context.Context, db *gorm.DB, cfg *Config) error {
 			Active:       true,
 		}); err != nil {
 			return fmt.Errorf("schedule %q: %w", s.Slug, err)
+		}
+	}
+
+	existing, err := flywheel.ListPeriodics(ctx, db)
+	if err != nil {
+		return fmt.Errorf("reconcile schedules: %w", err)
+	}
+	for _, v := range existing {
+		if v.Active && !configured[v.Slug] {
+			if derr := flywheel.SetPeriodicActive(ctx, db, v.Slug, false); derr != nil {
+				return fmt.Errorf("disable orphan schedule %q: %w", v.Slug, derr)
+			}
 		}
 	}
 	return nil
