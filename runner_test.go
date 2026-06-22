@@ -267,12 +267,12 @@ func TestRunnerSqliteDriverRejectsConcurrencyGreaterThanOne(t *testing.T) {
 	Register(reg, &successWorker{})
 
 	_, err := NewRunner(RunnerConfig{
-		DB:           db,
-		Driver:       NewSQLiteDriver(db),
-		Registry:     reg,
-		Queues:       []string{"default"},
-		ExecutorKind: ExecutorLocal,
-		Concurrency:  2,
+		DB:            db,
+		Driver:        NewSQLiteDriver(db),
+		Registry:      reg,
+		Queues:        []string{"default"},
+		ExecutorClass: "local",
+		Concurrency:   2,
 	})
 	require.ErrorIs(t, err, ErrSQLiteConcurrency)
 }

@@ -20,14 +20,6 @@ import (
 
 // --- pure unit tests (no database) -----------------------------------------
 
-func TestRunOnValuesByExecutorKind(t *testing.T) {
-	t.Parallel()
-	assert.Equal(t, []string{string(RunOnLambda), string(RunOnEither)}, runOnValues(ExecutorLambda))
-	assert.Equal(t, []string{string(RunOnECS), string(RunOnEither)}, runOnValues(ExecutorECS))
-	assert.Nil(t, runOnValues(ExecutorLocal))
-	assert.Nil(t, runOnValues(ExecutorKind("bogus")), "an unknown kind is unrestricted")
-}
-
 func TestDefaultBackoffGrowsThenCapsAtOneMinute(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, time.Second, defaultBackoff(0), "attempt below 1 is treated as 1")
@@ -180,6 +172,7 @@ func (fullWorker) Work(context.Context, *Job[fullArgs]) (Result, error) { return
 func (fullWorker) NextRetry(error, int) time.Duration                   { return time.Second }
 func (fullWorker) Classify(error) ErrorClass                            { return ErrorTransient }
 func (fullWorker) Defaults() InsertOpts                                 { return InsertOpts{Queue: "q"} }
+func (fullWorker) Timeout() time.Duration                               { return time.Second }
 
 func TestRegisterCapturesOptionalInterfaces(t *testing.T) {
 	t.Parallel()
@@ -190,6 +183,7 @@ func TestRegisterCapturesOptionalInterfaces(t *testing.T) {
 	assert.NotNil(t, e.classifier, "Classifier is captured")
 	assert.NotNil(t, e.retryable, "Retryable is captured")
 	assert.NotNil(t, e.defaults, "Defaults is captured")
+	assert.NotNil(t, e.timeouter, "Timeouter is captured")
 }
 
 func TestClassifyUsesClassifierAndRetryableDelay(t *testing.T) {
@@ -217,11 +211,11 @@ func TestNewRunnerAppliesZeroValueDefaults(t *testing.T) {
 		Driver:   NewSQLiteDriver(db),
 		Registry: NewRegistry(),
 		Queues:   []string{"default"},
-		// ExecutorKind, Concurrency, durations and Logger left zero.
+		// ExecutorClass, Concurrency, durations and Logger left zero.
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 1, r.cfg.Concurrency)
-	assert.Equal(t, ExecutorLocal, r.cfg.ExecutorKind)
+	assert.Equal(t, AnyClass, r.cfg.ExecutorClass, "executor class defaults to the wildcard")
 	assert.Equal(t, defaultLeaseDuration, r.cfg.LeaseDuration)
 	assert.Equal(t, defaultPollInterval, r.cfg.PollInterval)
 	assert.Equal(t, defaultRetryBackoffBase, r.cfg.RetryBackoffBase)
@@ -267,7 +261,7 @@ type fakeDriver struct {
 	finalized   int
 }
 
-func (f *fakeDriver) Dequeue(context.Context, []string, ExecutorKind, int, time.Duration) ([]RawJob, error) {
+func (f *fakeDriver) Dequeue(context.Context, []string, ExecutorClass, bool, int, time.Duration) ([]RawJob, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.dequeueErr != nil {
@@ -280,7 +274,7 @@ func (f *fakeDriver) Dequeue(context.Context, []string, ExecutorKind, int, time.
 	return f.batch, nil
 }
 
-func (f *fakeDriver) InsertRunStub(context.Context, string, RawJob, time.Time, ExecutorKind, string) error {
+func (f *fakeDriver) InsertRunStub(context.Context, string, RawJob, time.Time, ExecutorClass, string) error {
 	return f.stubErr
 }
 
@@ -300,12 +294,12 @@ func newFakeRunner(t *testing.T, fd *fakeDriver, concurrency int) *Runner {
 	reg := NewRegistry()
 	Register(reg, &successWorker{})
 	r, err := NewRunner(RunnerConfig{
-		DB:           newDB(t),
-		Driver:       fd,
-		Registry:     reg,
-		Queues:       []string{"default"},
-		ExecutorKind: ExecutorLocal,
-		Concurrency:  concurrency,
+		DB:            newDB(t),
+		Driver:        fd,
+		Registry:      reg,
+		Queues:        []string{"default"},
+		ExecutorClass: "local",
+		Concurrency:   concurrency,
 	})
 	require.NoError(t, err)
 	return r
@@ -431,26 +425,32 @@ func TestSchedulerFirePeriodicWithoutScheduleErrors(t *testing.T) {
 
 // --- sqlite driver ----------------------------------------------------------
 
-func TestSQLiteDequeueRunOnFilterAndEarlyReturns(t *testing.T) {
+func TestSQLiteDequeueExecutorClassFilterAndEarlyReturns(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	d := NewSQLiteDriver(db)
 	ctx := context.Background()
 
-	out, err := d.Dequeue(ctx, []string{"default"}, ExecutorLocal, 0, time.Second)
+	out, err := d.Dequeue(ctx, []string{"default"}, AnyClass, true, 0, time.Second)
 	require.NoError(t, err)
 	assert.Empty(t, out, "a non-positive limit claims nothing")
 
-	out, err = d.Dequeue(ctx, nil, ExecutorLocal, 5, time.Second)
+	out, err = d.Dequeue(ctx, nil, AnyClass, true, 5, time.Second)
 	require.NoError(t, err)
 	assert.Empty(t, out, "no queues claims nothing")
 
-	id, err := Insert(ctx, NewClient(db), successArgs{V: "x"}, InsertOpts{RunOn: RunOnLambda})
+	id, err := Insert(ctx, NewClient(db), successArgs{V: "x"}, InsertOpts{ExecutorClass: "gpu"})
 	require.NoError(t, err)
 
-	claimed, err := d.Dequeue(ctx, []string{"default"}, ExecutorLambda, 5, time.Second)
+	// A runner serving a different, non-wildcard class does not claim the
+	// gpu-routed job through the executor_class filter.
+	none, err := d.Dequeue(ctx, []string{"default"}, ExecutorClass("cpu"), false, 5, time.Second)
 	require.NoError(t, err)
-	require.Len(t, claimed, 1, "a lambda executor claims a lambda-restricted job via the run_on filter")
+	assert.Empty(t, none, "a cpu executor does not claim a gpu-routed job")
+
+	claimed, err := d.Dequeue(ctx, []string{"default"}, ExecutorClass("gpu"), false, 5, time.Second)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1, "a gpu executor claims a gpu-routed job via the executor_class filter")
 	assert.Equal(t, id, claimed[0].ID)
 }
 
@@ -464,8 +464,8 @@ func TestInsertRunStubDuplicateIDErrors(t *testing.T) {
 	raw := RawJob{ID: "job-1", Attempt: 1}
 	runID := NewID()
 
-	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorLocal, "h1"))
-	err := d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorLocal, "h1")
+	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
+	err := d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1")
 	require.Error(t, err, "a duplicate run-stub primary key surfaces an error")
 }
 
@@ -477,7 +477,7 @@ func TestFinalizeOutputMarshalErrors(t *testing.T) {
 
 	raw := RawJob{ID: "job-x", Attempt: 1, MaxAttempts: 5}
 	runID := NewID()
-	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorLocal, "h1"))
+	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
 
 	err := d.Finalize(ctx, raw, runID, Result{Output: make(chan int)}, nil, time.Now())
 	require.Error(t, err, "an unmarshalable worker Output surfaces a finalize error")
@@ -652,17 +652,10 @@ func TestRunnerThreadsRequestIDFromMetadataToWorkerCtx(t *testing.T) {
 
 // --- base.go lifecycle hooks -----------------------------------------------
 
-func TestJobRowBeforeCreateRejectsUnknownRunOn(t *testing.T) {
-	t.Parallel()
-	db := newDB(t)
-	err := db.Create(&jobRow{Kind: "k", RunOn: "bogus"}).Error
-	require.ErrorIs(t, err, ErrValidation)
-}
-
 func TestJobRunRowBeforeCreateDefaultsTimestamps(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	row := jobRunRow{JobID: "j", ExecutorKind: string(ExecutorLocal), ExecutorID: "h", Outcome: string(OutcomeStarted)}
+	row := jobRunRow{JobID: "j", ExecutorClass: "local", ExecutorID: "h", Outcome: string(OutcomeStarted)}
 	require.NoError(t, db.Create(&row).Error)
 	assert.NotEmpty(t, row.ID, "the id is minted")
 	assert.False(t, row.StartedAt.IsZero(), "StartedAt defaults to the clock's now")

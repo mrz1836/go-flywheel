@@ -19,15 +19,17 @@ const maxErrorMessage = 4096
 // driver_sqlite.go (BEGIN IMMEDIATE + serialized claim) — so the runtime code
 // above it never sees the SQL dialect.
 type Driver interface {
-	// Dequeue atomically claims up to limit ready jobs from the given queues
-	// for an executor of the given kind, leasing each for the lease duration.
-	// A claimed job has its state advanced to running and its attempt
-	// incremented.
-	Dequeue(ctx context.Context, queues []string, kind ExecutorKind, limit int, lease time.Duration) ([]RawJob, error)
+	// Dequeue atomically claims up to limit ready jobs from the given queues for
+	// the given executor class, leasing each for the lease duration. Unless
+	// claimAny is set, it claims only jobs whose executor_class equals class or is
+	// the empty wildcard. A claimed job has its state advanced to running and its
+	// attempt incremented.
+	Dequeue(ctx context.Context, queues []string, class ExecutorClass, claimAny bool, limit int, lease time.Duration) ([]RawJob, error)
 
 	// InsertRunStub commits a job_runs row with outcome started before the
-	// worker runs, so a side-effect FK to runID resolves through a crash.
-	InsertRunStub(ctx context.Context, runID string, raw RawJob, startedAt time.Time, kind ExecutorKind, execID string) error
+	// worker runs, so a side-effect FK to runID resolves through a crash. class
+	// is recorded as the run's executor_class.
+	InsertRunStub(ctx context.Context, runID string, raw RawJob, startedAt time.Time, class ExecutorClass, execID string) error
 
 	// Finalize runs, in one transaction, the run-row outcome update, the
 	// jobs.state advance, and any follow-up inserts. A follow-up colliding with
@@ -106,7 +108,11 @@ func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time
 				delay = ce.retryDelay
 			}
 		}
-		out := finalizeOutcome{runOutcome: OutcomeError, errorClass: &class}
+		outcome := OutcomeError
+		if class == ErrorTimeout {
+			outcome = OutcomeTimeout
+		}
+		out := finalizeOutcome{runOutcome: outcome, errorClass: &class}
 		permanent := class == ErrorPermanent || class == ErrorValidation
 		if permanent || raw.Attempt >= raw.MaxAttempts {
 			out.jobState = StateDiscarded
@@ -147,21 +153,6 @@ func defaultBackoff(attempt int) time.Duration {
 	return expBackoff(time.Second, time.Minute, attempt)
 }
 
-// runOnValues is the set of run_on values an executor of the given kind may
-// claim. A local executor is unrestricted (nil).
-func runOnValues(kind ExecutorKind) []string {
-	switch kind {
-	case ExecutorLambda:
-		return []string{string(RunOnLambda), string(RunOnEither)}
-	case ExecutorECS:
-		return []string{string(RunOnECS), string(RunOnEither)}
-	case ExecutorLocal:
-		return nil
-	default:
-		return nil
-	}
-}
-
 // claimableStates are the job states Dequeue may claim from.
 var claimableStates = []string{ //nolint:gochecknoglobals // intentional shared constant slice
 	string(StateAvailable), string(StateRetryable), string(StateScheduled),
@@ -182,6 +173,7 @@ func rawFromRow(r jobRow, attempt int) (RawJob, error) {
 		Args:        []byte(r.Args),
 		Attempt:     attempt,
 		MaxAttempts: r.MaxAttempts,
+		TimeoutMs:   r.TimeoutMs,
 		ParentJobID: r.ParentJobID,
 		Tags:        tags,
 		ScheduledAt: r.ScheduledAt,
@@ -206,17 +198,17 @@ type baseDriver struct {
 // InsertRunStub commits a job_runs row with outcome started before the worker
 // runs (research §8).
 func (d *baseDriver) InsertRunStub(
-	ctx context.Context, runID string, raw RawJob, startedAt time.Time, kind ExecutorKind, execID string,
+	ctx context.Context, runID string, raw RawJob, startedAt time.Time, class ExecutorClass, execID string,
 ) error {
 	row := jobRunRow{
-		ID:           runID,
-		JobID:        raw.ID,
-		Attempt:      raw.Attempt,
-		ExecutorKind: string(kind),
-		ExecutorID:   execID,
-		StartedAt:    startedAt,
-		Outcome:      string(OutcomeStarted),
-		CreatedAt:    startedAt,
+		ID:            runID,
+		JobID:         raw.ID,
+		Attempt:       raw.Attempt,
+		ExecutorClass: string(class),
+		ExecutorID:    execID,
+		StartedAt:     startedAt,
+		Outcome:       string(OutcomeStarted),
+		CreatedAt:     startedAt,
 	}
 	if err := d.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return fmt.Errorf("jobs: insert run stub: %w", WrapDBError(err))
@@ -332,19 +324,19 @@ func (d *baseDriver) InsertChild(
 	}
 	now := ClockFrom(ctx).Now(ctx)
 	row := jobRow{
-		ID:          NewID(),
-		CreatedAt:   now,
-		UpdatedAt:   now,
-		Metadata:    datatypes.JSON(metadataWithRequestID(nil, RequestIDFrom(ctx))),
-		Kind:        fu.Kind,
-		Queue:       orString(fu.Queue, defaultQueue),
-		Args:        datatypes.JSON(payload),
-		Priority:    orInt(fu.Priority, defaultPriority),
-		State:       string(StateAvailable),
-		MaxAttempts: defaultMaxAttempts,
-		ScheduledAt: now,
-		RunOn:       string(RunOnEither),
-		Tags:        datatypes.JSON("[]"),
+		ID:            NewID(),
+		CreatedAt:     now,
+		UpdatedAt:     now,
+		Metadata:      datatypes.JSON(metadataWithRequestID(nil, RequestIDFrom(ctx))),
+		Kind:          fu.Kind,
+		Queue:         orString(fu.Queue, defaultQueue),
+		Args:          datatypes.JSON(payload),
+		Priority:      orInt(fu.Priority, defaultPriority),
+		State:         string(StateAvailable),
+		MaxAttempts:   defaultMaxAttempts,
+		ScheduledAt:   now,
+		ExecutorClass: string(fu.ExecutorClass),
+		Tags:          datatypes.JSON("[]"),
 	}
 	if fu.ScheduleAt != nil {
 		row.ScheduledAt = *fu.ScheduleAt

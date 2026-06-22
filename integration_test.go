@@ -37,12 +37,12 @@ func (w *pgConcurrentWorker) Work(_ context.Context, _ *flywheel.Job[pgConcurren
 func newPostgresRunner(t *testing.T, db *gorm.DB, reg *flywheel.Registry, concurrency int) *flywheel.Runner {
 	t.Helper()
 	runner, err := flywheel.NewRunner(flywheel.RunnerConfig{
-		DB:           db,
-		Driver:       flywheel.NewPostgresDriver(db),
-		Registry:     reg,
-		Queues:       []string{"default", "periodic"},
-		ExecutorKind: flywheel.ExecutorLocal,
-		Concurrency:  concurrency,
+		DB:            db,
+		Driver:        flywheel.NewPostgresDriver(db),
+		Registry:      reg,
+		Queues:        []string{"default", "periodic"},
+		ExecutorClass: "local",
+		Concurrency:   concurrency,
 	})
 	require.NoError(t, err)
 	return runner
@@ -92,6 +92,52 @@ func TestRunnerPGSkipLockedConcurrency(t *testing.T) {
 
 	assert.EqualValues(t, totalJobs, worker.processed.Load(),
 		"every job ran exactly once — SKIP LOCKED prevents double-claim")
+	assert.EqualValues(t, totalJobs, countByState(t, db, "pg.concurrent", "succeeded"))
+}
+
+// TestNodePGMultipleRunnersExactlyOnce builds one Node hosting two Postgres
+// runners (concurrency 4 each) and asserts every enqueued job runs exactly once
+// — SKIP LOCKED across both runners prevents any double-dispatch, and the Node
+// drains cleanly on cancel.
+func TestNodePGMultipleRunnersExactlyOnce(t *testing.T) {
+	t.Parallel()
+	db := flywheel.NewPostgresIsolatedDB(t)
+
+	worker := &pgConcurrentWorker{}
+	reg := flywheel.NewRegistry()
+	flywheel.Register(reg, worker)
+
+	const totalJobs = 80
+	for i := range totalJobs {
+		_, err := flywheel.Insert(context.Background(), flywheel.NewClient(db),
+			pgConcurrentArgs{V: fmt.Sprintf("v%d", i)}, flywheel.InsertOpts{})
+		require.NoError(t, err)
+	}
+
+	mkRunner := func() flywheel.RunnerConfig {
+		return flywheel.RunnerConfig{
+			DB: db, Driver: flywheel.NewPostgresDriver(db), Registry: reg,
+			Queues: []string{"default", "periodic"}, ClaimAnyClass: true,
+			Concurrency: 4, PollInterval: 5 * time.Millisecond,
+		}
+	}
+	node, err := flywheel.NewNode(flywheel.NodeConfig{
+		Runners: []flywheel.RunnerConfig{mkRunner(), mkRunner()},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- node.Run(ctx) }()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && countByState(t, db, "pg.concurrent", "succeeded") < totalJobs {
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	require.NoError(t, <-runErr)
+
+	assert.EqualValues(t, totalJobs, worker.processed.Load(), "every job ran exactly once across both Node runners")
 	assert.EqualValues(t, totalJobs, countByState(t, db, "pg.concurrent", "succeeded"))
 }
 
@@ -157,7 +203,7 @@ func TestRunnerPGLeaseExpiryReclaimsJob(t *testing.T) {
 		"attempt":      1,
 	}).Error)
 	require.NoError(t, db.Exec(
-		`INSERT INTO job_runs(id, job_id, attempt, executor_kind, executor_id, started_at, outcome, created_at)
+		`INSERT INTO job_runs(id, job_id, attempt, executor_class, executor_id, started_at, outcome, created_at)
 		 VALUES (?,?,?,?,?,?,?,?)`,
 		"00000000-0000-7000-8000-000000000001", id, 1, "local", "deadbeef:1", now.Add(-time.Hour),
 		"started", now.Add(-time.Hour),

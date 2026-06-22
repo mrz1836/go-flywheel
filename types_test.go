@@ -21,13 +21,7 @@ func TestEnumWireValuesAreStable(t *testing.T) {
 	assert.Equal(t, "cancelled", string(StateCancelled))
 	assert.Equal(t, "discarded", string(StateDiscarded))
 
-	assert.Equal(t, "lambda", string(RunOnLambda))
-	assert.Equal(t, "ecs", string(RunOnECS))
-	assert.Equal(t, "either", string(RunOnEither))
-
-	assert.Equal(t, "lambda", string(ExecutorLambda))
-	assert.Equal(t, "ecs", string(ExecutorECS))
-	assert.Equal(t, "local", string(ExecutorLocal))
+	assert.Equal(t, "", string(AnyClass), "the wildcard executor class is the empty string")
 
 	assert.Equal(t, "transient", string(ErrorTransient))
 	assert.Equal(t, "permanent", string(ErrorPermanent))
@@ -50,12 +44,6 @@ func TestEnumValid(t *testing.T) {
 
 	assert.True(t, StateAvailable.Valid())
 	assert.False(t, JobState("invented").Valid())
-
-	assert.True(t, RunOnEither.Valid())
-	assert.False(t, RunOn("invented").Valid())
-
-	assert.True(t, ExecutorLocal.Valid())
-	assert.False(t, ExecutorKind("invented").Valid())
 
 	assert.True(t, ErrorTransient.Valid())
 	assert.False(t, ErrorClass("invented").Valid())

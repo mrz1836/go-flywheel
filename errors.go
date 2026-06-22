@@ -60,6 +60,12 @@ var (
 // errWorkerPanicked wraps a recovered worker panic.
 var errWorkerPanicked = errors.New("jobs: worker panicked")
 
+// Node configuration errors returned by NewNode.
+var (
+	errNodeNeedsRunner     = errors.New("jobs: node config requires at least one runner")
+	errNodeSchedulerConfig = errors.New("jobs: node scheduler config requires DB and Client")
+)
+
 // errPeriodicNoSchedule is returned when a periodic definition has neither a
 // cron expression nor an interval.
 var errPeriodicNoSchedule = errors.New("jobs: periodic has no schedule")

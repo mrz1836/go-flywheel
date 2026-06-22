@@ -154,14 +154,14 @@ func TestSchedulerSweepReclaimsExpiredLeases(t *testing.T) {
 	pastLease := now.Add(-time.Minute)
 	jobID := NewID()
 	require.NoError(t, db.Exec(
-		`INSERT INTO jobs(id, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, run_on, leased_until, tags, created_at, updated_at, metadata)
+		`INSERT INTO jobs(id, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, executor_class, leased_until, tags, created_at, updated_at, metadata)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		jobID, "test.k", "default", "{}", 100, string(StateRunning), 1, 25, now, string(RunOnEither), pastLease, "[]", now, now, "{}",
+		jobID, "test.k", "default", "{}", 100, string(StateRunning), 1, 25, now, string(AnyClass), pastLease, "[]", now, now, "{}",
 	).Error)
 	require.NoError(t, db.Exec(
-		`INSERT INTO job_runs(id, job_id, attempt, executor_kind, executor_id, started_at, outcome, created_at)
+		`INSERT INTO job_runs(id, job_id, attempt, executor_class, executor_id, started_at, outcome, created_at)
 		 VALUES (?,?,?,?,?,?,?,?)`,
-		NewID(), jobID, 1, string(ExecutorLocal), "h1", now.Add(-time.Hour), string(OutcomeStarted), now.Add(-time.Hour),
+		NewID(), jobID, 1, "local", "h1", now.Add(-time.Hour), string(OutcomeStarted), now.Add(-time.Hour),
 	).Error)
 
 	reclaimed, err := sched.Sweep(clockCtx(context.Background(), NewFixedClock(now)))

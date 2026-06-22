@@ -80,20 +80,20 @@ func (c *Client) insert(ctx context.Context, kind string, payload []byte, opts I
 	}
 
 	row := jobRow{
-		ID:          NewID(),
-		CreatedAt:   now,
-		UpdatedAt:   now,
-		Metadata:    datatypes.JSON(metadataWithRequestID(nil, requestID)),
-		Kind:        kind,
-		Queue:       orString(opts.Queue, defaultQueue),
-		Args:        datatypes.JSON(payload),
-		Priority:    orInt(opts.Priority, defaultPriority),
-		State:       string(StateAvailable),
-		MaxAttempts: orInt(opts.MaxAttempts, defaultMaxAttempts),
-		ScheduledAt: now,
-		ParentJobID: opts.Parent,
-		RunOn:       orString(string(opts.RunOn), string(RunOnEither)),
-		Tags:        datatypes.JSON("[]"),
+		ID:            NewID(),
+		CreatedAt:     now,
+		UpdatedAt:     now,
+		Metadata:      datatypes.JSON(metadataWithRequestID(nil, requestID)),
+		Kind:          kind,
+		Queue:         orString(opts.Queue, defaultQueue),
+		Args:          datatypes.JSON(payload),
+		Priority:      orInt(opts.Priority, defaultPriority),
+		State:         string(StateAvailable),
+		MaxAttempts:   orInt(opts.MaxAttempts, defaultMaxAttempts),
+		ScheduledAt:   now,
+		ParentJobID:   opts.Parent,
+		ExecutorClass: string(opts.ExecutorClass),
+		Tags:          datatypes.JSON("[]"),
 	}
 	if opts.ScheduleAt != nil {
 		row.ScheduledAt = *opts.ScheduleAt
@@ -101,6 +101,10 @@ func (c *Client) insert(ctx context.Context, kind string, payload []byte, opts I
 	if opts.UniqueKey != "" {
 		uk := opts.UniqueKey
 		row.UniqueKey = &uk
+	}
+	if opts.Timeout > 0 {
+		ms := int(opts.Timeout.Milliseconds())
+		row.TimeoutMs = &ms
 	}
 
 	if createErr := db.WithContext(ctx).Create(&row).Error; createErr != nil {
