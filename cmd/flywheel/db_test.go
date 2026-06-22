@@ -70,7 +70,7 @@ func TestDBLabel(t *testing.T) {
 func TestSQLiteDSNHasHardeningPragmas(t *testing.T) {
 	t.Parallel()
 	dsn := sqliteDSN("/x/y.db")
-	for _, want := range []string{"_journal_mode=WAL", "_busy_timeout=5000", "_txlock=immediate"} {
+	for _, want := range []string{"_pragma=journal_mode(WAL)", "_pragma=busy_timeout(5000)", "_txlock=immediate"} {
 		assert.Contains(t, dsn, want)
 	}
 }

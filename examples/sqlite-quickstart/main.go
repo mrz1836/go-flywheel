@@ -13,8 +13,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/glebarez/sqlite"
 	flywheel "github.com/mrz1836/go-flywheel"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -42,7 +42,7 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	// WAL mode + a single writer connection is the robust local-SQLite setup.
-	db, err := gorm.Open(sqlite.Open("file:flywheel.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open("file:flywheel.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate"), &gorm.Config{})
 	if err != nil {
 		logger.Error("open db", "error", err)
 		os.Exit(1)

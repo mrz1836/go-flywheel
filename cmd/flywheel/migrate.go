@@ -23,7 +23,7 @@ func newMigrateCmd(configPath *string) *cobra.Command {
 			if err := flywheel.Migrate(db); err != nil {
 				return fmt.Errorf("migrate: %w", err)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "schema up to date (%s)\n", dbLabel(cfg))
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "schema up to date (%s)\n", dbLabel(cfg))
 			return nil
 		},
 	}

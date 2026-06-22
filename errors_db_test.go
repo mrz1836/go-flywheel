@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
-	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
 
@@ -48,17 +48,6 @@ func TestWrapDBError(t *testing.T) {
 			want: ErrDatabaseError,
 		},
 		{
-			name: "sqlite unique violation",
-			in:   sqlite3.Error{Code: sqlite3.ErrConstraint, ExtendedCode: sqlite3.ErrConstraintUnique},
-			want: ErrDuplicateKey,
-			msg:  "sqlite unique extended code must map to ErrDuplicateKey",
-		},
-		{
-			name: "sqlite primary key violation",
-			in:   sqlite3.Error{Code: sqlite3.ErrConstraint, ExtendedCode: sqlite3.ErrConstraintPrimaryKey},
-			want: ErrDuplicateKey,
-		},
-		{
 			// A driver error that does not unwrap to a typed value must still be
 			// classified by message so duplicate-key idempotency survives.
 			name: "message fallback unique",
@@ -84,4 +73,20 @@ func TestWrapDBError(t *testing.T) {
 			assert.ErrorIs(t, got, tt.want, tt.msg)
 		})
 	}
+}
+
+// TestWrapDBErrorClassifiesRealSQLiteUnique drives a genuine modernc UNIQUE
+// violation through WrapDBError. modernc's *sqlite.Error has unexported fields
+// (it cannot be constructed by hand), so the typed-error branch is verified
+// against a real constraint failure rather than a literal.
+func TestWrapDBErrorClassifiesRealSQLiteUnique(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	require.NoError(t, db.Exec(`CREATE TABLE u (k text)`).Error)
+	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX ux ON u (k)`).Error)
+	require.NoError(t, db.Exec(`INSERT INTO u (k) VALUES ('x')`).Error)
+
+	err := db.Exec(`INSERT INTO u (k) VALUES ('x')`).Error
+	require.Error(t, err)
+	assert.ErrorIs(t, WrapDBError(err), ErrDuplicateKey, "a real modernc UNIQUE violation maps to ErrDuplicateKey")
 }

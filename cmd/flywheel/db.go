@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/glebarez/sqlite"
 	flywheel "github.com/mrz1836/go-flywheel"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
@@ -64,9 +64,15 @@ func sqlitePath(cfg *Config) (string, error) {
 
 // sqliteDSN builds the hardened DSN: WAL journaling for concurrent reads, a busy
 // timeout to absorb the brief claim lock, immediate transactions for the
-// serialized claim, and foreign keys on.
+// serialized claim, and foreign keys on. The pragmas use modernc/glebarez's
+// `_pragma=` query syntax (the pure-Go driver, so the release needs no CGO).
 func sqliteDSN(path string) string {
-	return "file:" + path + "?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate&_synchronous=NORMAL&_foreign_keys=on"
+	return "file:" + path +
+		"?_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=foreign_keys(1)" +
+		"&_txlock=immediate"
 }
 
 // expandHome expands a leading ~/ in a path to the user's home directory.
