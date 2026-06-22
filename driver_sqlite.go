@@ -28,7 +28,7 @@ func NewSQLiteDriver(db *gorm.DB) Driver {
 //
 //nolint:gocognit,gocyclo // the select-then-claim transaction is one cohesive unit
 func (d *sqliteDriver) Dequeue(
-	ctx context.Context, queues []string, kind ExecutorKind, limit int, lease time.Duration,
+	ctx context.Context, queues []string, class ExecutorClass, claimAny bool, limit int, lease time.Duration,
 ) ([]RawJob, error) {
 	if limit <= 0 || len(queues) == 0 {
 		return nil, nil
@@ -44,8 +44,8 @@ func (d *sqliteDriver) Dequeue(
 			Where("queue IN ?", queues).
 			Order("priority, scheduled_at").
 			Limit(limit)
-		if rv := runOnValues(kind); rv != nil {
-			query = query.Where("run_on IN ?", rv)
+		if !claimAny {
+			query = query.Where("executor_class IN ?", []string{string(class), ""})
 		}
 
 		var rows []jobRow

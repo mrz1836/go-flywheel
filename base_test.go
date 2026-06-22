@@ -25,7 +25,7 @@ func TestJobRowBeforeCreateAppliesDefaults(t *testing.T) {
 	assert.Equal(t, 100, row.Priority)
 	assert.Equal(t, 25, row.MaxAttempts)
 	assert.Equal(t, string(StateAvailable), row.State)
-	assert.Equal(t, string(RunOnEither), row.RunOn)
+	assert.Equal(t, string(AnyClass), row.ExecutorClass, "the default executor class is the wildcard")
 	assert.False(t, row.ScheduledAt.IsZero())
 	assert.False(t, row.CreatedAt.IsZero())
 	assert.JSONEq(t, "[]", string(row.Tags))
@@ -82,12 +82,12 @@ func TestJobRunRowBeforeCreateRequiresMandatoryFields(t *testing.T) {
 	db := newDB(t)
 
 	// Missing JobID.
-	err := db.Create(&jobRunRow{ExecutorKind: "local", ExecutorID: "h1", Outcome: "started"}).Error
+	err := db.Create(&jobRunRow{ExecutorClass: "local", ExecutorID: "h1", Outcome: "started"}).Error
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrValidation)
 
 	// A fully specified run row mints its ID and defaults the timestamps.
-	run := jobRunRow{JobID: NewID(), Attempt: 1, ExecutorKind: "local", ExecutorID: "h1", Outcome: "started"}
+	run := jobRunRow{JobID: NewID(), Attempt: 1, ExecutorClass: "local", ExecutorID: "h1", Outcome: "started"}
 	require.NoError(t, db.Create(&run).Error)
 	assert.NotEmpty(t, run.ID)
 	assert.False(t, run.StartedAt.IsZero())

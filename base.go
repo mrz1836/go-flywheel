@@ -12,7 +12,7 @@ import (
 const defaultPeriodicQueue = "periodic"
 
 // BeforeCreate mints the ID, stamps timestamps, requires Kind, and applies the
-// queue/state/run_on/priority/max_attempts/args/tags/metadata defaults. Running
+// queue/state/priority/max_attempts/args/tags/metadata defaults. Running
 // the defaulting in the row's own lifecycle hook means a caller gets a correct
 // row without the host having to replicate the producer defaults — the runtime
 // owns the invariant.
@@ -41,12 +41,6 @@ func (j *jobRow) BeforeCreate(tx *gorm.DB) error {
 	}
 	if !JobState(j.State).Valid() {
 		return newValidationError("state", "is not a recognized job state")
-	}
-	if j.RunOn == "" {
-		j.RunOn = string(RunOnEither)
-	}
-	if !RunOn(j.RunOn).Valid() {
-		return newValidationError("run_on", "is not a recognized run_on value")
 	}
 	if j.Priority == 0 {
 		j.Priority = defaultPriority
@@ -79,9 +73,6 @@ func (r *jobRunRow) BeforeCreate(tx *gorm.DB) error {
 	}
 	if r.JobID == "" {
 		return newValidationError("job_id", "is required")
-	}
-	if r.ExecutorKind == "" {
-		return newValidationError("executor_kind", "is required")
 	}
 	if r.ExecutorID == "" {
 		return newValidationError("executor_id", "is required")

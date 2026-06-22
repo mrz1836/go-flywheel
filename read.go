@@ -27,11 +27,11 @@ type JobView struct {
 
 // JobRunView is the public read projection of a single job attempt.
 type JobRunView struct {
-	ID           string     `json:"id"`
-	Outcome      string     `json:"outcome"`
-	ExecutorKind string     `json:"executor_kind"`
-	StartedAt    time.Time  `json:"started_at"`
-	FinishedAt   *time.Time `json:"finished_at"`
+	ID            string     `json:"id"`
+	Outcome       string     `json:"outcome"`
+	ExecutorClass string     `json:"executor_class"`
+	StartedAt     time.Time  `json:"started_at"`
+	FinishedAt    *time.Time `json:"finished_at"`
 }
 
 // JobsOverview is the aggregate job-state report: a count per state plus the
@@ -84,6 +84,43 @@ type ListRunsParams struct {
 // counts to a single job kind.
 type OverviewParams struct {
 	Kind string
+}
+
+// ListJobsParams filters and pages a ListJobs query. State and Kind, when set,
+// are exact-match filters; Limit caps the page (default 50).
+type ListJobsParams struct {
+	State string
+	Kind  string
+	Limit int
+}
+
+// defaultListJobsLimit caps a ListJobs page when the caller passes no limit.
+const defaultListJobsLimit = 50
+
+// ListJobs returns jobs newest-first (created_at desc, id desc), reading through
+// db and optionally filtered by exact state and kind. Soft-deleted jobs are
+// excluded. It is the inspection seam behind a "list jobs" CLI or dashboard.
+func ListJobs(ctx context.Context, db *gorm.DB, p ListJobsParams) ([]JobView, error) {
+	query := db.WithContext(ctx).Model(&jobRow{})
+	if p.State != "" {
+		query = query.Where("state = ?", p.State)
+	}
+	if p.Kind != "" {
+		query = query.Where("kind = ?", p.Kind)
+	}
+	limit := p.Limit
+	if limit <= 0 {
+		limit = defaultListJobsLimit
+	}
+	var rows []jobRow
+	if err := query.Order("created_at desc, id desc").Limit(limit).Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("flywheel: list jobs: %w", err)
+	}
+	views := make([]JobView, len(rows))
+	for i := range rows {
+		views[i] = jobViewFromRow(rows[i])
+	}
+	return views, nil
 }
 
 // FindJob returns the JobView for id, reading through the host-provided db. A
@@ -209,10 +246,10 @@ func jobViewFromRow(r jobRow) JobView {
 // jobRunViewFromRow projects an unexported jobRunRow into the public JobRunView.
 func jobRunViewFromRow(r jobRunRow) JobRunView {
 	return JobRunView{
-		ID:           r.ID,
-		Outcome:      r.Outcome,
-		ExecutorKind: r.ExecutorKind,
-		StartedAt:    r.StartedAt,
-		FinishedAt:   r.FinishedAt,
+		ID:            r.ID,
+		Outcome:       r.Outcome,
+		ExecutorClass: r.ExecutorClass,
+		StartedAt:     r.StartedAt,
+		FinishedAt:    r.FinishedAt,
 	}
 }

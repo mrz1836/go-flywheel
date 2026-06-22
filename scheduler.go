@@ -28,16 +28,58 @@ type Scheduler struct {
 	sweepInterval time.Duration
 }
 
-// NewScheduler returns a Scheduler over db and the producer client.
+// SchedulerConfig configures a Scheduler. Only DB and Client are required; the
+// cadence and backfill knobs default when left zero. It is the config form a
+// Node composes; NewScheduler is the two-argument shorthand for the common case.
+type SchedulerConfig struct {
+	// DB is the database the Scheduler reads periodic definitions from and runs
+	// the stuck-lease sweep against.
+	DB *gorm.DB
+	// Client is the producer the Scheduler enqueues periodic jobs through.
+	Client *Client
+	// Logger logs tick and sweep failures. Optional; defaults to slog.Default().
+	Logger *slog.Logger
+	// BackfillCap bounds how many missed buckets a single due definition
+	// enqueues on catch-up. Optional; defaults to 10.
+	BackfillCap int
+	// TickInterval is the cadence at which due periodic definitions are checked.
+	// Optional; defaults to one second.
+	TickInterval time.Duration
+	// SweepInterval is the cadence of the stuck-lease reclaim sweep. Optional;
+	// defaults to 30 seconds.
+	SweepInterval time.Duration
+}
+
+// NewScheduler returns a Scheduler over db and the producer client with the
+// default cadence and backfill cap.
 func NewScheduler(db *gorm.DB, client *Client) *Scheduler {
-	return &Scheduler{
-		db:            db,
-		client:        client,
-		logger:        slog.Default(),
-		backfillCap:   defaultBackfillCap,
-		tickInterval:  defaultTickInterval,
-		sweepInterval: defaultSweepInterval,
+	return NewSchedulerWithConfig(SchedulerConfig{DB: db, Client: client})
+}
+
+// NewSchedulerWithConfig returns a Scheduler from cfg, applying the cadence and
+// backfill defaults for any field left zero.
+func NewSchedulerWithConfig(cfg SchedulerConfig) *Scheduler {
+	s := &Scheduler{
+		db:            cfg.DB,
+		client:        cfg.Client,
+		logger:        cfg.Logger,
+		backfillCap:   cfg.BackfillCap,
+		tickInterval:  cfg.TickInterval,
+		sweepInterval: cfg.SweepInterval,
 	}
+	if s.logger == nil {
+		s.logger = slog.Default()
+	}
+	if s.backfillCap <= 0 {
+		s.backfillCap = defaultBackfillCap
+	}
+	if s.tickInterval <= 0 {
+		s.tickInterval = defaultTickInterval
+	}
+	if s.sweepInterval <= 0 {
+		s.sweepInterval = defaultSweepInterval
+	}
+	return s
 }
 
 // Run ticks periodic definitions and runs the stuck-lease sweep until ctx is

@@ -15,25 +15,26 @@ import (
 // gorm.DeletedAt so a host can retire a job without losing its audit trail. The
 // constraints are flywheel's own — no host/foundation base model is imported.
 type jobRow struct {
-	ID          string         `gorm:"column:id;primaryKey"`
-	CreatedAt   time.Time      `gorm:"column:created_at;not null"`
-	UpdatedAt   time.Time      `gorm:"column:updated_at;not null"`
-	Metadata    datatypes.JSON `gorm:"column:metadata;type:jsonb;not null;default:'{}'"`
-	Kind        string         `gorm:"column:kind;not null"`
-	Queue       string         `gorm:"column:queue;not null;default:'default'"`
-	Args        datatypes.JSON `gorm:"column:args;type:jsonb;not null"`
-	Priority    int            `gorm:"column:priority;not null;default:100"`
-	State       string         `gorm:"column:state;not null;default:'available'"`
-	Attempt     int            `gorm:"column:attempt;not null;default:0"`
-	MaxAttempts int            `gorm:"column:max_attempts;not null;default:25"`
-	ScheduledAt time.Time      `gorm:"column:scheduled_at;not null"`
-	LeasedUntil *time.Time     `gorm:"column:leased_until"`
-	UniqueKey   *string        `gorm:"column:unique_key"`
-	ParentJobID *string        `gorm:"column:parent_job_id"`
-	RunOn       string         `gorm:"column:run_on;not null;default:'either'"`
-	FinalizedAt *time.Time     `gorm:"column:finalized_at"`
-	Tags        datatypes.JSON `gorm:"column:tags;type:jsonb;not null;default:'[]'"`
-	DeletedAt   gorm.DeletedAt `gorm:"column:deleted_at"`
+	ID            string         `gorm:"column:id;primaryKey"`
+	CreatedAt     time.Time      `gorm:"column:created_at;not null"`
+	UpdatedAt     time.Time      `gorm:"column:updated_at;not null"`
+	Metadata      datatypes.JSON `gorm:"column:metadata;type:jsonb;not null;default:'{}'"`
+	Kind          string         `gorm:"column:kind;not null"`
+	Queue         string         `gorm:"column:queue;not null;default:'default'"`
+	Args          datatypes.JSON `gorm:"column:args;type:jsonb;not null"`
+	Priority      int            `gorm:"column:priority;not null;default:100"`
+	State         string         `gorm:"column:state;not null;default:'available'"`
+	Attempt       int            `gorm:"column:attempt;not null;default:0"`
+	MaxAttempts   int            `gorm:"column:max_attempts;not null;default:25"`
+	TimeoutMs     *int           `gorm:"column:timeout_ms"`
+	ScheduledAt   time.Time      `gorm:"column:scheduled_at;not null"`
+	LeasedUntil   *time.Time     `gorm:"column:leased_until"`
+	UniqueKey     *string        `gorm:"column:unique_key"`
+	ParentJobID   *string        `gorm:"column:parent_job_id"`
+	ExecutorClass string         `gorm:"column:executor_class;not null;default:''"`
+	FinalizedAt   *time.Time     `gorm:"column:finalized_at"`
+	Tags          datatypes.JSON `gorm:"column:tags;type:jsonb;not null;default:'[]'"`
+	DeletedAt     gorm.DeletedAt `gorm:"column:deleted_at"`
 }
 
 // TableName binds jobRow to the jobs table.
@@ -46,7 +47,7 @@ type jobRunRow struct {
 	ID               string         `gorm:"column:id;primaryKey"`
 	JobID            string         `gorm:"column:job_id;not null"`
 	Attempt          int            `gorm:"column:attempt;not null"`
-	ExecutorKind     string         `gorm:"column:executor_kind;not null"`
+	ExecutorClass    string         `gorm:"column:executor_class;not null;default:''"`
 	ExecutorID       string         `gorm:"column:executor_id;not null"`
 	StartedAt        time.Time      `gorm:"column:started_at;not null"`
 	FinishedAt       *time.Time     `gorm:"column:finished_at"`

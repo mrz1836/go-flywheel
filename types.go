@@ -17,47 +17,24 @@ import (
 	"gorm.io/gorm"
 )
 
-// ExecutorKind is the host kind an executor reports. Its string values are the
-// stable wire form persisted on job_runs rows.
-type ExecutorKind string
+// ExecutorClass is a free-form routing label that pairs a job with the executor
+// pool eligible to run it. It is a convention, not a closed enum: a local or
+// SQLite deployment uses "local" (or the empty wildcard), an AWS deployment uses
+// "lambda" or "ecs", and a specialized pool uses any string you like ("gpu",
+// "high-mem", ...). Its string value is the stable wire form persisted on
+// jobs.executor_class and job_runs.executor_class.
+//
+// The empty class — AnyClass — is the wildcard: a job carrying it may be claimed
+// by any runner, and a runner configured with ClaimAnyClass claims jobs of every
+// class. Routing a job to a dedicated pool is just a matter of giving the job and
+// that pool's runner the same non-empty class.
+type ExecutorClass string
 
-// Recognized ExecutorKind values.
-const (
-	ExecutorLambda ExecutorKind = "lambda"
-	ExecutorECS    ExecutorKind = "ecs"
-	ExecutorLocal  ExecutorKind = "local"
-)
-
-// Valid reports whether k is a recognized ExecutorKind.
-func (k ExecutorKind) Valid() bool {
-	switch k {
-	case ExecutorLambda, ExecutorECS, ExecutorLocal:
-		return true
-	default:
-		return false
-	}
-}
-
-// RunOn is the host kind a job declares it may run on. Its string values are
-// the stable wire form persisted on jobs rows.
-type RunOn string
-
-// Recognized RunOn values.
-const (
-	RunOnLambda RunOn = "lambda"
-	RunOnECS    RunOn = "ecs"
-	RunOnEither RunOn = "either"
-)
-
-// Valid reports whether r is a recognized RunOn.
-func (r RunOn) Valid() bool {
-	switch r {
-	case RunOnLambda, RunOnECS, RunOnEither:
-		return true
-	default:
-		return false
-	}
-}
+// AnyClass is the empty wildcard executor class. A job inserted with AnyClass
+// (the default) is claimable by every runner regardless of the runner's own
+// class; it is the right choice whenever a job is not pinned to a specific
+// executor pool.
+const AnyClass ExecutorClass = ""
 
 // ErrorClass classifies a worker error. Permanent and validation errors stop
 // retrying; transient and timeout errors are retried.
@@ -163,6 +140,16 @@ type Defaults interface {
 	Defaults() InsertOpts
 }
 
+// Timeouter is an optional worker interface. When implemented, the Runner cancels
+// the worker's ctx after the returned duration, turning a hung attempt into a
+// context.DeadlineExceeded that retries via the normal backoff and records a
+// timeout outcome. A zero or negative duration means no per-kind timeout; an
+// InsertOpts.Timeout overrides it. A worker that ignores ctx cancellation still
+// runs to completion — the lease sweep remains the ultimate backstop.
+type Timeouter interface {
+	Timeout() time.Duration
+}
+
 // Job is what a worker receives. RunID and Logger are injected by the Runner.
 type Job[A Args] struct {
 	ID          string
@@ -189,6 +176,9 @@ type RawJob struct {
 	Args        []byte
 	Attempt     int
 	MaxAttempts int
+	// TimeoutMs, when non-nil, is this job's per-job execution timeout in
+	// milliseconds, applied by the Runner around the worker call.
+	TimeoutMs   *int
 	ParentJobID *string
 	Tags        []string
 	ScheduledAt time.Time
@@ -225,17 +215,24 @@ type FollowUp struct {
 	// Parent, when true, sets the child's parent_job_id to the spawning job.
 	Parent   bool
 	Priority int
+	// ExecutorClass routes the child job to a specific executor pool. Empty
+	// (AnyClass) leaves the child claimable by any runner.
+	ExecutorClass ExecutorClass
 }
 
 // InsertOpts configures a single Insert.
 type InsertOpts struct {
-	Queue       string
-	UniqueKey   string
-	ScheduleAt  *time.Time
-	Parent      *string
-	Priority    int
-	RunOn       RunOn
-	MaxAttempts int
+	Queue         string
+	UniqueKey     string
+	ScheduleAt    *time.Time
+	Parent        *string
+	Priority      int
+	ExecutorClass ExecutorClass
+	MaxAttempts   int
+	// Timeout, when > 0, bounds this job's worker execution: the Runner cancels
+	// the worker's ctx after it elapses. It overrides the worker's Timeouter and
+	// the runner's DefaultTimeout.
+	Timeout time.Duration
 	// Tx, when set, writes the job row on the caller's transaction (outbox).
 	Tx *gorm.DB
 	// RequestID, when non-empty, is stamped on the job's metadata so the

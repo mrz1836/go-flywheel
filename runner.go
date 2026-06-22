@@ -38,8 +38,14 @@ type RunnerConfig struct {
 	Registry *Registry
 	// Queues are the logical queues this Runner claims from.
 	Queues []string
-	// ExecutorKind is the host kind this Runner reports.
-	ExecutorKind ExecutorKind
+	// ExecutorClass is the routing label this Runner serves: it claims jobs whose
+	// executor_class equals it (or is the empty wildcard) unless ClaimAnyClass is
+	// set, and stamps it on every job_runs row this Runner writes.
+	ExecutorClass ExecutorClass
+	// ClaimAnyClass, when true, makes this Runner claim jobs of every executor
+	// class, not only its own class and the wildcard. A single-node local
+	// deployment typically sets it so one Runner drains the whole queue.
+	ClaimAnyClass bool
 	// LeaseDuration is the visibility timeout on a claimed job.
 	LeaseDuration time.Duration
 	// PollInterval is the pause between empty polls.
@@ -50,6 +56,13 @@ type RunnerConfig struct {
 	// RetryBackoffBase is the base delay for the exponential retry backoff.
 	// Optional; defaults to one second.
 	RetryBackoffBase time.Duration
+	// DefaultTimeout, when > 0, is the execution ceiling applied to every attempt
+	// that specifies no timeout of its own (per-job InsertOpts.Timeout or per-kind
+	// Timeouter). Optional; zero means no default timeout.
+	DefaultTimeout time.Duration
+	// Observer, when set, receives lifecycle events (claim/start/finish/retry) for
+	// metrics or tracing. Optional; a nil Observer installs an internal no-op.
+	Observer Observer
 	// Logger is the base logger bound onto each Job. Optional.
 	Logger *slog.Logger
 }
@@ -93,8 +106,8 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 	if cfg.RetryBackoffBase <= 0 {
 		cfg.RetryBackoffBase = defaultRetryBackoffBase
 	}
-	if cfg.ExecutorKind == "" {
-		cfg.ExecutorKind = ExecutorLocal
+	if cfg.Observer == nil {
+		cfg.Observer = noopObserver{}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -169,7 +182,7 @@ func (r *Runner) pendingCount(ctx context.Context) (int64, error) {
 // pollOnce claims one batch and dispatches it, returning the batch size.
 func (r *Runner) pollOnce(ctx context.Context) (int, error) {
 	batch, err := r.cfg.Driver.Dequeue(
-		ctx, r.cfg.Queues, r.cfg.ExecutorKind, r.cfg.Concurrency, r.cfg.LeaseDuration,
+		ctx, r.cfg.Queues, r.cfg.ExecutorClass, r.cfg.ClaimAnyClass, r.cfg.Concurrency, r.cfg.LeaseDuration,
 	)
 	if err != nil {
 		return 0, err
@@ -177,6 +190,11 @@ func (r *Runner) pollOnce(ctx context.Context) (int, error) {
 	if len(batch) == 0 {
 		return 0, nil
 	}
+	r.cfg.Observer.OnClaim(ctx, ClaimEvent{
+		ExecutorClass: r.cfg.ExecutorClass,
+		Queues:        r.cfg.Queues,
+		Claimed:       len(batch),
+	})
 	if r.cfg.Concurrency == 1 {
 		for i := range batch {
 			if dispatchErr := r.dispatch(ctx, batch[i]); dispatchErr != nil {
@@ -204,15 +222,18 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
 	startedAt := ClockFrom(ctx).Now(ctx)
 
 	if err := r.cfg.Driver.InsertRunStub(
-		ctx, runID, raw, startedAt, r.cfg.ExecutorKind, r.executorID,
+		ctx, runID, raw, startedAt, r.cfg.ExecutorClass, r.executorID,
 	); err != nil {
 		return err
 	}
+
+	jobEv := JobEvent{JobID: raw.ID, RunID: runID, Kind: raw.Kind, Queue: raw.Queue, Attempt: raw.Attempt}
 
 	entry, known := r.cfg.Registry.lookup(raw.Kind)
 	if !known {
 		finishedAt := ClockFrom(ctx).Now(ctx)
 		unknown := &classifiedError{cause: ErrUnknownKind, class: ErrorPermanent}
+		r.observe(ctx, raw, jobEv, Result{}, unknown, startedAt, finishedAt)
 		return r.cfg.Driver.Finalize(ctx, raw, runID, Result{}, unknown, finishedAt)
 	}
 
@@ -236,14 +257,73 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
 		RunID:       runID,
 	}
 
-	result, workErr := r.runWork(ctx, entry, in)
+	r.cfg.Observer.OnStart(ctx, jobEv)
+
+	workCtx := ctx
+	if d := r.resolveTimeout(entry, raw); d > 0 {
+		var cancel context.CancelFunc
+		workCtx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+
+	result, workErr := r.runWork(workCtx, entry, in)
 	finishedAt := ClockFrom(ctx).Now(ctx)
 
 	var finalErr error
 	if workErr != nil {
 		finalErr = r.classify(entry, workErr, raw)
 	}
+	r.observe(ctx, raw, jobEv, result, finalErr, startedAt, finishedAt)
+	// Finalize on the parent ctx, not the (possibly expired) workCtx, so a
+	// timed-out attempt still records its outcome.
 	return r.cfg.Driver.Finalize(ctx, raw, runID, result, finalErr, finishedAt)
+}
+
+// observe emits the OnFinish event (and OnRetry when the attempt will retry) for
+// one finalized attempt. It reuses planFinalize so the observer sees the same
+// outcome, error class, and retry delay the Driver persists.
+func (r *Runner) observe(
+	ctx context.Context, raw RawJob, ev JobEvent, result Result, finalErr error, startedAt, finishedAt time.Time,
+) {
+	plan := planFinalize(raw, result, finalErr, finishedAt)
+	finish := FinishEvent{
+		JobEvent: ev,
+		Outcome:  plan.runOutcome,
+		Err:      finalErr,
+		Duration: finishedAt.Sub(startedAt),
+	}
+	if plan.errorClass != nil {
+		finish.ErrorClass = *plan.errorClass
+	}
+	r.cfg.Observer.OnFinish(ctx, finish)
+
+	if plan.jobState == StateRetryable {
+		var delay time.Duration
+		if plan.scheduledAt != nil {
+			delay = plan.scheduledAt.Sub(finishedAt)
+		}
+		r.cfg.Observer.OnRetry(ctx, RetryEvent{
+			JobEvent:    ev,
+			NextAttempt: ev.Attempt + 1,
+			Delay:       delay,
+			ErrorClass:  finish.ErrorClass,
+		})
+	}
+}
+
+// resolveTimeout selects the execution timeout for an attempt, preferring the
+// per-job timeout, then the worker's per-kind Timeouter, then the runner's
+// DefaultTimeout. A zero result means no timeout is applied.
+func (r *Runner) resolveTimeout(entry registryEntry, raw RawJob) time.Duration {
+	if raw.TimeoutMs != nil && *raw.TimeoutMs > 0 {
+		return time.Duration(*raw.TimeoutMs) * time.Millisecond
+	}
+	if entry.timeouter != nil {
+		if d := entry.timeouter.Timeout(); d > 0 {
+			return d
+		}
+	}
+	return r.cfg.DefaultTimeout
 }
 
 // runWork invokes the worker, recovering a panic into an error so the executor
@@ -269,6 +349,11 @@ func (r *Runner) classify(entry registryEntry, workErr error, raw RawJob) error 
 		if c := entry.classifier.Classify(workErr); c != "" {
 			class = c
 		}
+	}
+	// An execution-timeout deadline always classifies as timeout, overriding any
+	// worker classifier, so a hung attempt is distinguishable in the audit trail.
+	if errors.Is(workErr, context.DeadlineExceeded) {
+		class = ErrorTimeout
 	}
 	var delay time.Duration
 	if entry.retryable != nil {

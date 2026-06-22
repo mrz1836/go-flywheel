@@ -24,18 +24,18 @@ func NewPostgresDriver(db *gorm.DB) Driver {
 // row-locks the highest-priority rows with SKIP LOCKED, then the UPDATE claims
 // and leases them atomically, RETURNING the claimed rows.
 func (d *postgresDriver) Dequeue(
-	ctx context.Context, queues []string, kind ExecutorKind, limit int, lease time.Duration,
+	ctx context.Context, queues []string, class ExecutorClass, claimAny bool, limit int, lease time.Duration,
 ) ([]RawJob, error) {
 	if limit <= 0 || len(queues) == 0 {
 		return nil, nil
 	}
 	now := ClockFrom(ctx).Now(ctx)
 
-	runFilter := ""
+	classFilter := ""
 	args := []any{now, queues}
-	if rv := runOnValues(kind); rv != nil {
-		runFilter = "AND run_on IN ?"
-		args = append(args, rv)
+	if !claimAny {
+		classFilter = "AND (executor_class = ? OR executor_class = '')"
+		args = append(args, string(class))
 	}
 	args = append(args, limit, now.Add(lease), now)
 
@@ -55,8 +55,8 @@ UPDATE jobs
 SET state = 'running', attempt = attempt + 1, leased_until = ?, updated_at = ?
 FROM claimed
 WHERE jobs.id = claimed.id
-RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args,
-    jobs.attempt, jobs.max_attempts, jobs.parent_job_id, jobs.tags, jobs.scheduled_at`, runFilter)
+RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata`, classFilter)
 
 	var rows []jobRow
 	if err := d.db.WithContext(ctx).Raw(sql, args...).Scan(&rows).Error; err != nil {

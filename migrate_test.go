@@ -149,6 +149,89 @@ func TestReconcileIndexDDLUnsupportedDialect(t *testing.T) {
 	}
 }
 
+// TestMigrateRenamesLegacyRoutingColumns proves Migrate upgrades a pre-1.0
+// database — one that still carries the closed-vocabulary jobs.run_on and
+// job_runs.executor_kind columns — by renaming them to executor_class in place
+// and preserving the stored values, before AutoMigrate runs.
+func TestMigrateRenamesLegacyRoutingColumns(t *testing.T) {
+	db := newBareSQLite(t)
+
+	// Stand up a legacy-shaped schema carrying every column the runtime expects
+	// — with the same NOT NULL constraints the pre-1.0 schema had — but with the
+	// old routing column names, so the only change under test is the in-place
+	// rename. The seed rows populate every NOT NULL column, exactly as a real
+	// pre-upgrade database would.
+	if err := db.Exec(`CREATE TABLE jobs (
+		id text PRIMARY KEY, created_at datetime NOT NULL, updated_at datetime NOT NULL,
+		metadata jsonb NOT NULL DEFAULT '{}', kind text NOT NULL, queue text NOT NULL DEFAULT 'default',
+		args jsonb NOT NULL, priority integer NOT NULL DEFAULT 100, state text NOT NULL DEFAULT 'available',
+		attempt integer NOT NULL DEFAULT 0, max_attempts integer NOT NULL DEFAULT 25,
+		scheduled_at datetime NOT NULL, leased_until datetime, unique_key text, parent_job_id text,
+		run_on text NOT NULL DEFAULT 'either', finalized_at datetime, tags jsonb NOT NULL DEFAULT '[]',
+		deleted_at datetime
+	)`).Error; err != nil {
+		t.Fatalf("create legacy jobs: %v", err)
+	}
+	if err := db.Exec(`CREATE TABLE job_runs (
+		id text PRIMARY KEY, job_id text NOT NULL, attempt integer NOT NULL, executor_kind text NOT NULL,
+		executor_id text NOT NULL, started_at datetime NOT NULL, finished_at datetime, outcome text NOT NULL,
+		error_class text, error_message text, error_payload jsonb, output jsonb, duration_ms integer,
+		cost_micros integer, enqueued_children integer NOT NULL DEFAULT 0, created_at datetime NOT NULL
+	)`).Error; err != nil {
+		t.Fatalf("create legacy job_runs: %v", err)
+	}
+	if err := db.Exec(
+		`INSERT INTO jobs(id, created_at, updated_at, metadata, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, run_on, tags)
+		 VALUES ('j1','2026-01-01','2026-01-01','{}','k','default','{}',100,'available',0,25,'2026-01-01','lambda','[]')`,
+	).Error; err != nil {
+		t.Fatalf("seed legacy job: %v", err)
+	}
+	if err := db.Exec(
+		`INSERT INTO job_runs(id, job_id, attempt, executor_kind, executor_id, started_at, outcome, created_at)
+		 VALUES ('r1','j1',1,'ecs','h1','2026-01-01','started','2026-01-01')`,
+	).Error; err != nil {
+		t.Fatalf("seed legacy run: %v", err)
+	}
+
+	if err := Migrate(db); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	m := db.Migrator()
+	if !m.HasColumn("jobs", "executor_class") {
+		t.Error("jobs.run_on must be renamed to executor_class")
+	}
+	if m.HasColumn("jobs", "run_on") {
+		t.Error("the legacy jobs.run_on column must be gone")
+	}
+	if !m.HasColumn("job_runs", "executor_class") {
+		t.Error("job_runs.executor_kind must be renamed to executor_class")
+	}
+	if m.HasColumn("job_runs", "executor_kind") {
+		t.Error("the legacy job_runs.executor_kind column must be gone")
+	}
+
+	// The stored routing values survive the in-place rename.
+	var jobClass, runClass string
+	if err := db.Raw(`SELECT executor_class FROM jobs WHERE id = 'j1'`).Scan(&jobClass).Error; err != nil {
+		t.Fatalf("read jobs.executor_class: %v", err)
+	}
+	if err := db.Raw(`SELECT executor_class FROM job_runs WHERE id = 'r1'`).Scan(&runClass).Error; err != nil {
+		t.Fatalf("read job_runs.executor_class: %v", err)
+	}
+	if jobClass != "lambda" {
+		t.Errorf("jobs.executor_class = %q, want lambda", jobClass)
+	}
+	if runClass != "ecs" {
+		t.Errorf("job_runs.executor_class = %q, want ecs", runClass)
+	}
+
+	// Idempotent: a second Migrate is a no-op now the legacy columns are gone.
+	if err := Migrate(db); err != nil {
+		t.Fatalf("Migrate (second call): %v", err)
+	}
+}
+
 // newJobRowWithUniqueKey builds a minimal valid jobs row for migrate tests.
 func newJobRowWithUniqueKey(id string, uniqueKey *string) jobRow {
 	now := time.Now()
@@ -165,7 +248,6 @@ func newJobRowWithUniqueKey(id string, uniqueKey *string) jobRow {
 		MaxAttempts: 25,
 		ScheduledAt: now,
 		UniqueKey:   uniqueKey,
-		RunOn:       "either",
 		Tags:        datatypes.JSON("[]"),
 	}
 }

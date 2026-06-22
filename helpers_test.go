@@ -58,12 +58,12 @@ func newDB(t testing.TB) *gorm.DB {
 func newRunner(t testing.TB, db *gorm.DB, reg *Registry) *Runner {
 	t.Helper()
 	runner, err := NewRunner(RunnerConfig{
-		DB:           db,
-		Driver:       NewSQLiteDriver(db),
-		Registry:     reg,
-		Queues:       []string{"default", "periodic"},
-		ExecutorKind: ExecutorLocal,
-		Concurrency:  1,
+		DB:            db,
+		Driver:        NewSQLiteDriver(db),
+		Registry:      reg,
+		Queues:        []string{"default", "periodic"},
+		ExecutorClass: "local",
+		Concurrency:   1,
 	})
 	if err != nil {
 		t.Fatalf("newRunner: %v", err)

@@ -83,9 +83,9 @@ func TestListRunsNewestFirstOrdering(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	base := time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC)
-	seedRun(t, db, jobRunRow{ID: "r1", JobID: "j", Attempt: 1, ExecutorKind: string(ExecutorLocal), ExecutorID: "e", Outcome: string(OutcomeStarted), StartedAt: base, CreatedAt: base})
-	seedRun(t, db, jobRunRow{ID: "r2", JobID: "j", Attempt: 2, ExecutorKind: string(ExecutorLocal), ExecutorID: "e", Outcome: string(OutcomeSuccess), StartedAt: base.Add(time.Minute), CreatedAt: base.Add(time.Minute)})
-	seedRun(t, db, jobRunRow{ID: "rOther", JobID: "other", Attempt: 1, ExecutorKind: string(ExecutorLocal), ExecutorID: "e", Outcome: string(OutcomeStarted), StartedAt: base, CreatedAt: base})
+	seedRun(t, db, jobRunRow{ID: "r1", JobID: "j", Attempt: 1, ExecutorClass: "local", ExecutorID: "e", Outcome: string(OutcomeStarted), StartedAt: base, CreatedAt: base})
+	seedRun(t, db, jobRunRow{ID: "r2", JobID: "j", Attempt: 2, ExecutorClass: "local", ExecutorID: "e", Outcome: string(OutcomeSuccess), StartedAt: base.Add(time.Minute), CreatedAt: base.Add(time.Minute)})
+	seedRun(t, db, jobRunRow{ID: "rOther", JobID: "other", Attempt: 1, ExecutorClass: "local", ExecutorID: "e", Outcome: string(OutcomeStarted), StartedAt: base, CreatedAt: base})
 
 	runs, err := ListRuns(context.Background(), db, "j", ListRunsParams{})
 	require.NoError(t, err)
@@ -103,7 +103,7 @@ func TestListRunsBeforeCursorAndLimit(t *testing.T) {
 		ts := base.Add(time.Duration(i) * time.Minute)
 		seedRun(t, db, jobRunRow{
 			ID: string(rune('a' + i)), JobID: "j", Attempt: i + 1,
-			ExecutorKind: string(ExecutorLocal), ExecutorID: "e",
+			ExecutorClass: "local", ExecutorID: "e",
 			Outcome: string(OutcomeStarted), StartedAt: ts, CreatedAt: ts,
 		})
 	}
@@ -220,8 +220,8 @@ func TestCountRunsCountsEveryAttempt(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	base := time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC)
-	seedRun(t, db, jobRunRow{ID: "cr1", JobID: "j", Attempt: 1, ExecutorKind: string(ExecutorLocal), ExecutorID: "e", Outcome: string(OutcomeStarted), StartedAt: base, CreatedAt: base})
-	seedRun(t, db, jobRunRow{ID: "cr2", JobID: "j", Attempt: 2, ExecutorKind: string(ExecutorLocal), ExecutorID: "e", Outcome: string(OutcomeSuccess), StartedAt: base, CreatedAt: base})
+	seedRun(t, db, jobRunRow{ID: "cr1", JobID: "j", Attempt: 1, ExecutorClass: "local", ExecutorID: "e", Outcome: string(OutcomeStarted), StartedAt: base, CreatedAt: base})
+	seedRun(t, db, jobRunRow{ID: "cr2", JobID: "j", Attempt: 2, ExecutorClass: "local", ExecutorID: "e", Outcome: string(OutcomeSuccess), StartedAt: base, CreatedAt: base})
 
 	n, err := CountRuns(context.Background(), db)
 	require.NoError(t, err)
@@ -239,4 +239,38 @@ func TestCountActiveJobsCountsOnlyNonTerminal(t *testing.T) {
 	n, err := CountActiveJobs(context.Background(), db)
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, n)
+}
+
+func TestListJobsFiltersOrdersAndLimits(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	base := time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC)
+	seedJob(t, db, jobRow{ID: "lj1", Kind: "alpha", State: string(StateAvailable), CreatedAt: base})
+	seedJob(t, db, jobRow{ID: "lj2", Kind: "alpha", State: string(StateSucceeded), CreatedAt: base.Add(time.Minute)})
+	seedJob(t, db, jobRow{ID: "lj3", Kind: "beta", State: string(StateAvailable), CreatedAt: base.Add(2 * time.Minute)})
+
+	all, err := ListJobs(context.Background(), db, ListJobsParams{})
+	require.NoError(t, err)
+	require.Len(t, all, 3)
+	assert.Equal(t, "lj3", all[0].ID, "jobs are returned newest first")
+
+	avail, err := ListJobs(context.Background(), db, ListJobsParams{State: string(StateAvailable)})
+	require.NoError(t, err)
+	assert.Len(t, avail, 2, "the state filter is applied")
+
+	limited, err := ListJobs(context.Background(), db, ListJobsParams{Kind: "alpha", Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, limited, 1, "the kind filter and limit are applied")
+	assert.Equal(t, "lj2", limited[0].ID, "the newest alpha job is returned")
+}
+
+func TestListJobsExcludesSoftDeleted(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	seedJob(t, db, jobRow{ID: "ljd", Kind: "k", State: string(StateAvailable)})
+	require.NoError(t, db.Where("id = ?", "ljd").Delete(&jobRow{}).Error)
+
+	got, err := ListJobs(context.Background(), db, ListJobsParams{})
+	require.NoError(t, err)
+	assert.Empty(t, got)
 }

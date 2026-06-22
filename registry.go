@@ -38,6 +38,7 @@ type registryEntry struct {
 	classifier Classifier
 	retryable  Retryable
 	defaults   Defaults
+	timeouter  Timeouter
 }
 
 // Registry maps a job kind to its registered worker. It is safe for concurrent
@@ -96,6 +97,9 @@ func Register[A Args](reg *Registry, w Worker[A]) {
 	}
 	if d, ok := any(w).(Defaults); ok {
 		entry.defaults = d
+	}
+	if to, ok := any(w).(Timeouter); ok {
+		entry.timeouter = to
 	}
 	reg.entries[kind] = entry
 }

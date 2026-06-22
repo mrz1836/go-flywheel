@@ -24,14 +24,14 @@ func TestSweepReclaimsExpiredLeaseAndCrashesStub(t *testing.T) {
 	runID := "00000000-0000-7000-8000-00000000bbbb"
 
 	require.NoError(t, db.Exec(
-		`INSERT INTO jobs(id, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, run_on, leased_until, tags, created_at, updated_at, metadata)
+		`INSERT INTO jobs(id, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, executor_class, leased_until, tags, created_at, updated_at, metadata)
 		 VALUES (?,'test.k','default','{}',100,?,1,25,?,?,?,'[]',?,?,?)`,
-		jobID, string(StateRunning), now, string(RunOnEither), pastLease, now, now, "{}",
+		jobID, string(StateRunning), now, string(AnyClass), pastLease, now, now, "{}",
 	).Error)
 	require.NoError(t, db.Exec(
-		`INSERT INTO job_runs(id, job_id, attempt, executor_kind, executor_id, started_at, outcome, created_at)
+		`INSERT INTO job_runs(id, job_id, attempt, executor_class, executor_id, started_at, outcome, created_at)
 		 VALUES (?,?,1,?,'h1',?,?,?)`,
-		runID, jobID, string(ExecutorLocal), now.Add(-time.Hour), string(OutcomeStarted), now.Add(-time.Hour),
+		runID, jobID, "local", now.Add(-time.Hour), string(OutcomeStarted), now.Add(-time.Hour),
 	).Error)
 
 	sweeper := baseDriver{db: db}
