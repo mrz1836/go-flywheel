@@ -104,17 +104,27 @@ scheduler, automatic retries, and a complete per-run audit trail — no Redis, n
 external job server to operate. Your jobs live in the same database as your data, so enqueuing
 work can be transactional with the rest of your application.
 
+Use it two ways: **embed** it in your app (define `Worker[A]` types, wire a `Node`, and let it
+run the runner + scheduler + health server in ~10 lines), or **run it locally** as a daemon with
+the [`flywheel` CLI](cmd/flywheel/README.md) — a drop-in cron replacement that runs your shell
+scripts and HTTP calls durably, with retries, backfill, and a full audit trail.
+
 The runtime is built from focused, composable pieces:
 
 - **Typed workers** — generic `Worker[A]` interface, registered by `Kind()` ([registry.go](registry.go))
-- **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery ([scheduler.go](scheduler.go))
+- **One-call lifecycle** — `Node` runs N runners + the scheduler + an optional health server and drains cleanly on shutdown ([node.go](node.go))
+- **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `UpsertPeriodic` ([scheduler.go](scheduler.go), [schedule.go](schedule.go))
 - **Retries with backoff** — exponential backoff with jitter, overridable per worker ([runner.go](runner.go))
+- **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](runner.go))
 - **Lease-based recovery** — orphaned, crashed jobs reclaimed via `leased_until` sweeps ([scheduler.go](scheduler.go))
 - **Per-run audit** — append-only `job_runs` table records every attempt, outcome, timing, and cost ([read.go](read.go))
+- **Observability seam** — an `Observer` hook for metrics/tracing with no heavy dependencies ([observer.go](observer.go))
 - **Postgres + SQLite** — `FOR UPDATE SKIP LOCKED` and `BEGIN IMMEDIATE` drivers ([driver_postgres.go](driver_postgres.go), [driver_sqlite.go](driver_sqlite.go))
+- **Free-form routing** — a `ExecutorClass` label routes jobs to executor pools; empty is the wildcard ([types.go](types.go))
 - **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work ([client.go](client.go))
 - **Follow-up jobs (DAG)** — workers return child jobs that are enqueued atomically ([types.go](types.go))
 - **Outbox pattern** — enqueue on the caller's own `*gorm.DB` transaction for exactly-once side effects ([client.go](client.go))
+- **Generic workers** — ready-made `ExecWorker` (shell/binary) and `HTTPWorker` so cron jobs need no custom Go ([workers/](workers))
 
 <br/>
 
@@ -138,6 +148,102 @@ It supports two consumption modes:
 - **Embedded** — call `Migrate(db)` as one step of a host project's install/migration process.
 
 > Only PostgreSQL and SQLite are supported, because both express the partial indexes the runtime relies on; `Migrate` returns an error for any other dialect rather than silently dropping idempotency. A host that prefers versioned SQL — e.g. an Atlas / `atlas-provider-gorm` flow — can point its loader at `flywheel.Models()` (the runtime's row structs as a single source of truth) and generate migrations from there instead of calling `Migrate`. The module takes **no** hard dependency on Atlas or any external migration tool.
+
+<br/>
+
+### Quick start (embedded)
+
+Define a typed worker, register it, and let a `Node` run the runner and scheduler:
+
+```go
+package main
+
+import (
+	"context"
+	"os"
+	"os/signal"
+	"syscall"
+
+	flywheel "github.com/mrz1836/go-flywheel"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
+
+type EmailArgs struct {
+	To string `json:"to"`
+}
+
+func (EmailArgs) Kind() string { return "send_email" }
+
+type EmailWorker struct{}
+
+func (EmailWorker) Kind() string { return "send_email" }
+func (EmailWorker) Work(ctx context.Context, job *flywheel.Job[EmailArgs]) (flywheel.Result, error) {
+	job.Logger.InfoContext(ctx, "sending", "to", job.Args.To)
+	return flywheel.Result{}, nil
+}
+
+func main() {
+	db, _ := gorm.Open(sqlite.Open("flywheel.db"), &gorm.Config{})
+	_ = flywheel.Migrate(db)
+
+	reg := flywheel.NewRegistry()
+	flywheel.Register(reg, EmailWorker{})
+
+	// Enqueue work — transactionally with your own data via InsertOpts.Tx if you like.
+	_, _ = flywheel.Insert(context.Background(), flywheel.NewClient(db), EmailArgs{To: "a@b.com"}, flywheel.InsertOpts{})
+
+	node, _ := flywheel.NewNode(flywheel.NodeConfig{
+		Runners: []flywheel.RunnerConfig{{
+			DB: db, Driver: flywheel.NewSQLiteDriver(db), Registry: reg,
+			Queues: []string{"default", "periodic"}, Concurrency: 1, ClaimAnyClass: true,
+		}},
+		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db)},
+	})
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	_ = node.Run(ctx) // runner + scheduler, drains on Ctrl+C
+}
+```
+
+More runnable examples live in [`examples/`](examples).
+
+<br/>
+
+### Local daemon & cron replacement
+
+The [`flywheel` CLI](cmd/flywheel/README.md) runs the runtime as a local daemon over a SQLite file
+(zero-ops) or Postgres, and replaces cron with durable scheduled jobs — no custom Go required:
+
+```bash
+go install github.com/mrz1836/go-flywheel/cmd/flywheel@latest
+
+flywheel migrate   # stand up the schema
+flywheel serve     # run runner + scheduler until Ctrl+C
+flywheel jobs ls   # inspect the queue
+```
+
+Declare your shell jobs in `flywheel.yaml` — each run is retried, audited, and overlap-protected,
+strictly better than a crontab line:
+
+```yaml
+schedules:
+  - slug: nightly-maintenance
+    every: 24h
+    worker: exec
+    exec:
+      command: /usr/local/bin/maintenance.sh
+      timeout_seconds: 600
+  - slug: gateway-healthcheck
+    cron: "*/5 * * * *"
+    worker: http
+    http:
+      url: https://gateway.internal/healthz
+```
+
+See the [CLI README](cmd/flywheel/README.md) for every command, the config reference, and the
+macOS launchd setup.
 
 <br/>
 
