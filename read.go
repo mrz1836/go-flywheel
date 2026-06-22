@@ -64,7 +64,24 @@ func NonTerminalStates() []JobState {
 // "state IN ?" clause binds against, so the inspection queries share one
 // conversion instead of each re-deriving it.
 func nonTerminalStateStrings() []string {
-	states := NonTerminalStates()
+	return stateStrings(NonTerminalStates())
+}
+
+// TerminalStates returns the job states a job can no longer progress from
+// (succeeded, cancelled, discarded). A host uses it to scope "finished" queries
+// — e.g. retention — without re-deriving the runtime's state vocabulary.
+func TerminalStates() []JobState {
+	return []JobState{StateSucceeded, StateCancelled, StateDiscarded}
+}
+
+// terminalStateStrings returns TerminalStates as the []string a GORM
+// "state IN ?" clause binds against.
+func terminalStateStrings() []string {
+	return stateStrings(TerminalStates())
+}
+
+// stateStrings converts a JobState slice to the []string a GORM bind expects.
+func stateStrings(states []JobState) []string {
 	out := make([]string, len(states))
 	for i, s := range states {
 		out[i] = string(s)

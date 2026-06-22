@@ -13,19 +13,22 @@ import (
 
 // Scheduler defaults.
 const (
-	defaultBackfillCap   = 10
-	defaultTickInterval  = time.Second
-	defaultSweepInterval = 30 * time.Second
+	defaultBackfillCap       = 10
+	defaultTickInterval      = time.Second
+	defaultSweepInterval     = 30 * time.Second
+	defaultRetentionInterval = time.Hour
 )
 
 // Scheduler enqueues jobs from periodic definitions and reclaims stuck jobs.
 type Scheduler struct {
-	db            *gorm.DB
-	client        *Client
-	logger        *slog.Logger
-	backfillCap   int
-	tickInterval  time.Duration
-	sweepInterval time.Duration
+	db                *gorm.DB
+	client            *Client
+	logger            *slog.Logger
+	backfillCap       int
+	tickInterval      time.Duration
+	sweepInterval     time.Duration
+	retentionMaxAge   time.Duration
+	retentionInterval time.Duration
 }
 
 // SchedulerConfig configures a Scheduler. Only DB and Client are required; the
@@ -48,6 +51,14 @@ type SchedulerConfig struct {
 	// SweepInterval is the cadence of the stuck-lease reclaim sweep. Optional;
 	// defaults to 30 seconds.
 	SweepInterval time.Duration
+	// RetentionMaxAge enables the retention sweep: terminal jobs (and their
+	// job_runs) finalized longer ago than this are hard-deleted. Zero (the
+	// default) disables retention entirely — no surprise deletes for an embedded
+	// consumer that never asked for them.
+	RetentionMaxAge time.Duration
+	// RetentionInterval is the cadence of the retention sweep. It applies only
+	// when RetentionMaxAge is set; left zero, it defaults to one hour.
+	RetentionInterval time.Duration
 }
 
 // NewScheduler returns a Scheduler over db and the producer client with the
@@ -60,12 +71,14 @@ func NewScheduler(db *gorm.DB, client *Client) *Scheduler {
 // backfill defaults for any field left zero.
 func NewSchedulerWithConfig(cfg SchedulerConfig) *Scheduler {
 	s := &Scheduler{
-		db:            cfg.DB,
-		client:        cfg.Client,
-		logger:        cfg.Logger,
-		backfillCap:   cfg.BackfillCap,
-		tickInterval:  cfg.TickInterval,
-		sweepInterval: cfg.SweepInterval,
+		db:                cfg.DB,
+		client:            cfg.Client,
+		logger:            cfg.Logger,
+		backfillCap:       cfg.BackfillCap,
+		tickInterval:      cfg.TickInterval,
+		sweepInterval:     cfg.SweepInterval,
+		retentionMaxAge:   cfg.RetentionMaxAge,
+		retentionInterval: cfg.RetentionInterval,
 	}
 	if s.logger == nil {
 		s.logger = slog.Default()
@@ -79,16 +92,31 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) *Scheduler {
 	if s.sweepInterval <= 0 {
 		s.sweepInterval = defaultSweepInterval
 	}
+	// Retention is opt-in via RetentionMaxAge; only then does the interval default.
+	if s.retentionMaxAge > 0 && s.retentionInterval <= 0 {
+		s.retentionInterval = defaultRetentionInterval
+	}
 	return s
 }
 
 // Run ticks periodic definitions and runs the stuck-lease sweep until ctx is
-// cancelled. The sweep runs on a 30-second cadence (FR-030).
+// cancelled. The sweep runs on a 30-second cadence (FR-030). When retention is
+// enabled (RetentionMaxAge > 0) it also runs a retention sweep on its own
+// cadence; otherwise no retention ticker is armed.
 func (s *Scheduler) Run(ctx context.Context) error {
 	periodicTicker := time.NewTicker(s.tickInterval)
 	defer periodicTicker.Stop()
 	sweepTicker := time.NewTicker(s.sweepInterval)
 	defer sweepTicker.Stop()
+
+	// A disabled retention sweep gets a stopped ticker with a nil channel, which
+	// blocks forever in the select — the same as not having the case at all.
+	var retentionC <-chan time.Time
+	if s.retentionMaxAge > 0 {
+		retentionTicker := time.NewTicker(s.retentionInterval)
+		defer retentionTicker.Stop()
+		retentionC = retentionTicker.C
+	}
 
 	for {
 		select {
@@ -101,6 +129,12 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-sweepTicker.C:
 			if _, err := s.Sweep(ctx); err != nil {
 				s.logger.ErrorContext(ctx, "jobs: lease sweep failed", "error", err)
+			}
+		case <-retentionC:
+			if n, err := s.PruneRetention(ctx); err != nil {
+				s.logger.ErrorContext(ctx, "jobs: retention sweep failed", "error", err)
+			} else if n > 0 {
+				s.logger.InfoContext(ctx, "jobs: retention sweep pruned finished jobs", "deleted", n)
 			}
 		}
 	}
@@ -134,6 +168,18 @@ func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
 	now := ClockFrom(ctx).Now(ctx)
 	sweeper := baseDriver{db: s.db}
 	return sweeper.Sweep(ctx, now)
+}
+
+// PruneRetention hard-deletes terminal jobs (and their job_runs) finalized
+// longer ago than RetentionMaxAge, reporting how many jobs were removed. It is a
+// no-op returning (0, nil) when retention is disabled, so calling it on a
+// retention-less Scheduler can never delete anything.
+func (s *Scheduler) PruneRetention(ctx context.Context) (int64, error) {
+	if s.retentionMaxAge <= 0 {
+		return 0, nil
+	}
+	cutoff := ClockFrom(ctx).Now(ctx).Add(-s.retentionMaxAge)
+	return DeleteFinishedJobs(ctx, s.db, cutoff)
 }
 
 // fire enqueues one job per missed bucket of def (capped at backfillCap) and

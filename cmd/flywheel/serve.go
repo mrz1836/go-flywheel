@@ -46,8 +46,12 @@ func newServeCmd(configPath *string) *cobra.Command {
 					RetryBackoffBase: cfg.Runtime.RetryBackoffBase.Std(),
 					Logger:           logger,
 				}},
-				Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db)},
-				Logger:    logger,
+				Scheduler: &flywheel.SchedulerConfig{
+					DB:              db,
+					Client:          flywheel.NewClient(db),
+					RetentionMaxAge: cfg.Runtime.Retention.Std(),
+				},
+				Logger: logger,
 			})
 			if err != nil {
 				return err
@@ -56,10 +60,12 @@ func newServeCmd(configPath *string) *cobra.Command {
 			sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 			logger.Info("flywheel serve: started",
+				"version", resolveVersion(),
 				"db", dbLabel(cfg),
 				"queues", cfg.Runtime.Queues,
 				"concurrency", cfg.Runtime.Concurrency,
-				"schedules", len(cfg.Schedules))
+				"schedules", len(cfg.Schedules),
+				"retention", cfg.Runtime.Retention.Std().String())
 			return node.Run(sigCtx)
 		},
 	}
