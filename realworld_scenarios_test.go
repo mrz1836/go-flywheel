@@ -587,13 +587,16 @@ func TestRealWorldCrashRecoveryLeaseExpiry(t *testing.T) {
 	w := &recoverWorker{}
 	Register(reg, w)
 
+	// Insert under the same fixed clock the crash-claim uses, so scheduled_at is
+	// exactly base and the claim is deterministic regardless of wall-clock drift
+	// or stored-time precision.
 	ctx := context.Background()
-	id, err := Insert(ctx, NewClient(db), recoverArgs{V: "x"}, InsertOpts{})
+	claimCtx := clockCtx(ctx, NewFixedClock(base))
+	id, err := Insert(claimCtx, NewClient(db), recoverArgs{V: "x"}, InsertOpts{})
 	require.NoError(t, err)
 
 	// A "crashed" executor: claim the job and write its run stub, then never
 	// finalize.
-	claimCtx := clockCtx(ctx, NewFixedClock(base))
 	batch, err := driver.Dequeue(claimCtx, []string{"default"}, "local", true, 1, 30*time.Second)
 	require.NoError(t, err)
 	require.Len(t, batch, 1)
@@ -608,9 +611,11 @@ func TestRealWorldCrashRecoveryLeaseExpiry(t *testing.T) {
 	assert.Equal(t, 1, reclaimed, "the expired lease is reclaimed")
 	assert.Equal(t, string(StateAvailable), jobState(t, db, id), "the job is back to available")
 
-	// A fresh runner reruns it to success.
+	// A fresh runner reruns it to success, driven on a fixed clock past the lease
+	// so the whole test stays in consistent UTC (the stored scheduled_at is base;
+	// a wall-clock runner in a non-UTC zone would compare it inconsistently).
 	r := rwRunner(t, db, reg)
-	runToIdle(t, ctx, r)
+	runToIdle(t, sweepCtx, r)
 
 	assert.Equal(t, string(StateSucceeded), jobState(t, db, id), "the reclaimed job completes")
 	assert.EqualValues(t, 1, w.ran.Load(), "the work ran exactly once — the crash claim never executed the worker")
