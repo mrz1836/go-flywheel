@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -181,10 +182,17 @@ func rawFromRow(r jobRow, attempt int) (RawJob, error) {
 	}, nil
 }
 
-// truncate caps s at n bytes.
+// truncate caps s at n bytes, cutting on a rune boundary so a multi-byte rune is
+// never split. A raw byte slice would split a straddling rune and leave invalid
+// UTF-8 in the stored error message (corrupting the audit trail, and failing the
+// text insert outright on Postgres); backing the cut off to the previous rune
+// start keeps the stored prefix valid.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n]
 }
