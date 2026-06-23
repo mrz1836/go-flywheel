@@ -66,12 +66,61 @@ schedules:
 	assert.Equal(t, "https://x.test/health", cfg.Schedules[1].HTTP.URL)
 }
 
+func TestLoadConfigParsesLocalRunnerSchedules(t *testing.T) {
+	t.Parallel()
+	p := writeConfigFile(t, `
+db:
+  sqlite: /tmp/x.db
+schedules:
+  - slug: maint
+    every: 24h
+    worker: shell
+    shell:
+      script: /usr/local/bin/maintenance.sh
+      args: ["--verbose"]
+      timeout_seconds: 600
+  - slug: sync
+    cron: "0 * * * *"
+    worker: python
+    python:
+      script: /opt/sync.py
+      interpreter: python3
+  - slug: deps
+    every: 24h
+    worker: mage
+    mage:
+      targets: ["deps:update"]
+      binary: magex
+      dir: /repo
+`)
+	cfg, err := LoadConfig(p)
+	require.NoError(t, err)
+	require.Len(t, cfg.Schedules, 3)
+
+	require.NotNil(t, cfg.Schedules[0].Shell)
+	assert.Equal(t, "/usr/local/bin/maintenance.sh", cfg.Schedules[0].Shell.Script)
+	assert.Equal(t, []string{"--verbose"}, cfg.Schedules[0].Shell.Args)
+	assert.Equal(t, 600, cfg.Schedules[0].Shell.TimeoutSeconds)
+
+	require.NotNil(t, cfg.Schedules[1].Python)
+	assert.Equal(t, "/opt/sync.py", cfg.Schedules[1].Python.Script)
+	assert.Equal(t, "python3", cfg.Schedules[1].Python.Interpreter)
+
+	require.NotNil(t, cfg.Schedules[2].Mage)
+	assert.Equal(t, []string{"deps:update"}, cfg.Schedules[2].Mage.Targets)
+	assert.Equal(t, "magex", cfg.Schedules[2].Mage.Binary)
+	assert.Equal(t, "/repo", cfg.Schedules[2].Mage.Dir)
+}
+
 func TestLoadConfigValidationErrors(t *testing.T) {
 	t.Parallel()
 	tests := map[string]string{
 		"sqlite concurrency over 1": "runtime:\n  concurrency: 4\n",
 		"exec without command":      "schedules:\n  - slug: s\n    every: 1m\n    worker: exec\n",
 		"http without url":          "schedules:\n  - slug: s\n    every: 1m\n    worker: http\n",
+		"shell without script":      "schedules:\n  - slug: s\n    every: 1m\n    worker: shell\n",
+		"python without source":     "schedules:\n  - slug: s\n    every: 1m\n    worker: python\n",
+		"mage without targets":      "schedules:\n  - slug: s\n    every: 1m\n    worker: mage\n    mage: {dir: /x}\n",
 		"unknown worker":            "schedules:\n  - slug: s\n    every: 1m\n    worker: bogus\n    exec: {command: x}\n",
 		"both cron and every":       "schedules:\n  - slug: s\n    cron: \"* * * * *\"\n    every: 1m\n    worker: exec\n    exec: {command: x}\n",
 		"neither cron nor every":    "schedules:\n  - slug: s\n    worker: exec\n    exec: {command: x}\n",

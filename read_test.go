@@ -95,6 +95,36 @@ func TestListRunsNewestFirstOrdering(t *testing.T) {
 	assert.Equal(t, string(OutcomeSuccess), runs[0].Outcome)
 }
 
+func TestListRunsSurfacesOutputAndError(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	base := time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC)
+	msg := `exec "sh" exited with code 4`
+	seedRun(t, db, jobRunRow{
+		ID: "r-fail", JobID: "j", Attempt: 1, ExecutorClass: "local", ExecutorID: "e",
+		Outcome: string(OutcomeError), ErrorMessage: &msg,
+		Output:    datatypes.JSON(`{"exit_code":4,"stdout":"hi","stderr":"boom"}`),
+		StartedAt: base, CreatedAt: base,
+	})
+	seedRun(t, db, jobRunRow{
+		ID: "r-ok", JobID: "j", Attempt: 2, ExecutorClass: "local", ExecutorID: "e",
+		Outcome: string(OutcomeSuccess), StartedAt: base.Add(time.Minute), CreatedAt: base.Add(time.Minute),
+	})
+
+	runs, err := ListRuns(context.Background(), db, "j", ListRunsParams{})
+	require.NoError(t, err)
+	require.Len(t, runs, 2)
+
+	// The newest (success) attempt recorded no output or error.
+	assert.Nil(t, runs[0].Error)
+	assert.Empty(t, runs[0].Output)
+
+	// The failed attempt carries the captured output and the error message.
+	require.NotNil(t, runs[1].Error)
+	assert.Equal(t, msg, *runs[1].Error)
+	assert.JSONEq(t, `{"exit_code":4,"stdout":"hi","stderr":"boom"}`, string(runs[1].Output))
+}
+
 func TestListRunsBeforeCursorAndLimit(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)

@@ -100,15 +100,19 @@ type LogConfig struct {
 }
 
 // ScheduleEntry is one declarative periodic job — a cron line replacement. It
-// names a worker (exec or http) and exactly one of cron or every.
+// names a worker (exec, http, shell, python, or mage) and exactly one of cron or
+// every.
 type ScheduleEntry struct {
-	Slug   string    `yaml:"slug"`
-	Cron   string    `yaml:"cron"`
-	Every  Duration  `yaml:"every"`
-	Queue  string    `yaml:"queue"`
-	Worker string    `yaml:"worker"` // exec|http
-	Exec   *execSpec `yaml:"exec"`
-	HTTP   *httpSpec `yaml:"http"`
+	Slug   string      `yaml:"slug"`
+	Cron   string      `yaml:"cron"`
+	Every  Duration    `yaml:"every"`
+	Queue  string      `yaml:"queue"`
+	Worker string      `yaml:"worker"` // exec|http|shell|python|mage
+	Exec   *execSpec   `yaml:"exec"`
+	HTTP   *httpSpec   `yaml:"http"`
+	Shell  *shellSpec  `yaml:"shell"`
+	Python *pythonSpec `yaml:"python"`
+	Mage   *mageSpec   `yaml:"mage"`
 }
 
 // defaultConfig returns the runtime defaults applied to an unset flywheel.yaml.
@@ -197,8 +201,20 @@ func validateConfig(cfg *Config) error {
 			if s.HTTP == nil || s.HTTP.URL == "" {
 				return fmt.Errorf("config: schedule %q (http) needs an http.url", s.Slug)
 			}
+		case "shell":
+			if s.Shell == nil || (s.Shell.Script == "" && s.Shell.Inline == "") {
+				return fmt.Errorf("config: schedule %q (shell) needs a shell.script or shell.inline", s.Slug)
+			}
+		case "python":
+			if s.Python == nil || (s.Python.Script == "" && s.Python.Module == "" && s.Python.Inline == "") {
+				return fmt.Errorf("config: schedule %q (python) needs a python.script, python.module, or python.inline", s.Slug)
+			}
+		case "mage":
+			if s.Mage == nil || len(s.Mage.Targets) == 0 {
+				return fmt.Errorf("config: schedule %q (mage) needs at least one mage.targets entry", s.Slug)
+			}
 		default:
-			return fmt.Errorf("config: schedule %q has unknown worker %q (want exec or http)", s.Slug, s.Worker)
+			return fmt.Errorf("config: schedule %q has unknown worker %q (want exec, http, shell, python, or mage)", s.Slug, s.Worker)
 		}
 		if (s.Cron == "") == (s.Every <= 0) {
 			return fmt.Errorf("config: schedule %q needs exactly one of cron or every", s.Slug)
