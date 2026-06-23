@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -143,12 +144,7 @@ func (w ExecWorker) Classify(err error) flywheel.ErrorClass {
 
 // isPermanentExit reports whether code is in PermanentExitCodes.
 func (w ExecWorker) isPermanentExit(code int) bool {
-	for _, c := range w.PermanentExitCodes {
-		if c == code {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(w.PermanentExitCodes, code)
 }
 
 // buildEnv assembles the child environment from the allowlisted host variables

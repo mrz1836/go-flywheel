@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -128,10 +129,5 @@ func isSuccessStatus(status int, success []int) bool {
 	if len(success) == 0 {
 		return status >= http.StatusOK && status < http.StatusMultipleChoices
 	}
-	for _, s := range success {
-		if s == status {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(success, status)
 }
