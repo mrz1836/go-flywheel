@@ -230,17 +230,18 @@ func TestRealWorldStressChaosLeaseExpiry(t *testing.T) {
 	reg := NewRegistry()
 	Register(reg, &drainWorker{tracker: tracker})
 
+	// Insert under the same fixed clock the crash-claim uses, so scheduled_at is
+	// exactly base and the claim is deterministic regardless of wall-clock drift
+	// or stored-time precision.
+	claimCtx := clockCtx(context.Background(), NewFixedClock(base))
 	client := NewClient(db)
-	ids := make([]string, total)
 	for i := range total {
-		id, err := Insert(context.Background(), client, drainArgs{N: i}, InsertOpts{})
+		_, err := Insert(claimCtx, client, drainArgs{N: i}, InsertOpts{})
 		require.NoError(t, err)
-		ids[i] = id
 	}
 
 	// A "crashed" executor claims a chunk and writes run stubs, then dies: the
 	// jobs sit running with leases held by a process that will never finalize.
-	claimCtx := clockCtx(context.Background(), NewFixedClock(base))
 	claimedTotal := 0
 	for claimedTotal < crashed {
 		batch, err := driver.Dequeue(claimCtx, []string{"default"}, "local", true, crashed-claimedTotal, 30*time.Second)
@@ -264,9 +265,11 @@ func TestRealWorldStressChaosLeaseExpiry(t *testing.T) {
 	assert.Equal(t, crashed, reclaimed, "every expired lease is reclaimed in one sweep")
 
 	// A fresh runner drains everything — the reclaimed chunk plus the work the
-	// crashed executor never touched.
+	// crashed executor never touched — driven on a fixed clock past the lease so
+	// the whole test stays in consistent UTC (the stored scheduled_at is base; a
+	// wall-clock runner in a non-UTC zone would compare it inconsistently).
 	r := newRunner(t, db, reg)
-	runToIdle(t, context.Background(), r)
+	runToIdle(t, sweepCtx, r)
 
 	assert.Equal(t, total, tracker.distinct(), "every job ran")
 	assert.EqualValues(t, 0, tracker.dups.Load(), "no job ran twice despite the crash and reclaim")
