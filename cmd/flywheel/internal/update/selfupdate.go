@@ -34,6 +34,13 @@ const (
 	defaultBinaryName = "flywheel"
 )
 
+// osExecutable resolves the running binary's path. It is a variable so tests can
+// point SelfUpdate's default target at a temp file instead of the test binary,
+// without changing production behavior (it defaults to os.Executable).
+//
+//nolint:gochecknoglobals // injectable seam for tests; defaults to os.Executable
+var osExecutable = os.Executable
+
 // Self-update errors.
 var (
 	errNoAsset          = errors.New("no release asset for this os/arch")
@@ -101,7 +108,7 @@ func SelfUpdate(ctx context.Context, currentVersion string, fetcher ReleaseFetch
 
 	target := opts.TargetPath
 	if target == "" {
-		exe, exeErr := os.Executable()
+		exe, exeErr := osExecutable()
 		if exeErr != nil {
 			return latest, false, fmt.Errorf("resolve running binary: %w", exeErr)
 		}
@@ -211,6 +218,14 @@ func verifyChecksum(ctx context.Context, client *http.Client, data []byte, asset
 // extractBinary extracts the entry named binaryName from a tar.gz into destDir,
 // guarding against path traversal and oversized entries, and returns its path.
 func extractBinary(data []byte, binaryName, destDir string) (string, error) {
+	return extractBinaryWithCap(data, binaryName, destDir, maxBinarySize)
+}
+
+// extractBinaryWithCap is the core of extractBinary with the per-file size cap as
+// a parameter. extractBinary supplies maxBinarySize; tests supply a small cap to
+// exercise the oversized-entry guard without allocating a huge archive. Behavior
+// is identical to the previous inline implementation.
+func extractBinaryWithCap(data []byte, binaryName, destDir string, maxBytes int64) (string, error) {
 	gz, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return "", fmt.Errorf("open gzip: %w", err)
@@ -240,7 +255,7 @@ func extractBinary(data []byte, binaryName, destDir string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("create extracted file: %w", err)
 		}
-		n, copyErr := io.Copy(f, io.LimitReader(tr, maxBinarySize+1))
+		n, copyErr := io.Copy(f, io.LimitReader(tr, maxBytes+1))
 		closeErr := f.Close()
 		if copyErr != nil {
 			return "", fmt.Errorf("extract binary: %w", copyErr)
@@ -248,7 +263,7 @@ func extractBinary(data []byte, binaryName, destDir string) (string, error) {
 		if closeErr != nil {
 			return "", fmt.Errorf("close extracted file: %w", closeErr)
 		}
-		if n > maxBinarySize {
+		if n > maxBytes {
 			_ = os.Remove(destPath)
 			return "", errAssetTooLarge
 		}
