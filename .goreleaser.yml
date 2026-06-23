@@ -24,14 +24,26 @@ changelog:
 # ---------------------------
 # Builder
 # ---------------------------
+# flywheel uses the pure-Go modernc SQLite driver, so the binary builds with
+# CGO_ENABLED=0 and cross-compiles to every target from any runner (no macOS
+# runner, no C toolchain).
 builds:
-  - env:
+  - id: flywheel
+    main: ./cmd/flywheel
+    binary: flywheel
+    env:
       - CGO_ENABLED=0
     goos:
-      - linux
-      - windows
       - darwin
-    skip: true
+      - linux
+    goarch:
+      - arm64
+      - amd64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.buildDate={{.Date}}
 
 # ---------------------------
 # Archives
