@@ -102,7 +102,26 @@ func newJobsInspectCmd(configPath *string) *cobra.Command {
 			for _, r := range runs {
 				_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", r.ID, r.Outcome, orDash(r.ExecutorClass), r.StartedAt.Format("15:04:05"))
 			}
-			return tw.Flush()
+			if err := tw.Flush(); err != nil {
+				return err
+			}
+			// Show the captured output and error for runs that recorded them — for the
+			// exec/shell/python/mage workers this is the command's stdout/stderr and
+			// exit code, the reason you ran it durably in the first place.
+			for _, r := range runs {
+				hasErr := r.Error != nil && *r.Error != ""
+				if !hasErr && len(r.Output) == 0 {
+					continue
+				}
+				_, _ = fmt.Fprintf(out, "\n  run %s (%s):\n", r.ID, r.Outcome)
+				if hasErr {
+					_, _ = fmt.Fprintf(out, "    error:  %s\n", *r.Error)
+				}
+				if len(r.Output) > 0 {
+					_, _ = fmt.Fprintf(out, "    output: %s\n", string(r.Output))
+				}
+			}
+			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON instead of text")

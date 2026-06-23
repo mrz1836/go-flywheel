@@ -58,30 +58,123 @@ func (h httpSpec) toArgs() workers.HTTPArgs {
 	}
 }
 
-// workerKind returns the registered worker kind a schedule entry targets.
-func (s ScheduleEntry) workerKind() string {
-	if s.Worker == "http" {
-		return workers.HTTPKind
-	}
-	return workers.ExecKind
+// shellSpec is the YAML form of a shell schedule's script.
+type shellSpec struct {
+	Script         string            `yaml:"script"`
+	Inline         string            `yaml:"inline"`
+	Args           []string          `yaml:"args"`
+	Shell          string            `yaml:"shell"`
+	Env            map[string]string `yaml:"env"`
+	Dir            string            `yaml:"dir"`
+	Stdin          string            `yaml:"stdin"`
+	TimeoutSeconds int               `yaml:"timeout_seconds"`
 }
 
-// argsTemplate marshals the entry's exec/http spec into the JSON args template
-// the worker decodes on each fire.
+// toArgs converts the spec into the worker's args type.
+func (s shellSpec) toArgs() workers.ShellArgs {
+	return workers.ShellArgs{
+		Script:         s.Script,
+		Inline:         s.Inline,
+		Args:           s.Args,
+		Shell:          s.Shell,
+		Env:            s.Env,
+		Dir:            s.Dir,
+		Stdin:          s.Stdin,
+		TimeoutSeconds: s.TimeoutSeconds,
+	}
+}
+
+// pythonSpec is the YAML form of a python schedule's program.
+type pythonSpec struct {
+	Script         string            `yaml:"script"`
+	Module         string            `yaml:"module"`
+	Inline         string            `yaml:"inline"`
+	Args           []string          `yaml:"args"`
+	Interpreter    string            `yaml:"interpreter"`
+	Env            map[string]string `yaml:"env"`
+	Dir            string            `yaml:"dir"`
+	Stdin          string            `yaml:"stdin"`
+	TimeoutSeconds int               `yaml:"timeout_seconds"`
+}
+
+// toArgs converts the spec into the worker's args type.
+func (p pythonSpec) toArgs() workers.PythonArgs {
+	return workers.PythonArgs{
+		Script:         p.Script,
+		Module:         p.Module,
+		Inline:         p.Inline,
+		Args:           p.Args,
+		Interpreter:    p.Interpreter,
+		Env:            p.Env,
+		Dir:            p.Dir,
+		Stdin:          p.Stdin,
+		TimeoutSeconds: p.TimeoutSeconds,
+	}
+}
+
+// mageSpec is the YAML form of a mage schedule's targets.
+type mageSpec struct {
+	Targets        []string          `yaml:"targets"`
+	Binary         string            `yaml:"binary"`
+	Dir            string            `yaml:"dir"`
+	Env            map[string]string `yaml:"env"`
+	TimeoutSeconds int               `yaml:"timeout_seconds"`
+}
+
+// toArgs converts the spec into the worker's args type.
+func (m mageSpec) toArgs() workers.MageArgs {
+	return workers.MageArgs{
+		Targets:        m.Targets,
+		Binary:         m.Binary,
+		Dir:            m.Dir,
+		Env:            m.Env,
+		TimeoutSeconds: m.TimeoutSeconds,
+	}
+}
+
+// workerKind returns the registered worker kind a schedule entry targets.
+func (s ScheduleEntry) workerKind() string {
+	switch s.Worker {
+	case "http":
+		return workers.HTTPKind
+	case "shell":
+		return workers.ShellKind
+	case "python":
+		return workers.PythonKind
+	case "mage":
+		return workers.MageKind
+	default:
+		return workers.ExecKind
+	}
+}
+
+// argsTemplate marshals the entry's worker spec into the JSON args template the
+// worker decodes on each fire.
 func (s ScheduleEntry) argsTemplate() ([]byte, error) {
 	switch s.Worker {
 	case "http":
 		return json.Marshal(s.HTTP.toArgs())
+	case "shell":
+		return json.Marshal(s.Shell.toArgs())
+	case "python":
+		return json.Marshal(s.Python.toArgs())
+	case "mage":
+		return json.Marshal(s.Mage.toArgs())
 	default:
 		return json.Marshal(s.Exec.toArgs())
 	}
 }
 
-// buildRegistry registers the generic exec and http workers so any schedule (or
-// ad-hoc enqueue) of those kinds can run with no custom Go.
+// buildRegistry registers the generic workers so any schedule (or ad-hoc enqueue)
+// of those kinds can run with no custom Go: exec/shell/python/mage run local
+// commands, scripts, and build targets, and http calls a URL. The command workers
+// share the configured host-env allowlist.
 func buildRegistry(cfg *Config) *flywheel.Registry {
 	reg := flywheel.NewRegistry()
 	flywheel.Register(reg, workers.ExecWorker{EnvAllowlist: cfg.Runtime.EnvAllowlist})
+	flywheel.Register(reg, workers.ShellWorker{EnvAllowlist: cfg.Runtime.EnvAllowlist})
+	flywheel.Register(reg, workers.PythonWorker{EnvAllowlist: cfg.Runtime.EnvAllowlist})
+	flywheel.Register(reg, workers.MageWorker{EnvAllowlist: cfg.Runtime.EnvAllowlist})
 	flywheel.Register(reg, workers.HTTPWorker{Doer: flywheel.DefaultHTTPDoer()})
 	return reg
 }

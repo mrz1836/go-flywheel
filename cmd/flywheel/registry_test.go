@@ -24,6 +24,24 @@ func TestScheduleWorkerKindAndArgsTemplate(t *testing.T) {
 	tmpl, err = httpEntry.argsTemplate()
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"method":"GET","url":"https://x.test"}`, string(tmpl))
+
+	shell := ScheduleEntry{Worker: "shell", Shell: &shellSpec{Script: "/x.sh", Args: []string{"a"}}}
+	assert.Equal(t, workers.ShellKind, shell.workerKind())
+	tmpl, err = shell.argsTemplate()
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"script":"/x.sh","args":["a"]}`, string(tmpl))
+
+	py := ScheduleEntry{Worker: "python", Python: &pythonSpec{Module: "http.server", Interpreter: "python3"}}
+	assert.Equal(t, workers.PythonKind, py.workerKind())
+	tmpl, err = py.argsTemplate()
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"module":"http.server","interpreter":"python3"}`, string(tmpl))
+
+	mage := ScheduleEntry{Worker: "mage", Mage: &mageSpec{Targets: []string{"test"}, Binary: "magex"}}
+	assert.Equal(t, workers.MageKind, mage.workerKind())
+	tmpl, err = mage.argsTemplate()
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"targets":["test"],"binary":"magex"}`, string(tmpl))
 }
 
 func TestReconcileSchedulesUpsertsAndIsIdempotent(t *testing.T) {
@@ -72,10 +90,13 @@ func TestReconcileSchedulesDisablesOrphans(t *testing.T) {
 	assert.False(t, active["b"], "b is deactivated when removed from the config")
 }
 
-func TestBuildRegistryRegistersExecAndHTTP(t *testing.T) {
+func TestBuildRegistryRegistersAllWorkers(t *testing.T) {
 	t.Parallel()
-	// A duplicate registration panics, so registering the same kinds again proves
-	// the first call registered exec + http exactly once.
-	buildRegistry(&Config{})
-	assert.NotPanics(t, func() { buildRegistry(&Config{}) }, "each registry is independent")
+	// A duplicate registration panics, so building twice without panicking proves
+	// each registry is independent and every kind (exec, shell, python, mage, http)
+	// is registered exactly once per registry.
+	assert.NotPanics(t, func() {
+		buildRegistry(&Config{})
+		buildRegistry(&Config{})
+	})
 }

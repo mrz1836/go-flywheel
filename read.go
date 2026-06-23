@@ -2,6 +2,7 @@ package flywheel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -32,6 +33,12 @@ type JobRunView struct {
 	ExecutorClass string     `json:"executor_class"`
 	StartedAt     time.Time  `json:"started_at"`
 	FinishedAt    *time.Time `json:"finished_at"`
+	// Error is the worker error recorded for a failed attempt, if any.
+	Error *string `json:"error,omitempty"`
+	// Output is the worker's structured Result.Output as stored in job_runs.output
+	// (for the command workers, an ExecOutput with exit code and captured streams).
+	// It is empty when the attempt produced no output.
+	Output json.RawMessage `json:"output,omitempty"`
 }
 
 // JobsOverview is the aggregate job-state report: a count per state plus the
@@ -262,11 +269,16 @@ func jobViewFromRow(r jobRow) JobView {
 
 // jobRunViewFromRow projects an unexported jobRunRow into the public JobRunView.
 func jobRunViewFromRow(r jobRunRow) JobRunView {
-	return JobRunView{
+	v := JobRunView{
 		ID:            r.ID,
 		Outcome:       r.Outcome,
 		ExecutorClass: r.ExecutorClass,
 		StartedAt:     r.StartedAt,
 		FinishedAt:    r.FinishedAt,
+		Error:         r.ErrorMessage,
 	}
+	if len(r.Output) > 0 {
+		v.Output = json.RawMessage(r.Output)
+	}
+	return v
 }

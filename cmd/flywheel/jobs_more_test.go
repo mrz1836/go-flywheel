@@ -58,23 +58,33 @@ func TestCLIJobsInspectListsRunHistory(t *testing.T) {
 	db, _, err := openDB(loaded)
 	require.NoError(t, err)
 	now := "2026-06-22 12:00:00"
+	later := "2026-06-22 12:00:30"
 	require.NoError(t, db.Exec(
 		`INSERT INTO jobs(id, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, executor_class, tags, created_at, updated_at, metadata)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		"j-runs", "exec", "default", "{}", 100, "succeeded", 1, 25, now, "", "[]", now, now, "{}",
+		"j-runs", "exec", "default", "{}", 100, "succeeded", 2, 25, now, "", "[]", now, now, "{}",
 	).Error)
+	// A failed first attempt carries an error message and captured output...
 	require.NoError(t, db.Exec(
-		`INSERT INTO job_runs(id, job_id, attempt, executor_class, executor_id, started_at, outcome, error_class, error_message, created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		"j-runs-1", "j-runs", 1, "local", "host", now, "success", "", "", now,
+		`INSERT INTO job_runs(id, job_id, attempt, executor_class, executor_id, started_at, outcome, error_class, error_message, output, created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		"j-runs-1", "j-runs", 1, "local", "host", now, "error", "transient", `exec "sh" exited with code 1`, `{"exit_code":1,"stdout":"partial","stderr":"boom"}`, now,
+	).Error)
+	// ...and the successful retry carries the captured stdout.
+	require.NoError(t, db.Exec(
+		`INSERT INTO job_runs(id, job_id, attempt, executor_class, executor_id, started_at, outcome, error_class, error_message, output, created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		"j-runs-2", "j-runs", 2, "local", "host", later, "success", "", "", `{"exit_code":0,"stdout":"done","stderr":""}`, later,
 	).Error)
 	closeDB(db)
 
 	out, err := runRoot(context.Background(), "--config", cfg, "jobs", "inspect", "j-runs")
 	require.NoError(t, err)
-	assert.Contains(t, out, "runs:     1", "the run count is reported")
+	assert.Contains(t, out, "runs:     2", "the run count is reported")
 	assert.Contains(t, out, "j-runs-1", "the run row is listed")
 	assert.Contains(t, out, "local", "the run's executor class is shown")
+	assert.Contains(t, out, `exec "sh" exited with code 1`, "the failed run's error is shown")
+	assert.Contains(t, out, `"stdout":"done"`, "the captured output is shown")
 }
 
 func TestCLIJobsRetryAndCancel(t *testing.T) {
