@@ -39,7 +39,7 @@ func Migrate(db *gorm.DB) error {
 	}
 
 	if err := reconcileColumnRenames(db); err != nil {
-		return err
+		return fmt.Errorf("flywheel: Migrate: reconcile column renames: %w", err)
 	}
 
 	if err := db.AutoMigrate(Models()...); err != nil {
@@ -48,7 +48,7 @@ func Migrate(db *gorm.DB) error {
 
 	stmts, err := reconcileIndexDDL(db.Name())
 	if err != nil {
-		return err
+		return fmt.Errorf("flywheel: Migrate: reconcile index ddl: %w", err)
 	}
 	for _, ddl := range stmts {
 		if err := db.Exec(ddl).Error; err != nil {
