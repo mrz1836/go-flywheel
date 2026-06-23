@@ -153,61 +153,90 @@ It supports two consumption modes:
 
 ### Quick start (embedded)
 
-Define a typed worker, register it, and let a `Node` run the runner and scheduler:
+A job runtime earns its keep when work is **slow, flaky, costly, or must-not-be-lost** —
+which in 2026 describes almost every LLM and third-party API call your app makes. Blocking
+a web request on a 30-second model call that might rate-limit is fragile; *enqueuing* that
+call and letting flywheel run it in the background is durable. Each job is **retried** on
+failure, **recovered** if the process crashes mid-run, and **audited** down to its
+per-attempt cost.
+
+It's three moving parts — **① define the work, ② enqueue it, ③ run a `Node` that processes it:**
 
 ```go
 package main
 
 import (
 	"context"
-	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/glebarez/sqlite" // pure-Go SQLite: no cgo, no C compiler
 	flywheel "github.com/mrz1836/go-flywheel"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
-type EmailArgs struct {
-	To string `json:"to"`
+// ① Define the work: typed args + a worker that handles them.
+//    The job here is "summarize a document with an LLM" — slow, metered, and
+//    occasionally rate-limited, so you never want to run it inline or lose it.
+
+type SummarizeDoc struct {
+	DocID string `json:"doc_id"`
 }
 
-func (EmailArgs) Kind() string { return "send_email" }
+func (SummarizeDoc) Kind() string { return "summarize_doc" } // args name the kind they want
 
-type EmailWorker struct{}
+// Summarizer holds whatever the worker needs: a model client, DB handle, etc.
+type Summarizer struct{}
 
-func (EmailWorker) Kind() string { return "send_email" }
-func (EmailWorker) Work(ctx context.Context, job *flywheel.Job[EmailArgs]) (flywheel.Result, error) {
-	job.Logger.InfoContext(ctx, "sending", "to", job.Args.To)
-	return flywheel.Result{}, nil
+func (Summarizer) Kind() string { return "summarize_doc" } // worker names the kind it handles
+
+func (Summarizer) Work(ctx context.Context, job *flywheel.Job[SummarizeDoc]) (flywheel.Result, error) {
+	summary, costMicros, err := callLLM(ctx, job.Args.DocID)
+	if err != nil {
+		return flywheel.Result{}, err // returning an error → automatic retry with backoff
+	}
+	return flywheel.Result{
+		Output:     summary,    // recorded on this attempt's audit row
+		CostMicros: costMicros, // track spend per attempt, no extra plumbing
+	}, nil
 }
 
 func main() {
 	db, _ := gorm.Open(sqlite.Open("flywheel.db"), &gorm.Config{})
-	_ = flywheel.Migrate(db)
+	_ = flywheel.Migrate(db) // creates the jobs / job_runs / job_periodics tables
 
 	reg := flywheel.NewRegistry()
-	flywheel.Register(reg, EmailWorker{})
+	flywheel.Register(reg, Summarizer{})
 
-	// Enqueue work — transactionally with your own data via InsertOpts.Tx if you like.
-	_, _ = flywheel.Insert(context.Background(), flywheel.NewClient(db), EmailArgs{To: "a@b.com"}, flywheel.InsertOpts{})
+	// ② Enqueue work. Returns instantly — the caller never waits on the LLM.
+	//    (Pass InsertOpts.Tx to enqueue inside your own DB transaction.)
+	_, _ = flywheel.Insert(context.Background(), flywheel.NewClient(db),
+		SummarizeDoc{DocID: "42"}, flywheel.InsertOpts{})
 
+	// ③ Run a Node: it claims jobs, runs your worker, retries failures, and
+	//    drains cleanly on Ctrl+C. Concurrency: 4 → four summaries at once.
 	node, _ := flywheel.NewNode(flywheel.NodeConfig{
 		Runners: []flywheel.RunnerConfig{{
 			DB: db, Driver: flywheel.NewSQLiteDriver(db), Registry: reg,
-			Queues: []string{"default", "periodic"}, Concurrency: 1, ClaimAnyClass: true,
+			Queues: []string{"default"}, Concurrency: 4, ClaimAnyClass: true,
 		}},
-		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db)},
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	_ = node.Run(ctx) // runner + scheduler, drains on Ctrl+C
+	_ = node.Run(ctx) // blocks until Ctrl+C, then drains in-flight jobs
+}
+
+// callLLM stands in for your real model call (Anthropic, OpenAI, a local model…).
+func callLLM(ctx context.Context, docID string) (summary string, costMicros int64, err error) {
+	return "TL;DR of doc " + docID, 1_200, nil
 }
 ```
 
-More runnable examples live in [`examples/`](examples).
+That's a durable AI pipeline: enqueue returns instantly, the `Node` summarizes four
+documents at a time, a failed model call retries itself with backoff, and every attempt —
+including what it cost — lands in the `job_runs` audit table. Need periodic or cron-style
+runs too? Add a `Scheduler` to the `Node` (see [`examples/`](examples) for the full set).
 
 <br/>
 
