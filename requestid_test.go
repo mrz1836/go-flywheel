@@ -41,3 +41,21 @@ func FuzzRequestIDMetadataRoundTrip(f *testing.F) {
 		}
 	})
 }
+
+// BenchmarkMetadataWithRequestID measures the JSON merge-and-marshal that runs
+// on every enqueue, over a representative base blob carrying extra tags.
+func BenchmarkMetadataWithRequestID(b *testing.B) {
+	base := []byte(`{"tenant":"acme","source":"api"}`)
+	for b.Loop() {
+		_ = metadataWithRequestID(base, "req-0123456789abcdef")
+	}
+}
+
+// BenchmarkRequestIDFromMetadata measures the JSON unmarshal that runs on every
+// dequeue to recover the request_id from a persisted metadata blob.
+func BenchmarkRequestIDFromMetadata(b *testing.B) {
+	raw := metadataWithRequestID([]byte(`{"tenant":"acme","source":"api"}`), "req-0123456789abcdef")
+	for b.Loop() {
+		_ = requestIDFromMetadata(raw)
+	}
+}

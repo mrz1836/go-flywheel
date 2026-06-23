@@ -9,50 +9,63 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestJobRowBeforeCreateAppliesDefaults proves a jobs row created with only a
-// Kind lands with the canonical queue/priority/state/run_on/max_attempts
-// defaults and a non-zero scheduled_at — the producer defaults now live in the
-// row's own lifecycle hook.
-func TestJobRowBeforeCreateAppliesDefaults(t *testing.T) {
+// TestJobRowBeforeCreate proves the jobs-row BeforeCreate hook both applies the
+// producer defaults (queue/priority/state/executor_class/max_attempts and a
+// non-zero scheduled_at, all now living in the row's own lifecycle hook) and
+// rejects invalid rows with a ValidationError.
+func TestJobRowBeforeCreate(t *testing.T) {
 	t.Parallel()
-	db := newDB(t)
+	tests := []struct {
+		name    string
+		row     jobRow
+		wantErr error
+		check   func(t *testing.T, row jobRow)
+	}{
+		{
+			name: "applies defaults from kind alone",
+			row:  jobRow{Kind: "test.defaults"},
+			check: func(t *testing.T, row jobRow) {
+				t.Helper()
+				assert.NotEmpty(t, row.ID)
+				assert.Equal(t, "default", row.Queue)
+				assert.Equal(t, 100, row.Priority)
+				assert.Equal(t, 25, row.MaxAttempts)
+				assert.Equal(t, string(StateAvailable), row.State)
+				assert.Equal(t, string(AnyClass), row.ExecutorClass, "the default executor class is the wildcard")
+				assert.False(t, row.ScheduledAt.IsZero())
+				assert.False(t, row.CreatedAt.IsZero())
+				assert.JSONEq(t, "[]", string(row.Tags))
+				assert.JSONEq(t, "{}", string(row.Args))
+				assert.JSONEq(t, "{}", string(row.Metadata))
+			},
+		},
+		{
+			name:    "rejects a blank kind",
+			row:     jobRow{},
+			wantErr: ErrValidation,
+		},
+		{
+			name:    "rejects an unknown state literal",
+			row:     jobRow{Kind: "k", State: "invented"},
+			wantErr: ErrValidation,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
 
-	row := jobRow{Kind: "test.defaults"}
-	require.NoError(t, db.Create(&row).Error)
-
-	assert.NotEmpty(t, row.ID)
-	assert.Equal(t, "default", row.Queue)
-	assert.Equal(t, 100, row.Priority)
-	assert.Equal(t, 25, row.MaxAttempts)
-	assert.Equal(t, string(StateAvailable), row.State)
-	assert.Equal(t, string(AnyClass), row.ExecutorClass, "the default executor class is the wildcard")
-	assert.False(t, row.ScheduledAt.IsZero())
-	assert.False(t, row.CreatedAt.IsZero())
-	assert.JSONEq(t, "[]", string(row.Tags))
-	assert.JSONEq(t, "{}", string(row.Args))
-	assert.JSONEq(t, "{}", string(row.Metadata))
-}
-
-// TestJobRowBeforeCreateRejectsBlankKind proves a kind-less job is rejected with
-// a ValidationError.
-func TestJobRowBeforeCreateRejectsBlankKind(t *testing.T) {
-	t.Parallel()
-	db := newDB(t)
-
-	err := db.Create(&jobRow{}).Error
-	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrValidation)
-}
-
-// TestJobRowBeforeCreateRejectsUnknownState proves an unrecognized state literal
-// is rejected rather than silently persisted.
-func TestJobRowBeforeCreateRejectsUnknownState(t *testing.T) {
-	t.Parallel()
-	db := newDB(t)
-
-	err := db.Create(&jobRow{Kind: "k", State: "invented"}).Error
-	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrValidation)
+			row := tt.row
+			err := db.Create(&row).Error
+			if tt.wantErr != nil {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			tt.check(t, row)
+		})
+	}
 }
 
 // TestJobRowSoftDeleteScopesQueries proves gorm.DeletedAt soft-deletes a job:

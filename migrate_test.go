@@ -64,6 +64,7 @@ func sqliteHasIndex(t *testing.T, db *gorm.DB, name string) bool {
 // TestMigrateSQLite proves Migrate stands up the full schema on a bare SQLite
 // database (standalone mode) and is idempotent on a second call.
 func TestMigrateSQLite(t *testing.T) {
+	t.Parallel()
 	db := newBareSQLite(t)
 
 	if err := Migrate(db); err != nil {
@@ -93,6 +94,7 @@ func TestMigrateSQLite(t *testing.T) {
 // duplicate non-null unique_key insert is rejected and classifies as
 // ErrDuplicateKey via the runtime's WrapDBError seam.
 func TestMigrateSQLiteIdempotencyEnforced(t *testing.T) {
+	t.Parallel()
 	db := newBareSQLite(t)
 	if err := Migrate(db); err != nil {
 		t.Fatalf("Migrate: %v", err)
@@ -128,6 +130,7 @@ func TestMigrateSQLiteIdempotencyEnforced(t *testing.T) {
 
 // TestMigrateNilDB guards the nil-db precondition.
 func TestMigrateNilDB(t *testing.T) {
+	t.Parallel()
 	if err := Migrate(nil); err == nil {
 		t.Fatal("expected an error for a nil db")
 	}
@@ -136,6 +139,7 @@ func TestMigrateNilDB(t *testing.T) {
 // TestReconcileIndexDDLUnsupportedDialect proves a dialect that cannot express
 // partial indexes is rejected rather than silently dropping idempotency.
 func TestReconcileIndexDDLUnsupportedDialect(t *testing.T) {
+	t.Parallel()
 	if _, err := reconcileIndexDDL("mysql"); err == nil {
 		t.Fatal("expected mysql to be rejected as an unsupported dialect")
 	}
@@ -155,6 +159,7 @@ func TestReconcileIndexDDLUnsupportedDialect(t *testing.T) {
 // job_runs.executor_kind columns — by renaming them to executor_class in place
 // and preserving the stored values, before AutoMigrate runs.
 func TestMigrateRenamesLegacyRoutingColumns(t *testing.T) {
+	t.Parallel()
 	db := newBareSQLite(t)
 
 	// Stand up a legacy-shaped schema carrying every column the runtime expects
