@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -285,11 +286,44 @@ func TestNodeHealthMuxRoutes(t *testing.T) {
 			t.Parallel()
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
-			healthMux(tc.readiness).ServeHTTP(rec, req)
+			healthMux(tc.readiness, nil).ServeHTTP(rec, req)
 			assert.Equal(t, tc.wantCode, rec.Code)
 			assert.Equal(t, tc.wantBody, rec.Body.String())
 		})
 	}
+}
+
+func TestNodeHealthMuxServesMetricsWhenHandlerSet(t *testing.T) {
+	t.Parallel()
+	stub := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("metrics-body"))
+	})
+	mux := healthMux(nil, stub)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "metrics-body", rec.Body.String(), "the supplied metrics handler is served at /metrics")
+
+	// Liveness is unaffected by a metrics handler being present.
+	health := httptest.NewRecorder()
+	mux.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusOK, health.Code)
+}
+
+func TestNodeHealthMuxMetricsIs404WhenHandlerNil(t *testing.T) {
+	t.Parallel()
+	mux := healthMux(nil, nil)
+
+	metrics := httptest.NewRecorder()
+	mux.ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	assert.Equal(t, http.StatusNotFound, metrics.Code, "no handler leaves /metrics unrouted")
+
+	// /healthz still serves with no metrics handler.
+	health := httptest.NewRecorder()
+	mux.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Equal(t, http.StatusOK, health.Code)
 }
 
 func TestNodeServeHealthEndToEnd(t *testing.T) {
@@ -325,6 +359,45 @@ func TestNodeServeHealthEndToEnd(t *testing.T) {
 	// After the node drains, the health server is stopped.
 	_, err = client.Get(base + "/healthz")
 	require.Error(t, err, "the health server is stopped after the node drains")
+}
+
+func TestNodeServeMetricsEndToEnd(t *testing.T) {
+	t.Parallel()
+	db := newWALFileDB(t)
+	reg := NewRegistry()
+	Register(reg, &successWorker{})
+	addr := freeAddr(t)
+
+	metrics := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("flywheel_queue_ready 0\n"))
+	})
+	node, err := NewNode(NodeConfig{
+		Runners: []RunnerConfig{sqliteRunner(db, reg)},
+		Health:  HealthConfig{Addr: addr, MetricsHandler: metrics},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- node.Run(ctx) }()
+
+	base := "http://" + addr
+	requireEventually200(t, base+"/metrics", 3*time.Second)
+
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Get(base + "/metrics")
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Contains(t, string(body), "flywheel_queue_ready", "the Node serves the supplied metrics handler at /metrics")
+
+	// /healthz still serves alongside /metrics.
+	requireEventually200(t, base+"/healthz", time.Second)
+
+	cancel()
+	require.NoError(t, <-runErr)
 }
 
 func TestDBPingerReadiness(t *testing.T) {

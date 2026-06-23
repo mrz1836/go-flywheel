@@ -25,6 +25,11 @@ type HealthConfig struct {
 	// Node installs a default that pings the first runner's database. /healthz is
 	// always a shallow liveness 200; /readyz gates its 200 on Readiness.
 	Readiness func(ctx context.Context) error
+	// MetricsHandler, when non-nil, is served at /metrics. The Node stays format-
+	// agnostic: a host passes any http.Handler (e.g. observers.MetricsHandler for
+	// Prometheus), and a nil handler simply leaves /metrics unrouted (404). Liveness
+	// and readiness are unaffected either way.
+	MetricsHandler http.Handler
 	// ShutdownTimeout bounds the health server's graceful shutdown. Optional;
 	// defaults to five seconds.
 	ShutdownTimeout time.Duration
@@ -189,7 +194,7 @@ func (n *Node) serveHealth(ctx context.Context) error {
 	}
 	srv := &http.Server{
 		Addr:              n.cfg.Health.Addr,
-		Handler:           healthMux(n.cfg.Health.Readiness),
+		Handler:           healthMux(n.cfg.Health.Readiness, n.cfg.Health.MetricsHandler),
 		ReadHeaderTimeout: shutdownTimeout,
 	}
 
@@ -213,8 +218,10 @@ func (n *Node) serveHealth(ctx context.Context) error {
 }
 
 // healthMux builds the health server's routes: /healthz is an unconditional
-// liveness 200, /readyz returns 200 only when readiness (if set) reports nil.
-func healthMux(readiness func(ctx context.Context) error) *http.ServeMux {
+// liveness 200, /readyz returns 200 only when readiness (if set) reports nil, and
+// /metrics is served only when metricsHandler is non-nil (otherwise it 404s,
+// leaving liveness and readiness untouched).
+func healthMux(readiness func(ctx context.Context) error, metricsHandler http.Handler) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -231,6 +238,9 @@ func healthMux(readiness func(ctx context.Context) error) *http.ServeMux {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready"))
 	})
+	if metricsHandler != nil {
+		mux.Handle("/metrics", metricsHandler)
+	}
 	return mux
 }
 

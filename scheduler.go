@@ -21,14 +21,15 @@ const (
 
 // Scheduler enqueues jobs from periodic definitions and reclaims stuck jobs.
 type Scheduler struct {
-	db                *gorm.DB
-	client            *Client
-	logger            *slog.Logger
-	backfillCap       int
-	tickInterval      time.Duration
-	sweepInterval     time.Duration
-	retentionMaxAge   time.Duration
-	retentionInterval time.Duration
+	db                   *gorm.DB
+	client               *Client
+	logger               *slog.Logger
+	backfillCap          int
+	tickInterval         time.Duration
+	sweepInterval        time.Duration
+	retentionMaxAge      time.Duration
+	retentionInterval    time.Duration
+	healthSampleInterval time.Duration
 }
 
 // SchedulerConfig configures a Scheduler. Only DB and Client are required; the
@@ -59,6 +60,12 @@ type SchedulerConfig struct {
 	// RetentionInterval is the cadence of the retention sweep. It applies only
 	// when RetentionMaxAge is set; left zero, it defaults to one hour.
 	RetentionInterval time.Duration
+	// HealthSampleInterval enables the queue-health heartbeat: when > 0 the
+	// Scheduler samples QueueHealth on this cadence and logs a one-line pulse
+	// (ready, in-flight, oldest-ready lag, discarded). Zero (the default) disables
+	// it — no surprise log output for an embedded consumer that never asked for a
+	// heartbeat; a `/metrics` scrape samples fresh regardless.
+	HealthSampleInterval time.Duration
 }
 
 // NewScheduler returns a Scheduler over db and the producer client with the
@@ -71,14 +78,15 @@ func NewScheduler(db *gorm.DB, client *Client) *Scheduler {
 // backfill defaults for any field left zero.
 func NewSchedulerWithConfig(cfg SchedulerConfig) *Scheduler {
 	s := &Scheduler{
-		db:                cfg.DB,
-		client:            cfg.Client,
-		logger:            cfg.Logger,
-		backfillCap:       cfg.BackfillCap,
-		tickInterval:      cfg.TickInterval,
-		sweepInterval:     cfg.SweepInterval,
-		retentionMaxAge:   cfg.RetentionMaxAge,
-		retentionInterval: cfg.RetentionInterval,
+		db:                   cfg.DB,
+		client:               cfg.Client,
+		logger:               cfg.Logger,
+		backfillCap:          cfg.BackfillCap,
+		tickInterval:         cfg.TickInterval,
+		sweepInterval:        cfg.SweepInterval,
+		retentionMaxAge:      cfg.RetentionMaxAge,
+		retentionInterval:    cfg.RetentionInterval,
+		healthSampleInterval: cfg.HealthSampleInterval,
 	}
 	if s.logger == nil {
 		s.logger = slog.Default()
@@ -118,6 +126,15 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		retentionC = retentionTicker.C
 	}
 
+	// The queue-health heartbeat is opt-in the same way: a nil channel when
+	// HealthSampleInterval is zero blocks forever, so no pulse is ever logged.
+	var healthC <-chan time.Time
+	if s.healthSampleInterval > 0 {
+		healthTicker := time.NewTicker(s.healthSampleInterval)
+		defer healthTicker.Stop()
+		healthC = healthTicker.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -136,8 +153,36 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			} else if n > 0 {
 				s.logger.InfoContext(ctx, "jobs: retention sweep pruned finished jobs", "deleted", n)
 			}
+		case <-healthC:
+			s.logHealth(ctx)
 		}
 	}
+}
+
+// SampleHealth reads a QueueHealth gauge snapshot through the Scheduler's
+// database. It parallels Tick, Sweep, and PruneRetention so the heartbeat cadence
+// is testable directly, and lets a host reuse the Scheduler's db handle as the
+// sampler behind a `/metrics` endpoint.
+func (s *Scheduler) SampleHealth(ctx context.Context) (QueueHealth, error) {
+	return SampleQueueHealth(ctx, s.db)
+}
+
+// logHealth samples queue health and logs a one-line pulse. A sample failure is
+// logged and swallowed: a transient read error must not stop the scheduler loop.
+func (s *Scheduler) logHealth(ctx context.Context) {
+	qh, err := s.SampleHealth(ctx)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "jobs: queue health sample failed", "error", err)
+		return
+	}
+	s.logger.InfoContext(
+		ctx, "jobs: queue health",
+		"ready", qh.Ready,
+		"inflight", qh.InFlight,
+		"scheduled_ahead", qh.ScheduledAhead,
+		"oldest_ready", qh.OldestReadyAge.String(),
+		"discarded", qh.CountsByState[string(StateDiscarded)],
+	)
 }
 
 // Tick processes every due, active periodic definition once and reports how

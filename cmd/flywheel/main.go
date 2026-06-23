@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -38,17 +39,26 @@ func main() {
 	// can drain; commands that ignore it are unaffected.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	os.Exit(run(ctx, os.Args[1:], os.Stderr))
+}
 
+// run assembles and executes the command tree against ctx and args, writing any
+// error to stderr, and returns the process exit code. It is the testable core of
+// main: main only wires signal handling and os.Exit around it.
+func run(ctx context.Context, args []string, stderr io.Writer) int {
 	// Kick off a non-blocking "is a newer version available?" check. It is a no-op
 	// under CI / FLYWHEEL_DISABLE_UPDATE_CHECK / a dev build, and the root command
 	// drains it with a short timeout so a slow network never delays the CLI.
 	current := resolveVersion()
 	nudge := update.StartBackgroundCheck(ctx, current, update.NewGitHubFetcher(current))
 
-	if err := newRootCmd(nudge).ExecuteContext(ctx); err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, "flywheel:", err)
-		os.Exit(1)
+	root := newRootCmd(nudge)
+	root.SetArgs(args)
+	if err := root.ExecuteContext(ctx); err != nil {
+		_, _ = fmt.Fprintln(stderr, "flywheel:", err)
+		return 1
 	}
+	return 0
 }
 
 // newRootCmd assembles the command tree. nudge carries the background update
@@ -74,6 +84,7 @@ func newRootCmd(nudge <-chan *update.Result) *cobra.Command {
 		newJobsCmd(&configPath),
 		newScheduleCmd(&configPath),
 		newPruneCmd(&configPath),
+		newStatusCmd(&configPath),
 		newDoctorCmd(&configPath),
 		newVersionCmd(),
 		newUpdateCmd(),

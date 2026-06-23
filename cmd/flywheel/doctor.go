@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 
 	flywheel "github.com/mrz1836/go-flywheel"
 	"github.com/spf13/cobra"
@@ -18,44 +19,55 @@ func newDoctorCmd(configPath *string) *cobra.Command {
 		Short: "Validate config, check the database, and print effective settings",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			out := cmd.OutOrStdout()
 			cfg, db, _, err := loadAndOpen(*configPath)
 			if err != nil {
 				return err
 			}
 			defer closeDB(db)
-
-			ctx := cmd.Context()
-			if err := pingDB(ctx, db); err != nil {
-				return fmt.Errorf("database unreachable: %w", err)
-			}
-			if err := flywheel.Migrate(db); err != nil {
-				return fmt.Errorf("schema check failed: %w", err)
-			}
-
-			_, _ = fmt.Fprintln(out, "flywheel doctor:")
-			_, _ = fmt.Fprintf(out, "  config:       %s\n", *configPath)
-			_, _ = fmt.Fprintf(out, "  database:     %s (reachable, schema OK)\n", dbLabel(cfg))
-			if isSQLite(cfg) {
-				_, _ = fmt.Fprintf(out, "  sqlite:       WAL, busy_timeout=5000ms, single writer\n")
-			}
-			_, _ = fmt.Fprintf(out, "  queues:       %v\n", cfg.Runtime.Queues)
-			_, _ = fmt.Fprintf(out, "  concurrency:  %d\n", cfg.Runtime.Concurrency)
-			_, _ = fmt.Fprintf(out, "  lease:        %s\n", cfg.Runtime.Lease.Std())
-			_, _ = fmt.Fprintf(out, "  poll:         %s\n", cfg.Runtime.PollInterval.Std())
-			_, _ = fmt.Fprintf(out, "  schedules:    %d\n", len(cfg.Schedules))
-			for i := range cfg.Schedules {
-				s := cfg.Schedules[i]
-				when := s.Cron
-				if when == "" {
-					when = "every " + s.Every.Std().String()
-				}
-				_, _ = fmt.Fprintf(out, "    - %-20s %-5s %s\n", s.Slug, s.Worker, when)
-			}
-			_, _ = fmt.Fprintln(out, "  status:       OK")
-			return nil
+			return runDoctor(cmd.Context(), cmd.OutOrStdout(), *configPath, cfg, db)
 		},
 	}
+}
+
+// runDoctor performs the health check against an already-open db and writes the
+// effective-settings report to out. It is the testable core of the doctor command,
+// so its database-error branches can be driven with an injected handle.
+func runDoctor(ctx context.Context, out io.Writer, configPath string, cfg *Config, db *gorm.DB) error {
+	if err := pingDB(ctx, db); err != nil {
+		return fmt.Errorf("database unreachable: %w", err)
+	}
+	if err := flywheel.Migrate(db); err != nil {
+		return fmt.Errorf("schema check failed: %w", err)
+	}
+
+	_, _ = fmt.Fprintln(out, "flywheel doctor:")
+	_, _ = fmt.Fprintf(out, "  config:       %s\n", configPath)
+	_, _ = fmt.Fprintf(out, "  database:     %s (reachable, schema OK)\n", dbLabel(cfg))
+	if isSQLite(cfg) {
+		_, _ = fmt.Fprintf(out, "  sqlite:       WAL, busy_timeout=5000ms, single writer\n")
+	}
+	_, _ = fmt.Fprintf(out, "  queues:       %v\n", cfg.Runtime.Queues)
+	_, _ = fmt.Fprintf(out, "  concurrency:  %d\n", cfg.Runtime.Concurrency)
+	_, _ = fmt.Fprintf(out, "  lease:        %s\n", cfg.Runtime.Lease.Std())
+	_, _ = fmt.Fprintf(out, "  poll:         %s\n", cfg.Runtime.PollInterval.Std())
+	_, _ = fmt.Fprintf(out, "  schedules:    %d\n", len(cfg.Schedules))
+	for i := range cfg.Schedules {
+		s := cfg.Schedules[i]
+		when := s.Cron
+		if when == "" {
+			when = "every " + s.Every.Std().String()
+		}
+		_, _ = fmt.Fprintf(out, "    - %-20s %-5s %s\n", s.Slug, s.Worker, when)
+	}
+
+	health, err := flywheel.SampleQueueHealth(ctx, db)
+	if err != nil {
+		return fmt.Errorf("queue health check failed: %w", err)
+	}
+	_, _ = fmt.Fprintf(out, "  queue:        ready=%d in-flight=%d lag=%s\n",
+		health.Ready, health.InFlight, formatLag(health.OldestReadyAge))
+	_, _ = fmt.Fprintln(out, "  status:       OK")
+	return nil
 }
 
 // pingDB verifies the database is reachable.

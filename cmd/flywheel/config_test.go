@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -91,4 +92,69 @@ func TestLoadConfigPostgresAllowsHigherConcurrency(t *testing.T) {
 	cfg, err := LoadConfig(writeConfigFile(t, "db:\n  postgres: postgres://x\nruntime:\n  concurrency: 8\n"))
 	require.NoError(t, err)
 	assert.Equal(t, 8, cfg.Runtime.Concurrency)
+}
+
+func TestLoadConfigParsesMetricsAddrAndHealthInterval(t *testing.T) {
+	t.Parallel()
+	cfg, err := LoadConfig(writeConfigFile(t, `
+db:
+  sqlite: /tmp/x.db
+runtime:
+  metrics_addr: ":9090"
+  health_sample_interval: 30s
+`))
+	require.NoError(t, err)
+	assert.Equal(t, ":9090", cfg.Runtime.MetricsAddr)
+	assert.Equal(t, 30*time.Second, cfg.Runtime.HealthSampleInterval.Std())
+}
+
+func TestLoadConfigDefaultsLeaveMetricsDisabled(t *testing.T) {
+	t.Parallel()
+	cfg, err := LoadConfig(filepath.Join(t.TempDir(), "absent.yaml"))
+	require.NoError(t, err)
+	assert.Empty(t, cfg.Runtime.MetricsAddr, "metrics server is off by default")
+	assert.Zero(t, cfg.Runtime.HealthSampleInterval.Std(), "heartbeat is off by default")
+}
+
+// FuzzParseHumanDuration exercises the custom day/week duration parser on
+// arbitrary input. It must never panic; the d/w branch must accept any integer
+// prefix and compute days*unit; and every other input must behave exactly like
+// time.ParseDuration (same value, same error decision).
+func FuzzParseHumanDuration(f *testing.F) {
+	f.Add("30s")
+	f.Add("24h")
+	f.Add("14d")
+	f.Add("2w")
+	f.Add("")
+	f.Add("not-a-duration")
+	f.Add("-5m")
+	f.Add("1.5h30m")
+
+	f.Fuzz(func(t *testing.T, s string) {
+		got, err := parseHumanDuration(s)
+
+		// The custom branch fires only for a d/w suffix on an integer prefix.
+		if n := len(s); n >= 2 {
+			if unit := s[n-1]; unit == 'd' || unit == 'w' {
+				if days, aerr := strconv.Atoi(s[:n-1]); aerr == nil {
+					require.NoError(t, err, "an integer %c-suffixed duration must parse", unit)
+					per := 24 * time.Hour
+					if unit == 'w' {
+						per = 7 * 24 * time.Hour
+					}
+					require.Equal(t, time.Duration(days)*per, got, "d/w duration must be days*unit")
+					return
+				}
+			}
+		}
+
+		// Every other input must match time.ParseDuration exactly.
+		want, werr := time.ParseDuration(s)
+		if werr != nil {
+			require.Error(t, err, "input time.ParseDuration rejects must also be rejected")
+			return
+		}
+		require.NoError(t, err)
+		require.Equal(t, want, got, "non-d/w durations must match time.ParseDuration")
+	})
 }
