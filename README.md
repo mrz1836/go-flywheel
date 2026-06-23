@@ -107,7 +107,8 @@ work can be transactional with the rest of your application.
 Use it two ways: **embed** it in your app (define `Worker[A]` types, wire a `Node`, and let it
 run the runner + scheduler + health server in ~10 lines), or **run it locally** as a daemon with
 the [`flywheel` CLI](cmd/flywheel/README.md) — a drop-in cron replacement that runs your shell
-scripts and HTTP calls durably, with retries, backfill, and a full audit trail.
+scripts, Python scripts, magex/mage build tasks, and HTTP calls durably, with retries, backfill,
+and a full audit trail.
 
 The runtime is built from focused, composable pieces:
 
@@ -124,7 +125,7 @@ The runtime is built from focused, composable pieces:
 - **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work ([client.go](client.go))
 - **Follow-up jobs (DAG)** — workers return child jobs that are enqueued atomically ([types.go](types.go))
 - **Outbox pattern** — enqueue on the caller's own `*gorm.DB` transaction for exactly-once side effects ([client.go](client.go))
-- **Generic workers** — ready-made `ExecWorker` (shell/binary) and `HTTPWorker` so cron jobs need no custom Go ([workers/](workers))
+- **Generic workers** — ready-made `ExecWorker`, `ShellWorker`, `PythonWorker`, `MageWorker` (magex/mage), and `HTTPWorker` so local scripts and build tasks need no custom Go ([workers/](workers))
 
 <br/>
 
@@ -253,26 +254,47 @@ flywheel serve     # run runner + scheduler until Ctrl+C
 flywheel jobs ls   # inspect the queue
 ```
 
-Declare your shell jobs in `flywheel.yaml` — each run is retried, audited, and overlap-protected,
-strictly better than a crontab line:
+Declare your jobs in `flywheel.yaml` — each run is retried, audited, and overlap-protected,
+strictly better than a crontab line. Pick the worker that matches what you run locally: `shell`
+(a `.sh` file or inline snippet), `python` (a script, `-m` module, or `-c` snippet), `mage`
+(magex/mage build targets), `exec` (any binary), or `http` (call a URL):
 
 ```yaml
 schedules:
-  - slug: nightly-maintenance
+  - slug: nightly-maintenance      # a shell script — file or inline, no +x needed
     every: 24h
-    worker: exec
-    exec:
-      command: /usr/local/bin/maintenance.sh
+    worker: shell
+    shell:
+      script: /usr/local/bin/maintenance.sh
+      args: ["--verbose"]
       timeout_seconds: 600
-  - slug: gateway-healthcheck
+
+  - slug: hourly-sync              # a Python script — resolves python3, then python
+    cron: "0 * * * *"
+    worker: python
+    python:
+      script: /opt/hermes/sync.py
+      args: ["--since=1h"]
+
+  - slug: repo-deps-update         # magex/mage targets — the Go-native task runner
+    every: 24h
+    worker: mage
+    mage:
+      targets: ["deps:update"]     # e.g. ["test"], ["lint"], ["version:bump", "push=true"]
+      dir: /Users/me/projects/my-repo
+
+  - slug: gateway-healthcheck      # call a URL
     cron: "*/5 * * * *"
     worker: http
     http:
       url: https://gateway.internal/healthz
 ```
 
-See the [CLI README](cmd/flywheel/README.md) for every command, the config reference, and the
-macOS launchd setup.
+Every run's stdout, stderr, and exit code are captured to the `job_runs` audit trail — inspect
+them with `flywheel jobs inspect <id>`. Prefer to wire it from Go? The
+[examples/local-tasks](examples/local-tasks) program registers the shell, python, and mage
+workers and schedules one of each. See the [CLI README](cmd/flywheel/README.md) for every
+command, the config reference, and the macOS launchd setup.
 
 <br/>
 

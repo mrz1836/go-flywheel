@@ -26,6 +26,13 @@ log:
 # Declarative cron replacement. Each entry becomes a durable, retried, audited
 # periodic job — strictly better than crontab (history, backfill, overlap
 # protection). Use exactly one of `cron` or `every`.
+#
+# Pick the worker that matches what you run locally:
+#   exec    — any binary or command (lowest level)
+#   shell   — a .sh script file, or an inline snippet
+#   python  — a .py script, a -m module, or a -c snippet
+#   mage    — magex / mage build targets (Go-native task runner)
+#   http    — call a URL (health checks, webhooks)
 schedules:
   - slug: openclaw-nightly
     every: 24h
@@ -36,12 +43,41 @@ schedules:
       args: ["maintenance", "run"]
       timeout_seconds: 600
 
+  # Run a shell script file. No executable bit needed; runs as `sh <script>`.
+  - slug: nightly-maintenance
+    every: 24h
+    queue: periodic
+    worker: shell
+    shell:
+      script: /usr/local/bin/maintenance.sh
+      args: ["--verbose"]
+      timeout_seconds: 600
+      # shell: bash            # default is sh; switch to bash for bashisms
+      # inline: "echo hi"      # or run an inline snippet instead of a file
+
+  # Run a Python script. The interpreter resolves to python3 (then python).
   - slug: hermes-hourly-sync
     cron: "0 * * * *" # standard 5-field cron
     queue: periodic
-    worker: exec
-    exec:
-      command: /opt/hermes/bin/sync.sh # a shell script works the same as a binary
+    worker: python
+    python:
+      script: /opt/hermes/sync.py
+      args: ["--since=1h"]
+      timeout_seconds: 300
+      # module: http.server    # or run `python -m <module>`
+      # inline: "print('hi')"  # or run `python -c <snippet>`
+      # interpreter: /opt/hermes/.venv/bin/python  # pin a virtualenv
+
+  # Run magex/mage targets in a project directory (magex needs no magefile).
+  - slug: repo-deps-update
+    every: 24h
+    queue: periodic
+    worker: mage
+    mage:
+      targets: ["deps:update"] # e.g. ["test"], ["lint"], ["version:bump", "push=true"]
+      dir: /Users/me/projects/my-repo
+      timeout_seconds: 900
+      # binary: mage           # default is magex; set "mage" for vanilla mage
 
   - slug: gateway-healthcheck
     every: 1m
