@@ -43,3 +43,10 @@ func TestNewID_IsUnique(t *testing.T) {
 		seen[id] = struct{}{}
 	}
 }
+
+// BenchmarkNewID measures UUID v7 minting, which runs once per job insert.
+func BenchmarkNewID(b *testing.B) {
+	for b.Loop() {
+		_ = NewID()
+	}
+}
