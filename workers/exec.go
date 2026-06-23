@@ -78,24 +78,57 @@ func (w ExecWorker) Work(ctx context.Context, job *flywheel.Job[ExecArgs]) (flyw
 	if a.Command == "" {
 		return flywheel.Result{}, errors.New("exec: command is required")
 	}
-	if a.TimeoutSeconds > 0 {
+	out, err := runProcess(ctx, execInvocation(a), w.EnvAllowlist, w.MaxOutputBytes)
+	return flywheel.Result{Output: out}, err
+}
+
+// Classify makes an unresolvable command (not found / not executable) and any
+// configured PermanentExitCodes permanent; every other failure stays transient
+// and retries. It satisfies flywheel's optional Classifier interface.
+func (w ExecWorker) Classify(err error) flywheel.ErrorClass {
+	return classify(err, w.PermanentExitCodes)
+}
+
+// execInvocation is a fully-resolved process to run: the command and its
+// arguments, plus the environment, working directory, stdin, and timeout that
+// shape the run. The shell, python, and mage workers each translate their typed
+// args into one of these and hand it to runProcess, so every worker kind shares a
+// single execution path, output-capture policy, and error-shaping contract.
+type execInvocation struct {
+	Command        string
+	Args           []string
+	Env            map[string]string
+	Dir            string
+	Stdin          string
+	TimeoutSeconds int
+}
+
+// runProcess executes inv and captures its outcome. It bounds the run with
+// TimeoutSeconds (when > 0), captures capped stdout/stderr and the exit code into
+// an ExecOutput, and shapes failures the way the Runner expects: a fired deadline
+// becomes the context error (classified as a timeout), a non-zero exit becomes an
+// *execExitError carrying the code, and a start failure (e.g. command not found)
+// is wrapped so classify can mark it permanent. allow is the host-env allowlist
+// (nil uses the safe default, empty passes nothing); maxOut caps each captured
+// stream (<= 0 uses the 64 KiB default). The ExecOutput is always returned — even
+// on error — so the audit trail records what the command produced.
+func runProcess(ctx context.Context, inv execInvocation, allow []string, maxOut int) (ExecOutput, error) {
+	if inv.TimeoutSeconds > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(a.TimeoutSeconds)*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(inv.TimeoutSeconds)*time.Second)
 		defer cancel()
 	}
-
-	maxOut := w.MaxOutputBytes
 	if maxOut <= 0 {
 		maxOut = defaultMaxOutputBytes
 	}
 	stdout := &cappedBuffer{cap: maxOut}
 	stderr := &cappedBuffer{cap: maxOut}
 
-	cmd := exec.CommandContext(ctx, a.Command, a.Args...) //nolint:gosec // ExecWorker intentionally runs operator-configured commands
-	cmd.Env = w.buildEnv(a.Env)
-	cmd.Dir = a.Dir
-	if a.Stdin != "" {
-		cmd.Stdin = strings.NewReader(a.Stdin)
+	cmd := exec.CommandContext(ctx, inv.Command, inv.Args...) //nolint:gosec // workers intentionally run operator-configured commands
+	cmd.Env = buildEnv(allow, inv.Env)
+	cmd.Dir = inv.Dir
+	if inv.Stdin != "" {
+		cmd.Stdin = strings.NewReader(inv.Stdin)
 	}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -110,47 +143,42 @@ func (w ExecWorker) Work(ctx context.Context, job *flywheel.Job[ExecArgs]) (flyw
 	if cmd.ProcessState != nil {
 		out.ExitCode = cmd.ProcessState.ExitCode()
 	}
-	res := flywheel.Result{Output: out}
-
 	if runErr == nil {
-		return res, nil
+		return out, nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		// The deadline/cancel fired and killed the process; surface the ctx error
 		// so the Runner classifies it as a timeout.
-		return res, fmt.Errorf("exec %q timed out: %w", a.Command, ctxErr)
+		return out, fmt.Errorf("exec %q timed out: %w", inv.Command, ctxErr)
 	}
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) {
-		return res, &execExitError{command: a.Command, code: out.ExitCode}
+		return out, &execExitError{command: inv.Command, code: out.ExitCode}
 	}
-	return res, fmt.Errorf("exec %q failed to start: %w", a.Command, runErr)
+	return out, fmt.Errorf("exec %q failed to start: %w", inv.Command, runErr)
 }
 
-// Classify makes an unresolvable command (not found / not executable) and any
-// configured PermanentExitCodes permanent; every other failure stays transient
-// and retries. It satisfies flywheel's optional Classifier interface.
-func (w ExecWorker) Classify(err error) flywheel.ErrorClass {
+// classify maps a runProcess error to a flywheel.ErrorClass: an unresolvable
+// command (not found / not executable) and any exit code listed in permanent are
+// permanent failures (no retry); every other failure stays transient and retries.
+// The exec, shell, python, and mage workers share it via their Classify method.
+func classify(err error, permanent []int) flywheel.ErrorClass {
 	var notFound *exec.Error
 	if errors.As(err, &notFound) {
 		return flywheel.ErrorPermanent
 	}
 	var exitErr *execExitError
-	if errors.As(err, &exitErr) && w.isPermanentExit(exitErr.code) {
+	if errors.As(err, &exitErr) && slices.Contains(permanent, exitErr.code) {
 		return flywheel.ErrorPermanent
 	}
 	return flywheel.ErrorTransient
 }
 
-// isPermanentExit reports whether code is in PermanentExitCodes.
-func (w ExecWorker) isPermanentExit(code int) bool {
-	return slices.Contains(w.PermanentExitCodes, code)
-}
-
-// buildEnv assembles the child environment from the allowlisted host variables
-// plus the per-job extras (extras win on conflict).
-func (w ExecWorker) buildEnv(extra map[string]string) []string {
-	allow := w.EnvAllowlist
+// buildEnv assembles a child environment from the allowlisted host variables plus
+// the per-job extras (extras win on conflict). A nil allowlist uses the safe
+// default set (PATH, HOME, SHELL, LANG, TMPDIR); an explicit empty allowlist
+// passes no host environment at all.
+func buildEnv(allow []string, extra map[string]string) []string {
 	if allow == nil {
 		allow = defaultEnvAllowlist()
 	}
