@@ -43,6 +43,7 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel jobs cancel <id>` | Move a job to cancelled |
 | `flywheel schedule ls` | List periodic schedules |
 | `flywheel schedule add <slug> <kind>` | Add/update a schedule (`--cron \| --every`, `--args`) |
+| `flywheel status` | Show queue health, schedules, and recent failures (`--json --watch`) |
 | `flywheel doctor` | Validate config, check the database, print effective settings |
 
 All commands take `--config <path>` (default `./flywheel.yaml`, else
@@ -63,6 +64,34 @@ schedules:
     exec:
       command: /usr/local/bin/maintenance.sh
       timeout_seconds: 600
+```
+
+## Metrics & status
+
+`flywheel status` prints an at-a-glance operator report — queue health (ready /
+in-flight / **lag**), per-state counts, active schedules, and the last day's
+failures — read straight from the database, so it works whether or not a daemon
+is running:
+
+```bash
+flywheel status            # text report
+flywheel status --json     # the same report as JSON
+flywheel status --watch    # redraw on an interval until Ctrl+C
+```
+
+`serve` exposes telemetry when `runtime.metrics_addr` is set. The daemon then
+serves Prometheus text at `/metrics` (per-attempt counters plus queue-health
+gauges sampled per scrape) alongside `/healthz` and `/readyz`, and an optional
+`runtime.health_sample_interval` logs a queue-health heartbeat on a cadence:
+
+```yaml
+runtime:
+  metrics_addr: ":9090"          # expose /healthz, /readyz, /metrics; unset = off
+  health_sample_interval: 30s    # log a queue-health heartbeat on this cadence; unset = off
+```
+
+```bash
+curl localhost:9090/metrics      # flywheel_jobs_* counters + flywheel_queue_* gauges
 ```
 
 ## Run as a background daemon (macOS, launchd)

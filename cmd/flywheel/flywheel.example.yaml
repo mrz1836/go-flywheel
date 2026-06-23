@@ -15,6 +15,8 @@ runtime:
   lease: 30s # visibility timeout on a claimed job
   poll_interval: 250ms # pause between empty polls
   # retention: 14d  # prune finished jobs (and their runs) older than this; unset = keep forever
+  # metrics_addr: ":9090"  # expose /healthz, /readyz, and a Prometheus /metrics endpoint; unset = off
+  # health_sample_interval: 30s  # log a queue-health heartbeat (ready/in-flight/lag) on this cadence; unset = off
   # env_allowlist: [PATH, HOME, SHELL, LANG, TMPDIR]  # host env exec jobs inherit
 
 log:

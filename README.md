@@ -112,13 +112,13 @@ scripts and HTTP calls durably, with retries, backfill, and a full audit trail.
 The runtime is built from focused, composable pieces:
 
 - **Typed workers** — generic `Worker[A]` interface, registered by `Kind()` ([registry.go](registry.go))
-- **One-call lifecycle** — `Node` runs N runners + the scheduler + an optional health server and drains cleanly on shutdown ([node.go](node.go))
+- **One-call lifecycle** — `Node` runs N runners + the scheduler + an optional health/metrics server and drains cleanly on shutdown ([node.go](node.go))
 - **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `UpsertPeriodic` ([scheduler.go](scheduler.go), [schedule.go](schedule.go))
 - **Retries with backoff** — exponential backoff with jitter, overridable per worker ([runner.go](runner.go))
 - **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](runner.go))
 - **Lease-based recovery** — orphaned, crashed jobs reclaimed via `leased_until` sweeps ([scheduler.go](scheduler.go))
 - **Per-run audit** — append-only `job_runs` table records every attempt, outcome, timing, and cost ([read.go](read.go))
-- **Observability seam** — an `Observer` hook for metrics/tracing with no heavy dependencies ([observer.go](observer.go))
+- **Observability built in** — a dependency-free `Observer` seam with ready-made metrics, slog, and Prometheus adapters, queue-health/lag inspection, a `/metrics` endpoint, and `flywheel status` ([observer.go](observer.go), [observers/](observers), [health.go](health.go))
 - **Postgres + SQLite** — `FOR UPDATE SKIP LOCKED` and `BEGIN IMMEDIATE` drivers ([driver_postgres.go](driver_postgres.go), [driver_sqlite.go](driver_sqlite.go))
 - **Free-form routing** — a `ExecutorClass` label routes jobs to executor pools; empty is the wildcard ([types.go](types.go))
 - **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work ([client.go](client.go))
@@ -244,6 +244,45 @@ schedules:
 
 See the [CLI README](cmd/flywheel/README.md) for every command, the config reference, and the
 macOS launchd setup.
+
+<br/>
+
+### Observability
+
+The runtime is self-diagnosing. The `Observer` seam ([observer.go](observer.go)) reports every
+attempt's lifecycle — claim, start, finish, retry — with no metrics dependency in the core, and the
+[`observers/`](observers) package ships ready adapters that plug straight in:
+
+- `observers.NewMetrics(rec)` translates events into a `MetricsRecorder` — a one-method sink you back
+  with Prometheus, OpenTelemetry, statsd, or CloudWatch (the core imports none of them).
+- `observers.NewSlog(logger)` logs each event at debug level; `observers.NewMulti(...)` fans events
+  out to several observers at once.
+
+`SampleQueueHealth` ([health.go](health.go)) reads a point-in-time gauge snapshot — depth by state,
+ready / in-flight counts, and the **oldest-ready age (lag)**, the canonical "are the runners falling
+behind?" signal — and `RecentFailures` lists what was discarded recently and why. Give a `Node` a
+metrics handler and its health server also serves Prometheus text at `/metrics` (recorder counters
+plus the queue-health gauges, sampled fresh per scrape) alongside `/healthz` and `/readyz`:
+
+```go
+mem := observers.NewMemRecorder()
+node, _ := flywheel.NewNode(flywheel.NodeConfig{
+    Runners: []flywheel.RunnerConfig{{
+        DB: db, Driver: flywheel.NewSQLiteDriver(db), Registry: reg,
+        Queues: []string{"default"}, ClaimAnyClass: true,
+        Observer: observers.NewMulti(observers.NewSlog(logger), observers.NewMetrics(mem)),
+    }},
+    Health: flywheel.HealthConfig{
+        Addr: ":9090",
+        MetricsHandler: observers.MetricsHandler(mem, func(ctx context.Context) (flywheel.QueueHealth, error) {
+            return flywheel.SampleQueueHealth(ctx, db)
+        }),
+    },
+})
+```
+
+The [`flywheel` CLI](cmd/flywheel/README.md) turns all of this on by default and adds `flywheel status`
+for an at-a-glance report of queue health, schedules, and recent failures.
 
 <br/>
 

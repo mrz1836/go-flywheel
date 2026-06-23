@@ -80,6 +80,14 @@ type RuntimeConfig struct {
 	// terminal jobs (and their runs) finalized longer ago than this are pruned on
 	// a cadence. Zero (the default) disables it — nothing is ever deleted.
 	Retention Duration `yaml:"retention"`
+	// MetricsAddr, when set (e.g. ":9090"), makes `serve` start the Node's HTTP
+	// server exposing /healthz, /readyz, and a Prometheus /metrics endpoint. Empty
+	// (the default) disables the server entirely.
+	MetricsAddr string `yaml:"metrics_addr"`
+	// HealthSampleInterval, when > 0, enables the scheduler's queue-health
+	// heartbeat in `serve`: a one-line pulse (ready, in-flight, lag, discarded)
+	// logged on this cadence. Zero (the default) disables it.
+	HealthSampleInterval Duration `yaml:"health_sample_interval"`
 	// EnvAllowlist names the host environment variables exec jobs inherit. Nil
 	// uses the ExecWorker default (PATH, HOME, SHELL, LANG, TMPDIR).
 	EnvAllowlist []string `yaml:"env_allowlist"`

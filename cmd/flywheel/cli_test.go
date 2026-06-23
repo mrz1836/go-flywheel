@@ -66,6 +66,8 @@ func TestCLIMigrateEnqueueListDoctor(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out, "status:")
 	assert.Contains(t, out, "OK")
+	assert.Contains(t, out, "queue:", "doctor surfaces the queue-health summary")
+	assert.Contains(t, out, "ready=", "doctor reports the ready count")
 }
 
 func TestCLIEnqueueRejectsInvalidJSON(t *testing.T) {
