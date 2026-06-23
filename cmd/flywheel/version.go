@@ -38,10 +38,17 @@ func resolveBuildInfo() buildInfo {
 // resolveVersion returns the build version: the ldflags value when set,
 // otherwise the module version (go install @vX.Y.Z) or the short VCS revision.
 func resolveVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	return resolveVersionFrom(info, ok)
+}
+
+// resolveVersionFrom is the testable core of resolveVersion: it picks the ldflags
+// value, then the embedded module version or VCS revision from info.
+func resolveVersionFrom(info *debug.BuildInfo, ok bool) string {
 	if version != "dev" && version != "" && !isTemplateString(version) {
 		return version
 	}
-	if info, ok := debug.ReadBuildInfo(); ok {
+	if ok {
 		if info.Main.Version != "" && info.Main.Version != "(devel)" {
 			return info.Main.Version
 		}
@@ -55,10 +62,16 @@ func resolveVersion() string {
 // resolveCommit returns the build commit: the ldflags value when set, otherwise
 // the embedded VCS revision (shortened for readability).
 func resolveCommit() string {
+	info, ok := debug.ReadBuildInfo()
+	return resolveCommitFrom(info, ok)
+}
+
+// resolveCommitFrom is the testable core of resolveCommit.
+func resolveCommitFrom(info *debug.BuildInfo, ok bool) string {
 	if commit != "none" && commit != "" && !isTemplateString(commit) {
 		return commit
 	}
-	if info, ok := debug.ReadBuildInfo(); ok {
+	if ok {
 		if rev := vcsSetting(info, "vcs.revision"); rev != "" {
 			return shortCommit(rev)
 		}
@@ -69,10 +82,16 @@ func resolveCommit() string {
 // resolveBuildDate returns the build date: the ldflags value when set, otherwise
 // the embedded VCS commit time (or a generic marker for a go-install build).
 func resolveBuildDate() string {
+	info, ok := debug.ReadBuildInfo()
+	return resolveBuildDateFrom(info, ok)
+}
+
+// resolveBuildDateFrom is the testable core of resolveBuildDate.
+func resolveBuildDateFrom(info *debug.BuildInfo, ok bool) string {
 	if buildDate != "unknown" && buildDate != "" && !isTemplateString(buildDate) {
 		return buildDate
 	}
-	if info, ok := debug.ReadBuildInfo(); ok {
+	if ok {
 		if ts := vcsSetting(info, "vcs.time"); ts != "" {
 			if t, err := time.Parse(time.RFC3339, ts); err == nil {
 				return t.UTC().Format("2006-01-02_15:04:05_UTC")
