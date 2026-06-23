@@ -197,15 +197,20 @@ func (s *Scheduler) Tick(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("jobs: load due periodics: %w", err)
 	}
 
+	// Each definition is fired in isolation: one broken definition (e.g. an
+	// invalid cron that slipped past write-time validation) must not starve the
+	// healthy definitions scanned after it. Errors are aggregated and still
+	// returned so a caller and the scheduler log see every failure.
 	enqueued := 0
+	var errs []error
 	for i := range defs {
 		n, err := s.fire(ctx, defs[i], now)
-		if err != nil {
-			return enqueued, err
-		}
 		enqueued += n
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return enqueued, nil
+	return enqueued, errors.Join(errs...)
 }
 
 // Sweep reclaims jobs whose lease has expired (FR-030, FR-031).
