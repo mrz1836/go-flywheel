@@ -51,20 +51,49 @@ All commands take `--config <path>` (default `./flywheel.yaml`, else
 
 ## Replacing cron
 
-Declare your shell jobs as `exec` schedules in `flywheel.yaml` (or with `flywheel
-schedule add`). Each run is durable, retried with backoff, overlap-protected by
-the lease, and fully recorded in the `job_runs` audit trail — strictly better
-than a crontab line. `http` schedules call a URL on the same terms.
+Declare your jobs in `flywheel.yaml` (or with `flywheel schedule add`). Each run
+is durable, retried with backoff, overlap-protected by the lease, and fully
+recorded in the `job_runs` audit trail — strictly better than a crontab line.
+Choose the worker that matches what you run locally:
+
+| `worker:` | Runs | Key fields |
+|---|---|---|
+| `shell` | a `.sh` script file, or an inline snippet | `script` \| `inline`, `args`, `shell` (default `sh`) |
+| `python` | a `.py` script, a `-m` module, or a `-c` snippet | `script` \| `module` \| `inline`, `args`, `interpreter` (default `python3`→`python`) |
+| `mage` | magex / mage build targets | `targets` (required), `binary` (default `magex`), `dir` |
+| `exec` | any binary or command | `command` (required), `args` |
+| `http` | an HTTP request | `url` (required), `method`, `success_status` |
+
+The command workers (`shell`, `python`, `mage`, `exec`) also accept `env`, `dir`,
+and `timeout_seconds`, and inherit the host env named in `runtime.env_allowlist`.
 
 ```yaml
 schedules:
-  - slug: nightly-maintenance
+  - slug: nightly-maintenance      # shell script (no executable bit needed)
     every: 24h
-    worker: exec
-    exec:
-      command: /usr/local/bin/maintenance.sh
+    worker: shell
+    shell:
+      script: /usr/local/bin/maintenance.sh
       timeout_seconds: 600
+
+  - slug: hourly-sync              # python script (resolves python3, then python)
+    cron: "0 * * * *"
+    worker: python
+    python:
+      script: /opt/hermes/sync.py
+      args: ["--since=1h"]
+
+  - slug: repo-deps-update         # magex/mage targets (magex needs no magefile)
+    every: 24h
+    worker: mage
+    mage:
+      targets: ["deps:update"]     # e.g. ["test"], ["lint"], ["version:bump", "push=true"]
+      dir: /Users/me/projects/my-repo
 ```
+
+After a run, see its captured stdout/stderr and exit code with `flywheel jobs
+inspect <id>`. A complete [`flywheel.example.yaml`](flywheel.example.yaml) with
+every worker type ships alongside this README.
 
 ## Metrics & status
 
