@@ -14,7 +14,7 @@ Any released version of **go-flywheel** that is not marked as deprecated is acti
 If you’ve found a security issue, **please don’t open a public issue or PR**.
 
 Instead, send a private email to:
-📧 [atlas@mrz1818.com](mailto:atlas@mrz1818.com)
+📧 [go-flywheel@mrz1818.com](mailto:go-flywheel@mrz1818.com)
 
 Include the following:
 
