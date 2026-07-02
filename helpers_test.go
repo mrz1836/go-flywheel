@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/glebarez/sqlite"
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -84,6 +85,6 @@ func runToIdle(t testing.TB, ctx context.Context, r *Runner) {
 
 // clockCtx returns a ctx carrying clk so scheduler-driven tests get a
 // deterministic clock.
-func clockCtx(ctx context.Context, clk Clock) context.Context {
-	return WithClock(ctx, clk)
+func clockCtx(ctx context.Context, clk models.Clock) context.Context {
+	return models.WithClock(ctx, clk)
 }

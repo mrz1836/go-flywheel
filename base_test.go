@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -100,7 +101,7 @@ func TestJobRunRowBeforeCreateRequiresMandatoryFields(t *testing.T) {
 	assert.ErrorIs(t, err, ErrValidation)
 
 	// A fully specified run row mints its ID and defaults the timestamps.
-	run := jobRunRow{JobID: NewID(), Attempt: 1, ExecutorClass: "local", ExecutorID: "h1", Outcome: "started"}
+	run := jobRunRow{JobID: models.NewID(), Attempt: 1, ExecutorClass: "local", ExecutorID: "h1", Outcome: "started"}
 	require.NoError(t, db.Create(&run).Error)
 	assert.NotEmpty(t, run.ID)
 	assert.False(t, run.StartedAt.IsZero())
@@ -152,7 +153,7 @@ func TestJobPeriodicRowBeforeSaveAppliesDefaultsAndStampsUpdatedAt(t *testing.T)
 	db := newDB(t)
 
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := WithClock(context.Background(), NewFixedClock(now))
+	ctx := models.WithClock(context.Background(), models.NewFixedClock(now))
 
 	interval := 30
 	row := jobPeriodicRow{Slug: "defaults", Kind: "k", NextRunAt: now, IntervalSeconds: &interval}

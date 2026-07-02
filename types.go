@@ -184,7 +184,7 @@ type RawJob struct {
 	ScheduledAt time.Time
 	// Metadata is the raw jobs.metadata JSON blob. The Runner uses it to
 	// thread request_id through to the worker's ctx and slog attrs; workers
-	// generally read the value via [RequestIDFrom] rather than parsing it.
+	// generally read the value via [ctxutil.RequestIDFrom] rather than parsing it.
 	Metadata []byte
 }
 
@@ -246,6 +246,6 @@ type InsertOpts struct {
 	Tx *gorm.DB
 	// RequestID, when non-empty, is stamped on the job's metadata so the
 	// Runner can thread it through ctx + slog on dequeue. Falls back to
-	// [RequestIDFrom] on the caller's ctx when this field is empty.
+	// [ctxutil.RequestIDFrom] on the caller's ctx when this field is empty.
 	RequestID string
 }

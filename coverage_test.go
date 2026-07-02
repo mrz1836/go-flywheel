@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/ctxutil"
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
@@ -62,27 +64,6 @@ func TestValidationErrorErrorAndUnwrap(t *testing.T) {
 	assert.ErrorIs(t, err, ErrValidation)
 }
 
-func TestRequestIDContextRoundTrip(t *testing.T) {
-	t.Parallel()
-	assert.Empty(t, RequestIDFrom(WithRequestID(context.Background(), "")), "an empty id is a no-op")
-	assert.Equal(t, "req-1", RequestIDFrom(WithRequestID(context.Background(), "req-1")))
-}
-
-func TestMetadataWithRequestID(t *testing.T) {
-	t.Parallel()
-	assert.JSONEq(t, `{"request_id":"req-1"}`, string(metadataWithRequestID(nil, "req-1")))
-	assert.JSONEq(t, `{}`, string(metadataWithRequestID(nil, "")), "no base, no id is an empty object")
-	assert.JSONEq(t, `{"foo":"bar","request_id":"req-2"}`,
-		string(metadataWithRequestID([]byte(`{"foo":"bar"}`), "req-2")), "base is merged ahead of the id")
-}
-
-func TestRequestIDFromMetadata(t *testing.T) {
-	t.Parallel()
-	assert.Empty(t, requestIDFromMetadata(nil))
-	assert.Empty(t, requestIDFromMetadata([]byte("not json")), "a malformed blob tolerates rather than crashes")
-	assert.Equal(t, "req-9", requestIDFromMetadata([]byte(`{"request_id":"req-9"}`)))
-}
-
 func TestReconcileIndexDDLSupportedDialects(t *testing.T) {
 	t.Parallel()
 	pg, err := reconcileIndexDDL("postgres")
@@ -115,41 +96,6 @@ func TestCronBucketsInvalidExprErrors(t *testing.T) {
 	now := time.Now()
 	_, _, err := cronBuckets("definitely not a cron", now.Add(-time.Hour), now, 10)
 	require.Error(t, err)
-}
-
-func TestWrapByMessageForeignKeyAndDefault(t *testing.T) {
-	t.Parallel()
-	assert.ErrorIs(t, wrapByMessage(errors.New("FOREIGN KEY constraint failed")), ErrForeignKey)
-	assert.ErrorIs(t, wrapByMessage(errors.New(`violates foreign key constraint "x"`)), ErrForeignKey)
-	assert.ErrorIs(t, wrapByMessage(errors.New("some other failure")), ErrDatabaseError)
-}
-
-func TestWrapSqliteErrorForeignKeyAndDefault(t *testing.T) {
-	t.Parallel()
-	// modernc's *sqlite.Error has unexported fields, so the FK and unmapped-
-	// constraint branches are exercised against real violations. Pinning a single
-	// connection keeps PRAGMA foreign_keys = ON in effect for the inserts.
-	db := newDB(t)
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
-
-	require.NoError(t, db.Exec(`PRAGMA foreign_keys = ON`).Error)
-	require.NoError(t, db.Exec(`CREATE TABLE parent (id integer primary key)`).Error)
-	require.NoError(t, db.Exec(`CREATE TABLE child (id integer primary key, pid integer REFERENCES parent(id))`).Error)
-
-	fkErr := db.Exec(`INSERT INTO child (id, pid) VALUES (1, 999)`).Error
-	require.Error(t, fkErr)
-	ok, wrapped := wrapSqliteError(fkErr)
-	require.True(t, ok)
-	assert.ErrorIs(t, wrapped, ErrForeignKey)
-
-	require.NoError(t, db.Exec(`CREATE TABLE chk (n integer CHECK (n > 0))`).Error)
-	chkErr := db.Exec(`INSERT INTO chk (n) VALUES (-1)`).Error
-	require.Error(t, chkErr)
-	ok, wrapped = wrapSqliteError(chkErr)
-	require.True(t, ok)
-	assert.ErrorIs(t, wrapped, ErrDatabaseError, "an unmapped constraint falls back to ErrDatabaseError")
 }
 
 // --- client -----------------------------------------------------------------
@@ -423,14 +369,14 @@ func TestSchedulerFirePeriodicWithoutScheduleErrors(t *testing.T) {
 	sched := NewScheduler(db, NewClient(db))
 
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	// Seed a row with neither cron_expr nor interval_seconds, bypassing the
 	// BeforeSave validation hook with raw SQL.
 	require.NoError(t, db.Exec(
 		`INSERT INTO job_periodics(id, slug, kind, args_template, queue, next_run_at, is_active, created_at, updated_at)
 		 VALUES (?,?,?,?,?,?,?,?,?)`,
-		NewID(), "cov-noplan", "cov.k", "{}", "periodic", now.Add(-time.Minute), true, now, now,
+		models.NewID(), "cov-noplan", "cov.k", "{}", "periodic", now.Add(-time.Minute), true, now, now,
 	).Error)
 
 	_, err := sched.Tick(ctx)
@@ -476,7 +422,7 @@ func TestInsertRunStubDuplicateIDErrors(t *testing.T) {
 	d := baseDriver{db: db}
 	ctx := context.Background()
 	raw := RawJob{ID: "job-1", Attempt: 1}
-	runID := NewID()
+	runID := models.NewID()
 
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
 	err := d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1")
@@ -490,7 +436,7 @@ func TestFinalizeOutputMarshalErrors(t *testing.T) {
 	ctx := context.Background()
 
 	raw := RawJob{ID: "job-x", Attempt: 1, MaxAttempts: 5}
-	runID := NewID()
+	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
 
 	err := d.Finalize(ctx, raw, runID, Result{Output: make(chan int)}, nil, time.Now())
@@ -644,7 +590,7 @@ type reqIDWorker struct{ got string }
 
 func (*reqIDWorker) Kind() string { return "cov.reqid" }
 func (w *reqIDWorker) Work(ctx context.Context, _ *Job[reqIDArgs]) (Result, error) {
-	w.got = RequestIDFrom(ctx)
+	w.got = ctxutil.RequestIDFrom(ctx)
 	return Result{}, nil
 }
 

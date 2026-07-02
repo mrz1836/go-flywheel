@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -22,7 +23,7 @@ func installPeriodic(t *testing.T, db *gorm.DB, slug, kind string, nextRunAt tim
 	require.NoError(t, db.Exec(
 		`INSERT INTO job_periodics(id, slug, kind, args_template, queue, interval_seconds, next_run_at, is_active, created_at, updated_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		NewID(), slug, kind, "{}", "periodic", defaultPeriodicIntervalSeconds, nextRunAt, active,
+		models.NewID(), slug, kind, "{}", "periodic", defaultPeriodicIntervalSeconds, nextRunAt, active,
 		time.Now().UTC(), time.Now().UTC(),
 	).Error)
 }
@@ -32,7 +33,7 @@ func installPeriodicCron(t *testing.T, db *gorm.DB, slug, kind, cronExpr string,
 	require.NoError(t, db.Exec(
 		`INSERT INTO job_periodics(id, slug, kind, args_template, queue, cron_expr, next_run_at, is_active, created_at, updated_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		NewID(), slug, kind, "{}", "periodic", cronExpr, nextRunAt, true,
+		models.NewID(), slug, kind, "{}", "periodic", cronExpr, nextRunAt, true,
 		time.Now().UTC(), time.Now().UTC(),
 	).Error)
 }
@@ -52,7 +53,7 @@ func TestSchedulerTickFiresIntervalAndAdvancesNextRunAt(t *testing.T) {
 	// Anchor a fixed clock so the test is unaffected by wall-clock drift /
 	// stored-text-vs-time-Time round-trip subtleties.
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	due := now.Add(-time.Minute)
 	installPeriodic(t, db, "tick-interval", "test.interval", due, true)
@@ -74,7 +75,7 @@ func TestSchedulerTickFiresCron(t *testing.T) {
 	sched := NewScheduler(db, NewClient(db))
 
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	due := now.Add(-2 * time.Minute)
 	installPeriodicCron(t, db, "tick-cron", "test.cron", "*/1 * * * *", due)
@@ -91,7 +92,7 @@ func TestSchedulerTickIdempotentOnRepeatTick(t *testing.T) {
 	sched := NewScheduler(db, NewClient(db))
 
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	due := now.Add(-time.Minute)
 	installPeriodic(t, db, "tick-idem", "test.idem", due, true)
@@ -115,7 +116,7 @@ func TestSchedulerTickSkipsInactiveDefinitions(t *testing.T) {
 	sched := NewScheduler(db, NewClient(db))
 
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	due := now.Add(-time.Minute)
 	installPeriodic(t, db, "tick-inactive", "test.inactive", due, false)
@@ -132,7 +133,7 @@ func TestSchedulerTickBackfillsAtMostBackfillCapJobs(t *testing.T) {
 	sched := NewScheduler(db, NewClient(db))
 
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	// 60s interval, due-time was 1 hour ago = 60 missed buckets. The default
 	// backfill cap is 10.
@@ -152,7 +153,7 @@ func TestSchedulerSweepReclaimsExpiredLeases(t *testing.T) {
 
 	now := time.Now().UTC()
 	pastLease := now.Add(-time.Minute)
-	jobID := NewID()
+	jobID := models.NewID()
 	require.NoError(t, db.Exec(
 		`INSERT INTO jobs(id, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, executor_class, leased_until, tags, created_at, updated_at, metadata)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -161,10 +162,10 @@ func TestSchedulerSweepReclaimsExpiredLeases(t *testing.T) {
 	require.NoError(t, db.Exec(
 		`INSERT INTO job_runs(id, job_id, attempt, executor_class, executor_id, started_at, outcome, created_at)
 		 VALUES (?,?,?,?,?,?,?,?)`,
-		NewID(), jobID, 1, "local", "h1", now.Add(-time.Hour), string(OutcomeStarted), now.Add(-time.Hour),
+		models.NewID(), jobID, 1, "local", "h1", now.Add(-time.Hour), string(OutcomeStarted), now.Add(-time.Hour),
 	).Error)
 
-	reclaimed, err := sched.Sweep(clockCtx(context.Background(), NewFixedClock(now)))
+	reclaimed, err := sched.Sweep(clockCtx(context.Background(), models.NewFixedClock(now)))
 	require.NoError(t, err)
 	assert.Equal(t, 1, reclaimed)
 }

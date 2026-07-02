@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrz1836/go-foundation/ctxutil"
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/gorm"
 )
 
@@ -218,8 +220,8 @@ func (r *Runner) pollOnce(ctx context.Context) (int, error) {
 // dispatch runs one claimed job: it pre-allocates the audit stub, runs the
 // worker outside any transaction with panic recovery, then finalizes.
 func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
-	runID := NewID()
-	startedAt := ClockFrom(ctx).Now(ctx)
+	runID := models.NewID()
+	startedAt := models.ClockFrom(ctx).Now(ctx)
 
 	if err := r.cfg.Driver.InsertRunStub(
 		ctx, runID, raw, startedAt, r.cfg.ExecutorClass, r.executorID,
@@ -231,15 +233,15 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
 
 	entry, known := r.cfg.Registry.lookup(raw.Kind)
 	if !known {
-		finishedAt := ClockFrom(ctx).Now(ctx)
+		finishedAt := models.ClockFrom(ctx).Now(ctx)
 		unknown := &classifiedError{cause: ErrUnknownKind, class: ErrorPermanent}
 		r.observe(ctx, raw, jobEv, Result{}, unknown, startedAt, finishedAt)
 		return r.cfg.Driver.Finalize(ctx, raw, runID, Result{}, unknown, finishedAt)
 	}
 
 	logger := r.cfg.Logger.With("job_id", raw.ID, "kind", raw.Kind, "run_id", runID)
-	if reqID := requestIDFromMetadata(raw.Metadata); reqID != "" {
-		ctx = WithRequestID(ctx, reqID)
+	if reqID := ctxutil.RequestIDFromMetadata(raw.Metadata); reqID != "" {
+		ctx = ctxutil.WithRequestID(ctx, reqID)
 		logger = logger.With("request_id", reqID)
 	}
 
@@ -267,7 +269,7 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
 	}
 
 	result, workErr := r.runWork(workCtx, entry, in)
-	finishedAt := ClockFrom(ctx).Now(ctx)
+	finishedAt := models.ClockFrom(ctx).Now(ctx)
 
 	var finalErr error
 	if workErr != nil {

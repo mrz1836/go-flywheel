@@ -1,6 +1,7 @@
 package flywheel
 
 import (
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -19,9 +20,9 @@ const defaultPeriodicQueue = "periodic"
 //
 //nolint:gocognit,gocyclo // a flat sequence of independent field defaults and checks
 func (j *jobRow) BeforeCreate(tx *gorm.DB) error {
-	now := ClockFrom(tx.Statement.Context).Now(tx.Statement.Context)
+	now := models.ClockFrom(tx.Statement.Context).Now(tx.Statement.Context)
 	if j.ID == "" {
-		j.ID = NewID()
+		j.ID = models.NewID()
 	}
 	if j.CreatedAt.IsZero() {
 		j.CreatedAt = now
@@ -67,9 +68,9 @@ func (j *jobRow) BeforeCreate(tx *gorm.DB) error {
 // StartedAt and CreatedAt to the context clock's now. job_runs is append-only,
 // so there is no save-time hook.
 func (r *jobRunRow) BeforeCreate(tx *gorm.DB) error {
-	now := ClockFrom(tx.Statement.Context).Now(tx.Statement.Context)
+	now := models.ClockFrom(tx.Statement.Context).Now(tx.Statement.Context)
 	if r.ID == "" {
-		r.ID = NewID()
+		r.ID = models.NewID()
 	}
 	if r.JobID == "" {
 		return newValidationError("job_id", "is required")
@@ -92,9 +93,9 @@ func (r *jobRunRow) BeforeCreate(tx *gorm.DB) error {
 // BeforeCreate mints the ID and defaults CreatedAt. Required-field and schedule
 // validation runs in BeforeSave so it covers both create and full-row update.
 func (p *jobPeriodicRow) BeforeCreate(tx *gorm.DB) error {
-	now := ClockFrom(tx.Statement.Context).Now(tx.Statement.Context)
+	now := models.ClockFrom(tx.Statement.Context).Now(tx.Statement.Context)
 	if p.ID == "" {
-		p.ID = NewID()
+		p.ID = models.NewID()
 	}
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = now
@@ -137,6 +138,6 @@ func (p *jobPeriodicRow) BeforeSave(tx *gorm.DB) error {
 	if len(p.ArgsTemplate) == 0 {
 		p.ArgsTemplate = datatypes.JSON("{}")
 	}
-	p.UpdatedAt = ClockFrom(tx.Statement.Context).Now(tx.Statement.Context)
+	p.UpdatedAt = models.ClockFrom(tx.Statement.Context).Now(tx.Statement.Context)
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -48,7 +49,7 @@ func TestSchedulerSampleHealthReturnsSnapshot(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := healthAnchor
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 	seedJob(t, db, jobRow{ID: "sh1", Kind: "k", State: string(StateAvailable), ScheduledAt: now.Add(-time.Minute)})
 	seedJob(t, db, jobRow{ID: "sh2", Kind: "k", State: string(StateRunning), ScheduledAt: now.Add(-time.Minute)})
 
@@ -64,7 +65,7 @@ func TestSchedulerRunEmitsHealthHeartbeatOnCadence(t *testing.T) {
 	t.Parallel()
 	db := newWALFileDB(t) // file-backed WAL so the Run goroutine and the sampler don't deadlock
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	// A ready job so the heartbeat has something to report.
 	seedJob(t, db, jobRow{ID: "hb1", Kind: "k", State: string(StateAvailable), ScheduledAt: now.Add(-time.Minute)})
@@ -107,7 +108,7 @@ func TestSchedulerRunNoHeartbeatWhenIntervalZero(t *testing.T) {
 	t.Parallel()
 	db := newWALFileDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	handler := &captureHandler{}
 	sched := NewSchedulerWithConfig(SchedulerConfig{

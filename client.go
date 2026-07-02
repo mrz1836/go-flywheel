@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/mrz1836/go-foundation/ctxutil"
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -72,18 +74,18 @@ func (c *Client) insert(ctx context.Context, kind string, payload []byte, opts I
 	if opts.Tx != nil {
 		db = opts.Tx
 	}
-	now := ClockFrom(ctx).Now(ctx)
+	now := models.ClockFrom(ctx).Now(ctx)
 
 	requestID := opts.RequestID
 	if requestID == "" {
-		requestID = RequestIDFrom(ctx)
+		requestID = ctxutil.RequestIDFrom(ctx)
 	}
 
 	row := jobRow{
-		ID:            NewID(),
+		ID:            models.NewID(),
 		CreatedAt:     now,
 		UpdatedAt:     now,
-		Metadata:      datatypes.JSON(metadataWithRequestID(nil, requestID)),
+		Metadata:      datatypes.JSON(ctxutil.RequestIDToMetadata(nil, requestID)),
 		Kind:          kind,
 		Queue:         orString(opts.Queue, defaultQueue),
 		Args:          datatypes.JSON(payload),
@@ -112,8 +114,8 @@ func (c *Client) insert(ctx context.Context, kind string, payload []byte, opts I
 	}
 
 	if createErr := db.WithContext(ctx).Create(&row).Error; createErr != nil {
-		wrapped := WrapDBError(createErr)
-		if errors.Is(wrapped, ErrDuplicateKey) {
+		wrapped := models.WrapDBError(createErr)
+		if errors.Is(wrapped, models.ErrDuplicateKey) {
 			return "", ErrAlreadyEnqueued
 		}
 		return "", fmt.Errorf("jobs: insert: %w", wrapped)

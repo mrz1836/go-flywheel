@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -96,7 +97,7 @@ func TestMigratePostgres(t *testing.T) {
 
 // TestMigratePostgresIdempotencyEnforced proves the jobs_unique_key partial
 // unique index is enforced on Postgres: a duplicate non-null unique_key insert
-// is rejected and classifies as ErrDuplicateKey.
+// is rejected and classifies as models.ErrDuplicateKey.
 func TestMigratePostgresIdempotencyEnforced(t *testing.T) {
 	db := newBarePostgres(t)
 	if err := Migrate(db); err != nil {
@@ -104,23 +105,23 @@ func TestMigratePostgresIdempotencyEnforced(t *testing.T) {
 	}
 
 	uk := "idempotency-key-1"
-	first := newJobRowWithUniqueKey(NewID(), &uk)
+	first := newJobRowWithUniqueKey(models.NewID(), &uk)
 	if err := db.Create(&first).Error; err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
 
 	dupKey := uk
-	second := newJobRowWithUniqueKey(NewID(), &dupKey)
+	second := newJobRowWithUniqueKey(models.NewID(), &dupKey)
 	err := db.Create(&second).Error
 	if err == nil {
 		t.Fatal("expected duplicate unique_key insert to be rejected, got nil error")
 	}
-	if wrapped := WrapDBError(err); !errors.Is(wrapped, ErrDuplicateKey) {
-		t.Fatalf("expected ErrDuplicateKey, got %v", wrapped)
+	if wrapped := models.WrapDBError(err); !errors.Is(wrapped, models.ErrDuplicateKey) {
+		t.Fatalf("expected models.ErrDuplicateKey, got %v", wrapped)
 	}
 
-	a := newJobRowWithUniqueKey(NewID(), nil)
-	b := newJobRowWithUniqueKey(NewID(), nil)
+	a := newJobRowWithUniqueKey(models.NewID(), nil)
+	b := newJobRowWithUniqueKey(models.NewID(), nil)
 	if err := db.Create(&a).Error; err != nil {
 		t.Fatalf("null-key insert a: %v", err)
 	}

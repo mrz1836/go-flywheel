@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -49,7 +50,7 @@ func seedRunErr(t *testing.T, db *gorm.DB, id, jobID string, attempt int, class 
 func assertQueueHealthSnapshot(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	now := healthAnchor
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	// Ready: claimable and due. qh-ready-old is the oldest, so it sets the lag.
 	seedJob(t, db, jobRow{ID: "qh-ready-old", Kind: "k", State: string(StateAvailable), ScheduledAt: now.Add(-10 * time.Minute)})
@@ -92,7 +93,7 @@ func assertQueueHealthSnapshot(t *testing.T, db *gorm.DB) {
 func assertQueueHealthEmpty(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	now := healthAnchor
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	qh, err := SampleQueueHealth(ctx, db)
 	require.NoError(t, err)
@@ -221,7 +222,7 @@ func TestSampleQueueHealthJustDueJobHasZeroLag(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := healthAnchor
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 	// A job whose scheduled_at is exactly now is ready, but its lag is zero — it
 	// just became claimable, it has not fallen behind.
 	seedJob(t, db, jobRow{ID: "just-due", Kind: "k", State: string(StateAvailable), ScheduledAt: now})

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -233,7 +234,7 @@ func TestRealWorldStressChaosLeaseExpiry(t *testing.T) {
 	// Insert under the same fixed clock the crash-claim uses, so scheduled_at is
 	// exactly base and the claim is deterministic regardless of wall-clock drift
 	// or stored-time precision.
-	claimCtx := clockCtx(context.Background(), NewFixedClock(base))
+	claimCtx := clockCtx(context.Background(), models.NewFixedClock(base))
 	client := NewClient(db)
 	for i := range total {
 		_, err := Insert(claimCtx, client, drainArgs{N: i}, InsertOpts{})
@@ -248,7 +249,7 @@ func TestRealWorldStressChaosLeaseExpiry(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, batch, "the crashed executor must be able to claim work")
 		for i := range batch {
-			require.NoError(t, driver.InsertRunStub(claimCtx, NewID(), batch[i], base, "local", "deadbeef:1"))
+			require.NoError(t, driver.InsertRunStub(claimCtx, models.NewID(), batch[i], base, "local", "deadbeef:1"))
 		}
 		claimedTotal += len(batch)
 	}
@@ -258,7 +259,7 @@ func TestRealWorldStressChaosLeaseExpiry(t *testing.T) {
 	assert.EqualValues(t, crashed, running, "the crashed chunk is leased and in flight")
 
 	// The leases expire; one sweep reclaims the whole crashed chunk.
-	sweepCtx := clockCtx(context.Background(), NewFixedClock(base.Add(time.Hour)))
+	sweepCtx := clockCtx(context.Background(), models.NewFixedClock(base.Add(time.Hour)))
 	sched := NewScheduler(db, client)
 	reclaimed, err := sched.Sweep(sweepCtx)
 	require.NoError(t, err)

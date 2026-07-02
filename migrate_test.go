@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -92,7 +93,7 @@ func TestMigrateSQLite(t *testing.T) {
 // TestMigrateSQLiteIdempotencyEnforced proves the correctness-bearing
 // jobs_unique_key partial unique index is actually enforced after Migrate: a
 // duplicate non-null unique_key insert is rejected and classifies as
-// ErrDuplicateKey via the runtime's WrapDBError seam.
+// models.ErrDuplicateKey via the runtime's models.WrapDBError seam.
 func TestMigrateSQLiteIdempotencyEnforced(t *testing.T) {
 	t.Parallel()
 	db := newBareSQLite(t)
@@ -112,8 +113,8 @@ func TestMigrateSQLiteIdempotencyEnforced(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected duplicate unique_key insert to be rejected, got nil error")
 	}
-	if wrapped := WrapDBError(err); !errors.Is(wrapped, ErrDuplicateKey) {
-		t.Fatalf("expected ErrDuplicateKey, got %v", wrapped)
+	if wrapped := models.WrapDBError(err); !errors.Is(wrapped, models.ErrDuplicateKey) {
+		t.Fatalf("expected models.ErrDuplicateKey, got %v", wrapped)
 	}
 
 	// The partial index excludes NULL unique_key: two NULL-key jobs must both

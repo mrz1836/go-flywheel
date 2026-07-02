@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/robfig/cron/v3"
 	"gorm.io/gorm"
 )
@@ -188,7 +189,7 @@ func (s *Scheduler) logHealth(ctx context.Context) {
 // Tick processes every due, active periodic definition once and reports how
 // many jobs were enqueued.
 func (s *Scheduler) Tick(ctx context.Context) (int, error) {
-	now := ClockFrom(ctx).Now(ctx)
+	now := models.ClockFrom(ctx).Now(ctx)
 
 	var defs []jobPeriodicRow
 	if err := s.db.WithContext(ctx).
@@ -215,7 +216,7 @@ func (s *Scheduler) Tick(ctx context.Context) (int, error) {
 
 // Sweep reclaims jobs whose lease has expired (FR-030, FR-031).
 func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
-	now := ClockFrom(ctx).Now(ctx)
+	now := models.ClockFrom(ctx).Now(ctx)
 	sweeper := baseDriver{db: s.db}
 	return sweeper.Sweep(ctx, now)
 }
@@ -228,7 +229,7 @@ func (s *Scheduler) PruneRetention(ctx context.Context) (int64, error) {
 	if s.retentionMaxAge <= 0 {
 		return 0, nil
 	}
-	cutoff := ClockFrom(ctx).Now(ctx).Add(-s.retentionMaxAge)
+	cutoff := models.ClockFrom(ctx).Now(ctx).Add(-s.retentionMaxAge)
 	return DeleteFinishedJobs(ctx, s.db, cutoff)
 }
 

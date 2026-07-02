@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	flywheel "github.com/mrz1836/go-flywheel"
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -21,7 +21,7 @@ var statusAnchor = time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
 // statusClockCtx returns a context carrying a fixed clock at statusAnchor, so the
 // status command reads "now" deterministically.
 func statusClockCtx() context.Context {
-	return flywheel.WithClock(context.Background(), flywheel.NewFixedClock(statusAnchor))
+	return models.WithClock(context.Background(), models.NewFixedClock(statusAnchor))
 }
 
 // seedStatusJobs inserts a known spread of jobs — one ready, one running, one

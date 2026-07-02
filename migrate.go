@@ -64,7 +64,7 @@ func Migrate(db *gorm.DB) error {
 //
 //   - jobs_unique_key      UNIQUE (unique_key) WHERE unique_key IS NOT NULL
 //     — correctness: enforces enqueue idempotency (a duplicate unique_key insert
-//     is rejected by the database, surfacing as ErrDuplicateKey).
+//     is rejected by the database, surfacing as models.ErrDuplicateKey).
 //   - jobs_unique_active_key UNIQUE (unique_active_key) WHERE unique_active_key IS
 //     NOT NULL AND state IN ('available','running','retryable','scheduled')
 //     — correctness: enforces "at most one active job per key". Unlike

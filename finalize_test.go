@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -23,7 +24,7 @@ func TestFinalizePersistsThroughCancelledContext(t *testing.T) {
 		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning),
 		Attempt: 1, MaxAttempts: 5, CreatedAt: now, UpdatedAt: now, ScheduledAt: now,
 	})
-	runID := NewID()
+	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(context.Background(), runID, raw, now, ExecutorClass("local"), "h1"))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -55,7 +56,7 @@ func TestFinalizeSkipsSupersededCancel(t *testing.T) {
 		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning),
 		Attempt: 1, MaxAttempts: 5, CreatedAt: now, UpdatedAt: now, ScheduledAt: now, LeasedUntil: &now,
 	})
-	runID := NewID()
+	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, now, ExecutorClass("local"), "h1"))
 
 	// The job is cancelled out from under the running attempt.
@@ -94,7 +95,7 @@ func TestFinalizeSuccessPathEnqueuesFollowUps(t *testing.T) {
 		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning),
 		Attempt: 1, MaxAttempts: 5, CreatedAt: now, UpdatedAt: now, ScheduledAt: now,
 	})
-	runID := NewID()
+	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, now, ExecutorClass("local"), "h1"))
 
 	result := Result{FollowUps: []FollowUp{{Kind: "child", Args: map[string]any{}}}}

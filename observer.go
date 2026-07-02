@@ -13,7 +13,7 @@ import (
 // Every method is called synchronously on the dispatch path and must not block; an
 // implementation that needs to do I/O should buffer and return immediately. All
 // methods receive the worker ctx, so a tracing implementation can pull the active
-// span and RequestIDFrom(ctx) without extra plumbing.
+// span and ctxutil.RequestIDFrom(ctx) without extra plumbing.
 //
 // OnStart fires only for a registered kind; a job whose kind has no worker goes
 // straight to OnFinish (with a permanent error) and never OnStart.

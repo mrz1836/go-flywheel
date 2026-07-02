@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/robfig/cron/v3"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -84,7 +85,7 @@ func UpsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) error {
 	if err := spec.validate(); err != nil {
 		return err
 	}
-	now := ClockFrom(ctx).Now(ctx)
+	now := models.ClockFrom(ctx).Now(ctx)
 
 	args := spec.ArgsTemplate
 	if len(args) == 0 {
@@ -129,7 +130,7 @@ func insertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec, queue s
 		row.CronExpr = &cronExpr
 	}
 	if err := db.WithContext(ctx).Create(&row).Error; err != nil {
-		return fmt.Errorf("flywheel: insert periodic %q: %w", spec.Slug, WrapDBError(err))
+		return fmt.Errorf("flywheel: insert periodic %q: %w", spec.Slug, models.WrapDBError(err))
 	}
 	return nil
 }
@@ -161,7 +162,7 @@ func updatePeriodic(
 	}
 	if err := db.WithContext(ctx).Model(&jobPeriodicRow{}).
 		Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
-		return fmt.Errorf("flywheel: update periodic %q: %w", spec.Slug, WrapDBError(err))
+		return fmt.Errorf("flywheel: update periodic %q: %w", spec.Slug, models.WrapDBError(err))
 	}
 	return nil
 }
@@ -182,7 +183,7 @@ func scheduleChanged(existing jobPeriodicRow, spec PeriodicSpec) bool {
 // orphan-disable and the CLI's enable/disable, and returns ErrPeriodicNotFound
 // when no definition has the slug.
 func SetPeriodicActive(ctx context.Context, db *gorm.DB, slug string, active bool) error {
-	now := ClockFrom(ctx).Now(ctx)
+	now := models.ClockFrom(ctx).Now(ctx)
 	res := db.WithContext(ctx).Model(&jobPeriodicRow{}).Where("slug = ?", slug).Updates(map[string]any{
 		"is_active":  active,
 		"updated_at": now,
@@ -260,7 +261,7 @@ func periodicViewFromRow(r jobPeriodicRow) PeriodicView {
 // "retry now" — it works on a terminal (discarded/cancelled/succeeded) job as well
 // as a stuck one. It returns ErrJobNotFound when no live job has the id.
 func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
-	now := ClockFrom(ctx).Now(ctx)
+	now := models.ClockFrom(ctx).Now(ctx)
 	res := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id).Updates(map[string]any{
 		"state":        string(StateAvailable),
 		"leased_until": nil,
@@ -281,7 +282,7 @@ func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
 // flight is not interrupted, but the job will not be retried or re-claimed. It
 // returns ErrJobNotFound when no live job has the id.
 func CancelJob(ctx context.Context, db *gorm.DB, id string) error {
-	now := ClockFrom(ctx).Now(ctx)
+	now := models.ClockFrom(ctx).Now(ctx)
 	res := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id).Updates(map[string]any{
 		"state":        string(StateCancelled),
 		"leased_until": nil,

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/gorm"
 )
 
@@ -36,7 +37,7 @@ func (d *sqliteDriver) Dequeue(
 
 	var claimed []RawJob
 	err := d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		now := ClockFrom(ctx).Now(ctx)
+		now := models.ClockFrom(ctx).Now(ctx)
 
 		query := tx.Model(&jobRow{}).
 			Where("state IN ?", claimableStates).
