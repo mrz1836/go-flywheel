@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -125,7 +126,7 @@ func TestBugHuntB2TickIsolatesBadDefinition(t *testing.T) {
 	sched := NewScheduler(db, NewClient(db))
 
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 	due := now.Add(-time.Minute)
 
 	// Insertion order is the scan order (rowid). The broken definition is first,

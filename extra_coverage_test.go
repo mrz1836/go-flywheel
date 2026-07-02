@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
@@ -144,7 +145,7 @@ func TestFinalizeSurfacesLoadStubError(t *testing.T) {
 	require.NoError(t, db.Migrator().DropTable(&jobRunRow{}), "drop job_runs so the stub load fails")
 
 	raw := RawJob{ID: "job-x", Attempt: 1, MaxAttempts: 5}
-	err := d.Finalize(context.Background(), raw, NewID(), Result{}, nil, time.Now())
+	err := d.Finalize(context.Background(), raw, models.NewID(), Result{}, nil, time.Now())
 	require.ErrorContains(t, err, "load run stub", "a failed run-stub load surfaces a finalize error")
 }
 
@@ -159,7 +160,7 @@ func TestFinalizeSurfacesAdvanceError(t *testing.T) {
 
 	raw := RawJob{ID: "job-a", Attempt: 1, MaxAttempts: 5}
 	seedJob(t, db, jobRow{ID: raw.ID, Kind: "k", State: string(StateRunning), ScheduledAt: time.Now()})
-	runID := NewID()
+	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
 	require.NoError(t, db.Migrator().DropTable(&jobRow{}), "drop jobs so only the state advance fails")
 
@@ -178,7 +179,7 @@ func TestFinalizeRecordsErrorPayload(t *testing.T) {
 
 	raw := RawJob{ID: "job-e", Attempt: 1, MaxAttempts: 5}
 	seedJob(t, db, jobRow{ID: raw.ID, Kind: "k", State: string(StateRunning), ScheduledAt: time.Now()})
-	runID := NewID()
+	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
 
 	require.NoError(t, d.Finalize(ctx, raw, runID, Result{}, errors.New("boom"), time.Now()))
@@ -274,7 +275,7 @@ func TestSampleQueueHealthOldestReadyAge(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	seedJob(t, db, jobRow{
 		ID: "old-ready", Kind: "k", State: string(StateAvailable),
@@ -540,14 +541,14 @@ func TestSchedulerFireSurfacesAdvanceError(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 	sched := NewScheduler(db, NewClient(db))
 
 	require.NoError(t, db.Migrator().DropTable(&jobPeriodicRow{}), "drop job_periodics so only the advance fails")
 
 	secs := 60
 	def := jobPeriodicRow{
-		ID: NewID(), Slug: "due", Kind: "cov.k", Queue: "periodic",
+		ID: models.NewID(), Slug: "due", Kind: "cov.k", Queue: "periodic",
 		ArgsTemplate: datatypes.JSON("{}"), NextRunAt: now.Add(-time.Hour),
 		IntervalSeconds: &secs, IsActive: true,
 	}
@@ -561,12 +562,12 @@ func TestSchedulerFireSurfacesCronBucketError(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 	sched := NewScheduler(db, NewClient(db))
 
 	bad := "not a cron"
 	def := jobPeriodicRow{
-		ID: NewID(), Slug: "c", Kind: "cov.k", Queue: "periodic",
+		ID: models.NewID(), Slug: "c", Kind: "cov.k", Queue: "periodic",
 		ArgsTemplate: datatypes.JSON("{}"), NextRunAt: now.Add(-time.Hour),
 		CronExpr: &bad, IsActive: true,
 	}
@@ -581,7 +582,7 @@ func TestSchedulerFireSurfacesEnqueueError(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 	sched := NewScheduler(db, NewClient(db))
 
 	sqlDB, err := db.DB()
@@ -591,7 +592,7 @@ func TestSchedulerFireSurfacesEnqueueError(t *testing.T) {
 
 	secs := 60
 	def := jobPeriodicRow{
-		ID: NewID(), Slug: "due", Kind: "cov.k", Queue: "periodic",
+		ID: models.NewID(), Slug: "due", Kind: "cov.k", Queue: "periodic",
 		ArgsTemplate: datatypes.JSON("{}"), NextRunAt: now.Add(-time.Hour),
 		IntervalSeconds: &secs, IsActive: true,
 	}
@@ -606,7 +607,7 @@ func TestEnqueueBucketDefaultsEmptyPayload(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 	sched := NewScheduler(db, NewClient(db))
 
 	def := jobPeriodicRow{Slug: "e", Kind: "cov.k", Queue: "periodic", ArgsTemplate: nil}
@@ -621,7 +622,7 @@ func TestEnqueueBucketCollisionIsNoOp(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 	sched := NewScheduler(db, NewClient(db))
 
 	def := jobPeriodicRow{
@@ -645,7 +646,7 @@ func TestEnqueueBucketSurfacesInsertError(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 	sched := NewScheduler(db, NewClient(db))
 	closeDB(t, db)
 

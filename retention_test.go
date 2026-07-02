@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -74,7 +75,7 @@ func TestSchedulerPruneRetentionDeletesOldTerminalJobs(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	seedFinished(t, db, "old-done", StateSucceeded, now.Add(-30*24*time.Hour))
 	seedFinished(t, db, "new-done", StateSucceeded, now.Add(-time.Hour))
@@ -93,7 +94,7 @@ func TestSchedulerPruneRetentionDisabledIsNoOp(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(now))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	seedFinished(t, db, "old-done", StateSucceeded, now.Add(-30*24*time.Hour))
 
@@ -118,7 +119,7 @@ func TestSchedulerRunFiresRetentionOnCadence(t *testing.T) {
 		RetentionMaxAge:   14 * 24 * time.Hour,
 		RetentionInterval: 10 * time.Millisecond,
 	})
-	ctx, cancel := context.WithCancel(clockCtx(context.Background(), NewFixedClock(now)))
+	ctx, cancel := context.WithCancel(clockCtx(context.Background(), models.NewFixedClock(now)))
 	defer cancel()
 	go func() { _ = sched.Run(ctx) }()
 

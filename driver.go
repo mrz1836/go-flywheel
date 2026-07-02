@@ -8,6 +8,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mrz1836/go-foundation/ctxutil"
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -219,7 +221,7 @@ func (d *baseDriver) InsertRunStub(
 		CreatedAt:     startedAt,
 	}
 	if err := d.db.WithContext(ctx).Create(&row).Error; err != nil {
-		return fmt.Errorf("jobs: insert run stub: %w", WrapDBError(err))
+		return fmt.Errorf("jobs: insert run stub: %w", models.WrapDBError(err))
 	}
 	return nil
 }
@@ -343,12 +345,12 @@ func (d *baseDriver) InsertChild(
 	if err != nil {
 		return fmt.Errorf("jobs: marshal child args: %w", err)
 	}
-	now := ClockFrom(ctx).Now(ctx)
+	now := models.ClockFrom(ctx).Now(ctx)
 	row := jobRow{
-		ID:            NewID(),
+		ID:            models.NewID(),
 		CreatedAt:     now,
 		UpdatedAt:     now,
-		Metadata:      datatypes.JSON(metadataWithRequestID(nil, RequestIDFrom(ctx))),
+		Metadata:      datatypes.JSON(ctxutil.RequestIDToMetadata(nil, ctxutil.RequestIDFrom(ctx))),
 		Kind:          fu.Kind,
 		Queue:         orString(fu.Queue, defaultQueue),
 		Args:          datatypes.JSON(payload),
@@ -371,8 +373,8 @@ func (d *baseDriver) InsertChild(
 		row.ParentJobID = &pid
 	}
 	if createErr := tx.WithContext(ctx).Create(&row).Error; createErr != nil {
-		wrapped := WrapDBError(createErr)
-		if errors.Is(wrapped, ErrDuplicateKey) {
+		wrapped := models.WrapDBError(createErr)
+		if errors.Is(wrapped, models.ErrDuplicateKey) {
 			return ErrAlreadyEnqueued
 		}
 		return fmt.Errorf("jobs: insert child: %w", wrapped)

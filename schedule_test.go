@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -13,7 +14,7 @@ func TestUpsertPeriodicInsertsIntervalDefinition(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	base := time.Now().UTC().Truncate(time.Second)
-	ctx := WithClock(context.Background(), NewFixedClock(base))
+	ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
 
 	require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{
 		Slug: "p-interval", Kind: "test.k", Every: time.Minute, Active: true,
@@ -106,13 +107,13 @@ func TestUpsertPeriodicThenSchedulerFiresWhenDue(t *testing.T) {
 
 	// Upsert at base: next_run_at becomes base + 60s.
 	require.NoError(t, UpsertPeriodic(
-		WithClock(context.Background(), NewFixedClock(base)), db,
+		models.WithClock(context.Background(), models.NewFixedClock(base)), db,
 		PeriodicSpec{Slug: "fires", Kind: "test.success", Every: time.Minute, Active: true},
 	))
 
 	// At base+90s the definition is due; a tick fires it through the same insert
 	// core the Scheduler uses.
-	fireCtx := WithClock(context.Background(), NewFixedClock(base.Add(90*time.Second)))
+	fireCtx := models.WithClock(context.Background(), models.NewFixedClock(base.Add(90*time.Second)))
 	n, err := NewScheduler(db, NewClient(db)).Tick(fireCtx)
 	require.NoError(t, err)
 	assert.Positive(t, n, "the upserted periodic fires once due")

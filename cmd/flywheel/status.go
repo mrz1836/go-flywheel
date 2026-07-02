@@ -8,6 +8,7 @@ import (
 	"time"
 
 	flywheel "github.com/mrz1836/go-flywheel"
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/spf13/cobra"
 	"gorm.io/gorm"
 )
@@ -104,7 +105,7 @@ func runStatusWatch(cmd *cobra.Command, db *gorm.DB, cfg *Config, interval time.
 // "Now" comes from the context Clock so the gauge, the lag, and the failure
 // window all agree, and a test drives them deterministically.
 func renderStatusOnce(ctx context.Context, w io.Writer, db *gorm.DB, cfg *Config, asJSON bool) error {
-	report, err := gatherStatus(ctx, db, cfg, flywheel.ClockFrom(ctx).Now(ctx))
+	report, err := gatherStatus(ctx, db, cfg, models.ClockFrom(ctx).Now(ctx))
 	if err != nil {
 		return err
 	}

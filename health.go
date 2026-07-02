@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/gorm"
 )
 
@@ -39,8 +40,8 @@ type QueueHealth struct {
 }
 
 // SampleQueueHealth reads a QueueHealth gauge snapshot through db. "Now" comes
-// from the context Clock (ClockFrom), so a test drives it deterministically with
-// a FixedClock and production uses the wall clock.
+// from the context Clock (models.ClockFrom), so a test drives it deterministically with
+// a models.FixedClock and production uses the wall clock.
 //
 // It runs four index-backed reads, none of which mutate: a GROUP BY state count
 // (soft-deleted excluded), a ready count and a scheduled-ahead count over the
@@ -55,7 +56,7 @@ type QueueHealth struct {
 // consistent to the single job. That is the right trade for a gauge an operator
 // scrapes infrequently — correctness of each number, not a frozen global view.
 func SampleQueueHealth(ctx context.Context, db *gorm.DB) (QueueHealth, error) {
-	now := ClockFrom(ctx).Now(ctx)
+	now := models.ClockFrom(ctx).Now(ctx)
 	qh := QueueHealth{CountsByState: map[string]int64{}, SampledAt: now}
 
 	// Counts by state (soft-deleted excluded via the gorm DeletedAt scope). The

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/gorm"
 )
 
@@ -29,7 +30,7 @@ func (d *postgresDriver) Dequeue(
 	if limit <= 0 || len(queues) == 0 {
 		return nil, nil
 	}
-	now := ClockFrom(ctx).Now(ctx)
+	now := models.ClockFrom(ctx).Now(ctx)
 
 	classFilter := ""
 	args := []any{now, queues}

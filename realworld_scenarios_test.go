@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -245,15 +246,15 @@ func TestRealWorldPeriodicPolling(t *testing.T) {
 
 		// A fresh schedule seeds next_run_at = base + Every, so it does not fire
 		// immediately at base.
-		require.NoError(t, UpsertPeriodic(clockCtx(context.Background(), NewFixedClock(base)),
+		require.NoError(t, UpsertPeriodic(clockCtx(context.Background(), models.NewFixedClock(base)),
 			db, PeriodicSpec{Slug: "ingest", Kind: "rw.periodic.interval", Every: time.Minute, Active: true}))
 
-		atBase, err := sched.Tick(clockCtx(context.Background(), NewFixedClock(base)))
+		atBase, err := sched.Tick(clockCtx(context.Background(), models.NewFixedClock(base)))
 		require.NoError(t, err)
 		assert.Zero(t, atBase, "nothing is due at the seed instant")
 
 		// Advance past the first fire.
-		due := clockCtx(context.Background(), NewFixedClock(base.Add(90*time.Second)))
+		due := clockCtx(context.Background(), models.NewFixedClock(base.Add(90*time.Second)))
 		fired, err := sched.Tick(due)
 		require.NoError(t, err)
 		assert.Positive(t, fired, "the due interval fires")
@@ -272,10 +273,10 @@ func TestRealWorldPeriodicPolling(t *testing.T) {
 		sched := NewScheduler(db, NewClient(db))
 		base := time.Now().UTC().Truncate(time.Minute)
 
-		require.NoError(t, UpsertPeriodic(clockCtx(context.Background(), NewFixedClock(base)),
+		require.NoError(t, UpsertPeriodic(clockCtx(context.Background(), models.NewFixedClock(base)),
 			db, PeriodicSpec{Slug: "cron-ingest", Kind: "rw.periodic.cron", Cron: "*/1 * * * *", Active: true}))
 
-		due := clockCtx(context.Background(), NewFixedClock(base.Add(150*time.Second)))
+		due := clockCtx(context.Background(), models.NewFixedClock(base.Add(150*time.Second)))
 		fired, err := sched.Tick(due)
 		require.NoError(t, err)
 		assert.Positive(t, fired, "an every-minute cron with slack fires")
@@ -288,11 +289,11 @@ func TestRealWorldPeriodicPolling(t *testing.T) {
 		sched := NewSchedulerWithConfig(SchedulerConfig{DB: db, Client: NewClient(db), BackfillCap: 10})
 		base := time.Now().UTC().Truncate(time.Second)
 
-		require.NoError(t, UpsertPeriodic(clockCtx(context.Background(), NewFixedClock(base)),
+		require.NoError(t, UpsertPeriodic(clockCtx(context.Background(), models.NewFixedClock(base)),
 			db, PeriodicSpec{Slug: "lagging", Kind: "rw.periodic.backfill", Every: time.Minute, Active: true}))
 
 		// Tick an hour later: ~60 missed buckets, capped at 10.
-		fired, err := sched.Tick(clockCtx(context.Background(), NewFixedClock(base.Add(time.Hour))))
+		fired, err := sched.Tick(clockCtx(context.Background(), models.NewFixedClock(base.Add(time.Hour))))
 		require.NoError(t, err)
 		assert.Equal(t, 10, fired, "catch-up is bounded by the backfill cap")
 		assert.EqualValues(t, 10, jobCount(t, db, "rw.periodic.backfill"))
@@ -591,7 +592,7 @@ func TestRealWorldCrashRecoveryLeaseExpiry(t *testing.T) {
 	// exactly base and the claim is deterministic regardless of wall-clock drift
 	// or stored-time precision.
 	ctx := context.Background()
-	claimCtx := clockCtx(ctx, NewFixedClock(base))
+	claimCtx := clockCtx(ctx, models.NewFixedClock(base))
 	id, err := Insert(claimCtx, NewClient(db), recoverArgs{V: "x"}, InsertOpts{})
 	require.NoError(t, err)
 
@@ -600,11 +601,11 @@ func TestRealWorldCrashRecoveryLeaseExpiry(t *testing.T) {
 	batch, err := driver.Dequeue(claimCtx, []string{"default"}, "local", true, 1, 30*time.Second)
 	require.NoError(t, err)
 	require.Len(t, batch, 1)
-	require.NoError(t, driver.InsertRunStub(claimCtx, NewID(), batch[0], base, "local", "deadbeef:1"))
+	require.NoError(t, driver.InsertRunStub(claimCtx, models.NewID(), batch[0], base, "local", "deadbeef:1"))
 	assert.Equal(t, string(StateRunning), jobState(t, db, id), "the job is leased to the now-dead executor")
 
 	// The lease expires; sweep reclaims it and crashes the stale stub.
-	sweepCtx := clockCtx(ctx, NewFixedClock(base.Add(time.Hour)))
+	sweepCtx := clockCtx(ctx, models.NewFixedClock(base.Add(time.Hour)))
 	sched := NewScheduler(db, NewClient(db))
 	reclaimed, err := sched.Sweep(sweepCtx)
 	require.NoError(t, err)
@@ -636,7 +637,7 @@ func TestRealWorldSupersededFinalizeIsNoDoubleFinalize(t *testing.T) {
 	db := newDB(t)
 	driver := NewSQLiteDriver(db)
 	base := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(base))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(base))
 
 	id, err := Insert(ctx, NewClient(db), recoverArgs{V: "x"}, InsertOpts{})
 	require.NoError(t, err)
@@ -644,7 +645,7 @@ func TestRealWorldSupersededFinalizeIsNoDoubleFinalize(t *testing.T) {
 	batch, err := driver.Dequeue(ctx, []string{"default"}, "local", true, 1, 30*time.Second)
 	require.NoError(t, err)
 	require.Len(t, batch, 1)
-	runID := NewID()
+	runID := models.NewID()
 	require.NoError(t, driver.InsertRunStub(ctx, runID, batch[0], base, "local", "exec-1"))
 
 	// The job is cancelled out from under the running attempt.
@@ -801,7 +802,7 @@ func TestRealWorldQueueHealthGauges(t *testing.T) {
 	db := newDB(t)
 	client := NewClient(db)
 	base := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(base))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(base))
 
 	// Three ready jobs, scheduled in the past so the oldest has measurable lag.
 	const ready = 3
@@ -816,7 +817,7 @@ func TestRealWorldQueueHealthGauges(t *testing.T) {
 	require.NoError(t, err)
 	// One running job (in flight).
 	seedJob(t, db, jobRow{
-		ID: NewID(), Kind: "test.success", State: string(StateRunning),
+		ID: models.NewID(), Kind: "test.success", State: string(StateRunning),
 		Attempt: 1, MaxAttempts: 25, CreatedAt: base, UpdatedAt: base, ScheduledAt: base, LeasedUntil: &future,
 	})
 
@@ -846,7 +847,7 @@ func TestRealWorldRetentionRemovesTerminalJobs(t *testing.T) {
 	Register(reg, &successWorker{})
 	client := NewClient(db)
 	base := time.Now().UTC().Truncate(time.Second)
-	ctx := clockCtx(context.Background(), NewFixedClock(base))
+	ctx := clockCtx(context.Background(), models.NewFixedClock(base))
 
 	// One job that runs to succeeded (terminal, finalized at base).
 	finishedID, err := Insert(ctx, client, successArgs{V: "done"}, InsertOpts{})
