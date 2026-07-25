@@ -80,6 +80,73 @@ func TestRunDrainsEverySeededJob(t *testing.T) {
 	}
 }
 
+// TestRunEveryMixCompletes drives each declared shape against a real server.
+//
+// Every mix is a string in a committed report, so a shape that does not actually
+// run is a name published for something that does not exist. Each case is small:
+// this asserts that the shape works, and the benchmarks measure it.
+func TestRunEveryMixCompletes(t *testing.T) {
+	dsn := requireDSN(t)
+
+	for _, mix := range []Workload{
+		WorkloadEnqueueOnly, WorkloadDrainOnly, WorkloadSteady, WorkloadFanOut, WorkloadMixedSpeed,
+	} {
+		t.Run(string(mix), func(t *testing.T) {
+			cfg := Config{
+				DSN: dsn, Jobs: 200, Seed: 3, Runners: 2, Workers: 4,
+				Mix: mix, Indexes: IndexesFull, Timeout: 2 * time.Minute,
+			}
+			report, err := Run(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("Run(%s): %v", mix, err)
+			}
+			if report.WorkloadDigest == "" {
+				t.Error("every run must record the digest of the workload it generated")
+			}
+			if len(report.Errors) != 0 {
+				t.Errorf("the run collected errors: %v", report.Errors)
+			}
+			if mix == WorkloadEnqueueOnly {
+				return
+			}
+			// Every job the mix planned must reach a terminal state — including
+			// the children a fan-out run creates, which is why the target is the
+			// plan's total rather than the seeded row count.
+			want := int64(plan(cfg).TotalJobs())
+			if report.Drained != want {
+				t.Errorf("Drained = %d, want %d", report.Drained, want)
+			}
+		})
+	}
+}
+
+// TestRunIsReproducibleAcrossRuns is acceptance A3 reduced to a comparison of
+// two strings: two runs with identical configs must generate the same workload.
+func TestRunIsReproducibleAcrossRuns(t *testing.T) {
+	dsn := requireDSN(t)
+
+	cfg := Config{
+		DSN: dsn, Jobs: 300, Seed: 99, Runners: 1, Workers: 1,
+		Mix: WorkloadDrainOnly, Timeout: time.Minute,
+	}
+	first, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// The second run differs in concurrency, which must not reach the workload.
+	cfg.Runners, cfg.Workers = 4, 8
+	second, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+
+	if first.WorkloadDigest != second.WorkloadDigest {
+		t.Fatalf("the two runs generated different workloads:\n %s\n %s",
+			first.WorkloadDigest, second.WorkloadDigest)
+	}
+}
+
 // TestRunEnqueueOnlyDoesNotDrain proves the enqueue mix measures what it says:
 // its number is an insert rate, so nothing may drain the rows underneath it.
 func TestRunEnqueueOnlyDoesNotDrain(t *testing.T) {

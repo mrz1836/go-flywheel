@@ -49,6 +49,10 @@ type Harness struct {
 	driver   flywheel.Driver
 	registry *flywheel.Registry
 
+	// digest identifies the generated workload. It is set once, by
+	// prepareWorkload, before any runner exists.
+	digest string
+
 	prog  *progress
 	errs  *errset
 	notes *noteset

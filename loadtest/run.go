@@ -64,78 +64,112 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 	}
 
 	report := Report{Config: cfg, Schema: h.schema}
+	p, specs := h.prepareWorkload()
 
-	seedElapsed, err := h.seed(runCtx)
-	if err != nil {
-		return report, err
-	}
-	if seedElapsed > 0 {
-		report.EnqueueThroughput = float64(h.prog.enqueued.Load()) / seedElapsed.Seconds()
-	}
+	var driveErr error
+	if cfg.Mix == WorkloadSteady {
+		// Enqueue and drain overlap by definition here, so there is no separate
+		// seed window to exclude: the whole run is the measured window, and both
+		// rates are computed against it.
+		report.StartedAt = time.Now()
+		driveErr = h.driveSteady(runCtx, p, specs)
+		report.Duration = time.Since(report.StartedAt)
+		if report.Duration > 0 {
+			report.EnqueueThroughput = float64(h.prog.enqueued.Load()) / report.Duration.Seconds()
+		}
+	} else {
+		seedElapsed, seedErr := h.insert(runCtx, p, specs)
+		if seedErr != nil {
+			report.Errors = h.errs.errs()
+			report.Notes = h.notes.all()
+			return report, seedErr
+		}
+		if seedElapsed > 0 {
+			report.EnqueueThroughput = float64(h.prog.enqueued.Load()) / seedElapsed.Seconds()
+		}
 
-	report.StartedAt = time.Now()
-	driveErr := h.drive(runCtx)
-	report.Duration = time.Since(report.StartedAt)
+		report.StartedAt = time.Now()
+		driveErr = h.drive(runCtx)
+		report.Duration = time.Since(report.StartedAt)
+	}
 
 	if err := h.collect(context.WithoutCancel(ctx), &report); err != nil {
 		h.errs.add(err)
 	}
+	report.WorkloadDigest = h.digest
 	report.Errors = h.errs.errs()
 	report.Notes = h.notes.all()
 
 	return report, driveErr
 }
 
-// seed loads the target with the run's workload and reports how long it took.
+// prepareWorkload generates the run's workload and records what it is.
 //
-// The elapsed time is the enqueue measurement, so it covers the inserts and
-// nothing else: schema provisioning happened in newHarness and teardown happens
-// after collect, neither of which is in this window.
-func (h *Harness) seed(ctx context.Context) (time.Duration, error) {
-	if err := h.supportedMix(); err != nil {
-		return 0, err
-	}
+// Generation is single-threaded and finishes here, before any runner exists.
+// That is what makes "concurrency does not change the workload" a property this
+// harness can assert rather than assume: generate at Runners: 1 and generate at
+// Runners: 64 return identical slices, and the digest recorded here proves it
+// after the fact from a committed report.
+func (h *Harness) prepareWorkload() (mixPlan, []jobSpec) {
+	p := plan(h.cfg)
+	specs := generate(h.cfg)
+	h.digest = workloadDigest(specs)
 
-	start := time.Now()
-	client := flywheel.NewClient(h.work)
-	args := loadArgs{WorkNanos: h.cfg.WorkDuration.Nanoseconds()}
+	// A fan-out run inserts parents and creates children as it drains, so the
+	// drain denominator is the total job count, not the seeded row count.
+	h.prog.target = int64(p.TotalJobs())
 
-	for i := range h.cfg.Jobs {
-		if err := ctx.Err(); err != nil {
-			return time.Since(start), fmt.Errorf("loadtest: seed interrupted after %d jobs: %w", i, err)
-		}
-		args.N = i
-		payload, err := marshalArgs(args)
-		if err != nil {
-			return time.Since(start), err
-		}
-		if _, err := flywheel.Enqueue(ctx, client, loadKind, payload, flywheel.InsertOpts{
-			Queue:         h.cfg.Queue,
-			ExecutorClass: flywheel.ExecutorClass(h.cfg.ExecutorClass),
-		}); err != nil {
-			return time.Since(start), fmt.Errorf("loadtest: seed job %d: %w", i, err)
-		}
-		h.prog.enqueued.Add(1)
-	}
-	return time.Since(start), nil
-}
-
-// supportedMix reports whether this build can generate the configured mix.
-//
-// fan-out and mixed-speed need per-job variation — a child count, a bimodal work
-// duration — which is the workload generator's job. Until it lands, asking for
-// one of them is an error rather than a silently uniform workload: a report
-// labelled "mixed-speed" that measured a uniform run is worse than no report.
-func (h *Harness) supportedMix() error {
-	switch h.cfg.Mix {
-	case WorkloadEnqueueOnly, WorkloadDrainOnly, WorkloadSteady:
-		return nil
-	default:
-		return fmt.Errorf(
-			"loadtest: mix %q needs the workload generator, which is not in this build: %w",
-			h.cfg.Mix, ErrInvalidConfig,
+	if p.Bulk {
+		h.notes.add(
+			"Seeding used the bulk path, so EnqueueThroughput is the harness's batch-insert rate " +
+				"rather than the runtime's producer API. The enqueue and steady mixes measure the API.",
 		)
 	}
+	return p, specs
+}
+
+// insert loads the workload and reports how long it took. The window covers the
+// inserts and nothing else: generation happened in prepareWorkload, schema
+// provisioning in newHarness, and teardown after collect.
+func (h *Harness) insert(ctx context.Context, p mixPlan, specs []jobSpec) (time.Duration, error) {
+	start := time.Now()
+	if p.Bulk {
+		err := seedBulk(ctx, h.work, h.cfg, specs, func(n int) { h.prog.enqueued.Add(int64(n)) })
+		return time.Since(start), err
+	}
+	err := seedAPI(ctx, h.work, h.cfg, specs, func() { h.prog.enqueued.Add(1) })
+	return time.Since(start), err
+}
+
+// driveSteady runs the enqueue and the drain against each other, which is the
+// only mix where queue depth is the difference between two rates rather than a
+// starting condition.
+//
+// The drain wait does not begin until seeding has finished. It has to: the
+// completion check asks whether any job is active, and asked one microsecond
+// after the runners started it would answer "none" — because none had been
+// inserted yet — and declare the run complete before it began.
+func (h *Harness) driveSteady(ctx context.Context, p mixPlan, specs []jobSpec) error {
+	if err := h.startRunners(ctx); err != nil {
+		return err
+	}
+	defer h.stopRunners()
+
+	seedDone := make(chan error, 1)
+	go func() {
+		_, err := h.insert(ctx, p, specs)
+		seedDone <- err
+	}()
+
+	select {
+	case err := <-seedDone:
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		return h.drainTimeout(ctx)
+	}
+	return h.awaitDrain(ctx)
 }
 
 // drive runs the workload to completion.
