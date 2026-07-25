@@ -129,6 +129,79 @@ func TestRunTimesClaimFinalizeAndSweep(t *testing.T) {
 	}
 }
 
+// TestRunSamplesStorageAndContention proves the sampler produces a real series
+// against a real server, and that every number it carries is either measured or
+// explicitly disclosed as absent.
+func TestRunSamplesStorageAndContention(t *testing.T) {
+	dsn := requireDSN(t)
+
+	// Sized to run for a couple of seconds, which is not incidental. PostgreSQL's
+	// cumulative statistics are reported by each backend rather than written
+	// live, and no more often than about once a second, so a sub-second drain
+	// finishes before its own scan and tuple counters ever appear. A shorter
+	// version of this test would assert that the sampler collects nothing.
+	report, err := Run(context.Background(), Config{
+		DSN: dsn, Jobs: 1200, Seed: 8, Runners: 1, Workers: 2,
+		Mix: WorkloadDrainOnly, Indexes: IndexesFull,
+		WorkDuration:   4 * time.Millisecond,
+		SampleInterval: 100 * time.Millisecond,
+		Timeout:        2 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(report.Storage) < 2 {
+		t.Fatalf("got %d storage samples, want at least 2 — a single sample has no trajectory",
+			len(report.Storage))
+	}
+
+	last := report.Storage[len(report.Storage)-1]
+	for _, table := range sampledTables {
+		if _, ok := last.LiveTuples[table]; !ok {
+			t.Errorf("no live-tuple count for %s", table)
+		}
+		if last.TableBytes[table] <= 0 {
+			t.Errorf("%s reports %d bytes, want a positive size", table, last.TableBytes[table])
+		}
+	}
+
+	// The scan counters are what make the index-condition delta direct evidence
+	// rather than an inference about timing, so a run that collected none of them
+	// has lost the strongest number this harness produces. Under the full index
+	// set the claim has jobs_ready available, so the index scans must dominate.
+	if last.IdxScans["jobs"] == 0 {
+		t.Error("jobs reports no index scans under the full index set: the plan evidence is missing")
+	}
+	if last.IdxScans["jobs"] <= last.SeqScans["jobs"] {
+		t.Errorf("jobs: %d index scans against %d sequential — the claim is not using jobs_ready",
+			last.IdxScans["jobs"], last.SeqScans["jobs"])
+	}
+
+	// WAL is a delta, so the first sample has none; a later one must.
+	var sawWAL bool
+	for _, s := range report.Storage[1:] {
+		if s.WALBytes > 0 {
+			sawWAL = true
+			break
+		}
+	}
+	if !sawWAL {
+		t.Error("no sample recorded WAL generation, though the run wrote 1200 jobs and their audit rows")
+	}
+
+	// Every caveat travels with the numbers it qualifies.
+	for _, want := range []string{"LockWaits is an instantaneous sample", "cluster-wide", "not the PostgreSQL server"} {
+		if findNote(report.Notes, want) == "" {
+			t.Errorf("the report must disclose %q; notes were %v", want, report.Notes)
+		}
+	}
+
+	if report.PeakRSS == 0 && findNote(report.Notes, "none available") == "" {
+		t.Error("a platform that can read RSS must report a non-zero peak")
+	}
+}
+
 // TestRunEveryMixCompletes drives each declared shape against a real server.
 //
 // Every mix is a string in a committed report, so a shape that does not actually

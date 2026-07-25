@@ -248,6 +248,14 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 	report.Histogram = histogramSpec()
 	h.noteHistogramRange()
 
+	// One last reading now the runners have stopped: the periodic series ended
+	// wherever the drain did, and PostgreSQL's cumulative statistics only settle
+	// once the runners' backends have gone idle.
+	h.finalSample(ctx)
+	report.Storage = h.samples.all()
+	report.PeakRSS = h.peakRSS()
+	h.noteSamplingCaveats()
+
 	if report.Duration > 0 {
 		report.DrainThroughput = float64(h.prog.terminal()) / report.Duration.Seconds()
 	}
@@ -350,4 +358,19 @@ func (h *Harness) noteHistogramRange() {
 			)
 		}
 	}
+}
+
+// peakRSS reports the highest resident set the run reached.
+//
+// It is the larger of what the sampler saw and what getrusage reports, and each
+// term repairs a gap in the other. On linux the sampler reads a genuine current
+// RSS but can miss a spike between two ticks, which getrusage's high-water mark
+// catches. On darwin the sampler is already reading that high-water mark, so the
+// two agree and the second term is the true peak either way.
+func (h *Harness) peakRSS() uint64 {
+	peak := h.samples.peak()
+	if rusage, ok := getrusageMaxRSS(); ok && rusage > peak {
+		return rusage
+	}
+	return peak
 }
