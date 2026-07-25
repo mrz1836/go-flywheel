@@ -260,22 +260,50 @@ func runFinalizeUpdate(
 		upd["error_class"] = string(*plan.errorClass)
 	}
 	if workErr != nil {
-		message := truncate(workErr.Error(), maxErrorMessage)
-		upd["error_message"] = message
-		payload, err := json.Marshal(map[string]string{"message": message})
+		message, payload, err := runErrorFields(workErr.Error())
 		if err != nil {
-			return nil, fmt.Errorf("jobs: marshal error payload: %w", err)
+			return nil, err
 		}
-		upd["error_payload"] = datatypes.JSON(payload)
+		upd["error_message"] = message
+		upd["error_payload"] = payload
 	}
 	if result.Output != nil {
-		out, err := json.Marshal(result.Output)
+		out, err := marshalRunOutput(result.Output)
 		if err != nil {
-			return nil, fmt.Errorf("jobs: marshal output: %w", err)
+			return nil, err
 		}
-		upd["output"] = datatypes.JSON(out)
+		upd["output"] = out
 	}
 	return upd, nil
+}
+
+// runErrorFields renders a raw error message into the pair of job_runs columns
+// that record it: the truncated error_message and its error_payload JSON. It is
+// shared by the runtime's own finalize path and SeedRun, so a seeded row's error
+// is byte-identical in shape to one a real failed attempt produced — same cap,
+// same rune-safe cut, same payload key.
+func runErrorFields(message string) (string, datatypes.JSON, error) {
+	message = truncate(message, maxErrorMessage)
+	payload, err := json.Marshal(map[string]string{"message": message})
+	if err != nil {
+		return "", nil, fmt.Errorf("jobs: marshal error payload: %w", err)
+	}
+	return message, datatypes.JSON(payload), nil
+}
+
+// marshalRunOutput renders a worker's structured output into the job_runs.output
+// payload. A nil output stores no value, leaving the column NULL. It is shared
+// by the finalize path and SeedRun so both land the same bytes in the column
+// ListRuns reads back.
+func marshalRunOutput(output any) (datatypes.JSON, error) {
+	if output == nil {
+		return nil, nil
+	}
+	out, err := json.Marshal(output)
+	if err != nil {
+		return nil, fmt.Errorf("jobs: marshal output: %w", err)
+	}
+	return datatypes.JSON(out), nil
 }
 
 // Finalize applies one attempt's outcome — the run-row update, the jobs.state
