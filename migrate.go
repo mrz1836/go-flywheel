@@ -10,30 +10,65 @@ import (
 // Models returns the runtime's row structs so a consumer can drive schema
 // generation from a single source of truth — the same structs Migrate uses.
 //
-// This is the seam for the "embedded" install mode: a host that prefers
+// This is the table half of the host-owned install mode: a host that prefers
 // versioned SQL (e.g. an Atlas/atlas-provider-gorm flow) points its loader at
 // these models instead of re-declaring the columns. The runtime keeps the row
 // structs unexported on purpose; Models exposes them as a stable []any without
 // widening the package's typed API surface.
+//
+// It is not the whole install. Pair it with [InstallIndexes] for the index half:
+// the indexes are not expressible as struct tags, so they are not in what a
+// loader reads from these models, and four of them are correctness-bearing. See
+// [Migrate] for the contract that decides between the two modes.
 func Models() []any {
 	return []any{&jobRow{}, &jobRunRow{}, &jobPeriodicRow{}}
 }
 
-// Migrate is the single source of truth for the job schema: it brings up the
-// three job tables (jobs, job_runs, job_periodics) — with their NOT-NULL
-// constraints, column defaults, and the jobs soft-delete column — plus the
-// partial/unique indexes GORM AutoMigrate cannot express. A host installs the
-// schema by calling Migrate(db) and nothing else. It supports both consumption
-// modes:
+// Migrate is the library-owned install: it brings up the three job tables (jobs,
+// job_runs, job_periodics) — with their NOT-NULL constraints, column defaults,
+// and the jobs soft-delete column — plus the partial/unique indexes GORM
+// AutoMigrate cannot express. A host in this mode calls Migrate(db) and nothing
+// else.
 //
-//   - standalone: call it against a bare SQLite or PostgreSQL database and the
-//     runtime stands up its own schema with no external migration tooling.
-//   - embedded: call it as one step of a host project's install/migration
-//     process. The module takes no hard Atlas dependency; a host that wants
-//     versioned SQL can generate it from Models instead.
+// # Choosing an install mode
 //
-// The indexes it applies are IndexSet(db.Name()), in that order — a host in the
-// embedded mode reaches the same set through InstallIndexes.
+// The runtime owns three tables and there are two ways to install them. They are
+// not layers. A host picks exactly one; running both means two migration
+// authorities against one database.
+//
+//	Question                      Library-owned            Host-owned
+//	----------------------------  -----------------------  -------------------------------
+//	Who creates the tables?       Migrate(db)              your loader, from Models
+//	Who creates the indexes?      Migrate(db)              you, from IndexSet/InstallIndexes
+//	Who owns migration history?   nobody (AutoMigrate      your migration tool
+//	                              is declarative)
+//	Runtime runs DDL at startup?  yes, every start         no
+//	Co-located host schema safe?  only if the host's       yes — the tables are in
+//	                              tooling excludes the     your loader
+//	                              three tables
+//	Pick this when                the database is the      the runtime's tables share a
+//	                              runtime's alone          database with an app schema
+//
+// The last row is the rule: a shared database means host-owned. A migration tool
+// that cannot see the three tables will propose dropping them, and a runtime
+// that runs its own DDL inside a versioned schema is a second migration
+// authority with no coordination.
+//
+// The half a host most often misses is the indexes. Models yields tables and
+// columns; it does not yield indexes, because every one of them carries a WHERE
+// predicate or spans columns a GORM struct tag cannot express. Four are
+// correctness-bearing (see [IndexSet]), so a host-owned schema installed without
+// [InstallIndexes] is one in which idempotent enqueue silently does not work.
+//
+// # Using Migrate
+//
+// Call it against a bare SQLite or PostgreSQL database the runtime is the only
+// writer of. A host that owns its schema history but still wants the installer
+// sets [MigrateOpts].SkipColumnReconcile, so the runtime issues no ALTER TABLE
+// of its own.
+//
+// The indexes it applies are IndexSet(db.Name()), in that order, through the
+// same apply path [InstallIndexes] uses.
 //
 // Migrate is idempotent: AutoMigrate is a no-op against an up-to-date schema and
 // every index uses IF NOT EXISTS, so repeated calls are safe.
