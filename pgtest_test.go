@@ -18,8 +18,39 @@ import (
 // testDatabaseURLEnv points NewPostgresIsolatedDB at a running PostgreSQL
 // instance. When it is unset the Postgres suite is skipped rather than failed,
 // so `go test -tags integration` degrades gracefully where no database is
-// available (CI sets it for the Postgres half of the matrix).
+// available.
 const testDatabaseURLEnv = "FLYWHEEL_TEST_DATABASE_URL"
+
+// requirePostgresEnv turns that skip into a failure. An automated environment
+// sets it so that a misconfigured or missing DSN surfaces as a red build,
+// instead of a green run in which every Postgres test quietly skipped. The
+// SKIP LOCKED claim path has no SQLite equivalent, so a suite that cannot
+// distinguish "passed" from "never ran" reports a guarantee it did not check.
+const requirePostgresEnv = "FLYWHEEL_REQUIRE_POSTGRES"
+
+// requirePostgresDSN resolves the target database for the Postgres suite. It
+// returns the DSN, or skips the test when none is configured — unless
+// requirePostgresEnv is set, in which case a missing DSN is fatal.
+//
+// Every Postgres entry point routes through this one function on purpose: the
+// strictness guarantee is only worth as much as its least-guarded caller, and a
+// second helper that read the environment directly would silently reopen the
+// hole this closes.
+func requirePostgresDSN(t *testing.T) string {
+	t.Helper()
+
+	if dsn := os.Getenv(testDatabaseURLEnv); dsn != "" {
+		return dsn
+	}
+	if os.Getenv(requirePostgresEnv) != "" {
+		t.Fatalf(
+			"%s is set but %s is empty: the Postgres suite must not be skipped in this environment",
+			requirePostgresEnv, testDatabaseURLEnv,
+		)
+	}
+	t.Skipf("%s is not set; skipping the Postgres suite", testDatabaseURLEnv)
+	return ""
+}
 
 // pgIsolatedSeq disambiguates schema names across parallel calls within the
 // same test binary.
@@ -50,10 +81,7 @@ var pgPartialIndexes = []string{
 func NewPostgresIsolatedDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
-	dsn := os.Getenv(testDatabaseURLEnv)
-	if dsn == "" {
-		t.Skipf("%s is not set; skipping the Postgres suite", testDatabaseURLEnv)
-	}
+	dsn := requirePostgresDSN(t)
 
 	base, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
