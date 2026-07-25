@@ -203,3 +203,52 @@ jobs:
             exit 1
           fi
           echo "All 5 exactly-once guarantees exercised against real PostgreSQL."
+
+      # --------------------------------------------------------------------
+      # Compile the load harness.
+      #
+      # loadtest/ is excluded from the default test matrix, which means it is also
+      # excluded from the linter and from `go build ./...`. Nothing else in CI would
+      # notice if it stopped compiling. This step buys that coverage back for the
+      # price of a vet pass — it runs no load and touches no database.
+      # --------------------------------------------------------------------
+      - name: 🏗️ Vet the load harness
+        run: go vet -tags=loadtest ./...
+
+      # --------------------------------------------------------------------
+      # The one chaos scenario that asserts.
+      #
+      # A runner is killed 40% through a 2,000-job drain and the lease sweep must
+      # recover everything it was holding, with no job running twice. It is sized as
+      # an assertion rather than a measurement so it fits this job's budget; the
+      # measurements live in the benchmarks, which never run here.
+      #
+      # FLYWHEEL_LOADTEST_DATABASE_URL is set only for this step. The harness reads
+      # that variable and deliberately does not fall back to the suite's, so a 100k
+      # benchmark can never start itself inside a job budgeted in seconds.
+      # --------------------------------------------------------------------
+      - name: 💥 Run the worker-kill chaos scenario
+        env:
+          FLYWHEEL_LOADTEST_DATABASE_URL: postgres://flywheel:flywheel@localhost:5432/flywheel_test?sslmode=disable
+        run: |
+          set -euo pipefail
+          go test -tags=loadtest -count=1 -timeout=10m -v \
+            -run 'TestWorkerKillMidDrainReclaimsEveryJob' ./loadtest/ 2>&1 | tee /tmp/loadtest-chaos.log
+
+      # --------------------------------------------------------------------
+      # Prove the scenario ran rather than skipped.
+      #
+      # The harness skips itself when its DSN is unset, which is correct everywhere
+      # except here. Without this check, a typo in the variable above would turn the
+      # step green while running nothing — the same failure mode
+      # FLYWHEEL_REQUIRE_POSTGRES exists to prevent for the suite.
+      # --------------------------------------------------------------------
+      - name: ✅ Assert the chaos scenario ran
+        run: |
+          set -euo pipefail
+          if grep -qE '^--- PASS: TestWorkerKillMidDrainReclaimsEveryJob\b' /tmp/loadtest-chaos.log; then
+            echo "  ✅ TestWorkerKillMidDrainReclaimsEveryJob"
+            exit 0
+          fi
+          echo "::error::TestWorkerKillMidDrainReclaimsEveryJob did not report PASS — it was skipped, renamed, or removed."
+          exit 1

@@ -136,6 +136,8 @@ type Config struct {
 	// process left in the target database.
 	Queue         string
 	ExecutorClass string
+	// Faults, when non-nil, injects a failure on the schedule the Fault declares.
+	Faults Fault
 }
 
 // connections reports the connection budget this configuration plans for: the
@@ -203,6 +205,21 @@ func (c Config) validate() (Config, error) {
 	}
 	if c.ExecutorClass == "" {
 		c.ExecutorClass = defaultExecutorClass
+	}
+
+	if c.Faults != nil {
+		if c.Faults.At() <= 0 || c.Faults.At() >= 1 {
+			return Config{}, fmt.Errorf(
+				"loadtest: fault fraction %.3f is not in (0,1): a fault at 0 fires before the run starts "+
+					"and one at 1 fires after it ends: %w",
+				c.Faults.At(), ErrInvalidConfig,
+			)
+		}
+		// The fault validates against the normalized config, so it sees the
+		// defaulted Runners count rather than the caller's zero.
+		if err := c.Faults.Validate(c); err != nil {
+			return Config{}, err
+		}
 	}
 
 	if n := c.connections(); n > maxConnections {

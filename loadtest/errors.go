@@ -24,6 +24,10 @@ var (
 	ErrTooManyConnections = errors.New("connection budget exceeded")
 	// ErrRunTimedOut reports a run that hit Config.Timeout with work outstanding.
 	ErrRunTimedOut = errors.New("run timed out")
+	// ErrExactlyOnceViolated reports that the same job was observed executing in
+	// two workers at once. It is the runtime's central guarantee, so it is a
+	// distinct sentinel: a caller must be able to tell it from any other failure.
+	ErrExactlyOnceViolated = errors.New("exactly-once violated: concurrent execution observed")
 	// ErrUnsupportedDialect reports a target that is not PostgreSQL. The harness
 	// is deliberately Postgres-only: the claim path it exists to measure is
 	// FOR UPDATE SKIP LOCKED, which has no SQLite equivalent.

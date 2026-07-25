@@ -117,10 +117,14 @@ func TestReportRoundTripsThroughJSON(t *testing.T) {
 			P95: 4 * time.Millisecond, P99: 11 * time.Millisecond, Max: 210 * time.Millisecond,
 			Mean: 1200 * time.Microsecond,
 		},
-		Finalize: Latency{Count: 100_000, Min: time.Microsecond, P50: 2 * time.Millisecond,
-			P95: 5 * time.Millisecond, P99: 9 * time.Millisecond, Max: time.Second, Mean: 3 * time.Millisecond},
-		Sweep: Latency{Count: 90, Min: time.Millisecond, P50: time.Millisecond, P95: 2 * time.Millisecond,
-			P99: 3 * time.Millisecond, Max: 4 * time.Millisecond, Mean: time.Millisecond},
+		Finalize: Latency{
+			Count: 100_000, Min: time.Microsecond, P50: 2 * time.Millisecond,
+			P95: 5 * time.Millisecond, P99: 9 * time.Millisecond, Max: time.Second, Mean: 3 * time.Millisecond,
+		},
+		Sweep: Latency{
+			Count: 90, Min: time.Millisecond, P50: time.Millisecond, P95: 2 * time.Millisecond,
+			P99: 3 * time.Millisecond, Max: 4 * time.Millisecond, Mean: time.Millisecond,
+		},
 		PeakRSS:    412 * 1024 * 1024,
 		Enqueued:   100_000,
 		Drained:    99_998,

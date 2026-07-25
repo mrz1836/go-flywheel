@@ -94,6 +94,16 @@ type Report struct {
 
 	Enqueued, Drained, Retried, Discarded, Superseded int64
 
+	// Reclaimed counts jobs the harness's sweeper returned to available after
+	// their lease expired. A non-zero value in a run with no injected fault is a
+	// finding, not noise.
+	Reclaimed int64
+
+	// ConcurrentExecutions counts times the same job was observed running in two
+	// workers at once. It must be zero: it is the exactly-once guarantee stated
+	// as a number.
+	ConcurrentExecutions int64
+
 	// Errors are the distinct errors the run collected, each carrying its
 	// occurrence count. See errset for why they are deduplicated.
 	Errors []error
@@ -178,6 +188,9 @@ type configJSON struct {
 	Timeout        string `json:"timeout"`
 	Queue          string `json:"queue"`
 	ExecutorClass  string `json:"executor_class"`
+	// Faults is the fault's description, never the value: a Fault is an
+	// interface, so it marshals to an empty object and cannot be read back.
+	Faults string `json:"faults,omitempty"`
 }
 
 // reportJSON is Report's wire form.
@@ -193,6 +206,8 @@ type reportJSON struct {
 	Sweep          *latencyJSON    `json:"sweep,omitempty"`
 	Storage        []StorageSample `json:"storage,omitempty"`
 	PeakRSS        uint64          `json:"peak_rss_bytes"`
+	Reclaimed      int64           `json:"reclaimed"`
+	Concurrent     int64           `json:"concurrent_executions"`
 	Enqueued       int64           `json:"enqueued"`
 	Drained        int64           `json:"drained"`
 	Retried        int64           `json:"retried"`
@@ -219,6 +234,8 @@ func (r Report) MarshalJSON() ([]byte, error) {
 		Sweep:          latencyToJSON(r.Sweep),
 		Storage:        r.Storage,
 		PeakRSS:        r.PeakRSS,
+		Reclaimed:      r.Reclaimed,
+		Concurrent:     r.ConcurrentExecutions,
 		Enqueued:       r.Enqueued,
 		Drained:        r.Drained,
 		Retried:        r.Retried,
@@ -249,26 +266,28 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("loadtest: unmarshal report: %w", err)
 	}
 	*r = Report{
-		Config:            configFromJSON(in.Config),
-		StartedAt:         in.StartedAt,
-		Duration:          time.Duration(in.DurationNanos),
-		EnqueueThroughput: in.Enqueue,
-		DrainThroughput:   in.Drain,
-		Claim:             latencyFromJSON(in.Claim),
-		Finalize:          latencyFromJSON(in.Finalize),
-		Sweep:             latencyFromJSON(in.Sweep),
-		Storage:           in.Storage,
-		PeakRSS:           in.PeakRSS,
-		Enqueued:          in.Enqueued,
-		Drained:           in.Drained,
-		Retried:           in.Retried,
-		Discarded:         in.Discarded,
-		Superseded:        in.Superseded,
-		Errors:            errorsFromJSON(in.Errors),
-		Notes:             in.Notes,
-		WorkloadDigest:    in.WorkloadDigest,
-		Histogram:         in.Histogram,
-		Schema:            in.Schema,
+		Config:               configFromJSON(in.Config),
+		StartedAt:            in.StartedAt,
+		Duration:             time.Duration(in.DurationNanos),
+		EnqueueThroughput:    in.Enqueue,
+		DrainThroughput:      in.Drain,
+		Claim:                latencyFromJSON(in.Claim),
+		Finalize:             latencyFromJSON(in.Finalize),
+		Sweep:                latencyFromJSON(in.Sweep),
+		Storage:              in.Storage,
+		PeakRSS:              in.PeakRSS,
+		Reclaimed:            in.Reclaimed,
+		ConcurrentExecutions: in.Concurrent,
+		Enqueued:             in.Enqueued,
+		Drained:              in.Drained,
+		Retried:              in.Retried,
+		Discarded:            in.Discarded,
+		Superseded:           in.Superseded,
+		Errors:               errorsFromJSON(in.Errors),
+		Notes:                in.Notes,
+		WorkloadDigest:       in.WorkloadDigest,
+		Histogram:            in.Histogram,
+		Schema:               in.Schema,
 	}
 	return nil
 }
@@ -289,7 +308,16 @@ func configToJSON(c Config) configJSON {
 		Timeout:        c.Timeout.String(),
 		Queue:          c.Queue,
 		ExecutorClass:  c.ExecutorClass,
+		Faults:         describeFault(c.Faults),
 	}
+}
+
+// describeFault renders a configured fault, or "" when there is none.
+func describeFault(f Fault) string {
+	if f == nil {
+		return ""
+	}
+	return f.Describe()
 }
 
 // configFromJSON reads a Config back. DSN stays empty: the credentials were
