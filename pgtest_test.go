@@ -58,22 +58,26 @@ func requirePostgresDSN(t *testing.T) string {
 //nolint:gochecknoglobals // per-test-binary sequence counter for schema uniqueness
 var pgIsolatedSeq atomic.Uint64
 
-// pgPartialIndexes is the minimum index set the runtime depends on for
-// correctness: the unique_key partial index enforces enqueue idempotency. The
-// remaining production partial indexes are performance-only and intentionally
-// omitted from the test schema, mirroring the SQLite test setup.
-//
-//nolint:gochecknoglobals // shared DDL fixtures applied across tests
-var pgPartialIndexes = []string{
-	`CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_key ON jobs (unique_key) WHERE unique_key IS NOT NULL`,
-	`CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_active_key ON jobs (unique_active_key) WHERE unique_active_key IS NOT NULL AND state IN ('available', 'running', 'retryable', 'scheduled')`,
-}
-
 // NewPostgresIsolatedDB returns a *gorm.DB bound to a freshly created Postgres
-// schema with the three runtime row types migrated into it. Each call mints a
-// unique schema and its own connection pool, so callers can use t.Parallel
-// safely even though the underlying database is shared with sibling tests. The
-// schema is dropped on test cleanup.
+// schema carrying the runtime's full production schema — every table and every
+// index, exactly what a host gets from Migrate. Each call mints a unique schema
+// and its own connection pool, so callers can use t.Parallel safely even though
+// the underlying database is shared with sibling tests. The schema is dropped on
+// test cleanup.
+//
+// # Why the whole schema, not a reduced one
+//
+// The schema comes from Migrate rather than from a local DDL list so it cannot
+// drift: there is one installer and every real caller uses it. An index-reduced
+// fixture makes a passing test prove something other than what it says — and on
+// Postgres that is sharper than on SQLite, because this is the only dialect that
+// runs the FOR UPDATE SKIP LOCKED claim. Without jobs_ready that claim is a
+// sequential scan under a row lock, so a concurrency test on a reduced schema
+// exercises a plan production never uses.
+//
+// The standing rule that follows: no test file in this package carries local
+// index DDL. A test that wants a deliberately reduced schema builds it from
+// IndexSet through applyIndexKinds and says at the call site why.
 //
 // It is defined in an internal (package flywheel) test file so it can migrate
 // the unexported row structs; being exported lets the external
@@ -116,13 +120,8 @@ func NewPostgresIsolatedDB(t *testing.T) *gorm.DB {
 		_ = base.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`).Error
 	})
 
-	if err := db.AutoMigrate(&jobRow{}, &jobRunRow{}, &jobPeriodicRow{}); err != nil {
+	if err := Migrate(db); err != nil {
 		t.Fatalf("migrate schema %s: %v", schema, err)
-	}
-	for _, ddl := range pgPartialIndexes {
-		if err := db.Exec(ddl).Error; err != nil {
-			t.Fatalf("apply partial index on %s: %v", schema, err)
-		}
 	}
 	return db
 }

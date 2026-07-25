@@ -258,6 +258,10 @@ func TestRecentFailuresErrorsOnClosedDB(t *testing.T) {
 func TestSampleQueueHealthSurfacesReadyQueryError(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
+	// jobs_ready covers scheduled_at, and SQLite refuses to drop a column an index
+	// still references — so the index goes first. Needed since the fixture gained
+	// the full production schema; before that, jobs_ready did not exist here.
+	require.NoError(t, db.Exec("DROP INDEX jobs_ready").Error)
 	// Drop scheduled_at so the by-state count still succeeds but the ready query —
 	// which filters on scheduled_at — errors, proving a mid-snapshot query failure
 	// is surfaced rather than yielding a half-built gauge.

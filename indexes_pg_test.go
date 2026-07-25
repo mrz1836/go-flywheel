@@ -53,20 +53,12 @@ func TestCorrectnessIndexesAreWhatEnforceIdempotencyPostgres(t *testing.T) {
 	})
 
 	t.Run("performance indexes only", func(t *testing.T) {
+		// The reduced-schema path, used here for the one purpose it exists for.
+		// applyIndexKinds fails the test if the subset is empty, so this half
+		// cannot pass vacuously.
 		db := newBarePostgres(t)
 		require.NoError(t, db.AutoMigrate(Models()...))
-
-		set, err := IndexSet(db.Name())
-		require.NoError(t, err)
-		applied := 0
-		for _, idx := range set {
-			if idx.Kind != IndexPerformance {
-				continue
-			}
-			require.NoError(t, db.Exec(idx.DDL).Error)
-			applied++
-		}
-		require.Positive(t, applied, "the performance subset must be non-empty for this half to mean anything")
+		applyIndexKinds(t, db, IndexPerformance)
 
 		assert.NoError(t, enqueueTwice(t, db),
 			"omitting the correctness indexes silently accepts the duplicate — ErrAlreadyEnqueued never fires")
