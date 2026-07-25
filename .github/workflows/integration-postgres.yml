@@ -1,0 +1,186 @@
+# ------------------------------------------------------------------------------------
+#  Integration — PostgreSQL Workflow
+#
+#  Purpose: Execute the integration-tagged test suite against a real PostgreSQL server.
+#  The runtime's claim path is a single CTE using FOR UPDATE SKIP LOCKED, which SQLite
+#  cannot express, so the exactly-once guarantees (concurrent claim, multi-runner
+#  dispatch, unique-key races, lease expiry, fan-out atomicity) are exercised nowhere
+#  else. Without this workflow they are verified by CI zero times.
+#
+#  Repo-owned: this file is deliberately NOT part of the synced fortress-* set and does
+#  not depend on .github/actions/*, which the sync also owns. A repo-owned guarantee
+#  must not be removable by an upstream template update.
+#
+#  Hardening:
+#    - Default-deny permissions; the single job requests contents:read only
+#    - Third-party actions pinned to commit SHAs with human-readable version comments
+#    - Checkout runs without persisting credentials
+#    - Pinned runner image and an explicit job timeout
+#    - GOTOOLCHAIN=local: the toolchain in go.mod is used, never downloaded on demand
+#    - Test caching defeated (-count=1) so a green run always reflects a real execution
+#
+#  Triggers:
+#    - Push to master
+#    - Pull requests
+#    - Manual: via workflow_dispatch
+#
+#  Maintainer: @mrz1836
+#
+# ------------------------------------------------------------------------------------
+
+name: Integration (PostgreSQL)
+
+# --------------------------------------------------------------------
+# Trigger Configuration
+# --------------------------------------------------------------------
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch: # Allow manual triggering
+
+# Security: Restrict default permissions (jobs must explicitly request what they need)
+permissions: {}
+
+# --------------------------------------------------------------------
+# Concurrency Control
+# --------------------------------------------------------------------
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ----------------------------------------------------------------------------------
+  # Integration suite against a real PostgreSQL server
+  #
+  # Workflow phases (each preserved as a step):
+  #   📥 Checkout code          → source only, no credentials persisted
+  #   🐹 Set up Go              → version resolved from go.mod, no toolchain download
+  #   🐘 Wait for PostgreSQL    → fail fast with a clear message if the service is down
+  #   🧪 Run integration suite  → -tags=integration -race, skips made fatal
+  #   ✅ Assert coverage        → prove the exactly-once tests ran rather than skipped
+  # ----------------------------------------------------------------------------------
+  postgres:
+    name: 🐘 PostgreSQL 17
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read # Required: checkout the source under test
+
+    # ------------------------------------------------------------------
+    # Service container
+    #
+    # Image matches the version the downstream consumer's test harness boots, so a
+    # behavioral difference between here and there is never the image. Swap the tag
+    # for a digest pin (postgres@sha256:...) if you want image immutability too; the
+    # cost is a manual bump on every upstream patch release.
+    # ------------------------------------------------------------------
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: flywheel
+          POSTGRES_PASSWORD: flywheel
+          POSTGRES_DB: flywheel_test
+        ports:
+          - 5432:5432
+        # Kept on one line: a folded block scalar here gets rewritten by the
+        # repository's YAML formatter, which leaves a marker comment behind.
+        options: '--health-cmd="pg_isready -U flywheel -d flywheel_test" --health-interval=5s --health-timeout=5s --health-retries=10 --health-start-period=5s'
+    env:
+      # The suite resolves its target from this DSN. sslmode=disable is correct for a
+      # loopback service container; there is no network path to secure.
+      FLYWHEEL_TEST_DATABASE_URL: postgres://flywheel:flywheel@localhost:5432/flywheel_test?sslmode=disable
+      # Turn "no database, skip the suite" into a hard failure. Without this, a typo in
+      # the variable above would skip every Postgres test and still report success —
+      # a green build that proves nothing, which is the exact failure this workflow
+      # exists to prevent.
+      FLYWHEEL_REQUIRE_POSTGRES: "1"
+      # Use the toolchain declared in go.mod; never fetch one mid-build.
+      GOTOOLCHAIN: local
+
+    steps:
+      # --------------------------------------------------------------------
+      # Check out the code under test
+      # --------------------------------------------------------------------
+      - name: 📥 Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # --------------------------------------------------------------------
+      # Go toolchain
+      #
+      # actions/setup-go is used directly rather than ./.github/actions/setup-go-with-cache:
+      # that composite action is owned by the upstream sync and takes four inputs fed by
+      # the fortress configuration machinery this workflow deliberately does not join.
+      # go-version-file keeps the version correct without a second source of truth.
+      # --------------------------------------------------------------------
+      - name: 🐹 Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # --------------------------------------------------------------------
+      # Confirm the service is reachable before running anything expensive, so a
+      # container failure reads as a container failure rather than a test failure.
+      # --------------------------------------------------------------------
+      - name: 🐘 Wait for PostgreSQL
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -p 5432 -U flywheel -d flywheel_test >/dev/null 2>&1; then
+              echo "PostgreSQL is accepting connections after ${i} attempt(s)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::PostgreSQL did not become ready within 60 seconds."
+          exit 1
+
+      # --------------------------------------------------------------------
+      # The suite itself.
+      #
+      # -count=1 defeats the test cache: a cached PASS would report green without
+      # touching the database. pipefail keeps a test failure from being masked by tee.
+      # --------------------------------------------------------------------
+      - name: 🧪 Run the integration suite
+        run: |
+          set -euo pipefail
+          go test -tags=integration -race -count=1 -timeout=15m -v ./... 2>&1 | tee /tmp/integration-postgres.log
+
+      # --------------------------------------------------------------------
+      # Prove the guarantees were actually exercised.
+      #
+      # FLYWHEEL_REQUIRE_POSTGRES already makes a missing DSN fatal. This is the second
+      # line of defense: it asserts the five exactly-once tests reported PASS by name,
+      # so a future refactor that renames, moves, or accidentally excludes them turns
+      # the build red instead of quietly reducing coverage to nothing.
+      # --------------------------------------------------------------------
+      - name: ✅ Assert the exactly-once tests ran
+        run: |
+          set -euo pipefail
+          expected="TestRunnerPGSkipLockedConcurrency
+          TestNodePGMultipleRunnersExactlyOnce
+          TestRunnerPGUniqueKeyRaceOneWins
+          TestRunnerPGLeaseExpiryReclaimsJob
+          TestRunnerPGFanOutAtomicityNoDoubleDispatch"
+
+          missing=0
+          while read -r name; do
+            name="$(echo "${name}" | xargs)"
+            [ -z "${name}" ] && continue
+            if grep -qE "^--- PASS: ${name}\b" /tmp/integration-postgres.log; then
+              echo "  ✅ ${name}"
+            else
+              echo "::error::${name} did not report PASS — it was skipped, renamed, or removed."
+              missing=$((missing + 1))
+            fi
+          done <<< "${expected}"
+
+          if [ "${missing}" -ne 0 ]; then
+            echo "::error::${missing} exactly-once test(s) did not run. A green suite that skips these proves nothing."
+            exit 1
+          fi
+          echo "All 5 exactly-once guarantees exercised against real PostgreSQL."
