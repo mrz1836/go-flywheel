@@ -32,12 +32,31 @@ name: Integration (PostgreSQL)
 
 # --------------------------------------------------------------------
 # Trigger Configuration
+#
+# Documentation-only changes cannot affect the claim path, so they do not spend a
+# runner or add a pending check. Note what is deliberately NOT ignored:
+# .github/workflows/** — a change to this file must re-run this workflow.
+#
+# Caution for later: if this job is ever made a required status check under branch
+# protection, paths-ignore becomes a trap. GitHub treats a required check that
+# never ran as permanently pending and blocks the merge. The fix at that point is
+# a companion always-succeeds job, not deleting these filters.
 # --------------------------------------------------------------------
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
   pull_request:
-  workflow_dispatch: # Allow manual triggering
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+  workflow_dispatch: # Allow manual triggering — bypasses paths-ignore
 
 # Security: Restrict default permissions (jobs must explicitly request what they need)
 permissions: {}
