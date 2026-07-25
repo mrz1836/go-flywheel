@@ -30,6 +30,9 @@ go.list
 # Notes
 todo.md
 
+# Working plans (temporary, local-only)
+/plans/
+
 # Distribution
 dist
 
