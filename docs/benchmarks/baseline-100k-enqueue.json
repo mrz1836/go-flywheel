@@ -1,0 +1,94 @@
+{
+    "concurrent_executions": 0,
+    "config": {
+        "executor_class": "loadtest",
+        "indexes": "full",
+        "jobs": 100000,
+        "mix": "enqueue",
+        "queue": "default",
+        "runners": 4,
+        "sample_interval": "1s",
+        "seed": 1,
+        "target": "postgres://localhost:5432/flywheel_test",
+        "timeout": "30m0s",
+        "work_duration": "0s",
+        "work_jitter": "0s",
+        "workers": 8
+    },
+    "discarded": 0,
+    "drain_throughput_per_sec": 0,
+    "drained": 0,
+    "duration": "667ns",
+    "duration_nanos": 667,
+    "enqueue_throughput_per_sec": 9897.079650150607,
+    "enqueued": 100000,
+    "histogram": {
+        "Buckets": 83,
+        "MaxExponent": 37,
+        "MaxRelativeError": 0.1552734375,
+        "MinExponent": 10,
+        "SubBucketsPerOctave": 3
+    },
+    "notes": [
+        "LockWaits is an instantaneous sample of pg_locks: it counts requests ungranted at the moment of the sample, and lock waits under normal contention are far shorter than the sampling interval. A run of zeroes means the sampler did not catch one, not that there was no contention.",
+        "WALBytes is the delta in pg_stat_wal, which is cluster-wide: PostgreSQL offers no per-database breakdown, so any other activity on the same server is included.",
+        "Index condition \"full\" installed 11 indexes: idx_job_periodics_slug, idx_jobs_deleted_at, job_periodics_pkey, job_runs_job_attempt, job_runs_pkey, jobs_parent, jobs_pkey, jobs_ready, jobs_running_leased, jobs_unique_active_key, jobs_unique_key."
+    ],
+    "peak_rss_bytes": 79609856,
+    "reclaimed": 0,
+    "retried": 0,
+    "schema": "lt_dk81r43q0b5c_5xo_1",
+    "started_at": "2026-07-25T19:39:14.47545-04:00",
+    "storage": [
+        {
+            "At": "2026-07-25T19:39:14.475453-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 16384,
+                "jobs": 15654912
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 104668
+            },
+            "LockWaits": 0,
+            "RSS": 79609856,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 7
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 24576,
+                "jobs": 61218816
+            },
+            "WALBytes": 0
+        }
+    ],
+    "superseded": 0,
+    "workload_digest": "c111170f7509817c7a136763ebbdde98912308aad132a91d1eca319d012ed785"
+}

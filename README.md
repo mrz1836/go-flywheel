@@ -560,7 +560,7 @@ go install github.com/mrz1836/mage-x/cmd/magex@latest
 ## 📚 Documentation
 
 - **API Reference** – Dive into the godocs at [pkg.go.dev/github.com/mrz1836/go-flywheel](https://pkg.go.dev/github.com/mrz1836/go-flywheel)
-- **Benchmarks** – Check the latest numbers in the [benchmark results](#benchmark-results)
+- **Benchmarks** – The measured 100k baseline, environment, and index comparison in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
 - **Test Suite** – Review both the [unit tests](integration_test.go) (powered by [`testify`](https://github.com/stretchr/testify))
 
 <br/>
@@ -676,7 +676,18 @@ Run the Go benchmarks:
 magex bench
 ```
 
-> Benchmarks for the runtime's hot paths (claim, finalize, sweep) are added as those paths are tuned.
+**[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) publishes the runtime's measured baseline**: enqueue,
+claim, finalize, and sweep against real PostgreSQL at 100,000 jobs, with the full environment, the
+commands that produced every number, and a full-index versus correctness-index-only comparison. The
+JSON reports behind it are committed under [`docs/benchmarks/`](docs/benchmarks/).
+
+The hot paths are measured by a load harness in [`loadtest/`](loadtest/), behind its own build tag so
+its runs never join an ordinary `go test ./...`:
+
+```bash
+export FLYWHEEL_LOADTEST_DATABASE_URL="postgres://localhost:5432/flywheel_test?sslmode=disable"
+go test -tags=loadtest -run='^$' -bench='BenchmarkClaim100k|BenchmarkEnqueue100k' -benchtime=1x ./loadtest/
+```
 
 <br/>
 
