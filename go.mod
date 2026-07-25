@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/glebarez/sqlite v1.11.0
-	github.com/mrz1836/go-foundation v0.3.3
+	github.com/mrz1836/go-foundation v0.3.4
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
@@ -29,7 +29,7 @@ require (
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/kr/text v0.2.0 // indirect
-	github.com/mattn/go-isatty v0.0.23 // indirect
+	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
