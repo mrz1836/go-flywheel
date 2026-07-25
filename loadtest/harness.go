@@ -58,9 +58,10 @@ type Harness struct {
 	// prepareWorkload, before any runner exists.
 	digest string
 
-	prog  *progress
-	errs  *errset
-	notes *noteset
+	prog    *progress
+	errs    *errset
+	notes   *noteset
+	samples *sampleset
 
 	runners       []*runnerHandle
 	cancelSweeper context.CancelFunc
@@ -210,11 +211,12 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 	}
 
 	h := &Harness{
-		cfg:    cfg,
-		schema: newSchemaName(),
-		errs:   &errset{},
-		notes:  &noteset{},
-		prog:   &progress{target: int64(cfg.Jobs)},
+		cfg:     cfg,
+		schema:  newSchemaName(),
+		errs:    &errset{},
+		notes:   &noteset{},
+		samples: &sampleset{},
+		prog:    &progress{target: int64(cfg.Jobs)},
 	}
 
 	// The admin pool stays tiny and is bound to the raw DSN: it exists to create
@@ -393,6 +395,11 @@ func (h *Harness) startRunners(ctx context.Context) error {
 	h.cancelSweeper = cancelSweep
 	sweeper := newTimingDriver(h.inner, h.timings, h.cfg.Runners)
 	h.wg.Go(func() { h.runSweeper(sweepCtx, sweeper) })
+
+	// The sampler shares the sweeper's cancellation: both are the harness's own
+	// background work, and both must be stopped before collect reads what they
+	// produced.
+	h.wg.Go(func() { h.runSampler(sweepCtx) })
 
 	return nil
 }
