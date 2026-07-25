@@ -1,0 +1,146 @@
+//go:build loadtest
+
+package loadtest
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	flywheel "github.com/mrz1836/go-flywheel"
+	"gorm.io/gorm"
+)
+
+// schemaSeq disambiguates schema names minted within one process.
+//
+//nolint:gochecknoglobals // per-process sequence counter for schema uniqueness
+var schemaSeq atomic.Uint64
+
+// maxSchemaNameLen is PostgreSQL's identifier limit. A longer name is silently
+// truncated by the server, which turns two distinct runs into one schema.
+const maxSchemaNameLen = 63
+
+// newSchemaName mints a fresh schema name for one run.
+//
+// The name is concatenated into DDL — PostgreSQL has no bind parameter for an
+// identifier — so it is built to be injection-safe by construction rather than
+// escaped after the fact: every component is a base-36 rendering of an integer,
+// which can only ever produce [0-9a-z]. There is no code path by which caller
+// input reaches it. validSchemaName then re-checks the result, so the guarantee
+// is enforced rather than argued.
+func newSchemaName() string {
+	return "lt_" +
+		strconv.FormatInt(time.Now().UnixNano(), 36) + "_" +
+		strconv.FormatInt(int64(os.Getpid()), 36) + "_" +
+		strconv.FormatUint(schemaSeq.Add(1), 36)
+}
+
+// validSchemaName reports whether name is safe to concatenate into DDL: a
+// lowercase-leading identifier of [a-z0-9_] within PostgreSQL's length limit.
+func validSchemaName(name string) bool {
+	if name == "" || len(name) > maxSchemaNameLen {
+		return false
+	}
+	if name[0] < 'a' || name[0] > 'z' {
+		return false
+	}
+	for i := range len(name) {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// withSearchPath appends a search_path runtime parameter to a Postgres DSN so
+// every connection on the resulting pool resolves unqualified names to the given
+// schema first. It is how a run gets its own copy of the runtime's three tables
+// inside a shared database without qualifying a single query.
+func withSearchPath(dsn, schema string) string {
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + "search_path=" + schema
+}
+
+// createSchema creates the run's isolated schema on the admin connection.
+func createSchema(ctx context.Context, admin *gorm.DB, schema string) error {
+	if !validSchemaName(schema) {
+		return fmt.Errorf("loadtest: refusing to create schema %q: %w", schema, ErrInvalidConfig)
+	}
+	if err := admin.WithContext(ctx).Exec(`CREATE SCHEMA ` + schema).Error; err != nil {
+		return fmt.Errorf("loadtest: create schema %s: %w", schema, err)
+	}
+	return nil
+}
+
+// dropSchema removes the run's schema and everything in it.
+func dropSchema(ctx context.Context, admin *gorm.DB, schema string) error {
+	if !validSchemaName(schema) {
+		return fmt.Errorf("loadtest: refusing to drop schema %q: %w", schema, ErrInvalidConfig)
+	}
+	if err := admin.WithContext(ctx).Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`).Error; err != nil {
+		return fmt.Errorf("loadtest: drop schema %s: %w", schema, err)
+	}
+	return nil
+}
+
+// installSchema brings up the runtime's tables and the index set the condition
+// selects.
+//
+// Both conditions run the same two steps in the same order — AutoMigrate over
+// the runtime's own Models, then the runtime's own IndexSet — and differ only in
+// which entries of that set are applied. That is what makes a delta between the
+// two conditions attributable to the indexes: there is exactly one variable, and
+// neither arm hand-writes a line of DDL.
+//
+// It deliberately does not call Migrate. Migrate would install the full set
+// unconditionally, so the correctness-only condition would be unbuildable
+// through it, and its pre-1.0 column reconciliation is a no-op on a schema
+// created seconds earlier.
+func installSchema(ctx context.Context, db *gorm.DB, cond IndexCondition) error {
+	if db.Name() != "postgres" {
+		return fmt.Errorf("loadtest: target dialect is %q: %w", db.Name(), ErrUnsupportedDialect)
+	}
+	if !cond.Valid() {
+		return fmt.Errorf("loadtest: unknown index condition %q: %w", cond, ErrInvalidConfig)
+	}
+
+	if err := db.WithContext(ctx).AutoMigrate(flywheel.Models()...); err != nil {
+		return fmt.Errorf("loadtest: automigrate: %w", err)
+	}
+
+	set, err := flywheel.IndexSet(db.Name())
+	if err != nil {
+		return fmt.Errorf("loadtest: index set: %w", err)
+	}
+	for _, idx := range set {
+		if cond == IndexesCorrectness && idx.Kind != flywheel.IndexCorrectness {
+			continue
+		}
+		if err := db.WithContext(ctx).Exec(idx.DDL).Error; err != nil {
+			return fmt.Errorf("loadtest: create index %s: %w", idx.Name, err)
+		}
+	}
+	return nil
+}
+
+// installedIndexes lists the indexes present in the current schema, so a run can
+// report the condition it actually got rather than the one it asked for.
+func installedIndexes(ctx context.Context, db *gorm.DB) ([]string, error) {
+	var names []string
+	if err := db.WithContext(ctx).Raw(
+		`SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() ORDER BY indexname`,
+	).Scan(&names).Error; err != nil {
+		return nil, fmt.Errorf("loadtest: list installed indexes: %w", err)
+	}
+	return names, nil
+}
