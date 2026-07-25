@@ -131,7 +131,24 @@ The runtime is built from focused, composable pieces:
 
 ### Schema setup
 
-`go-flywheel` owns its three tables (`jobs`, `job_runs`, `job_periodics`) and ships them via a single exported entry point:
+`go-flywheel` owns three tables — `jobs`, `job_runs`, `job_periodics` — and there are **two ways to
+install them. Pick exactly one.** They are not layers; running both means two migration authorities
+against one database.
+
+| Question | **Library-owned** | **Host-owned** |
+|---|---|---|
+| Who creates the three tables? | `Migrate(db)` | your loader, from `Models()` |
+| Who creates the indexes? | `Migrate(db)` | you, from `IndexSet(dialect)` / `InstallIndexes` |
+| Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
+| Does the runtime run DDL at startup? | yes, every start | no |
+| Is a co-located host schema safe? | only if the host's tooling excludes the three tables | yes — the tables are in your loader |
+| **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
+
+**The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
+same database, your migration tool must know about `jobs`, `job_runs`, and `job_periodics` — a tool that
+cannot see them will happily propose dropping them.
+
+**Library-owned** — one call, no external tooling:
 
 ```go
 import "github.com/mrz1836/go-flywheel"
@@ -141,14 +158,55 @@ if err := flywheel.Migrate(db); err != nil { // db is a *gorm.DB
 }
 ```
 
-`Migrate` runs `AutoMigrate` over the row structs and then reconciles the partial/unique indexes GORM cannot express from struct tags — including the correctness-bearing `jobs_unique_key` partial unique index that enforces enqueue idempotency. It is idempotent (`AutoMigrate` no-op + `CREATE INDEX IF NOT EXISTS`), so repeated calls are safe.
+`Migrate` runs `AutoMigrate` over the row structs and then applies the partial/unique indexes GORM
+cannot express from struct tags. It is idempotent (`AutoMigrate` no-op + `CREATE INDEX IF NOT EXISTS`),
+so repeated calls are safe.
 
-It supports two consumption modes:
+**Host-owned** — your loader creates the tables, you apply the indexes:
 
-- **Standalone** — call `Migrate(db)` against a bare SQLite or PostgreSQL database and the runtime stands up its own schema with no external migration tooling.
-- **Embedded** — call `Migrate(db)` as one step of a host project's install/migration process.
+```go
+// 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
+//    so your migration tool knows the three tables exist and never proposes dropping them.
+stmts, err := gormschema.New("postgres").Load(
+    append(myapp.AllModels(), flywheel.Models()...)...,
+)
 
-> Only PostgreSQL and SQLite are supported, because both express the partial indexes the runtime relies on; `Migrate` returns an error for any other dialect rather than silently dropping idempotency. A host that prefers versioned SQL — e.g. an Atlas / `atlas-provider-gorm` flow — can point its loader at `flywheel.Models()` (the runtime's row structs as a single source of truth) and generate migrations from there instead of calling `Migrate`. The module takes **no** hard dependency on Atlas or any external migration tool.
+// 2. In your install/deploy path, right where you apply your migrations.
+if err := flywheel.InstallIndexes(ctx, db); err != nil {
+    return err
+}
+```
+
+Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
+it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
+GORM struct tag cannot express. Four of the eight are correctness-bearing — without `jobs_unique_key`
+and `jobs_unique_active_key` the database accepts duplicate enqueues and **`ErrAlreadyEnqueued` is never
+returned.** Use `flywheel.IndexSet(dialect)` when you want them classified:
+
+```go
+for _, idx := range must(flywheel.IndexSet("postgres")) {
+    if idx.Kind == flywheel.IndexCorrectness {
+        // omitting this one does not cost throughput — it removes a guarantee
+    }
+}
+```
+
+> **Apply the indexes to a database; do not paste them into a generated migration.** Your loader still
+> does not describe them, so a migration that creates them has its *next* diff see indexes in the
+> migration directory that are absent from the desired state — and propose dropping them back out. Run
+> them as an install step instead: a versioned diff compares the directory against the loader and never
+> inspects the live database, so indexes created outside the directory are invisible to it. (A
+> declarative `schema apply` *does* inspect the database and would drop them, which is one more reason a
+> shared database wants versioned mode.)
+
+A host that owns its schema history but still wants the installer can have both:
+`MigrateWithOptions(db, MigrateOpts{SkipColumnReconcile: true})` skips the pre-1.0 routing-column rename
+pass, so the runtime issues no `ALTER TABLE` of its own inside a versioned schema. That reconciliation
+is removed in v1.0.0.
+
+> Only PostgreSQL and SQLite are supported, because both express the partial indexes the runtime relies
+> on. Every entry point returns `flywheel.ErrUnsupportedDialect` for anything else rather than silently
+> dropping idempotency. The module takes **no** hard dependency on Atlas or any external migration tool.
 
 <br/>
 
@@ -238,6 +296,155 @@ That's a durable AI pipeline: enqueue returns instantly, the `Node` summarizes f
 documents at a time, a failed model call retries itself with backoff, and every attempt —
 including what it cost — lands in the `job_runs` audit table. Need periodic or cron-style
 runs too? Add a `Scheduler` to the `Node` (see [`examples/`](examples) for the full set).
+
+<br/>
+
+### Recording what an attempt did
+
+**You do not need your own job-lifecycle table.** Every attempt already gets a row in `job_runs`, and
+that row has a stable id you can hang a foreign key off. Two fields are the whole seam:
+
+- **`Job.RunID`** — the `job_runs.id` for *this* attempt, handed to your worker before its body runs.
+- **`Result.Output`** — your structured record of what the attempt did, stored on `job_runs.output`
+  and read back by `flywheel.ListRuns`.
+
+```go
+func (w EnrichWorker) Work(ctx context.Context, job *flywheel.Job[EnrichArgs]) (flywheel.Result, error) {
+    fetch, err := w.fetchFromProvider(ctx, job.Args.PersonID)
+    if err != nil {
+        return flywheel.Result{}, err // retried with backoff; the failure is recorded on this run
+    }
+
+    // A side-effect row correlated to the attempt that produced it. RunID is safe
+    // to reference: the run row is committed before your worker body starts.
+    w.db.Create(&SourceFetch{
+        ID:       fetch.ID,
+        Provider: fetch.Provider,
+        JobRunID: &job.RunID, // FK → job_runs.id
+    })
+
+    // What this attempt did, on the attempt's own audit row.
+    return flywheel.Result{
+        Output:     map[string]any{"source_fetch_id": fetch.ID, "records": len(fetch.Records)},
+        CostMicros: fetch.CostMicros,
+    }, nil
+}
+```
+
+Read it back — no join table, no lifecycle mirror:
+
+```go
+runs, err := flywheel.ListRuns(ctx, db, jobID, flywheel.ListRunsParams{Limit: 20})
+for _, run := range runs {
+    fmt.Println(run.Outcome, run.StartedAt, run.FinishedAt, string(run.Output))
+}
+```
+
+**The lifetime of `job_runs.id`, so you can decide your FK's `ON DELETE`:**
+
+| Moment | What happens to the row |
+|---|---|
+| Before your worker body runs | The row is **committed** with outcome `started`. A side-effect row written during the attempt can reference it immediately, and it survives a rollback of your own work. |
+| Attempt finishes | The same row is updated in place with the outcome, timings, cost, and `Result.Output`. |
+| Process crashes mid-attempt | The lease sweep marks the row `crashed`. It is **not deleted**, so your FK never dangles. |
+| Retention runs | The only thing that removes it. `DeleteFinishedJobs` deletes `job_runs` **before** `jobs`, so a host FK onto `job_runs.id` wants **`ON DELETE SET NULL`** — or leave retention disabled. |
+
+Need run history that no worker produced — fixtures, a backfill, an import? `flywheel.SeedRun` writes a
+`job_runs` row directly, honoring your transaction, and returns the same stable id:
+
+```go
+runID, err := flywheel.SeedRun(ctx, db, flywheel.RunSeed{
+    JobID:      jobID,
+    Attempt:    1,
+    ExecutorID: "backfill",
+    Outcome:    flywheel.OutcomeSuccess,
+    Output:     map[string]any{"records": 42},
+})
+```
+
+> **The anti-pattern this replaces.** A second table with its own `status`, `started_at`,
+> `completed_at`, `error`, and `stats` columns — and no join key back to the run that produced them. It
+> duplicates most of the `jobs` row, it drifts from the real outcome the moment a retry happens, and
+> nothing can answer "which attempt wrote this?". If you have domain columns to store, keep the table
+> and give it a `job_run_id` — the lifecycle columns belong to `job_runs`.
+
+<br/>
+
+### Running one registry across two executors
+
+One `Registry`, one database, two very different processes: a long-running pool and a bounded one that
+must finish inside an invocation budget (Lambda, a Kubernetes Job, a CI step). `ExecutorClass` is what
+routes between them — a free-form label, not an enum.
+
+```go
+// One registry, built once, compiled into both binaries. Both know every kind;
+// the class decides who claims what.
+func newRegistry() *flywheel.Registry {
+    reg := flywheel.NewRegistry()
+    flywheel.Register(reg, ReindexWorker{})
+    flywheel.Register(reg, ThumbnailWorker{})
+    return reg
+}
+```
+
+**The long-running process** runs a `Node` on its class, and owns the scheduler:
+
+```go
+node, _ := flywheel.NewNode(flywheel.NodeConfig{
+    Runners: []flywheel.RunnerConfig{{
+        DB: db, Driver: flywheel.NewPostgresDriver(db), Registry: newRegistry(),
+        Queues: []string{"default", "periodic"}, ExecutorClass: "worker", Concurrency: 4,
+    }},
+    Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db)},
+})
+_ = node.Run(ctx)
+```
+
+**The bounded process** builds a bare `Runner` and drains under a deadline that reserves a teardown
+margin below its own budget:
+
+```go
+runner, _ := flywheel.NewRunner(flywheel.RunnerConfig{
+    DB: db, Driver: flywheel.NewPostgresDriver(db), Registry: newRegistry(),
+    Queues: []string{"default"}, ExecutorClass: "burst", Concurrency: 4,
+})
+
+// Reserve teardown time: a deadline set *at* the platform's limit gets the
+// process killed mid-finalize.
+budget, cancel := context.WithTimeout(ctx, invocationBudget-teardownMargin)
+defer cancel()
+
+switch err := runner.RunUntilIdle(budget); {
+case err == nil:
+    // Every job reached a terminal state.
+case errors.Is(err, context.DeadlineExceeded):
+    // Budget spent with work outstanding. Normal for a bounded invocation, not a
+    // failure: the leftover jobs stay claimable for the next one.
+default:
+    return err // a real failure — driver error, unregistered kind
+}
+```
+
+**What `RunUntilIdle` guarantees.** It returns `nil` **only when no job is in a non-terminal state** —
+not merely when this runner found nothing to claim. A job another pool is still running, or one waiting
+out a retry backoff, keeps it looping. That is why the deadline branch is separate: `context.DeadlineExceeded`
+means "budget spent", not "something broke".
+
+**Routing rules:**
+
+| The job's class | Who can claim it |
+|---|---|
+| `flywheel.AnyClass` (the empty default) | any runner, whichever polls first |
+| `"burst"` | a runner with `ExecutorClass: "burst"`, or any runner with `ClaimAnyClass: true` |
+
+Leave a job unpinned unless it genuinely needs one pool's hardware, credentials, or budget.
+
+> **The trap: the scheduler must run on exactly one process.** It owns the periodic ticks *and* the
+> stuck-lease sweep that reclaims jobs whose executor died. Two schedulers means every tick fires twice
+> and two sweeps race. Every process except one leaves `NodeConfig.Scheduler` nil — and a bounded
+> process, which by definition is not always running, is never the one that has it.
+
+A complete, runnable version of this is [`examples/split-executors`](examples/split-executors).
 
 <br/>
 
