@@ -29,7 +29,7 @@ func requireDSN(t *testing.T) string {
 	if testing.Short() {
 		t.Skip("skipping the load harness in short mode")
 	}
-	dsn := os.Getenv(databaseURLEnv)
+	dsn := envOrEmpty(databaseURLEnv)
 	if dsn == "" {
 		t.Skipf("%s is not set; skipping the database-backed harness tests", databaseURLEnv)
 	}
@@ -372,4 +372,10 @@ func findNote(notes []string, prefix string) string {
 		}
 	}
 	return ""
+}
+
+// envOrEmpty reads an environment variable, shared by the test and benchmark
+// skip guards so both resolve the target the same way.
+func envOrEmpty(name string) string {
+	return os.Getenv(name)
 }
