@@ -54,8 +54,10 @@ func NewRegistry() *Registry {
 }
 
 // Register builds the typed dispatch closure for w and stores it keyed by
-// w.Kind(). It panics if the kind is already registered — a duplicate
-// registration is a programming error that must fail at startup (FR-037).
+// w.Kind(). It panics if the kind is already registered: two workers claiming
+// one kind is a programming error with no correct resolution — silently keeping
+// either one would route live jobs to a worker the author did not intend — so it
+// fails at startup rather than at dispatch.
 func Register[A Args](reg *Registry, w Worker[A]) {
 	kind := w.Kind()
 

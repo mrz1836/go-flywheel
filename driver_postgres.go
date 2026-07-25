@@ -11,7 +11,8 @@ import (
 
 // postgresDriver is the PostgreSQL Driver implementation. It claims jobs with a
 // single CTE statement using FOR UPDATE SKIP LOCKED, so N executors poll the
-// same table with zero blocking and no double-execution (research §2).
+// same table with zero blocking and no double-execution: a claimant skips rows
+// another transaction already holds instead of queueing behind them.
 type postgresDriver struct {
 	baseDriver
 }

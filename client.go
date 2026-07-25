@@ -41,9 +41,13 @@ type kindNamer interface {
 }
 
 // Insert enqueues one job with typed args. The job kind is read from the args
-// value, which must implement Kind() string. When opts.Tx is set the row is
-// written on that transaction (outbox, FR-003). A unique_key collision returns
-// ErrAlreadyEnqueued, never a raw driver error (FR-004).
+// value, which must implement Kind() string.
+//
+// When opts.Tx is set the row is written on that transaction, so enqueuing is
+// atomic with the caller's own writes — the outbox pattern, without an outbox
+// table. A unique_key collision returns ErrAlreadyEnqueued rather than a raw
+// driver error, so a caller can treat "already submitted" as a normal outcome
+// without matching on driver-specific constraint-violation text.
 func Insert[A Args](ctx context.Context, c *Client, args A, opts InsertOpts) (string, error) {
 	namer, ok := any(args).(kindNamer)
 	if !ok {

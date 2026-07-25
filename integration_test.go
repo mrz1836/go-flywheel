@@ -267,9 +267,10 @@ func (w *pgChildWorker) Work(_ context.Context, job *flywheel.Job[pgChildArgs]) 
 }
 
 // TestRunnerPGFanOutAtomicityNoDoubleDispatch confirms a parent job's fan-out
-// follow-ups are enqueued atomically with parent finalization (FR-006) and
-// that 4 concurrent runners never dispatch the same child twice under SKIP
-// LOCKED contention.
+// follow-ups are enqueued atomically with parent finalization — a crash between
+// the two cannot leave the parent succeeded with its children missing — and that
+// 4 concurrent runners never dispatch the same child twice under SKIP LOCKED
+// contention.
 func TestRunnerPGFanOutAtomicityNoDoubleDispatch(t *testing.T) {
 	t.Parallel()
 	db := flywheel.NewPostgresIsolatedDB(t)
