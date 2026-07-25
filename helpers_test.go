@@ -17,10 +17,13 @@ import (
 //nolint:gochecknoglobals // sequence counter for per-test DSN uniqueness
 var dbSeq atomic.Uint64
 
-// jobsPartialIndexes is the minimum index set the jobs runtime depends on for
-// correctness: the unique_key partial index enforces idempotency (FR-005).
-// Other production partial indexes are performance-only and intentionally
-// omitted from the test schema.
+// jobsPartialIndexes is a subset of the indexes the runtime depends on for
+// correctness: the two unique_key partial indexes, which are what make a
+// duplicate enqueue a database rejection and therefore ErrAlreadyEnqueued.
+//
+// It is not the whole correctness set — job_runs_job_attempt and
+// idx_job_periodics_slug are missing — so a test that depends on either belongs
+// on a database topped up with InstallIndexes rather than on this fixture.
 //
 //nolint:gochecknoglobals // shared DDL fixtures applied across tests
 var jobsPartialIndexes = []string{

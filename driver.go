@@ -79,12 +79,13 @@ type finalizeOutcome struct {
 // planFinalize maps an attempt's result and error onto the job state machine.
 // Cancellation and snooze take precedence over an error.
 //
-// A snooze is free (research §6): it must never advance the job toward
-// discarded. It is made free by raising max_attempts by one rather than by
-// decrementing attempt — attempt is the dequeue counter and also the JobRun
-// audit key (the job_runs(job_id, attempt) unique index, FR-020), so it must
-// stay strictly monotonic. Raising max_attempts preserves the retry headroom
-// (max_attempts - attempt) exactly, which is the observable guarantee.
+// A snooze is free: it must never advance the job toward discarded, because a
+// worker that defers its own work has not failed. It is made free by raising
+// max_attempts by one rather than by decrementing attempt — attempt is the
+// dequeue counter and also the JobRun audit key (the job_runs(job_id, attempt)
+// unique index), so it must stay strictly monotonic. Raising max_attempts
+// preserves the retry headroom (max_attempts - attempt) exactly, which is the
+// observable guarantee.
 //
 //nolint:gocognit // one switch over the four mutually exclusive outcomes
 func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time) finalizeOutcome {
@@ -206,7 +207,10 @@ type baseDriver struct {
 }
 
 // InsertRunStub commits a job_runs row with outcome started before the worker
-// runs (research §8).
+// runs. Committing first is what makes job_runs.id a usable foreign-key target:
+// a side-effect row the worker writes during the attempt can reference it, and
+// the reference survives a crash — the sweep marks the stub crashed rather than
+// deleting it.
 func (d *baseDriver) InsertRunStub(
 	ctx context.Context, runID string, raw RawJob, startedAt time.Time, class ExecutorClass, execID string,
 ) error {
@@ -307,7 +311,9 @@ func marshalRunOutput(output any) (datatypes.JSON, error) {
 }
 
 // Finalize applies one attempt's outcome — the run-row update, the jobs.state
-// advance, and any follow-up inserts — in a single transaction (FR-015).
+// advance, and any follow-up inserts — in a single transaction, so a crash
+// between the three cannot leave a job succeeded with its children unenqueued or
+// its audit row still reading started.
 //
 //nolint:gocognit // one transaction closure with three cohesive steps
 func (d *baseDriver) Finalize(
@@ -447,8 +453,10 @@ func (d *baseDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
 	return reclaimed, nil
 }
 
-// insertFollowUps inserts a worker's follow-up jobs on tx, skipping unique_key
-// collisions (FR-016), and reports how many were enqueued.
+// insertFollowUps inserts a worker's follow-up jobs on tx and reports how many
+// were enqueued. A unique_key collision is skipped rather than fatal: the child
+// is already enqueued, so the parent's finalization has nothing to correct and
+// must not be rolled back over it.
 func (d *baseDriver) insertFollowUps(
 	ctx context.Context, tx *gorm.DB, followUps []FollowUp, parentID string,
 ) (int, error) {

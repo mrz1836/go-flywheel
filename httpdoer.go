@@ -78,7 +78,10 @@ func (f *FakeHTTPDoer) StubError(url string, err error) *FakeHTTPDoer {
 }
 
 // StubBodyReadError programs requests to url to return a response whose Body
-// fails every Read with readErr — modeling a truncated stream (FR-017).
+// fails every Read with readErr — modeling a truncated stream, where the
+// response headers arrive and the connection dies mid-body. It is the case a
+// status-code-only stub cannot reach: the request looks successful right up to
+// the point the worker tries to consume it.
 func (f *FakeHTTPDoer) StubBodyReadError(url string, status int, readErr error) *FakeHTTPDoer {
 	f.mu.Lock()
 	defer f.mu.Unlock()

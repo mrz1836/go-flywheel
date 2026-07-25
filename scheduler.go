@@ -109,7 +109,9 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) *Scheduler {
 }
 
 // Run ticks periodic definitions and runs the stuck-lease sweep until ctx is
-// cancelled. The sweep runs on a 30-second cadence (FR-030). When retention is
+// cancelled. The sweep runs on a 30-second cadence — frequent enough that a
+// crashed executor's jobs come back promptly, cheap enough to be a single
+// indexed scan. When retention is
 // enabled (RetentionMaxAge > 0) it also runs a retention sweep on its own
 // cadence; otherwise no retention ticker is armed.
 func (s *Scheduler) Run(ctx context.Context) error {
@@ -214,7 +216,10 @@ func (s *Scheduler) Tick(ctx context.Context) (int, error) {
 	return enqueued, errors.Join(errs...)
 }
 
-// Sweep reclaims jobs whose lease has expired (FR-030, FR-031).
+// Sweep reclaims jobs whose lease has expired — state running with leased_until
+// in the past, which is what a job looks like when its executor died mid-attempt
+// — returning them to available and marking each stale run stub crashed. It is
+// the runtime's only recovery path for work lost to a crashed process.
 func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
 	now := models.ClockFrom(ctx).Now(ctx)
 	sweeper := baseDriver{db: s.db}
@@ -278,8 +283,10 @@ func (s *Scheduler) fire(ctx context.Context, def jobPeriodicRow, now time.Time)
 }
 
 // enqueueBucket enqueues one job for a single time bucket through the Client.
-// The bucketed unique_key makes a redundant tick idempotent (FR-028): a
-// collision is a successful no-op.
+// The bucketed unique_key makes a redundant tick idempotent: a tick that fires
+// twice — a restart, a clock adjustment, a backfill overlapping the live
+// schedule — computes the same key for the same bucket, so the second insert
+// collides and is a successful no-op rather than a duplicate run.
 func (s *Scheduler) enqueueBucket(ctx context.Context, def jobPeriodicRow, bucket time.Time) (bool, error) {
 	payload := []byte(def.ArgsTemplate)
 	if len(payload) == 0 {

@@ -10,15 +10,18 @@ import (
 )
 
 // sqliteDriver is the SQLite Driver implementation. It claims jobs with a
-// serialized SELECT-then-UPDATE inside a BEGIN IMMEDIATE transaction; it is
-// correct only at Concurrency 1, which NewRunner enforces (FR-039).
+// serialized SELECT-then-UPDATE inside a BEGIN IMMEDIATE transaction. SQLite has
+// no SKIP LOCKED, so nothing stops a second claimant from selecting the same
+// row: it is correct only at Concurrency 1, which NewRunner enforces with
+// ErrSQLiteConcurrency.
 type sqliteDriver struct {
 	baseDriver
 }
 
 // NewSQLiteDriver returns a Driver backed by a SQLite connection. The
 // connection should be opened with the _txlock=immediate DSN parameter so the
-// write lock is taken up front (research §3).
+// write lock is taken up front: a transaction that starts deferred and upgrades
+// to a write mid-claim can fail with SQLITE_BUSY even against a single writer.
 func NewSQLiteDriver(db *gorm.DB) Driver {
 	return &sqliteDriver{baseDriver{db: db}}
 }

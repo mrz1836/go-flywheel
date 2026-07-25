@@ -76,7 +76,9 @@ type Runner struct {
 }
 
 // NewRunner validates cfg and returns a Runner. It returns ErrSQLiteConcurrency
-// when a SQLite driver is wired with Concurrency greater than 1 (FR-039).
+// when a SQLite driver is wired with Concurrency greater than 1: the SQLite
+// claim is a serialized SELECT-then-UPDATE with no SKIP LOCKED, so it is only
+// correct with a single claimant.
 //
 //nolint:gocognit,gocyclo // straight-line config validation and zero-value defaulting
 func NewRunner(cfg RunnerConfig) (*Runner, error) {
@@ -329,7 +331,9 @@ func (r *Runner) resolveTimeout(entry registryEntry, raw RawJob) time.Duration {
 }
 
 // runWork invokes the worker, recovering a panic into an error so the executor
-// survives it (FR-011, SC-008).
+// survives it. A panicking worker must cost one attempt, not the whole process:
+// the recovered value becomes an ordinary job error that retries under the
+// normal backoff, and the other in-flight jobs on this runner are unaffected.
 func (r *Runner) runWork(
 	ctx context.Context, entry registryEntry, in dispatchInput,
 ) (result Result, err error) {
