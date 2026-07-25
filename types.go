@@ -201,8 +201,6 @@ type Result struct {
 	FollowUps []FollowUp
 	// CostMicros is the accumulated external-call cost for this attempt.
 	CostMicros int64
-	// SourceFetchIDs records side-effect source fetches this attempt produced.
-	SourceFetchIDs []string
 }
 
 // FollowUp describes a child job a worker requests be enqueued.
