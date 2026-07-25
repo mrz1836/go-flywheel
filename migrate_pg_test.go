@@ -5,7 +5,6 @@ package flywheel
 import (
 	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -17,15 +16,13 @@ import (
 
 // newBarePostgres mints a fresh, empty PostgreSQL schema with NO tables, so the
 // test exercises Migrate from scratch (unlike NewPostgresIsolatedDB, which
-// pre-migrates). The schema is dropped on cleanup. The suite is skipped when
-// FLYWHEEL_TEST_DATABASE_URL is unset so the matrix degrades gracefully.
+// pre-migrates). The schema is dropped on cleanup. Target resolution — including
+// whether a missing database is a skip or a failure — is shared with the rest of
+// the Postgres suite via requirePostgresDSN.
 func newBarePostgres(t *testing.T) *gorm.DB {
 	t.Helper()
 
-	dsn := os.Getenv(testDatabaseURLEnv)
-	if dsn == "" {
-		t.Skipf("%s is not set; skipping the Postgres migrate suite", testDatabaseURLEnv)
-	}
+	dsn := requirePostgresDSN(t)
 
 	base, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	if err != nil {
