@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	flywheel "github.com/mrz1836/go-flywheel"
@@ -45,8 +47,53 @@ type loadArgs struct {
 // Kind names the job kind.
 func (loadArgs) Kind() string { return loadKind }
 
+// execTracker records which jobs are executing right now, so a job observed in
+// two workers at once is counted rather than inferred.
+//
+// It is the in-process half of the exactly-once check. The other two halves read
+// the audit table after the fact — one success row per job, and no two attempts
+// on a job overlapping in time — and this one watches it happen. Three
+// independent checks because a single one that happened to be wrong would be
+// indistinguishable from a guarantee that held.
+//
+// The map is held only for the duration of an entry or an exit, which is
+// microseconds against millisecond-scale database work, so it does not become
+// the thing being measured.
+type execTracker struct {
+	mu      sync.Mutex
+	running map[string]bool
+	// violations counts entries that found the job already running.
+	violations atomic.Int64
+}
+
+// enter records a job starting.
+func (e *execTracker) enter(jobID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.running == nil {
+		e.running = make(map[string]bool)
+	}
+	if e.running[jobID] {
+		e.violations.Add(1)
+		return
+	}
+	e.running[jobID] = true
+}
+
+// exit records a job finishing.
+func (e *execTracker) exit(jobID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.running, jobID)
+}
+
+// count reports how many concurrent executions were observed.
+func (e *execTracker) count() int64 { return e.violations.Load() }
+
 // loadWorker is the harness's only worker.
-type loadWorker struct{}
+type loadWorker struct {
+	track *execTracker
+}
 
 // Kind names the job kind this worker serves.
 func (loadWorker) Kind() string { return loadKind }
@@ -60,7 +107,12 @@ func (loadWorker) Kind() string { return loadKind }
 //
 // The sleep honors ctx so an execution timeout or a shutdown is observed
 // promptly rather than after the full duration.
-func (loadWorker) Work(ctx context.Context, job *flywheel.Job[loadArgs]) (flywheel.Result, error) {
+func (w loadWorker) Work(ctx context.Context, job *flywheel.Job[loadArgs]) (flywheel.Result, error) {
+	if w.track != nil {
+		w.track.enter(job.ID)
+		defer w.track.exit(job.ID)
+	}
+
 	if d := time.Duration(job.Args.WorkNanos); d > 0 {
 		timer := time.NewTimer(d)
 		defer timer.Stop()

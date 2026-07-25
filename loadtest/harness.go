@@ -62,9 +62,18 @@ type Harness struct {
 	errs    *errset
 	notes   *noteset
 	samples *sampleset
+	exec    *execTracker
+
+	// gates are the per-runner fault gates, indexed by runner ordinal. A fault
+	// reaches a runner's driver through its gate and through nothing else.
+	gates []*gate
+	// killed counts runners a fault has stopped, so a scenario can assert the
+	// fault actually fired rather than assuming it did.
+	killed atomic.Int64
 
 	runners       []*runnerHandle
 	cancelSweeper context.CancelFunc
+	cancelFaults  context.CancelFunc
 	wg            sync.WaitGroup
 }
 
@@ -216,6 +225,7 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 		errs:    &errset{},
 		notes:   &noteset{},
 		samples: &sampleset{},
+		exec:    &execTracker{},
 		prog:    &progress{target: int64(cfg.Jobs)},
 	}
 
@@ -253,7 +263,7 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 	h.inner = flywheel.NewPostgresDriver(h.work)
 	h.timings = newTimings(cfg.Runners)
 	h.registry = flywheel.NewRegistry()
-	flywheel.Register(h.registry, loadWorker{})
+	flywheel.Register(h.registry, loadWorker{track: h.exec})
 
 	return h, nil
 }
@@ -342,21 +352,33 @@ func (h *Harness) stopRunners() {
 	if h.cancelSweeper != nil {
 		h.cancelSweeper()
 	}
+	if h.cancelFaults != nil {
+		h.cancelFaults()
+	}
 	h.wg.Wait()
 	h.runners = nil
 	h.cancelSweeper = nil
+	h.cancelFaults = nil
 }
 
 // startRunners launches cfg.Runners loops against the harness's driver. Each one
 // gets its own cancellable context and its own ordinal, so a fault can stop one
 // without touching the others.
 func (h *Harness) startRunners(ctx context.Context) error {
+	h.gates = make([]*gate, h.cfg.Runners)
+	for i := range h.gates {
+		h.gates[i] = &gate{}
+	}
+
 	for i := range h.cfg.Runners {
 		runner, err := flywheel.NewRunner(flywheel.RunnerConfig{
 			DB: h.work,
-			// Runner i writes histogram shard i. The binding happens here, once,
-			// so the hot path never selects a shard.
-			Driver:        newTimingDriver(h.inner, h.timings, i),
+			// Runner i writes histogram shard i and sits behind gate i. Both
+			// bindings happen here, once, so the hot path never selects either.
+			// The chain is gateDriver -> timingDriver -> the real driver: gating
+			// outside the timing means a gated call records no observation, rather
+			// than a near-zero one that would pull every percentile down.
+			Driver:        &gateDriver{inner: newTimingDriver(h.inner, h.timings, i), gate: h.gates[i]},
 			Registry:      h.registry,
 			Queues:        []string{h.cfg.Queue},
 			ExecutorClass: flywheel.ExecutorClass(h.cfg.ExecutorClass),
@@ -415,4 +437,18 @@ func leaseFor(cfg Config) time.Duration {
 		return minLease
 	}
 	return lease
+}
+
+// orphanedByFaults reports how many finalizes a kill fault blocked — how many
+// jobs were left claimed, started, and never finished.
+//
+// It is the difference between "the fault fired" and "the fault did what it was
+// injected to do". A scenario that asserts recovery has to check the second one,
+// or it is asserting that a healthy run is healthy.
+func (h *Harness) orphanedByFaults() int64 {
+	var n int64
+	for _, g := range h.gates {
+		n += g.orphaned.Load()
+	}
+	return n
 }

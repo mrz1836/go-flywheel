@@ -154,6 +154,7 @@ func (h *Harness) driveSteady(ctx context.Context, p mixPlan, specs []jobSpec) e
 		return err
 	}
 	defer h.stopRunners()
+	h.startFaults(ctx)
 
 	seedDone := make(chan error, 1)
 	go func() {
@@ -185,8 +186,23 @@ func (h *Harness) drive(ctx context.Context) error {
 		return err
 	}
 	defer h.stopRunners()
+	h.startFaults(ctx)
 
 	return h.awaitDrain(ctx)
+}
+
+// startFaults launches the fault scheduler, if this run has one.
+//
+// It shares the runners' cancellation, so a reversible fault is always reverted
+// before collect reads the result: a run that ended mid-fault would leave the
+// harness gated and every subsequent assertion looking at a paused system.
+func (h *Harness) startFaults(ctx context.Context) {
+	if h.cfg.Faults == nil {
+		return
+	}
+	faultCtx, cancel := context.WithCancel(ctx)
+	h.cancelFaults = cancel
+	h.wg.Go(func() { h.runFaultScheduler(faultCtx, h.cfg.Faults) })
 }
 
 // awaitDrain blocks until no job is in a non-terminal state, the run's context
@@ -261,6 +277,23 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 	}
 	report.Enqueued = h.prog.enqueued.Load()
 	report.Retried = h.prog.retried.Load()
+	report.Reclaimed = h.prog.reclaimed.Load()
+	report.ConcurrentExecutions = h.exec.count()
+
+	if report.ConcurrentExecutions > 0 {
+		// This is the exactly-once guarantee failing, observed in process. It is a
+		// finding, not a statistic, so it is an error as well as a number.
+		h.errs.add(fmt.Errorf(
+			"loadtest: %d concurrent executions of the same job were observed: %w",
+			report.ConcurrentExecutions, ErrExactlyOnceViolated,
+		))
+	}
+	if report.Reclaimed > 0 {
+		h.notes.add(
+			"The sweeper reclaimed %d expired leases. With no injected fault that is a finding: "+
+				"it means an attempt outlived its lease.", report.Reclaimed,
+		)
+	}
 
 	counts, err := h.stateCounts(ctx)
 	if err != nil {
