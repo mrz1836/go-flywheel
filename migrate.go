@@ -1,6 +1,7 @@
 package flywheel
 
 import (
+	"context"
 	"fmt"
 
 	"gorm.io/gorm"
@@ -31,8 +32,11 @@ func Models() []any {
 //     process. The module takes no hard Atlas dependency; a host that wants
 //     versioned SQL can generate it from Models instead.
 //
+// The indexes it applies are IndexSet(db.Name()), in that order — a host in the
+// embedded mode reaches the same set through InstallIndexes.
+//
 // Migrate is idempotent: AutoMigrate is a no-op against an up-to-date schema and
-// every reconciled index uses IF NOT EXISTS, so repeated calls are safe.
+// every index uses IF NOT EXISTS, so repeated calls are safe.
 func Migrate(db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("flywheel: Migrate: db is nil")
@@ -46,67 +50,10 @@ func Migrate(db *gorm.DB) error {
 		return fmt.Errorf("flywheel: Migrate: automigrate: %w", err)
 	}
 
-	stmts, err := reconcileIndexDDL(db.Name())
-	if err != nil {
-		return fmt.Errorf("flywheel: Migrate: reconcile index ddl: %w", err)
-	}
-	for _, ddl := range stmts {
-		if err := db.Exec(ddl).Error; err != nil {
-			return fmt.Errorf("flywheel: Migrate: reconcile index: %w", err)
-		}
+	if err := applyIndexes(context.Background(), db); err != nil {
+		return fmt.Errorf("flywheel: Migrate: %w", err)
 	}
 	return nil
-}
-
-// reconcileIndexDDL returns the dialect-appropriate DDL for the indexes
-// AutoMigrate cannot express from the row structs. The set is correctness- and
-// hot-path-bearing:
-//
-//   - jobs_unique_key      UNIQUE (unique_key) WHERE unique_key IS NOT NULL
-//     — correctness: enforces enqueue idempotency (a duplicate unique_key insert
-//     is rejected by the database, surfacing as models.ErrDuplicateKey).
-//   - jobs_unique_active_key UNIQUE (unique_active_key) WHERE unique_active_key IS
-//     NOT NULL AND state IN ('available','running','retryable','scheduled')
-//     — correctness: enforces "at most one active job per key". Unlike
-//     jobs_unique_key the constraint is scoped to live states, so the key frees
-//     up once the job reaches a terminal state and the same key can enqueue again.
-//   - jobs_ready           (queue, executor_class, priority, scheduled_at) WHERE
-//     state IN ('available','retryable','scheduled') — the claim hot path.
-//   - jobs_parent          (parent_job_id) WHERE parent_job_id IS NOT NULL
-//     — follow-up/DAG lookup.
-//   - jobs_running_leased  (leased_until) WHERE state = 'running'
-//     — stuck-lease / orphan-recovery sweep.
-//   - idx_jobs_deleted_at   (deleted_at) WHERE deleted_at IS NOT NULL
-//     — soft-delete restore/audit lookups; a partial index a struct tag cannot
-//     express, so it lives here rather than on jobRow.DeletedAt.
-//   - job_runs_job_attempt UNIQUE (job_id, attempt) — one audit row per attempt.
-//   - idx_job_periodics_slug UNIQUE (slug) — one schedule per slug.
-//
-// PostgreSQL and SQLite both support partial indexes (CREATE INDEX ... WHERE)
-// and IF NOT EXISTS, so the DDL is portable between them. The switch keeps the
-// dialect seam explicit and rejects dialects that cannot express partial
-// indexes (e.g. MySQL) rather than silently dropping idempotency.
-func reconcileIndexDDL(dialect string) ([]string, error) {
-	ddl := []string{
-		`CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_key ON jobs (unique_key) WHERE unique_key IS NOT NULL`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_active_key ON jobs (unique_active_key) WHERE unique_active_key IS NOT NULL AND state IN ('available', 'running', 'retryable', 'scheduled')`,
-		`CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (queue, executor_class, priority, scheduled_at) WHERE state IN ('available', 'retryable', 'scheduled')`,
-		`CREATE INDEX IF NOT EXISTS jobs_parent ON jobs (parent_job_id) WHERE parent_job_id IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS jobs_running_leased ON jobs (leased_until) WHERE state = 'running'`,
-		`CREATE INDEX IF NOT EXISTS idx_jobs_deleted_at ON jobs (deleted_at) WHERE deleted_at IS NOT NULL`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS job_runs_job_attempt ON job_runs (job_id, attempt)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_job_periodics_slug ON job_periodics (slug)`,
-	}
-
-	switch dialect {
-	case "postgres", "sqlite":
-		return ddl, nil
-	default:
-		return nil, fmt.Errorf(
-			"flywheel: Migrate: unsupported dialect %q: partial indexes require postgres or sqlite",
-			dialect,
-		)
-	}
 }
 
 // reconcileColumnRenames renames the pre-1.0 routing columns to their

@@ -64,16 +64,6 @@ func TestValidationErrorErrorAndUnwrap(t *testing.T) {
 	assert.ErrorIs(t, err, ErrValidation)
 }
 
-func TestReconcileIndexDDLSupportedDialects(t *testing.T) {
-	t.Parallel()
-	pg, err := reconcileIndexDDL("postgres")
-	require.NoError(t, err)
-	assert.NotEmpty(t, pg)
-	lite, err := reconcileIndexDDL("sqlite")
-	require.NoError(t, err)
-	assert.NotEmpty(t, lite)
-}
-
 func TestRunnerBackoffWithinJitterBounds(t *testing.T) {
 	t.Parallel()
 	r := &Runner{cfg: RunnerConfig{RetryBackoffBase: time.Second}}

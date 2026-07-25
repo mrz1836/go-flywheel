@@ -137,20 +137,31 @@ func TestMigrateNilDB(t *testing.T) {
 	}
 }
 
-// TestReconcileIndexDDLUnsupportedDialect proves a dialect that cannot express
-// partial indexes is rejected rather than silently dropping idempotency.
-func TestReconcileIndexDDLUnsupportedDialect(t *testing.T) {
+// TestIndexSetMatchesTheMigrateOracle ties the exported IndexSet back to
+// migrateIndexes, the hand-written list this file asserts Migrate creates on a
+// real database. migrateIndexes is deliberately an *independent* oracle — it is
+// literal names, not derived from the package under test — so this assertion is
+// what proves IndexSet describes the same schema Migrate installs. Deriving the
+// oracle from IndexSet instead would make both halves agree by construction and
+// prove nothing.
+func TestIndexSetMatchesTheMigrateOracle(t *testing.T) {
 	t.Parallel()
-	if _, err := reconcileIndexDDL("mysql"); err == nil {
-		t.Fatal("expected mysql to be rejected as an unsupported dialect")
-	}
-	for _, d := range []string{"postgres", "sqlite"} {
-		stmts, err := reconcileIndexDDL(d)
+	for _, dialect := range []string{"postgres", "sqlite"} {
+		set, err := IndexSet(dialect)
 		if err != nil {
-			t.Fatalf("reconcileIndexDDL(%q): %v", d, err)
+			t.Fatalf("IndexSet(%q): %v", dialect, err)
 		}
-		if len(stmts) != len(migrateIndexes) {
-			t.Errorf("reconcileIndexDDL(%q): got %d statements, want %d", d, len(stmts), len(migrateIndexes))
+		names := make([]string, len(set))
+		for i, idx := range set {
+			names[i] = idx.Name
+		}
+		if len(names) != len(migrateIndexes) {
+			t.Fatalf("IndexSet(%q): got %d indexes, want %d", dialect, len(names), len(migrateIndexes))
+		}
+		for i := range names {
+			if names[i] != migrateIndexes[i] {
+				t.Errorf("IndexSet(%q)[%d] = %q, want %q", dialect, i, names[i], migrateIndexes[i])
+			}
 		}
 	}
 }
