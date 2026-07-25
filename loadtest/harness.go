@@ -46,7 +46,12 @@ type Harness struct {
 	// gates the work pool leaves the harness able to see through it.
 	probe *gorm.DB
 
-	driver   flywheel.Driver
+	// inner is the undecorated driver. Each runner wraps it in its own
+	// timingDriver bound to its own histogram shard, so shard selection costs
+	// nothing on the hot path.
+	inner   flywheel.Driver
+	timings *timings
+
 	registry *flywheel.Registry
 
 	// digest identifies the generated workload. It is set once, by
@@ -57,8 +62,9 @@ type Harness struct {
 	errs  *errset
 	notes *noteset
 
-	runners []*runnerHandle
-	wg      sync.WaitGroup
+	runners       []*runnerHandle
+	cancelSweeper context.CancelFunc
+	wg            sync.WaitGroup
 }
 
 // progress is the run's live completion state, fed by the harness's own
@@ -76,6 +82,9 @@ type progress struct {
 	finished  atomic.Int64
 	retried   atomic.Int64
 	discarded atomic.Int64
+	// reclaimed counts jobs the harness's sweeper returned to available. A
+	// reclaimed job runs again, so it is progress undone.
+	reclaimed atomic.Int64
 }
 
 // terminal estimates how many jobs have reached a terminal state.
@@ -239,7 +248,8 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 		return h, err
 	}
 
-	h.driver = flywheel.NewPostgresDriver(h.work)
+	h.inner = flywheel.NewPostgresDriver(h.work)
+	h.timings = newTimings(cfg.Runners)
 	h.registry = flywheel.NewRegistry()
 	flywheel.Register(h.registry, loadWorker{})
 
@@ -318,13 +328,21 @@ func (h *Harness) Close(ctx context.Context) error {
 	return firstErr
 }
 
-// stopRunners cancels every runner and waits for all of them to return.
+// stopRunners cancels every runner and the sweeper, then waits for all of them.
+//
+// Waiting matters beyond tidiness: the histograms are merged after this returns,
+// and the wait is what gives that merge a happens-before edge on every recorded
+// observation.
 func (h *Harness) stopRunners() {
 	for _, r := range h.runners {
 		r.cancel()
 	}
+	if h.cancelSweeper != nil {
+		h.cancelSweeper()
+	}
 	h.wg.Wait()
 	h.runners = nil
+	h.cancelSweeper = nil
 }
 
 // startRunners launches cfg.Runners loops against the harness's driver. Each one
@@ -333,8 +351,10 @@ func (h *Harness) stopRunners() {
 func (h *Harness) startRunners(ctx context.Context) error {
 	for i := range h.cfg.Runners {
 		runner, err := flywheel.NewRunner(flywheel.RunnerConfig{
-			DB:            h.work,
-			Driver:        h.driver,
+			DB: h.work,
+			// Runner i writes histogram shard i. The binding happens here, once,
+			// so the hot path never selects a shard.
+			Driver:        newTimingDriver(h.inner, h.timings, i),
 			Registry:      h.registry,
 			Queues:        []string{h.cfg.Queue},
 			ExecutorClass: flywheel.ExecutorClass(h.cfg.ExecutorClass),
@@ -365,6 +385,15 @@ func (h *Harness) startRunners(ctx context.Context) error {
 			}
 		})
 	}
+
+	// The sweeper is the harness's, not the runtime's: nothing in the dispatch
+	// loop calls Sweep, so this goroutine is the only reason Report.Sweep has
+	// observations. It gets the last shard, past the runners'.
+	sweepCtx, cancelSweep := context.WithCancel(ctx)
+	h.cancelSweeper = cancelSweep
+	sweeper := newTimingDriver(h.inner, h.timings, h.cfg.Runners)
+	h.wg.Go(func() { h.runSweeper(sweepCtx, sweeper) })
+
 	return nil
 }
 

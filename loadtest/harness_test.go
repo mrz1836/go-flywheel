@@ -80,6 +80,55 @@ func TestRunDrainsEverySeededJob(t *testing.T) {
 	}
 }
 
+// TestRunTimesClaimFinalizeAndSweep is the acceptance criterion for the
+// harness's own instrumentation: a drain run must report non-zero percentiles
+// for all three operations, produced without importing the observer or metrics
+// packages.
+//
+// Sweep is the one that could silently report nothing. The Runner does not
+// sweep — nothing in its dispatch loop calls Sweep — so those observations exist
+// only because the harness runs its own sweeper goroutine. If that goroutine
+// ever stops being wired up, this is what catches it.
+func TestRunTimesClaimFinalizeAndSweep(t *testing.T) {
+	dsn := requireDSN(t)
+
+	report, err := Run(context.Background(), Config{
+		DSN: dsn, Jobs: 400, Seed: 5, Runners: 2, Workers: 4,
+		Mix: WorkloadDrainOnly, Indexes: IndexesFull,
+		// Long enough for the one-second sweeper to tick at least twice.
+		WorkDuration: 5 * time.Millisecond,
+		Timeout:      2 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	for name, l := range map[string]Latency{
+		"claim": report.Claim, "finalize": report.Finalize, "sweep": report.Sweep,
+	} {
+		if l.Count == 0 {
+			t.Errorf("%s recorded no observations", name)
+			continue
+		}
+		if l.P50 <= 0 || l.P99 <= 0 {
+			t.Errorf("%s reported non-positive percentiles: %+v", name, l)
+		}
+		if l.Min > l.P50 || l.P50 > l.P99 || l.P99 > l.Max {
+			t.Errorf("%s percentiles are not ordered: %+v", name, l)
+		}
+	}
+
+	// Every finalize is one attempt, so the count is a lower bound on the jobs
+	// that ran — a sharded histogram that lost updates would show up here.
+	if report.Finalize.Count < report.Drained {
+		t.Errorf("finalize recorded %d observations for %d drained jobs",
+			report.Finalize.Count, report.Drained)
+	}
+	if report.Histogram.Buckets == 0 || report.Histogram.MaxRelativeError <= 0 {
+		t.Errorf("the report must publish the bucketing behind its percentiles, got %+v", report.Histogram)
+	}
+}
+
 // TestRunEveryMixCompletes drives each declared shape against a real server.
 //
 // Every mix is a string in a committed report, so a shape that does not actually

@@ -240,6 +240,14 @@ func (h *Harness) drainTimeout(ctx context.Context) error {
 // authoritative account — the observer counters are a live estimate for
 // scheduling, and a job the sweep reclaimed fires no event at all.
 func (h *Harness) collect(ctx context.Context, report *Report) error {
+	// The runners and the sweeper have stopped by now, so the merge sees a
+	// settled distribution and has a happens-before edge on every observation.
+	report.Claim = h.timings.claim.latency()
+	report.Finalize = h.timings.finalize.latency()
+	report.Sweep = h.timings.sweep.latency()
+	report.Histogram = histogramSpec()
+	h.noteHistogramRange()
+
 	if report.Duration > 0 {
 		report.DrainThroughput = float64(h.prog.terminal()) / report.Duration.Seconds()
 	}
@@ -315,4 +323,31 @@ func (h *Harness) supersededCount(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("loadtest: count superseded finalizations: %w", err)
 	}
 	return n, nil
+}
+
+// noteHistogramRange discloses when observations fell outside the histogram's
+// covered range.
+//
+// The published relative error applies to quantiles drawn from the in-range
+// buckets. A value below 1 µs or above 137 s lands in an unbounded bucket that
+// can only report its finite edge, so a report whose quantiles came from one is
+// making a weaker claim than its error bar suggests — and has to say so.
+func (h *Harness) noteHistogramRange() {
+	for name, rec := range map[string]*recorder{
+		"claim": h.timings.claim, "finalize": h.timings.finalize, "sweep": h.timings.sweep,
+	} {
+		m := rec.merge()
+		if m.under > 0 {
+			h.notes.add(
+				"%d %s observations fell below the histogram's 1 µs floor; quantiles drawn from that "+
+					"bucket are not covered by the published relative error.", m.under, name,
+			)
+		}
+		if m.over > 0 {
+			h.notes.add(
+				"%d %s observations exceeded the histogram's 137 s ceiling; quantiles drawn from that "+
+					"bucket are not covered by the published relative error.", m.over, name,
+			)
+		}
+	}
 }
