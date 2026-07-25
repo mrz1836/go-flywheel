@@ -17,45 +17,113 @@ import (
 //nolint:gochecknoglobals // sequence counter for per-test DSN uniqueness
 var dbSeq atomic.Uint64
 
-// jobsPartialIndexes is a subset of the indexes the runtime depends on for
-// correctness: the two unique_key partial indexes, which are what make a
-// duplicate enqueue a database rejection and therefore ErrAlreadyEnqueued.
-//
-// It is not the whole correctness set — job_runs_job_attempt and
-// idx_job_periodics_slug are missing — so a test that depends on either belongs
-// on a database topped up with InstallIndexes rather than on this fixture.
-//
-//nolint:gochecknoglobals // shared DDL fixtures applied across tests
-var jobsPartialIndexes = []string{
-	`CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_key ON jobs (unique_key) WHERE unique_key IS NOT NULL`,
-	`CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_active_key ON jobs (unique_active_key) WHERE unique_active_key IS NOT NULL AND state IN ('available', 'running', 'retryable', 'scheduled')`,
-}
-
-// newDB builds a fresh in-memory SQLite DB and migrates the jobs-runtime row
-// types (jobRow/jobRunRow/jobPeriodicRow from rows.go). The DSN uses
-// shared-cache so the runner's claim transaction and a concurrent writer
-// reach the same in-memory database.
-func newDB(t testing.TB) *gorm.DB {
+// newBareSQLite opens a fresh in-memory SQLite database with NO schema applied.
+// It is the open half every SQLite fixture in the package shares, so the DSN and
+// the cleanup are written once: newDB migrates on top of it, newDBWithIndexKinds
+// installs a reduced schema on top of it, and the migrate tests use it directly
+// to exercise Migrate from scratch.
+func newBareSQLite(t testing.TB) *gorm.DB {
 	t.Helper()
-	dsn := fmt.Sprintf("file:jobs-test-%d?mode=memory&cache=shared", dbSeq.Add(1))
+	dsn := fmt.Sprintf("file:flywheel-test-%d?mode=memory&cache=shared", dbSeq.Add(1))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	if err != nil {
-		t.Fatalf("newDB: open: %v", err)
+		t.Fatalf("newBareSQLite: open: %v", err)
 	}
 	t.Cleanup(func() {
 		if sqlDB, derr := db.DB(); derr == nil {
 			_ = sqlDB.Close()
 		}
 	})
-	if err := db.AutoMigrate(&jobRow{}, &jobRunRow{}, &jobPeriodicRow{}); err != nil {
+	return db
+}
+
+// newDB builds a fresh in-memory SQLite database carrying the runtime's full
+// production schema — every table and every index, exactly what a host gets from
+// Migrate. It is the default fixture for the package's functional tests.
+//
+// # Why the whole schema, not a reduced one
+//
+// The schema comes from Migrate rather than from a local DDL list so it cannot
+// drift: there is one installer, every real caller uses it (cmd/flywheel/serve.go,
+// all four examples/, and every downstream host), and a test fixture that
+// installs something else is testing a database that does not exist anywhere.
+//
+// Concretely, an index-reduced fixture makes a passing test prove something
+// other than what it says. Without jobs_ready the claim runs as a sequential
+// scan, so "the claim returns the highest-priority job" proves the ORDER BY
+// works, not that the index serves it. Without job_runs_job_attempt — which is
+// correctness-bearing, see IndexSet — nothing enforces one audit row per attempt,
+// which is the invariant planFinalize's free-snooze reasoning rests on.
+//
+// The standing rule that follows: no test file in this package carries local
+// index DDL. A test that wants a deliberately reduced schema calls
+// newDBWithIndexKinds and says at the call site why.
+//
+// # Two deliberate divergences from a production pool
+//
+// The DSN uses shared-cache so the runner's claim transaction and a concurrent
+// writer reach the same in-memory database, and the pool is left uncapped.
+// A downstream host that opens a bare `:memory:` database must set
+// SetMaxOpenConns(1), because each pooled connection would otherwise get its own
+// private empty database. That is a workaround for a DSN this fixture does not
+// use, not a stricter setting: capping the pool at one here would turn any test
+// that holds a transaction open while issuing a second query into a deadlock
+// instead of a red assertion.
+func newDB(t testing.TB) *gorm.DB {
+	t.Helper()
+	db := newBareSQLite(t)
+	if err := Migrate(db); err != nil {
 		t.Fatalf("newDB: migrate: %v", err)
 	}
-	for _, ddl := range jobsPartialIndexes {
-		if err := db.Exec(ddl).Error; err != nil {
-			t.Fatalf("newDB: partial index: %v", err)
-		}
-	}
 	return db
+}
+
+// newDBWithIndexKinds builds an in-memory SQLite database whose schema carries
+// only the named index kinds — the tables from Models, then the IndexSet entries
+// matching kinds and nothing else. Passing no kinds yields a schema with no
+// indexes at all.
+//
+// It exists to quantify what a kind is worth, and it is derived from IndexSet so
+// it cannot drift from the real set. No functional test may use it: a test that
+// asserts behavior on a reduced schema asserts it about a database no host runs.
+func newDBWithIndexKinds(t testing.TB, kinds ...IndexKind) *gorm.DB {
+	t.Helper()
+	db := newBareSQLite(t)
+	if err := db.AutoMigrate(Models()...); err != nil {
+		t.Fatalf("newDBWithIndexKinds: automigrate: %v", err)
+	}
+	applyIndexKinds(t, db, kinds...)
+	return db
+}
+
+// applyIndexKinds applies exactly the IndexSet entries for db's dialect whose
+// Kind appears in kinds, and reports how many it applied. It fails the test when
+// the selection is empty, because a comparison against an empty subset proves
+// nothing about the subset.
+func applyIndexKinds(t testing.TB, db *gorm.DB, kinds ...IndexKind) int {
+	t.Helper()
+	set, err := IndexSet(db.Name())
+	if err != nil {
+		t.Fatalf("applyIndexKinds: IndexSet(%q): %v", db.Name(), err)
+	}
+	want := make(map[IndexKind]bool, len(kinds))
+	for _, k := range kinds {
+		want[k] = true
+	}
+	applied := 0
+	for _, idx := range set {
+		if !want[idx.Kind] {
+			continue
+		}
+		if err := db.Exec(idx.DDL).Error; err != nil {
+			t.Fatalf("applyIndexKinds: create index %s: %v", idx.Name, err)
+		}
+		applied++
+	}
+	if len(kinds) > 0 && applied == 0 {
+		t.Fatalf("applyIndexKinds: %v matched no index; the comparison would be vacuous", kinds)
+	}
+	return applied
 }
 
 // newRunner builds a SQLite-backed Runner. Tests that need a custom registry

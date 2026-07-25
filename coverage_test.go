@@ -406,17 +406,42 @@ func TestSQLiteDequeueExecutorClassFilterAndEarlyReturns(t *testing.T) {
 
 // --- baseDriver direct paths ------------------------------------------------
 
+// TestInsertRunStubDuplicateIDErrors and its sibling below were one test until
+// the fixture gained the full production schema. Written as a single case —
+// same run id and the same (job-1, 1) — either the primary key or
+// job_runs_job_attempt could produce the error, so a pass no longer identified
+// which constraint fired. Each half now varies exactly one of the two.
 func TestInsertRunStubDuplicateIDErrors(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	d := baseDriver{db: db}
 	ctx := context.Background()
-	raw := RawJob{ID: "job-1", Attempt: 1}
 	runID := models.NewID()
 
-	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
-	err := d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1")
+	require.NoError(t, d.InsertRunStub(ctx, runID, RawJob{ID: "job-1", Attempt: 1},
+		time.Now(), ExecutorClass("local"), "h1"))
+
+	// Same run id, different attempt: only the primary key can reject this.
+	err := d.InsertRunStub(ctx, runID, RawJob{ID: "job-1", Attempt: 2},
+		time.Now(), ExecutorClass("local"), "h1")
 	require.Error(t, err, "a duplicate run-stub primary key surfaces an error")
+}
+
+// TestInsertRunStubDuplicateAttemptErrors is the other half: a fresh run id on
+// an attempt that already has an audit row. Only job_runs_job_attempt can reject
+// it, which is the invariant planFinalize's free-snooze reasoning rests on —
+// one audit row per attempt.
+func TestInsertRunStubDuplicateAttemptErrors(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	d := baseDriver{db: db}
+	ctx := context.Background()
+	raw := RawJob{ID: "job-1", Attempt: 1}
+
+	require.NoError(t, d.InsertRunStub(ctx, models.NewID(), raw, time.Now(), ExecutorClass("local"), "h1"))
+
+	err := d.InsertRunStub(ctx, models.NewID(), raw, time.Now(), ExecutorClass("local"), "h1")
+	require.Error(t, err, "a second audit row for the same (job_id, attempt) surfaces an error")
 }
 
 func TestFinalizeOutputMarshalErrors(t *testing.T) {

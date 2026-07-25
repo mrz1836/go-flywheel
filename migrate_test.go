@@ -2,15 +2,12 @@ package flywheel
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
-	"github.com/glebarez/sqlite"
 	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // migrateTables and migrateIndexes are the schema objects Migrate must create on
@@ -31,24 +28,6 @@ var (
 		"idx_job_periodics_slug",
 	}
 )
-
-// newBareSQLite opens a fresh in-memory SQLite database with NO schema applied,
-// so the test exercises Migrate from scratch rather than the pre-migrated
-// helpers_test.go fixture.
-func newBareSQLite(t *testing.T) *gorm.DB {
-	t.Helper()
-	dsn := fmt.Sprintf("file:flywheel-migrate-%d?mode=memory&cache=shared", dbSeq.Add(1))
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	if err != nil {
-		t.Fatalf("newBareSQLite: open: %v", err)
-	}
-	t.Cleanup(func() {
-		if sqlDB, derr := db.DB(); derr == nil {
-			_ = sqlDB.Close()
-		}
-	})
-	return db
-}
 
 // sqliteHasIndex reports whether a named index exists in a SQLite database.
 func sqliteHasIndex(t *testing.T, db *gorm.DB, name string) bool {
