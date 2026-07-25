@@ -37,13 +37,45 @@ func Models() []any {
 //
 // Migrate is idempotent: AutoMigrate is a no-op against an up-to-date schema and
 // every index uses IF NOT EXISTS, so repeated calls are safe.
+//
+// Migrate is MigrateWithOptions(db, MigrateOpts{}).
 func Migrate(db *gorm.DB) error {
+	return MigrateWithOptions(db, MigrateOpts{})
+}
+
+// MigrateOpts configures MigrateWithOptions. The zero value is the library-owned
+// install: the runtime brings up its own tables, indexes, and pre-1.0 column
+// reconciliation against a database it is the only writer of.
+type MigrateOpts struct {
+	// SkipColumnReconcile disables the pre-1.0 routing-column rename pass. Set it
+	// when the database's schema history is owned by an external migration tool:
+	// the rename is imperative DDL, and running it inside a versioned schema means
+	// two migration authorities on one database.
+	//
+	// The reconciliation belongs to the library-owned mode only. It is removed in
+	// v1.0.0, at which point this field becomes a no-op — a host that sets it
+	// today needs no further change then.
+	SkipColumnReconcile bool
+}
+
+// MigrateWithOptions installs the schema per opts: the pre-1.0 column
+// reconciliation (unless opts skips it), AutoMigrate over Models, then
+// IndexSet's statements in order.
+//
+// A host that owns its schema history but still wants the installer — one
+// process, one call, no hand-copied DDL — sets SkipColumnReconcile so the
+// runtime issues no ALTER TABLE of its own inside a versioned schema. A host
+// whose migration tool already created the tables wants InstallIndexes instead:
+// it applies the index half and nothing else.
+func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 	if db == nil {
 		return fmt.Errorf("flywheel: Migrate: db is nil")
 	}
 
-	if err := reconcileColumnRenames(db); err != nil {
-		return fmt.Errorf("flywheel: Migrate: reconcile column renames: %w", err)
+	if !opts.SkipColumnReconcile {
+		if err := reconcileColumnRenames(db); err != nil {
+			return fmt.Errorf("flywheel: Migrate: reconcile column renames: %w", err)
+		}
 	}
 
 	if err := db.AutoMigrate(Models()...); err != nil {
@@ -69,6 +101,11 @@ func Migrate(db *gorm.DB) error {
 // jobs_ready partial index keeps covering the routing column without a reindex.
 // It is idempotent: once renamed, HasColumn(old) is false and the branch is
 // skipped.
+//
+// This pass belongs to the library-owned install mode. It is imperative DDL, so
+// a host whose schema history is owned by a migration tool skips it with
+// MigrateOpts.SkipColumnReconcile rather than running a second migration
+// authority against its database. It is removed in v1.0.0.
 func reconcileColumnRenames(db *gorm.DB) error {
 	renames := []struct{ table, oldCol, newCol string }{
 		{"jobs", "run_on", "executor_class"},
