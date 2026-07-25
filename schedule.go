@@ -278,22 +278,58 @@ func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
 	return nil
 }
 
-// CancelJob moves a job to the terminal cancelled state. An attempt already in
-// flight is not interrupted, but the job will not be retried or re-claimed. It
-// returns ErrJobNotFound when no live job has the id.
+// CancelJob moves a still-in-flight job to the terminal cancelled state. An
+// attempt already running is not interrupted, but the job will not be retried or
+// re-claimed.
+//
+// A job that has already reached a terminal state (succeeded, cancelled, or
+// discarded) is left exactly as it is and ErrJobTerminal is returned: cancelling
+// must never overwrite a recorded outcome or its finalized_at stamp. It returns
+// ErrJobNotFound when no live job has the id.
 func CancelJob(ctx context.Context, db *gorm.DB, id string) error {
 	now := models.ClockFrom(ctx).Now(ctx)
-	res := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id).Updates(map[string]any{
-		"state":        string(StateCancelled),
-		"leased_until": nil,
-		"finalized_at": now,
-		"updated_at":   now,
-	})
+	// Scope the write to the states a job can still be cancelled from. Naming the
+	// allowed states rather than excluding the terminal ones is deliberate: a row
+	// in a state this runtime does not recognize is refused rather than clobbered,
+	// so the guard can never be defeated by a state added to the vocabulary but
+	// missed here.
+	res := db.WithContext(ctx).Model(&jobRow{}).
+		Where("id = ? AND state IN ?", id, nonTerminalStateStrings()).
+		Updates(map[string]any{
+			"state":        string(StateCancelled),
+			"leased_until": nil,
+			"finalized_at": now,
+			"updated_at":   now,
+		})
 	if res.Error != nil {
 		return fmt.Errorf("flywheel: cancel job %q: %w", id, res.Error)
 	}
 	if res.RowsAffected == 0 {
-		return ErrJobNotFound
+		return classifyCancelMiss(ctx, db, id)
 	}
 	return nil
+}
+
+// classifyCancelMiss explains why CancelJob's guarded UPDATE matched no row: the
+// job does not exist (ErrJobNotFound), or it exists but is no longer cancellable
+// (ErrJobTerminal). The count is scoped exactly like the UPDATE — Model(&jobRow{})
+// applies gorm's deleted_at IS NULL — so a soft-deleted job reads as missing
+// rather than terminal.
+//
+// It runs outside a transaction on purpose. The miss path writes nothing, and the
+// only interleaving it can misread is a concurrent RetryJob resurrecting the job
+// between the two statements, which reports ErrJobTerminal for a job that just
+// became available again — a stale diagnosis the operator resolves by re-running
+// the cancel. A deletion in the same window yields ErrJobNotFound, which is the
+// right answer regardless. Serializing an operator-scale diagnostic read would
+// cost a write lock on SQLite for no correctness gain.
+func classifyCancelMiss(ctx context.Context, db *gorm.DB, id string) error {
+	var count int64
+	if err := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id).Count(&count).Error; err != nil {
+		return fmt.Errorf("flywheel: cancel job %q: %w", id, err)
+	}
+	if count == 0 {
+		return ErrJobNotFound
+	}
+	return ErrJobTerminal
 }

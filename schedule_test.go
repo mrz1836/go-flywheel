@@ -8,6 +8,7 @@ import (
 	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestUpsertPeriodicInsertsIntervalDefinition(t *testing.T) {
@@ -150,6 +151,93 @@ func TestCancelJobMissingReturnsErrJobNotFound(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	require.ErrorIs(t, CancelJob(context.Background(), db, "nope"), ErrJobNotFound)
+}
+
+// jobRowByID reads a whole jobs row. The cancel tests assert on nullable time
+// columns (finalized_at, leased_until), which jobState's bare Scan into a string
+// cannot express — that helper only works because state is NOT NULL.
+func jobRowByID(t *testing.T, db *gorm.DB, jobID string) jobRow {
+	t.Helper()
+	var row jobRow
+	require.NoError(t, db.Model(&jobRow{}).Where("id = ?", jobID).First(&row).Error)
+	return row
+}
+
+func TestCancelJobTerminalJobIsRefused(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]JobState{
+		"succeeded": StateSucceeded,
+		"cancelled": StateCancelled,
+		"discarded": StateDiscarded,
+	}
+
+	for name, state := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
+			base := time.Now().UTC().Truncate(time.Second)
+			finalized := base.Add(-time.Hour)
+			ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
+
+			seedJob(t, db, jobRow{
+				ID: "j-terminal", Kind: "k", State: string(state), FinalizedAt: &finalized,
+			})
+
+			require.ErrorIs(t, CancelJob(ctx, db, "j-terminal"), ErrJobTerminal)
+
+			row := jobRowByID(t, db, "j-terminal")
+			assert.Equal(t, string(state), row.State, "a terminal job keeps its recorded outcome")
+			require.NotNil(t, row.FinalizedAt)
+			assert.True(t, row.FinalizedAt.Equal(finalized), "finalized_at is not restamped")
+		})
+	}
+}
+
+func TestCancelJobActiveJobMovesToCancelled(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]JobState{
+		"available": StateAvailable,
+		"running":   StateRunning,
+		"retryable": StateRetryable,
+		"scheduled": StateScheduled,
+	}
+
+	for name, state := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
+			base := time.Now().UTC().Truncate(time.Second)
+			leased := base.Add(time.Minute)
+			ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
+
+			seedJob(t, db, jobRow{
+				ID: "j-active", Kind: "k", State: string(state), LeasedUntil: &leased,
+			})
+
+			require.NoError(t, CancelJob(ctx, db, "j-active"))
+
+			row := jobRowByID(t, db, "j-active")
+			assert.Equal(t, string(StateCancelled), row.State)
+			require.NotNil(t, row.FinalizedAt)
+			assert.True(t, row.FinalizedAt.Equal(base), "finalized_at is stamped from the clock")
+			assert.Nil(t, row.LeasedUntil, "cancelling releases the lease")
+		})
+	}
+}
+
+func TestCancelJobSoftDeletedReturnsErrJobNotFound(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+
+	seedJob(t, db, jobRow{ID: "j-gone", Kind: "k", State: string(StateAvailable)})
+	require.NoError(t, db.Delete(&jobRow{}, "id = ?", "j-gone").Error)
+
+	// A soft-deleted job is invisible to the guarded update and to the classifying
+	// count alike, so it reads as missing rather than terminal.
+	require.ErrorIs(t, CancelJob(ctx, db, "j-gone"), ErrJobNotFound)
 }
 
 func TestSetPeriodicActiveToggles(t *testing.T) {

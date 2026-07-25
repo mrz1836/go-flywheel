@@ -40,7 +40,7 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel jobs ls` | List recent jobs (`--state --kind --limit --json`) |
 | `flywheel jobs inspect <id>` | Show a job and its run history |
 | `flywheel jobs retry <id>` | Force a job back to available |
-| `flywheel jobs cancel <id>` | Move a job to cancelled |
+| `flywheel jobs cancel <id>` | Move a job to cancelled (refused once a job is terminal) |
 | `flywheel schedule ls` | List periodic schedules |
 | `flywheel schedule add <slug> <kind>` | Add/update a schedule (`--cron \| --every`, `--args`) |
 | `flywheel status` | Show queue health, schedules, and recent failures (`--json --watch`) |

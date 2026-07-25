@@ -519,6 +519,33 @@ func TestPeriodicWritersReturnNotFound(t *testing.T) {
 	assert.ErrorIs(t, CancelJob(ctx, db, "missing"), ErrJobNotFound)
 }
 
+// TestCancelJobSurfacesClassificationReadError drives the error branch inside
+// CancelJob's miss classifier. Closing the DB cannot reach it — the UPDATE
+// fails first — so the read is failed on its own: gorm routes Count through the
+// Query callbacks while Updates goes through the Update callbacks, so a
+// Query-only fault leaves the write path intact.
+func TestCancelJobSurfacesClassificationReadError(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+
+	seedJob(t, db, jobRow{ID: "j-active", Kind: "k", State: string(StateAvailable)})
+
+	errQuery := errors.New("query callback failed")
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:fail_query",
+		func(tx *gorm.DB) { _ = tx.AddError(errQuery) }))
+
+	// Assert the write still works first, so a passing result cannot come from the
+	// UPDATE failing instead of the classifying read.
+	require.NoError(t, CancelJob(ctx, db, "j-active"))
+
+	// The job is now terminal, so the second cancel misses and must classify —
+	// which is the read that now fails.
+	err := CancelJob(ctx, db, "j-active")
+	require.ErrorIs(t, err, errQuery)
+	assert.NotErrorIs(t, err, ErrJobTerminal, "a failed classification is not a verdict")
+}
+
 // --- scheduler.go Tick / fire / enqueueBucket error branches ----------------
 
 // TestSchedulerTickSurfacesLoadError proves Tick surfaces a failure loading the
