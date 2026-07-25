@@ -40,6 +40,13 @@ var ErrAlreadyEnqueued = errors.New("jobs: already enqueued")
 // registered worker.
 var ErrUnknownKind = errors.New("jobs: unknown job kind")
 
+// ErrUnsupportedDialect is returned by Migrate, IndexSet, Indexes, and
+// InstallIndexes for a dialect that cannot express the runtime's partial
+// indexes (anything but postgres and sqlite). It is wrapped with the offending
+// dialect name, so every one of those entry points fails identically under
+// errors.Is.
+var ErrUnsupportedDialect = errors.New("flywheel: unsupported dialect")
+
 // ErrSQLiteConcurrency is returned by NewRunner when a SQLite driver is wired
 // with a concurrency greater than 1 — SQLite serializes writers and a second
 // concurrent dequeue would deadlock.
