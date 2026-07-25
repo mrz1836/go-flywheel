@@ -73,3 +73,9 @@ var errPeriodicNoSchedule = errors.New("jobs: periodic has no schedule")
 // ErrPeriodicNotFound is returned by SetPeriodicActive and DeletePeriodic when
 // no periodic definition has the requested slug.
 var ErrPeriodicNotFound = errors.New("flywheel: periodic not found")
+
+// ErrJobTerminal is returned when an operator action targets a job that has
+// already reached a terminal state (succeeded, cancelled, discarded). The
+// runtime refuses the write rather than overwriting a recorded outcome and its
+// finalized_at stamp.
+var ErrJobTerminal = errors.New("flywheel: job has already reached a terminal state")
