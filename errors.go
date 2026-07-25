@@ -36,6 +36,12 @@ func newValidationError(field, msg string) error {
 // already submitted.
 var ErrAlreadyEnqueued = errors.New("jobs: already enqueued")
 
+// ErrRunAlreadyRecorded is returned by SeedRun when a seeded run collides with
+// an existing (job_id, attempt) pair. It is the job_runs counterpart of
+// ErrAlreadyEnqueued: the database rejected the row, so the attempt is already
+// recorded and the caller's write was a duplicate.
+var ErrRunAlreadyRecorded = errors.New("flywheel: run already recorded for this attempt")
+
 // ErrUnknownKind is returned by the registry when a job's kind has no
 // registered worker.
 var ErrUnknownKind = errors.New("jobs: unknown job kind")
