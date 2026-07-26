@@ -147,6 +147,36 @@ noise (232 MB against 233 MB).
 
 <br/>
 
+## Bloat and WAL trajectory
+
+Sampled once per second across the drain. The row *count* never changes — 100,000 jobs are seeded
+before the clock starts and none are added — so everything below is the cost of updating them.
+
+| | Start | End | Change |
+|---|---|---|---|
+| `jobs` table | 61.7 MB | 89.3 MB | **+45 %** |
+| `jobs` indexes | 15.7 MB | 22.1 MB | +41 % |
+| `job_runs` table | 0.5 MB | 39.0 MB | (one audit row per attempt) |
+| Dead tuples in `jobs` | 31 | **98,377** | ≈ 1 per live row |
+| Autovacuum passes on `jobs` | — | 2 | in 2 m 05 s |
+| WAL | — | 232 MB | **2,322 bytes/job** |
+
+Each job takes two updates on its `jobs` row — the claim sets `state`, `attempt`, and `leased_until`;
+the finalize sets `state` and `finalized_at` — and PostgreSQL's MVCC makes each one a new tuple
+version. Two hundred thousand updates over 100,000 rows leaves the table half again as large as it
+started, with roughly as many dead tuples as live rows still uncollected when the run ends. Autovacuum
+ran twice and did not catch up.
+
+The correctness-only run is worse on both counts, ending at 121,444 dead tuples and +55 % table
+growth. Its index footprint nearly doubles (6.0 MB → 11.8 MB) — a smaller index set bloats by a larger
+*fraction*, while remaining about half the absolute size.
+
+This is a finding rather than a tuning result: nothing here was tuned. It says the runtime's
+steady-state storage cost is dominated by update churn on `jobs`, not by row growth, and that the
+default autovacuum settings do not keep pace with a 100k drain at this rate.
+
+<br/>
+
 ## Throughput is barrier-bound, not database-bound
 
 This is the most important thing to know before comparing any future number against these.
