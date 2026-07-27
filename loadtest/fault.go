@@ -356,10 +356,30 @@ func (p PauseDatabase) Inject(_ context.Context, h *Harness) (func(), error) {
 // Injecting the sweep makes the reclaim part of the fault instead of a race
 // against a ticker, so what the scenario measures is the fence under a mass
 // reclaim rather than the sampling luck of the sweep interval.
+//
+// # Why it retries rather than firing once
+//
+// The trigger is anti-correlated with the state the fault needs, which took a
+// measurement to notice. Drain progress is counted from OnFinish, and OnFinish
+// is exactly the event that empties the running set: at Runners 4 × Workers 8
+// the whole in-flight batch finalizes together, so the instant progress crosses
+// the threshold is an instant when *nothing* is running. Fired once, this fault
+// expired zero leases on three consecutive 50,000-job runs while a concurrent
+// poll of the same table showed 32 rows running throughout.
+//
+// So it retries on the scheduler's own interval until it catches a non-empty
+// in-flight set, and reports plainly when it never does. "At 50% drained" is
+// approximate either way; a fault that silently expires nothing is not.
 type MassLeaseExpiry struct {
 	// Fraction is the drain progress at which every held lease is expired.
 	Fraction float64
 }
+
+// massExpiryAttempts bounds the retry. At faultPollInterval it is a window of
+// about a second — long enough to span several claim cycles at any realistic
+// work duration, short enough that a run whose queue has genuinely drained does
+// not spend meaningful time looking for it.
+const massExpiryAttempts = 100
 
 // At reports when the fault fires.
 func (m MassLeaseExpiry) At() float64 { return m.Fraction }
@@ -389,10 +409,30 @@ func (m MassLeaseExpiry) Validate(cfg Config) error {
 // concurrently, and a second writer to one shard would race; an untimed sweep
 // costs one observation out of a run's worth and keeps the histogram honest.
 func (m MassLeaseExpiry) Inject(ctx context.Context, h *Harness) (func(), error) {
-	expired, err := h.expireLeases(ctx)
-	if err != nil {
-		return nil, err
+	var expired int64
+	for attempt := range massExpiryAttempts {
+		n, err := h.expireLeases(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if expired = n; expired > 0 {
+			break
+		}
+		if attempt == massExpiryAttempts-1 {
+			h.notes.add(
+				"MassLeaseExpiry found no held lease in %d attempts over %s and expired nothing. "+
+					"The run drained before it could catch an in-flight batch.",
+				massExpiryAttempts, massExpiryAttempts*faultPollInterval,
+			)
+			return nil, nil //nolint:nilnil // nothing was injected, so there is nothing to revert
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil //nolint:nilnil // the run ended before the fault could fire
+		case <-time.After(faultPollInterval):
+		}
 	}
+
 	reclaimed, err := h.reclaimExpired(ctx)
 	if err != nil {
 		return nil, err
