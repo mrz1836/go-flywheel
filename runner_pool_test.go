@@ -207,6 +207,62 @@ func TestPoolFreesASlotWhenItsJobFinalizes(t *testing.T) {
 	p.release(got + 1)
 }
 
+// TestPoolWakesEveryWaiterWhenSlotsFree proves a release wakes all waiters, not
+// one.
+//
+// Only the dispatch loop reserves today, so a single-waiter wakeup would pass
+// every other test in this file. It is pinned anyway because the failure is
+// silent and permanent: a capacity-1 nudge channel delivers one token however
+// many slots were freed, and the waiters that missed it then block forever next
+// to free slots unless some later release happens to wake them.
+//
+// It frees both slots in one release call rather than two, which is what makes
+// the assertion deterministic instead of a race against whether the first token
+// was consumed before the second was sent. One call is also the realistic shape:
+// claimAndDispatch hands back every unused reservation at once.
+func TestPoolWakesEveryWaiterWhenSlotsFree(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	p := newPool(4)
+
+	// Fill the pool, then park two waiters on it.
+	n, err := p.reserve(ctx, 4)
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+
+	got := make(chan int, 2)
+	for range 2 {
+		go func() {
+			slots, rErr := p.reserve(ctx, 1)
+			if rErr != nil {
+				got <- -1
+				return
+			}
+			got <- slots
+		}()
+	}
+	// Both goroutines are blocked: the pool is full and nothing has been released.
+	select {
+	case n := <-got:
+		t.Fatalf("a waiter got %d slots from a full pool", n)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Two slots freed by one call: a single-token nudge wakes exactly one waiter.
+	p.release(2)
+
+	for range 2 {
+		select {
+		case n := <-got:
+			assert.Equal(t, 1, n, "each waiter took the slot it was owed")
+		case <-time.After(5 * time.Second):
+			t.Fatal("a waiter was stranded next to a free slot")
+		}
+	}
+	p.release(4)
+	require.NoError(t, p.waitIdle(ctx))
+}
+
 // TestPoolNeverExceedsConcurrencyInFlight proves the pool is a real bound: a
 // deep backlog and a worker that counts its own concurrency never observe more
 // than Concurrency executions at once.

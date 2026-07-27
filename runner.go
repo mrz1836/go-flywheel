@@ -359,8 +359,15 @@ type pool struct {
 	// It keys on held rather than running so a waiter cannot slip through the
 	// window between Dequeue returning a batch and the first start.
 	idle chan struct{}
-	// freed is a capacity-1 nudge, sent without blocking whenever held drops, so
-	// a waiter in reserve rechecks.
+	// freed is closed and replaced each time held drops, waking every waiter in
+	// reserve at once.
+	//
+	// A capacity-1 nudge channel is *almost* right and is wrong in a way that only
+	// shows up under a second waiter: two releases racing one unconsumed token
+	// drop the second send, and a waiter is then stranded next to a free slot until
+	// some later release happens to wake it. Only the dispatch loop reserves today,
+	// so that is unreachable — but the next change to this loop should not have to
+	// know that.
 	freed chan struct{}
 	errs  errCollector
 }
@@ -375,7 +382,7 @@ func newPool(limit int) *pool {
 		limit:  limit,
 		inline: limit == 1,
 		idle:   make(chan struct{}),
-		freed:  make(chan struct{}, 1),
+		freed:  make(chan struct{}),
 	}
 	close(p.idle)
 	return p
@@ -396,12 +403,16 @@ func (p *pool) reserve(ctx context.Context, want int) (int, error) {
 			p.mu.Unlock()
 			return n, nil
 		}
+		// Snapshotted under the mutex that replaces it, so a release landing between
+		// here and the select closes the channel this waiter is about to wait on
+		// rather than one it has already stopped watching.
+		freed := p.freed
 		p.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
-		case <-p.freed:
+		case <-freed:
 		}
 	}
 }
@@ -427,24 +438,23 @@ func (p *pool) admitLocked(n int) {
 	p.held += n
 }
 
-// release hands n unused reservations back and wakes a waiter.
+// release hands n unused reservations back and wakes every waiter in reserve.
 func (p *pool) release(n int) {
 	if n <= 0 {
 		return
 	}
 	p.mu.Lock()
-	n = min(n, p.held)
-	p.held -= n
-	if n > 0 && p.held == 0 {
-		close(p.idle)
-	}
-	p.mu.Unlock()
+	defer p.mu.Unlock()
 
-	if n > 0 {
-		select {
-		case p.freed <- struct{}{}:
-		default:
-		}
+	n = min(n, p.held)
+	if n == 0 {
+		return
+	}
+	p.held -= n
+	close(p.freed)
+	p.freed = make(chan struct{})
+	if p.held == 0 {
+		close(p.idle)
 	}
 }
 
