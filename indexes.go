@@ -150,8 +150,27 @@ func runtimeIndexes() []Index {
 		},
 		{
 			// Performance: the claim hot path.
+			//
+			// The key is (queue, priority, scheduled_at) — deliberately without
+			// executor_class, even though the claim filters on it. A claim orders by
+			// priority, scheduled_at, and with the class in the key neither of its
+			// two routing modes can reach an ordered scan: the routed mode's
+			// `class = ? OR class = ''` is an OR on the second column, and
+			// ClaimAnyClass omits the column entirely and leaves a gap in the
+			// leading columns. Both fall back to scanning the whole ready set and
+			// sorting it. Dropping the column fixes both at once and costs a cheap
+			// heap filter on the rows the ordered scan already visits.
+			//
+			// queue leads rather than priority for the case that dominates a
+			// deployment's wall clock: a runner polls on a fixed interval whether or
+			// not there is work, so most claims a queue ever serves return nothing.
+			// With the ordering columns leading, an empty poll walks the whole index
+			// instead of probing it. See docs/BENCHMARKS.md for both plans.
+			//
+			// deleted_at is in the predicate because the claim filters it, so
+			// without it every candidate tuple needs a heap visit to be rejected.
 			Name: "jobs_ready", Kind: IndexPerformance, Table: "jobs",
-			DDL: `CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (queue, executor_class, priority, scheduled_at) WHERE state IN ('available', 'retryable', 'scheduled')`,
+			DDL: `CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (queue, priority, scheduled_at) WHERE state IN ('available', 'retryable', 'scheduled') AND deleted_at IS NULL`,
 		},
 		{
 			// Performance: follow-up / DAG lookup.

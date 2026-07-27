@@ -131,11 +131,11 @@ func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 //
 // On a fresh database neither the old nor the new column exists, so every branch
 // is a guarded no-op and AutoMigrate creates the new columns directly. On an
-// upgraded database the rename carries the column's indexes with it — both
-// PostgreSQL and SQLite (>= 3.25) support ALTER TABLE ... RENAME COLUMN — so the
-// jobs_ready partial index keeps covering the routing column without a reindex.
-// It is idempotent: once renamed, HasColumn(old) is false and the branch is
-// skipped.
+// upgraded database the rename preserves the column's data and any index over
+// it — both PostgreSQL and SQLite (>= 3.25) support ALTER TABLE ... RENAME
+// COLUMN — where adding the new column and dropping the old one would discard
+// every routing value in the table. It is idempotent: once renamed,
+// HasColumn(old) is false and the branch is skipped.
 //
 // This pass belongs to the library-owned install mode. It is imperative DDL, so
 // a host whose schema history is owned by a migration tool skips it with

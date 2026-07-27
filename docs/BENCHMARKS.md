@@ -1,8 +1,9 @@
 # Benchmarks
 
 The runtime's measured baseline: enqueue, claim, finalize, and sweep against real PostgreSQL at
-100,000 jobs, plus a full-index versus correctness-index-only comparison, and the characterization at
-1,000,000 rows of why the claim never reached its index.
+100,000 jobs, plus a full-index versus correctness-index-only comparison — and the characterization at
+1,000,000 rows that found the claim never reached its index, together with the fix that took claim p50
+from 38.7 ms to 0.96 ms.
 
 Every number here was produced by a committed command line against a committed JSON report under
 [`docs/benchmarks/`](benchmarks/). Nothing is estimated, and every caveat a run discovered travels
@@ -17,7 +18,7 @@ with the numbers it qualifies.
 | **Machine** | Apple M4, 10 cores, 16 GB, macOS 26.5.2 (arm64) |
 | **Go** | go1.26.5 darwin/arm64 |
 | **PostgreSQL** | 17.10 (Homebrew), local loopback, same machine as the harness |
-| **Commit** | `1ecb5e9` (baseline, index comparison) · `c7dba1b` (heartbeat cost, sigkill and slow-job chaos) · `5ba4a08` (mass-expiry chaos, re-run after the fault's retry fix) |
+| **Commit** | `1ecb5e9` (baseline, index comparison) · `c7dba1b` (heartbeat cost, sigkill and slow-job chaos) · `5ba4a08` (mass-expiry chaos, re-run after the fault's retry fix) · `218fee9` (claim characterization at 1M, and the claim before/after) |
 | **Seed** | `1` (every run) |
 | **Workload digest** | `c111170f7509817c…` — identical across all three 100k runs |
 
@@ -56,7 +57,7 @@ go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix enqueue \
 
 # The claim-predicate matrix: every claim shape against every candidate index, at 1M rows.
 go run -tags=loadtest ./loadtest/cmd/explain -jobs 1000000 -queues 3 \
-  -out docs/benchmarks/claim-plans-1m-before.txt
+  -out docs/benchmarks/claim-plans-1m-after.txt
 ```
 
 The two drain runs generate a byte-identical workload — same seed, same digest — so the only variable
@@ -104,7 +105,11 @@ report's `histogram` object. Count, min, max, and mean are exact.
 
 The headline is not what the shape of the question suggests.
 
-### The claim path is unchanged, because the index is never used
+### The finding: the claim path never reached its index
+
+> **Fixed in v0.7.1.** This subsection is what the baseline measured and why; the characterization that
+> chose the fix, and the fix's own before/after, follow it. The baseline table above is the pre-fix
+> state and is left as measured.
 
 Claim p50 and p99 are *identical* with and without the performance indexes. That is not noise — it is
 the planner declining `jobs_ready` in both cases, and the scan counters in the reports say so
@@ -129,8 +134,7 @@ in either of its two modes:
   the ordering.
 
 Every claim therefore sorts the whole claimable set and spills 3.9 MB to disk, and that sort is
-essentially all of the 38.7 ms claim latency. This is a finding, recorded here and not fixed here; it
-is the single largest lever the baseline exposes.
+essentially all of the 38.7 ms claim latency — the single largest lever the baseline exposed.
 
 ### Characterizing it: the claim predicate at 1,000,000 rows
 
@@ -215,6 +219,106 @@ ordering columns have to lead. V2 takes the second option and pays for it: on an
 **5,749 buffers — 45 MB of index — to return zero rows**, because `queue = 'q-idle'` can only be
 applied as a non-leading index condition and the scan walks the whole thing.
 
+### The remedy: `jobs_ready` keyed on `(queue, priority, scheduled_at)`
+
+V3 ships, with `deleted_at IS NULL` folded into the predicate. Its case is that it **never loses**:
+there is no cell in the matrix where it is worse than what shipped before it, and it is three orders of
+magnitude better in the shapes it can reach.
+
+```sql
+-- before
+CREATE INDEX jobs_ready ON jobs (queue, executor_class, priority, scheduled_at)
+  WHERE state IN ('available', 'retryable', 'scheduled');
+-- after
+CREATE INDEX jobs_ready ON jobs (queue, priority, scheduled_at)
+  WHERE state IN ('available', 'retryable', 'scheduled') AND deleted_at IS NULL;
+```
+
+Dropping `executor_class` from the key is what makes both routing modes work at once: there is no
+longer a gap in the leading columns for `ClaimAnyClass` to fall into, and a routed claim gets its
+ordered scan with the class applied as a heap filter. The filter is cheap at the measured selectivity —
+A returns 8 rows having discarded 7, reading 12 buffers. `queue` still leads, which is what keeps the
+empty poll a probe rather than a scan.
+
+**The claim, per shape**, from [`claim-plans-1m-before.txt`](benchmarks/claim-plans-1m-before.txt) and
+[`claim-plans-1m-after.txt`](benchmarks/claim-plans-1m-after.txt) — same seed, same 1M rows, the index
+definition the only variable:
+
+| Shape | Before | After | |
+|---|---|---|---|
+| A — 1 queue, routed | 153.6 ms, Bitmap + Sort | **0.179 ms, Index Scan** | **858×** |
+| C — 1 queue, `ClaimAnyClass` | 219.6 ms, Bitmap + Sort | **0.135 ms, Index Scan** | **1,627×** |
+| E — idle queue, routed | 0.019 ms, Index Scan | **0.014 ms, Index Scan** | unchanged |
+| F — idle queue, `ClaimAnyClass` | 0.012 ms, Index Scan | **0.013 ms, Index Scan** | unchanged |
+| B — 3 queues, routed | 317.2 ms | 334.5 ms | unchanged (both scan and sort) |
+| D — 3 queues, `ClaimAnyClass` | 560.6 ms | 583.5 ms | unchanged (both Seq Scan) |
+
+**End to end**, the 100k drain at `-runners 4 -workers 8`, run at the same commit before and after:
+
+| | Before | After | |
+|---|---|---|---|
+| **Claim p50** | 38.75 ms | **0.96 ms** | **40× faster** |
+| **Claim p99** | 61.26 ms | **1.91 ms** | 32× faster |
+| **Drain throughput** | 735 jobs/s | **9,474 jobs/s** | **12.9×** |
+| **Wall time** | 2 m 16 s | **10.6 s** | 12.9× |
+| Finalize p50 / p99 | 1.56 ms / 12.5 ms | 1.21 ms / 2.42 ms | |
+| **`jobs` sequential scans** | **10,804** | **53** | against 12,682 claims |
+| `jobs` index bytes | 21.9 MB | 19.5 MB | the new key is one column shorter |
+| Workload digest | `c111170f7509817c…` | `c111170f7509817c…` | identical |
+| Retried / discarded / superseded | 0 / 0 / 0 | 0 / 0 / 0 | |
+
+The scan counters are the mechanism stated without inference. The baseline recorded ~11,200 sequential
+scans of `jobs` against ~12,500 claims — one full scan per claim. After the change there are **53**, and
+the claim count is unchanged. Nothing else about the run moved.
+
+Reports: [`claim-100k-before.json`](benchmarks/claim-100k-before.json),
+[`claim-100k-after.json`](benchmarks/claim-100k-after.json). The digests match, so the two runs drained
+a byte-identical workload.
+
+One number moved the *wrong* way and is an artifact rather than a regression: the `jobs` table ends at
+104.5 MB against 89.1 MB. The run finished in 10.6 s instead of 2 m 16 s, so autovacuum had a ninth of
+the wall clock in which to reclaim the dead tuples the drain produced. The index footprint, which
+autovacuum timing does not explain, went *down*.
+
+**Why not V2, which won B and D as well.** Trading a 1,100× regression on the operation a deployment
+issues most often — the empty poll, 0.019 ms against 21.4 ms — for a win on the one it issues least is
+not a trade worth making.
+A claim that scans while draining a backlog is at least doing useful work; an empty poll that reads
+45 MB of index to return nothing is not, and it recurs on every poll interval forever.
+
+**What is still slow, and the supported answer.** A claim naming more than one queue (B, D) remains a
+Seq Scan and a sort. One index cannot serve it — `queue` cannot both lead the key and be absent from
+it. The fix is a runner per queue, which is already how the runtime is meant to be deployed and costs
+nothing to adopt:
+
+```go
+// Instead of one runner over three queues...
+flywheel.NewRunner(flywheel.RunnerConfig{Queues: []string{"a", "b", "c"}, /* ... */})
+// ...run three, one per queue. Each one gets the ordered index scan.
+flywheel.NewRunner(flywheel.RunnerConfig{Queues: []string{"a"}, /* ... */})
+```
+
+**The one residual risk**, stated because it is the mirror image of what sank V2: with the class out of
+the key, a routed claim scans a queue's ready set in priority order and filters by class at the heap, so
+its cost scales as `LIMIT ÷ (fraction of the queue's ready rows the class predicate matches)`. At the
+measured 50% that is 15 index entries for 8 rows. It degenerates only where a single queue carries many
+executor classes, one of them starved, *and* no job uses the empty-wildcard class — because the claim's
+predicate is `class OR ''`, so any wildcard row is a match. Unlike V2's, this failure needs three
+conditions to hold at once rather than one, and it is bounded by a single queue rather than by the
+table. A queue per executor class removes it entirely.
+
+**Upgrading an existing database.** `InstallIndexes` and `Migrate` both use `CREATE INDEX IF NOT EXISTS`,
+which matches on **name only** — so a database that already carries an index named `jobs_ready` keeps
+the old definition, and the install step still reports success. Fresh installs and new test schemas get
+the new definition automatically. An existing database needs the drop done once:
+
+```sql
+DROP INDEX jobs_ready;   -- then InstallIndexes / Migrate, or your own migration, recreates it
+```
+
+A host with hand-written migrations adds a `DROP INDEX` + `CREATE INDEX` pair instead. There is no
+version check that can do this for you today: the installer compares names, not definitions.
+
 ### Where the performance indexes do pay: the sweep
 
 | | Full indexes | Correctness only | Delta |
@@ -232,6 +336,10 @@ normal case, not a degenerate one.
 10.3 MB of index on 100,000 rows — 22.1 MB against 11.8 MB, so they are 47 % of the index footprint —
 plus their maintenance on every insert and every state transition. WAL generation is unchanged within
 noise (232 MB against 233 MB).
+
+That pair predates the claim fix, which shortened `jobs_ready` by a column and narrowed its predicate:
+the same 100k drain now ends with 19.5 MB of `jobs` index rather than 21.9 MB, so the performance
+indexes cost about 2.4 MB less than the figure above.
 
 <br/>
 
@@ -274,17 +382,26 @@ parallelism. A poll claims N jobs, dispatches them across N goroutines, and wait
 before claiming again. The next claim cannot start until the slowest member of the current batch has
 finished.
 
-At `-workers 8` that means a runner spends one claim latency (38.7 ms) for every 8 jobs, and 4 runners
-× 8 jobs / 38.7 ms ≈ 827 jobs/s — which is the measured throughput almost exactly. The drain is
-paying for the claim, and the claim is paying for the sort.
+At the baseline that meant a runner spent one claim latency (38.7 ms) for every 8 jobs, and 4 runners
+× 8 jobs / 38.7 ms ≈ 827 jobs/s — the measured throughput almost exactly. The drain was paying for the
+claim, and the claim was paying for the sort.
 
-Two consequences for anyone reading these numbers later:
+**That prediction has since been tested.** The claim fix took claim p50 from 38.7 ms to 0.96 ms, and
+throughput moved from 735 to 9,474 jobs/s — but not by the 40× the claim itself improved by. The
+barrier is still there; the claim is simply no longer the term that dominates it. A batch now costs one
+claim (≈1 ms) plus the slowest of its eight finalizes (≈2 ms), so 4 runners × 8 jobs / ≈3 ms lands near
+the measured 9,474 jobs/s.
 
-1. **Throughput here is `runners × workers / claim latency`.** It will move when the claim plan is
-   fixed, and it will move again if the batch and the parallelism are ever separated. A change to
-   either invalidates a direct comparison against this table.
-2. **The finalize numbers are the honest ones.** Finalize is per-job, unbatched, and its p50 of
-   0.78–0.96 ms is a real per-operation cost that does not depend on the batching above it.
+Three consequences for anyone reading these numbers later:
+
+1. **Throughput here is `runners × workers / (claim + slowest finalize in the batch)`.** It moved once
+   when the claim plan was fixed, and it will move again if the batch and the parallelism are ever
+   separated. A change to either invalidates a direct comparison against this table.
+2. **A fix to one term does not buy its full factor.** The claim got 40× faster and the drain got
+   12.9× faster, because the barrier reassigned the wait rather than removing it. Separating the claim
+   batch from the in-batch parallelism is the change that removes it.
+3. **The finalize numbers are the honest ones.** Finalize is per-job, unbatched, and its p50 of
+   0.78–1.56 ms is a real per-operation cost that does not depend on the batching above it.
 
 <br/>
 
