@@ -3,7 +3,8 @@
 The runtime's measured baseline: enqueue, claim, finalize, and sweep against real PostgreSQL at
 100,000 jobs, plus a full-index versus correctness-index-only comparison — and the characterization at
 1,000,000 rows that found the claim never reached its index, together with the fix that took claim p50
-from 38.7 ms to 0.96 ms.
+from 38.7 ms to 0.96 ms — and the worker pool that took slot utilization on a mixed-speed drain from
+24.4 % to 95.4 %.
 
 Every number here was produced by a committed command line against a committed JSON report under
 [`docs/benchmarks/`](benchmarks/). Nothing is estimated, and every caveat a run discovered travels
@@ -18,7 +19,7 @@ with the numbers it qualifies.
 | **Machine** | Apple M4, 10 cores, 16 GB, macOS 26.5.2 (arm64) |
 | **Go** | go1.26.5 darwin/arm64 |
 | **PostgreSQL** | 17.10 (Homebrew), local loopback, same machine as the harness |
-| **Commit** | `1ecb5e9` (baseline, index comparison) · `c7dba1b` (heartbeat cost, sigkill and slow-job chaos) · `5ba4a08` (mass-expiry chaos, re-run after the fault's retry fix) · `218fee9` (claim characterization at 1M, and the claim before/after) |
+| **Commit** | `1ecb5e9` (baseline, index comparison) · `c7dba1b` (heartbeat cost, sigkill and slow-job chaos) · `5ba4a08` (mass-expiry chaos, re-run after the fault's retry fix) · `218fee9` (claim characterization at 1M, and the claim before/after) · `047cdf2` → `f24eec1` (the worker pool and poll-ladder before/after, both halves on the same machine in one session) |
 | **Seed** | `1` (every run) |
 | **Workload digest** | `c111170f7509817c…` — identical across all three 100k runs |
 
@@ -58,7 +59,20 @@ go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix enqueue \
 # The claim-predicate matrix: every claim shape against every candidate index, at 1M rows.
 go run -tags=loadtest ./loadtest/cmd/explain -jobs 1000000 -queues 3 \
   -out docs/benchmarks/claim-plans-1m-after.txt
+
+# The worker pool, on the mix where the barrier cost the most: 10% of jobs at 20x.
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix mixed-speed \
+  -runners 4 -workers 8 -work 10ms -out docs/benchmarks/pool-mixed-8-after.json
+
+# The poll-error ladder, against a 60-second database outage at 50% drained.
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 10000 -mix drain \
+  -fault pause-database:60s -out docs/benchmarks/poll-backoff-after.json
 ```
+
+The two `-after` runs above have committed `-before` halves taken by checking out `047cdf2` into a
+worktree and cherry-picking only the harness's measurement commit onto it — `SlotUtilization` and
+`BlockedClaims` did not exist before this release, and a before-half that could not report them would
+have nothing to compare.
 
 The two drain runs generate a byte-identical workload — same seed, same digest — so the only variable
 between them is the index set. Concurrency does not reach the workload either: generation is
@@ -373,35 +387,120 @@ default autovacuum settings do not keep pace with a 100k drain at this rate.
 
 <br/>
 
-## Throughput is barrier-bound, not database-bound
+## Throughput was barrier-bound, not database-bound — and the barrier is gone
 
-This is the most important thing to know before comparing any future number against these.
+This section is the history of the single most misleading number in this document, kept because every
+figure above it was measured under the barrier and cannot be compared against a later one without it.
 
-`Concurrency` is a single knob doing two jobs: it is the claim batch size *and* the in-batch
-parallelism. A poll claims N jobs, dispatches them across N goroutines, and waits for all of them
-before claiming again. The next claim cannot start until the slowest member of the current batch has
-finished.
+**What the barrier was.** `Concurrency` was a single knob doing two jobs: the claim batch size *and*
+the in-batch parallelism. A poll claimed N jobs, dispatched them across N goroutines, and waited for
+all of them before claiming again. The next claim could not start until the slowest member of the
+current batch had finished.
 
-At the baseline that meant a runner spent one claim latency (38.7 ms) for every 8 jobs, and 4 runners
-× 8 jobs / 38.7 ms ≈ 827 jobs/s — the measured throughput almost exactly. The drain was paying for the
-claim, and the claim was paying for the sort.
+At the original baseline that meant a runner spent one claim latency (38.7 ms) for every 8 jobs:
+4 runners × 8 jobs / 38.7 ms ≈ 827 jobs/s, the measured throughput almost exactly. The drain was paying
+for the claim, and the claim was paying for the sort.
 
-**That prediction has since been tested.** The claim fix took claim p50 from 38.7 ms to 0.96 ms, and
-throughput moved from 735 to 9,474 jobs/s — but not by the 40× the claim itself improved by. The
-barrier is still there; the claim is simply no longer the term that dominates it. A batch now costs one
-claim (≈1 ms) plus the slowest of its eight finalizes (≈2 ms), so 4 runners × 8 jobs / ≈3 ms lands near
-the measured 9,474 jobs/s.
+**That prediction was tested twice, and held twice.** The claim fix took claim p50 from 38.7 ms to
+0.96 ms and throughput from 735 to 9,474 jobs/s — but not by the 40× the claim itself improved by,
+because the barrier reassigned the wait rather than removing it. A batch then cost one claim (≈1 ms)
+plus the slowest of its eight finalizes (≈2 ms), and 4 runners × 8 jobs / ≈3 ms lands near the measured
+9,474 jobs/s.
 
-Three consequences for anyone reading these numbers later:
+### The removal, measured
 
-1. **Throughput here is `runners × workers / (claim + slowest finalize in the batch)`.** It moved once
-   when the claim plan was fixed, and it will move again if the batch and the parallelism are ever
-   separated. A change to either invalidates a direct comparison against this table.
-2. **A fix to one term does not buy its full factor.** The claim got 40× faster and the drain got
-   12.9× faster, because the barrier reassigned the wait rather than removing it. Separating the claim
-   batch from the in-batch parallelism is the change that removes it.
-3. **The finalize numbers are the honest ones.** Finalize is per-job, unbatched, and its p50 of
-   0.78–1.56 ms is a real per-operation cost that does not depend on the batching above it.
+`Concurrency` is now the pool size: the runner claims to fill its free slots and dispatches each job
+independently, so a slot frees the moment its own job finalizes.
+
+The mix matters enormously here, and it is the whole reason this is reported twice.
+
+**On a uniform workload the change is worth nothing measurable**, which is the arithmetic above
+predicting its own irrelevance: the slowest of eight identical finalizes is the median of eight
+identical finalizes, so there is no straggler to wait for. `BenchmarkClaim100k` at `-count=5`, taken on
+the pre-change tree and the branch on the same machine in the same session:
+
+```
+             │ baseline.txt │            new.txt            │
+             │    jobs/s    │    jobs/s      vs base        │
+Claim100k-10   9.975k ± ∞ ¹   9.970k ± ∞ ¹  ~ (p=0.310 n=5)
+```
+
+Claim p99 moved one histogram bucket the wrong way — 1.91 ms to 2.42 ms, adjacent bucket edges — which
+is what the bucketing's published relative error permits and is not a finding at five samples. The
+pool claims far more often in smaller batches, so that direction is expected.
+
+**On the mixed-speed mix the change is worth 4.2×.** 10 % of jobs at 20× the base work duration, which
+is the shape `loadtest/workload.go` chose so that 1 − 0.9⁸ ≈ 57 % of eight-job batches contain a
+straggler:
+
+| | Before (barrier) | After (pool) | |
+|---|---|---|---|
+| **Slot utilization** | **24.4 %** | **95.4 %** | **3.9×** |
+| **Drain throughput** | 247 jobs/s | **1,036 jobs/s** | **4.2×** |
+| **Wall time** | 6 m 44.5 s | **1 m 36.6 s** | 4.2× |
+| Claim p50 / p99 | 1.56 ms / 30.6 ms | **0.48 ms / 1.56 ms** | |
+| Finalize p50 / p99 | 1.56 ms / 100.0 ms | **0.61 ms / 1.91 ms** | |
+| Claims issued | 12,587 | 91,571 | smaller batches, far more often |
+| Retried / discarded / superseded | 0 / 0 / 0 | 0 / 0 / 0 | |
+| Workload digest | `ba1a209fd097f8ec…` | `ba1a209fd097f8ec…` | identical |
+
+Reports: [`pool-mixed-8-before.json`](benchmarks/pool-mixed-8-before.json),
+[`pool-mixed-8-after.json`](benchmarks/pool-mixed-8-after.json). The digests match, so both runs drained
+a byte-identical workload.
+
+**Read `SlotUtilization` as a floor.** It is the summed duration of every finished and superseded
+attempt over `Runners × Workers × Duration`, and an attempt's duration runs from its run stub to its
+finalize — so the claim, stub, and finalize round trips around each job are capacity the pool was using
+that this does not count. The before/after at one configuration is what carries the claim, not the
+absolute figure.
+
+The p99 columns are the barrier stated from a second direction. A finalize p99 of 100 ms on a workload
+whose slowest job is a 200 ms sleep is not the database being slow: it is finalizes queueing behind the
+barrier. Under the pool the same finalize p99 is 1.91 ms, and the *only* thing that changed is when
+`dispatch` is called.
+
+What still holds from the old arithmetic: **finalize is the honest per-job number.** It is per-job and
+unbatched, and its p50 of 0.61–1.56 ms is a real per-operation cost that does not depend on the
+dispatch shape above it.
+
+<br/>
+
+## A database outage: the poll-error ladder
+
+Consecutive poll failures now climb an exponential ladder from `PollInterval` to `MaxPollBackoff`
+(30 s by default) with jitter, resetting on the first success. Before it, a failing database was polled
+at the empty-queue rate forever, with an error log line per attempt.
+
+The harness gates every runner's driver for 60 seconds at 50 % drained and counts the claims the gate
+refused — which is the only measurement available, because a gated call deliberately records no latency
+observation:
+
+| | Before | After | |
+|---|---|---|---|
+| **Claims refused during the 60 s outage** | **42,676** | **56** | **762× fewer** |
+| Per runner | 10,669 | 14 | |
+| Error log lines | one per refused claim | one per refused claim | the ladder is what bounds both |
+| Drain throughput (whole run) | 163 jobs/s | 160 jobs/s | unchanged — the outage dominates |
+| Wall time | 1 m 01.3 s | 1 m 02.5 s | |
+| Retried / discarded / superseded | 0 / 0 / 0 | 0 / 0 / 0 | |
+
+Reports: [`poll-backoff-before.json`](benchmarks/poll-backoff-before.json),
+[`poll-backoff-after.json`](benchmarks/poll-backoff-after.json).
+
+**14 per runner is the ladder, not a coincidence.** The harness polls at 5 ms, so the rungs are
+5 ms, 10, 20, … doubling to the 30 s ceiling, and the first thirteen sum to 41.0 s with the fourteenth
+reaching past the 60 s window. Before the ladder, 60 s ÷ 5 ms ≈ 12,000 attempts per runner is the
+number, and 10,669 measured is that with the gate's own overhead taken out.
+
+Two caveats that travel with these numbers:
+
+- **The run got 1.2 s longer, and that is the shipped default showing through.** A runner that has
+  climbed to a 20 s rung sleeps out the rest of it after the gate reopens. The fault fires on drain
+  fraction rather than wall time, so at the 30 s ceiling the overshoot can be up to 30 s. That is
+  recorded rather than tuned away, so the published number reflects what a deployment actually gets.
+- **Throughput is unchanged because the outage is the whole story.** Both runs spend 60 of their
+  ~61 seconds gated. The ladder buys a database that is not hammered while it recovers and a log that
+  does not fill a disk; it does not buy throughput, and it is not published as though it did.
 
 <br/>
 

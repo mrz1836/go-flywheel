@@ -56,7 +56,7 @@ func (h *recordingHandler) records() []map[string]any {
 	return append([]map[string]any(nil), h.logs...)
 }
 
-// --- FR-04-07 / FR-04-08: the ladder itself ---------------------------------
+// --- the ladder itself ------------------------------------------------------
 
 // TestPollBackoffGrowsExponentiallyAndCapsAtMaxPollBackoff pins the ladder's
 // shape: each rung doubles, jitter stays inside ±25%, and saturation is reported
@@ -130,7 +130,7 @@ func TestNewRunnerDefaultsAndFloorsMaxPollBackoff(t *testing.T) {
 	}
 }
 
-// --- FR-04-09: bounded logging during an outage -----------------------------
+// --- bounded logging during an outage ---------------------------------------
 
 // TestPollErrorLoggingFollowsTheBackoffCadence is A5's logging half, asserted as
 // a number rather than narrated.
@@ -212,7 +212,7 @@ func TestRunKeepsPollingThroughAPersistentClaimFailure(t *testing.T) {
 	})
 }
 
-// --- FR-04-10: RunUntilIdle's tolerance and its bound -----------------------
+// --- RunUntilIdle's tolerance and its bound ---------------------------------
 
 // TestRunUntilIdleRetriesATransientPollFailureThenCompletes is A6's first half:
 // a blip inside the ladder's budget is absorbed rather than returned.

@@ -171,7 +171,7 @@ func runInBackground(t *testing.T, r *Runner) func() {
 	}
 }
 
-// --- FR-04-01 / FR-04-02: slots refill independently ------------------------
+// --- slots refill independently -------------------------------------------
 
 // TestPoolFreesASlotWhenItsJobFinalizes proves a slot becomes claimable the
 // moment its own job finishes, with no reference to any sibling.
@@ -268,7 +268,7 @@ func TestRunnerKeepsClaimingWhileOneJobIsSlow(t *testing.T) {
 	stop()
 }
 
-// --- FR-04-03: claim batch decoupled from the worker count ------------------
+// --- the claim batch is decoupled from the worker count --------------------
 
 // TestClaimLimitClampsToConcurrency covers the arithmetic on its own:
 // ClaimBatchSize may lower the claim and may never raise it.
@@ -383,7 +383,7 @@ func TestDequeueLimitNeverExceedsFreeSlots(t *testing.T) {
 		"no claim asked for more than the pool had free at that instant")
 }
 
-// --- FR-04-06: RunUntilIdle still means "every job is terminal" -------------
+// --- RunUntilIdle still means "every job is terminal" ----------------------
 
 // TestRunUntilIdleDoesNotReturnWhileAJobIsStillRunning is A4, and it is written
 // to fail against an implementation that counts pending rows without draining
@@ -448,7 +448,7 @@ func TestRunUntilIdleSurfacesADispatchErrorFromAPoolGoroutine(t *testing.T) {
 		"a dispatch error raised on a pool goroutine reaches the caller")
 }
 
-// --- FR-04-04 / FR-04-05: Concurrency 1 is unchanged ------------------------
+// --- Concurrency 1 is unchanged, and SQLite still requires it --------------
 
 // TestPoolStartRunsInlineAtLimitOne is A3 at the pool level: at limit 1 there is
 // no goroutine boundary, and above it there is.
@@ -567,7 +567,7 @@ func TestPoolAdmitsAnOverServingDriver(t *testing.T) {
 	assert.Zero(t, held, "every reservation, including the over-served ones, was returned")
 }
 
-// TestConcurrencyOneDispatchesSequentially pins the ordering half of FR-04-04:
+// TestConcurrencyOneDispatchesSequentially pins the ordering half:
 // at Concurrency 1 a batch runs one job after another, never overlapping.
 func TestConcurrencyOneDispatchesSequentially(t *testing.T) {
 	t.Parallel()

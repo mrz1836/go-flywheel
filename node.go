@@ -202,7 +202,7 @@ func (n *Node) drainContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), n.cfg.DrainTimeout)
 }
 
-// drainRunners expresses the Node's drain in terms of the Runner's (FR-04-13)
+// drainRunners expresses the Node's drain in terms of the Runner's
 // rather than duplicating it: waiting on component goroutines conflates "the
 // loop returned" with "in-flight work finished".
 //

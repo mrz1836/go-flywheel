@@ -40,7 +40,7 @@ func heldWorker(started chan<- struct{}, release <-chan struct{}) *peakWorker {
 	}}
 }
 
-// --- FR-04-11: Stop ---------------------------------------------------------
+// --- Stop -------------------------------------------------------------------
 
 // TestStopIsNonBlockingAndHaltsFurtherClaims covers both halves of Stop's
 // contract: it returns at once, and the loop stops claiming.
@@ -125,7 +125,7 @@ func TestStopDispatchesAClaimAlreadyInFlight(t *testing.T) {
 		"the already-leased job ran rather than being stranded for the sweep")
 }
 
-// --- FR-04-12: Drain -------------------------------------------------------
+// --- Drain ------------------------------------------------------------------
 
 // TestDrainWaitsForInFlightJobsThenReturnsNil is A7's happy half: three jobs in
 // flight and a deadline longer than they need.
