@@ -395,7 +395,13 @@ if err := runner.Drain(ctx); err != nil {
 
 `Stop` bounds *when the next claim is issued*, not what happens to a claim already in flight: a batch
 that came back from `Dequeue` after `Stop` landed is already leased, so it is dispatched rather than
-stranded until the sweep, and `Drain` waits for it too. `Drain` **does not cancel in-flight work** — a
+stranded until the sweep, and `Drain` waits for it too.
+
+**A stopped `Runner` is spent — there is no restart.** If your process outlives a single invocation (a
+Lambda on a warm container, a bounded drain driven by an external scheduler), build a `Runner` per
+invocation rather than stopping a shared one: a stopped `Runner` returns immediately having claimed
+nothing, with no error to notice. `NewRunner` does no I/O, and the `Registry`, `Driver`, and database
+handle are all safe to share. `Drain` **does not cancel in-flight work** — a
 worker that must be interrupted should respect the context it was given, and `DefaultTimeout` already
 bounds a hung attempt. Its contract is "no new claims, then wait", which is what makes a rolling deploy
 lose no work. On timeout the still-running jobs keep their leases and are recovered by the lease sweep,

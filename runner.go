@@ -237,6 +237,16 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 // drained queue and did not deliver one.
 //
 // Stop is safe before Run, concurrently with it, and after it returns.
+//
+// # A stopped Runner is spent
+//
+// There is no restart, and that has a consequence worth stating for a host whose
+// process outlives one invocation — a Lambda on a warm container, a worker pool
+// driven by an external scheduler. A Runner kept in a package variable and stopped
+// once will, on every later invocation, return immediately having claimed nothing:
+// no error, no log line, no work. Build a Runner per invocation instead. NewRunner
+// does no I/O, and the Registry, Driver, and database handle are all safe to share
+// across them.
 func (r *Runner) Stop() {
 	r.stopOnce.Do(func() { close(r.stopCh) })
 }
