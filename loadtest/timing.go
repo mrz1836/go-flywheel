@@ -95,6 +95,19 @@ func (d *timingDriver) Finalize(
 	return err
 }
 
+// RenewLease delegates without timing.
+//
+// It is a single guarded UPDATE off the dispatch path, on a cadence set by the
+// lease rather than by the workload, so it is not one of the three operations
+// the report names. Its cost shows up where it belongs — in the drain
+// throughput, and in the storage sampler's WAL and dead-tuple series, which is
+// where an extra UPDATE per job per third-of-lease is actually visible.
+func (d *timingDriver) RenewLease(
+	ctx context.Context, jobID, leaseToken string, until time.Time,
+) (bool, error) {
+	return d.inner.RenewLease(ctx, jobID, leaseToken, until)
+}
+
 // InsertChild delegates. It is structurally unreachable through this decorator.
 //
 // The runtime's finalize calls insertFollowUps, which calls InsertChild on its

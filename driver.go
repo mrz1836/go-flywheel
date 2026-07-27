@@ -39,6 +39,17 @@ type Driver interface {
 	// an existing unique_key is skipped, not fatal.
 	Finalize(ctx context.Context, raw RawJob, runID string, result Result, workErr error, finishedAt time.Time) error
 
+	// RenewLease extends a claimed job's lease, scoped to the claim that holds
+	// it. It reports whether the claim is still held: false means the claim was
+	// superseded — swept, cancelled, or otherwise released — and the caller must
+	// stop renewing.
+	//
+	// It never returns an error for a lost claim. Losing a claim is an outcome,
+	// not a failure: it is the ordinary consequence of a lease expiring, and a
+	// caller that had to distinguish it from a database error by inspecting one
+	// would get it wrong.
+	RenewLease(ctx context.Context, jobID, leaseToken string, until time.Time) (held bool, err error)
+
 	// InsertChild writes one follow-up job on tx, skipping a unique_key
 	// collision without error.
 	InsertChild(ctx context.Context, tx *gorm.DB, fu FollowUp, parentID string) error
@@ -389,6 +400,32 @@ func (d *baseDriver) Finalize(
 		return fmt.Errorf("jobs: finalize: %w", err)
 	}
 	return nil
+}
+
+// RenewLease extends a claimed job's lease for as long as the claim still holds
+// it. There is no dialect split: it is a single guarded UPDATE, and both drivers
+// express it identically.
+//
+// The guard is the same one Finalize uses, for the same reason — an attempt that
+// no longer holds the claim must not extend a lease the next claim is relying
+// on. That makes a lost claim indistinguishable from a lost race here, which is
+// correct: both mean "stop renewing".
+//
+// until is an absolute expiry rather than an extension, so a caller that renews
+// to now+lease cannot bank an ever-growing lease out of a stalled heartbeat.
+func (d *baseDriver) RenewLease(
+	ctx context.Context, jobID, leaseToken string, until time.Time,
+) (bool, error) {
+	res := d.db.WithContext(ctx).Model(&jobRow{}).
+		Where("id = ? AND state = ? AND lease_token = ?", jobID, string(StateRunning), leaseToken).
+		Updates(map[string]any{
+			"leased_until": until,
+			"updated_at":   models.ClockFrom(ctx).Now(ctx),
+		})
+	if res.Error != nil {
+		return false, fmt.Errorf("jobs: renew lease: %w", res.Error)
+	}
+	return res.RowsAffected == 1, nil
 }
 
 // InsertChild writes one follow-up job on tx. A unique_key collision is

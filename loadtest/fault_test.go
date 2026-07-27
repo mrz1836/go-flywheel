@@ -268,6 +268,12 @@ func TestGateBlocksTheDriver(t *testing.T) {
 	if _, err := d.Sweep(ctx, time.Now()); !errors.Is(err, ErrGated) {
 		t.Errorf("Sweep error = %v, want ErrGated", err)
 	}
+	// Gating renewal is what lets a killed runner's leases actually expire: a
+	// heartbeat that kept running would hold the orphan's lease for as long as
+	// the process lived, and the sweep would never see it.
+	if _, err := d.RenewLease(ctx, "j", "tok", time.Now()); !errors.Is(err, ErrGated) {
+		t.Errorf("RenewLease error = %v, want ErrGated", err)
+	}
 
 	// Reopened: the gate is reversible, which is what lets PauseDatabase promise
 	// a revert rather than lie about one.

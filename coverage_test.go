@@ -210,6 +210,11 @@ type fakeDriver struct {
 	stubErr     error
 	finalizeErr error
 	finalized   int
+	// renewed counts RenewLease calls; claimLost and renewErr make it report a
+	// superseded claim or fail outright.
+	renewed   int
+	claimLost bool
+	renewErr  error
 }
 
 func (f *fakeDriver) Dequeue(context.Context, []string, ExecutorClass, bool, int, time.Duration) ([]RawJob, error) {
@@ -234,6 +239,18 @@ func (f *fakeDriver) Finalize(context.Context, RawJob, string, Result, error, ti
 	f.finalized++
 	f.mu.Unlock()
 	return f.finalizeErr
+}
+
+// RenewLease reports the claim as held and counts the call, so a dispatch test
+// can assert on the heartbeat's cadence without a database.
+func (f *fakeDriver) RenewLease(context.Context, string, string, time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renewed++
+	if f.renewErr != nil {
+		return false, f.renewErr
+	}
+	return !f.claimLost, nil
 }
 
 func (f *fakeDriver) InsertChild(context.Context, *gorm.DB, FollowUp, string) error { return nil }

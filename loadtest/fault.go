@@ -156,6 +156,21 @@ func (d *gateDriver) Finalize(
 	return d.inner.Finalize(ctx, raw, runID, result, workErr, finishedAt)
 }
 
+// RenewLease extends a claim's lease unless gated.
+//
+// Gating it is what makes a killed runner's jobs actually expire. A gate that
+// blocked finalize but let the heartbeat through would keep the orphan's lease
+// alive for as long as the process lived, and the sweep — the thing the fault
+// exists to exercise — would never see it.
+func (d *gateDriver) RenewLease(
+	ctx context.Context, jobID, leaseToken string, until time.Time,
+) (bool, error) {
+	if err := d.gate.check(); err != nil {
+		return false, err
+	}
+	return d.inner.RenewLease(ctx, jobID, leaseToken, until)
+}
+
 // InsertChild delegates. It is unreachable through a decorator — see
 // timingDriver.InsertChild — so gating it would gate nothing.
 func (d *gateDriver) InsertChild(
