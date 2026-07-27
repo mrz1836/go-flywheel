@@ -239,11 +239,17 @@ func (d *baseDriver) InsertRunStub(
 }
 
 // jobFinalizeUpdate is the jobs-row column set for a finalization.
+//
+// The lease token is cleared alongside leased_until on every transition, because
+// every transition a finalization can make leaves the running state — even a
+// snooze or a retry, which return the job to the pool for a fresh claim to take
+// under a fresh token.
 func jobFinalizeUpdate(plan finalizeOutcome, finishedAt time.Time) map[string]any {
 	upd := map[string]any{
 		"state":        string(plan.jobState),
 		"updated_at":   finishedAt,
 		"leased_until": nil,
+		"lease_token":  nil,
 	}
 	if plan.scheduledAt != nil {
 		upd["scheduled_at"] = *plan.scheduledAt
@@ -348,7 +354,14 @@ func (d *baseDriver) Finalize(
 		// running and supersedes this finalize, so the UPDATE matches no row. We
 		// honor that — no state advance, no follow-up enqueue — but still write the
 		// job_runs audit row so the attempt is not lost, then return nil.
-		res := tx.Model(&jobRow{}).Where("id = ? AND state = ?", raw.ID, string(StateRunning)).
+		//
+		// The token is what makes the guard mean "this job is running under my
+		// claim" rather than "this job is running". Without it a reclaimed job is
+		// running again under a *different* attempt, the original attempt's
+		// finalize still matches, and whichever attempt finishes first wins
+		// regardless of which one holds the lease.
+		res := tx.Model(&jobRow{}).
+			Where("id = ? AND state = ? AND lease_token = ?", raw.ID, string(StateRunning), raw.LeaseToken).
 			Updates(jobFinalizeUpdate(plan, finishedAt))
 		if res.Error != nil {
 			return fmt.Errorf("jobs: advance job state: %w", res.Error)
@@ -440,7 +453,11 @@ func (d *baseDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
 		if err := tx.Model(&jobRow{}).Where("id IN ?", ids).Updates(map[string]any{
 			"state":        string(StateAvailable),
 			"leased_until": nil,
-			"updated_at":   now,
+			// Clearing the token is what makes the reclaim final: the attempt whose
+			// lease just expired can no longer finalize over the next claim, and it
+			// cannot renew the lease it no longer holds either.
+			"lease_token": nil,
+			"updated_at":  now,
 		}).Error; err != nil {
 			return fmt.Errorf("jobs: reclaim jobs: %w", err)
 		}

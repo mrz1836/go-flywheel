@@ -661,6 +661,19 @@ func TestRealWorldSupersededFinalizeIsNoDoubleFinalize(t *testing.T) {
 	var children int64
 	require.NoError(t, db.Table("jobs").Where("kind = ?", "rw.recover.child").Count(&children).Error)
 	assert.Zero(t, children, "a superseded finalize enqueues no follow-ups")
+
+	// Nothing else on the row moved either. The cancel wrote finalized_at and
+	// cleared the token; a superseded finalize that restamped either would be a
+	// partial write the state assertion above cannot see.
+	var row jobRow
+	require.NoError(t, db.Where("id = ?", id).First(&row).Error)
+	require.NotNil(t, row.FinalizedAt)
+	assert.Equal(t, base.UTC(), row.FinalizedAt.UTC(), "finalized_at still reads the cancel's stamp")
+	assert.Nil(t, row.LeaseToken, "the released claim is not re-taken by the attempt that lost it")
+
+	var outcome string
+	require.NoError(t, db.Table("job_runs").Select("outcome").Where("id = ?", runID).Scan(&outcome).Error)
+	assert.Equal(t, string(OutcomeSuccess), outcome, "the attempt is audited with the outcome it actually had")
 }
 
 // --- idempotent enqueue ------------------------------------------------------

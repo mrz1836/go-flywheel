@@ -19,9 +19,10 @@ func TestFinalizePersistsThroughCancelledContext(t *testing.T) {
 	d := baseDriver{db: db}
 	now := time.Now().UTC().Truncate(time.Second)
 
-	raw := RawJob{ID: "job-cancel-ctx", Kind: "k", Attempt: 1, MaxAttempts: 5}
+	token := models.NewID()
+	raw := RawJob{ID: "job-cancel-ctx", Kind: "k", Attempt: 1, MaxAttempts: 5, LeaseToken: token}
 	seedJob(t, db, jobRow{
-		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning),
+		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning), LeaseToken: &token,
 		Attempt: 1, MaxAttempts: 5, CreatedAt: now, UpdatedAt: now, ScheduledAt: now,
 	})
 	runID := models.NewID()
@@ -51,9 +52,10 @@ func TestFinalizeSkipsSupersededCancel(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
 
-	raw := RawJob{ID: "job-superseded", Kind: "k", Attempt: 1, MaxAttempts: 5}
+	token := models.NewID()
+	raw := RawJob{ID: "job-superseded", Kind: "k", Attempt: 1, MaxAttempts: 5, LeaseToken: token}
 	seedJob(t, db, jobRow{
-		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning),
+		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning), LeaseToken: &token,
 		Attempt: 1, MaxAttempts: 5, CreatedAt: now, UpdatedAt: now, ScheduledAt: now, LeasedUntil: &now,
 	})
 	runID := models.NewID()
@@ -90,9 +92,10 @@ func TestFinalizeSuccessPathEnqueuesFollowUps(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
 
-	raw := RawJob{ID: "job-success", Kind: "k", Attempt: 1, MaxAttempts: 5}
+	token := models.NewID()
+	raw := RawJob{ID: "job-success", Kind: "k", Attempt: 1, MaxAttempts: 5, LeaseToken: token}
 	seedJob(t, db, jobRow{
-		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning),
+		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning), LeaseToken: &token,
 		Attempt: 1, MaxAttempts: 5, CreatedAt: now, UpdatedAt: now, ScheduledAt: now,
 	})
 	runID := models.NewID()

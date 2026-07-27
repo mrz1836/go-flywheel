@@ -177,8 +177,14 @@ func TestFinalizeRecordsErrorPayload(t *testing.T) {
 	d := baseDriver{db: db}
 	ctx := context.Background()
 
-	raw := RawJob{ID: "job-e", Attempt: 1, MaxAttempts: 5}
-	seedJob(t, db, jobRow{ID: raw.ID, Kind: "k", State: string(StateRunning), ScheduledAt: time.Now()})
+	// The token matches the seeded row's, so this exercises the finalize that
+	// lands rather than the superseded one — which writes the same audit row and
+	// would let the assertion pass for the wrong reason.
+	token := models.NewID()
+	raw := RawJob{ID: "job-e", Attempt: 1, MaxAttempts: 5, LeaseToken: token}
+	seedJob(t, db, jobRow{
+		ID: raw.ID, Kind: "k", State: string(StateRunning), LeaseToken: &token, ScheduledAt: time.Now(),
+	})
 	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
 
