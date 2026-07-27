@@ -616,7 +616,7 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 		if !untilIdle {
 			backoff.reset()
 		} else {
-			// FR-04-06: "no job is in a non-terminal state" includes this runner's
+			// "No job is in a non-terminal state" includes this runner's
 			// own in-flight jobs, and with independent slots the claim going empty
 			// no longer implies the pool is empty. Waiting for it here makes the
 			// guarantee hold by construction rather than by the accident that
@@ -677,7 +677,7 @@ func (r *Runner) sleep(ctx context.Context, d time.Duration) error {
 // path to reach into for no reason.
 type pollBackoff struct{ failures int }
 
-// reset clears the ladder, which a successful poll does immediately (FR-04-08).
+// reset clears the ladder, which a successful poll does immediately.
 func (b *pollBackoff) reset() { b.failures = 0 }
 
 // next records one failure and reports how long to wait, plus whether the ladder
@@ -697,13 +697,13 @@ func (b *pollBackoff) next(base, maxDelay time.Duration) (time.Duration, bool) {
 // loop must stop with, or nil to carry on.
 //
 // One log line per failed attempt, and attempts are ladder-spaced, so the log
-// rate follows the backoff rather than the poll interval (FR-04-09) — a decaying
+// rate follows the backoff rather than the poll interval — a decaying
 // trickle during a sustained outage instead of ten lines a second per runner,
 // with no rate limiter to get wrong.
 //
 // Run never gives up: it backs off forever at the ceiling, because being there
 // when the database returns is the whole job. RunUntilIdle gives up on the first
-// failure whose ladder rung reaches MaxPollBackoff (FR-04-10) — bounded by the
+// failure whose ladder rung reaches MaxPollBackoff — bounded by the
 // ladder, not by the context, because its callers include harnesses that pass a
 // context with no deadline at all, and a context-only bound would hang them.
 //

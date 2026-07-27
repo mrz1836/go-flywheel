@@ -44,7 +44,7 @@ func (w *nodeDrainWorker) Work(ctx context.Context, _ *Job[nodeDrainArgs]) (Resu
 }
 
 // TestNodeAwaitDrainDrainsEachRunnerBeforeReturning proves a host cancel is a
-// drain request rather than an abort (FR-04-13).
+// drain request rather than an abort.
 //
 // It is the test the detached run context exists for. Previously runCtx was a
 // child of the caller's, so a cancel reached every worker's context: the job
