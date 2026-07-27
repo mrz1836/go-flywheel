@@ -23,6 +23,11 @@ const (
 	defaultRetryBackoffBase = time.Second
 	maxRetryBackoff         = time.Minute
 	backoffJitterSpread     = 0.5 // ±25% — the jitter multiplier spans [0.75, 1.25).
+	// defaultMaxPollBackoff caps the delay between polls during a sustained
+	// failure. A failing database must not be polled at the empty-queue rate:
+	// every runner in a fleet hitting it ten times a second is a retry storm
+	// aimed at a recovering database, plus an unbounded volume of error logs.
+	defaultMaxPollBackoff = 30 * time.Second
 	// heartbeatDivisor derives the renewal interval from the lease: renewing at
 	// one third means two consecutive renewals may fail before the lease can
 	// expire.
@@ -87,6 +92,14 @@ type RunnerConfig struct {
 	OnLeaseRenewed func(ctx context.Context, renewal LeaseRenewal) error
 	// PollInterval is the pause between empty polls.
 	PollInterval time.Duration
+	// MaxPollBackoff caps the delay between polls after consecutive failures.
+	// Zero selects thirty seconds. The delay starts at PollInterval, doubles per
+	// consecutive failure with jitter, and resets on the first success.
+	//
+	// It is floored at twice PollInterval. A ceiling the first rung already
+	// reaches is a ladder with nothing to climb, and RunUntilIdle — which gives
+	// up once the ladder saturates — would abandon its drain on a single blip.
+	MaxPollBackoff time.Duration
 	// Concurrency is the maximum number of jobs this Runner runs at once — its
 	// pool size. The Runner claims to fill its free slots and dispatches each
 	// job independently, so a slow job occupies one slot rather than stalling
@@ -173,6 +186,16 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = defaultPollInterval
+	}
+	if cfg.MaxPollBackoff <= 0 {
+		cfg.MaxPollBackoff = defaultMaxPollBackoff
+	}
+	// expBackoff does not clamp on the first attempt, so a ceiling at or below
+	// PollInterval would saturate the ladder on the very first failure — and
+	// RunUntilIdle, whose give-up rule is saturation, would abandon a drain that
+	// had budget left. Two intervals is the smallest ceiling with a rung to climb.
+	if floor := 2 * cfg.PollInterval; cfg.MaxPollBackoff < floor {
+		cfg.MaxPollBackoff = floor
 	}
 	if cfg.RetryBackoffBase <= 0 {
 		cfg.RetryBackoffBase = defaultRetryBackoffBase
@@ -434,6 +457,7 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 	// Runner reused for a second invocation starts from an empty pool.
 	defer func() { _ = r.pool.waitIdle(context.WithoutCancel(ctx)) }()
 
+	var backoff pollBackoff
 	for {
 		if err := ctx.Err(); err != nil {
 			return r.stopped(untilIdle, err)
@@ -452,16 +476,24 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			r.cfg.Logger.ErrorContext(ctx, "jobs: dispatch failed", "error", dispatchErr)
 		}
 		if claimErr != nil {
-			if untilIdle {
-				return claimErr
+			if stop := r.onPollError(ctx, &backoff, untilIdle, claimErr); stop != nil {
+				return stop
 			}
-			r.cfg.Logger.ErrorContext(ctx, "jobs: poll failed", "error", claimErr)
+			continue
 		}
 		if claimed > 0 {
+			backoff.reset()
 			continue
 		}
 
-		if untilIdle {
+		// An empty claim reached the database, but for RunUntilIdle the iteration
+		// is not over: the pending count is part of the same poll. Resetting the
+		// ladder here instead of after the count would mean a queue that is always
+		// empty and a count that always fails never climb a rung — the ladder would
+		// reset on every claim and the loop would spin forever.
+		if !untilIdle {
+			backoff.reset()
+		} else {
 			// FR-04-06: "no job is in a non-terminal state" includes this runner's
 			// own in-flight jobs, and with independent slots the claim going empty
 			// no longer implies the pool is empty. Waiting for it here makes the
@@ -478,10 +510,16 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 				return dispatchErr
 			}
 
+			// The count hits the same database the claim does, so a blip on it is as
+			// transient as a blip on the claim and takes the same ladder.
 			pending, countErr := r.pendingCount(ctx)
 			if countErr != nil {
-				return countErr
+				if stop := r.onPollError(ctx, &backoff, untilIdle, countErr); stop != nil {
+					return stop
+				}
+				continue
 			}
+			backoff.reset()
 			if pending == 0 {
 				return nil
 			}
@@ -489,12 +527,79 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			// wait one interval and poll again.
 		}
 
-		select {
-		case <-ctx.Done():
-			return r.stopped(untilIdle, ctx.Err())
-		case <-time.After(r.cfg.PollInterval):
+		if err := r.sleep(ctx, r.cfg.PollInterval); err != nil {
+			return r.stopped(untilIdle, err)
 		}
 	}
+}
+
+// sleep waits d out, reporting ctx's error when the wait was cut short.
+func (r *Runner) sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// pollBackoff is one dispatch loop's poll-failure ladder.
+//
+// It is loop-local rather than a Runner field on purpose: two invocations of the
+// loop have independent ladders, and a field would be shared state for the drain
+// path to reach into for no reason.
+type pollBackoff struct{ failures int }
+
+// reset clears the ladder, which a successful poll does immediately (FR-04-08).
+func (b *pollBackoff) reset() { b.failures = 0 }
+
+// next records one failure and reports how long to wait, plus whether the ladder
+// has reached its ceiling.
+//
+// Saturation is computed from the un-jittered rung, so it is a property of the
+// failure count alone: the ladder saturates on failure ceil(log2(maxDelay/base))
+// + 1, deterministically. That is what lets RunUntilIdle give up after a fixed
+// number of attempts rather than depending on a deadline it may not have.
+func (b *pollBackoff) next(base, maxDelay time.Duration) (time.Duration, bool) {
+	b.failures++
+	rung := expBackoff(base, maxDelay, b.failures)
+	return jittered(rung), rung >= maxDelay
+}
+
+// onPollError applies the ladder for one failed poll and reports the error the
+// loop must stop with, or nil to carry on.
+//
+// One log line per failed attempt, and attempts are ladder-spaced, so the log
+// rate follows the backoff rather than the poll interval (FR-04-09) — a decaying
+// trickle during a sustained outage instead of ten lines a second per runner,
+// with no rate limiter to get wrong.
+//
+// Run never gives up: it backs off forever at the ceiling, because being there
+// when the database returns is the whole job. RunUntilIdle gives up on the first
+// failure whose ladder rung reaches MaxPollBackoff (FR-04-10) — bounded by the
+// ladder, not by the context, because its callers include harnesses that pass a
+// context with no deadline at all, and a context-only bound would hang them.
+//
+// A wait cut short returns nil, leaving the loop's own top-of-iteration checks to
+// own the exit.
+func (r *Runner) onPollError(ctx context.Context, b *pollBackoff, untilIdle bool, err error) error {
+	delay, saturated := b.next(r.cfg.PollInterval, r.cfg.MaxPollBackoff)
+	r.cfg.Logger.ErrorContext(
+		ctx, "jobs: poll failed",
+		"error", err,
+		"consecutive_failures", b.failures,
+		"backoff", delay.String(),
+	)
+	if untilIdle && saturated {
+		return fmt.Errorf("jobs: run-until-idle: poll failed %d consecutive times: %w", b.failures, err)
+	}
+	_ = r.sleep(ctx, delay)
+	return nil
 }
 
 // stopped wraps the reason the loop ended, naming which entry point ended.
@@ -783,9 +888,15 @@ func (r *Runner) classify(entry registryEntry, workErr error, raw RawJob) error 
 
 // backoff is the exponential retry delay with ±25% jitter.
 func (r *Runner) backoff(attempt int) time.Duration {
-	delay := expBackoff(r.cfg.RetryBackoffBase, maxRetryBackoff, attempt)
-	jitter := (1.0 - backoffJitterSpread/2) + rand.Float64()*backoffJitterSpread //nolint:gosec // jitter, not security
-	return time.Duration(float64(delay) * jitter)
+	return jittered(expBackoff(r.cfg.RetryBackoffBase, maxRetryBackoff, attempt))
+}
+
+// jittered spreads d by ±25%. It is the one jitter this package applies — the
+// retry ladder and the poll ladder share it, so there is a single spread to
+// reason about.
+func jittered(d time.Duration) time.Duration {
+	spread := (1.0 - backoffJitterSpread/2) + rand.Float64()*backoffJitterSpread //nolint:gosec // jitter, not security
+	return time.Duration(float64(d) * spread)
 }
 
 // executorIdentity returns this process's executor identity (hostname:pid).
