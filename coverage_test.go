@@ -37,16 +37,17 @@ func TestTruncateCapsAtNBytes(t *testing.T) {
 
 func TestRawFromRowMalformedTagsErrors(t *testing.T) {
 	t.Parallel()
-	_, err := rawFromRow(jobRow{Tags: datatypes.JSON("not json")}, 1)
+	_, err := rawFromRow(jobRow{Tags: datatypes.JSON("not json")}, 1, "tok")
 	require.Error(t, err, "an undecodable tags blob is surfaced as an error")
 }
 
 func TestRawFromRowDecodesTags(t *testing.T) {
 	t.Parallel()
-	rj, err := rawFromRow(jobRow{ID: "x", Tags: datatypes.JSON(`["a","b"]`)}, 3)
+	rj, err := rawFromRow(jobRow{ID: "x", Tags: datatypes.JSON(`["a","b"]`)}, 3, "tok")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a", "b"}, rj.Tags)
 	assert.Equal(t, 3, rj.Attempt)
+	assert.Equal(t, "tok", rj.LeaseToken, "the token comes from the claim, not from the row")
 }
 
 func TestClassifiedErrorUnwrapAndError(t *testing.T) {

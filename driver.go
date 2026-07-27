@@ -162,8 +162,15 @@ var claimableStates = []string{ //nolint:gochecknoglobals // intentional shared 
 	string(StateAvailable), string(StateRetryable), string(StateScheduled),
 }
 
-// rawFromRow converts a claimed jobs row into a RawJob with the given attempt.
-func rawFromRow(r jobRow, attempt int) (RawJob, error) {
+// rawFromRow converts a claimed jobs row into a RawJob with the given attempt
+// and lease token.
+//
+// Both are parameters rather than fields read off r because neither dialect
+// hands them back: SQLite converts the row it selected *before* the claim
+// updated it, and the Postgres claim deliberately does not name lease_token in
+// its RETURNING list — the caller minted the token, so returning it would be
+// dead weight in the one statement on the hot path.
+func rawFromRow(r jobRow, attempt int, leaseToken string) (RawJob, error) {
 	var tags []string
 	if len(r.Tags) > 0 {
 		if err := json.Unmarshal(r.Tags, &tags); err != nil {
@@ -178,6 +185,7 @@ func rawFromRow(r jobRow, attempt int) (RawJob, error) {
 		Attempt:     attempt,
 		MaxAttempts: r.MaxAttempts,
 		TimeoutMs:   r.TimeoutMs,
+		LeaseToken:  leaseToken,
 		ParentJobID: r.ParentJobID,
 		Tags:        tags,
 		ScheduledAt: r.ScheduledAt,
