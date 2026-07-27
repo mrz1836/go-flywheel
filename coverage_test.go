@@ -234,11 +234,16 @@ func (f *fakeDriver) InsertRunStub(context.Context, string, RawJob, time.Time, E
 	return f.stubErr
 }
 
-func (f *fakeDriver) Finalize(context.Context, RawJob, string, Result, error, time.Time) error {
+func (f *fakeDriver) Finalize(
+	context.Context, RawJob, string, Result, error, time.Time,
+) (FinalizeOutcome, error) {
 	f.mu.Lock()
 	f.finalized++
 	f.mu.Unlock()
-	return f.finalizeErr
+	if f.finalizeErr != nil {
+		return FinalizeOutcome{}, f.finalizeErr
+	}
+	return FinalizeOutcome{State: StateSucceeded, RunOutcome: OutcomeSuccess}, nil
 }
 
 // RenewLease reports the claim as held and counts the call, so a dispatch test
@@ -472,7 +477,7 @@ func TestFinalizeOutputMarshalErrors(t *testing.T) {
 	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
 
-	err := d.Finalize(ctx, raw, runID, Result{Output: make(chan int)}, nil, time.Now())
+	_, err := d.Finalize(ctx, raw, runID, Result{Output: make(chan int)}, nil, time.Now())
 	require.Error(t, err, "an unmarshalable worker Output surfaces a finalize error")
 }
 

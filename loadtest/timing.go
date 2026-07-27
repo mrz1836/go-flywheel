@@ -88,11 +88,11 @@ func (d *timingDriver) InsertRunStub(
 func (d *timingDriver) Finalize(
 	ctx context.Context, raw flywheel.RawJob, runID string,
 	result flywheel.Result, workErr error, finishedAt time.Time,
-) error {
+) (flywheel.FinalizeOutcome, error) {
 	start := time.Now()
-	err := d.inner.Finalize(ctx, raw, runID, result, workErr, finishedAt)
+	out, err := d.inner.Finalize(ctx, raw, runID, result, workErr, finishedAt)
 	d.final.record(d.shard, time.Since(start))
-	return err
+	return out, err
 }
 
 // RenewLease delegates without timing.

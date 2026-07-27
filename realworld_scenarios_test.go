@@ -654,7 +654,8 @@ func TestRealWorldSupersededFinalizeIsNoDoubleFinalize(t *testing.T) {
 	// The worker finishes successfully with a follow-up, but the finalize is
 	// superseded by the cancel.
 	result := Result{FollowUps: []FollowUp{{Kind: "rw.recover.child", Args: recoverArgs{V: "child"}}}}
-	require.NoError(t, driver.Finalize(ctx, batch[0], runID, result, nil, base.Add(time.Second)))
+	_, finalizeErr := driver.Finalize(ctx, batch[0], runID, result, nil, base.Add(time.Second))
+	require.NoError(t, finalizeErr)
 
 	assert.Equal(t, string(StateCancelled), jobState(t, db, id), "the cancel is not overwritten by the finishing worker")
 	assert.EqualValues(t, 1, runCount(t, db, id), "the attempt is still audited exactly once")

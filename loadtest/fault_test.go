@@ -262,7 +262,7 @@ func TestGateBlocksTheDriver(t *testing.T) {
 	if err := d.InsertRunStub(ctx, "r", flywheel.RawJob{}, time.Now(), "", "e"); !errors.Is(err, ErrGated) {
 		t.Errorf("InsertRunStub error = %v, want ErrGated", err)
 	}
-	if err := d.Finalize(ctx, flywheel.RawJob{}, "r", flywheel.Result{}, nil, time.Now()); !errors.Is(err, ErrGated) {
+	if _, err := d.Finalize(ctx, flywheel.RawJob{}, "r", flywheel.Result{}, nil, time.Now()); !errors.Is(err, ErrGated) {
 		t.Errorf("Finalize error = %v, want ErrGated", err)
 	}
 	if _, err := d.Sweep(ctx, time.Now()); !errors.Is(err, ErrGated) {

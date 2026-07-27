@@ -149,9 +149,9 @@ func (d *gateDriver) InsertRunStub(
 func (d *gateDriver) Finalize(
 	ctx context.Context, raw flywheel.RawJob, runID string,
 	result flywheel.Result, workErr error, finishedAt time.Time,
-) error {
+) (flywheel.FinalizeOutcome, error) {
 	if err := d.gate.checkFinalize(); err != nil {
-		return err
+		return flywheel.FinalizeOutcome{}, err
 	}
 	return d.inner.Finalize(ctx, raw, runID, result, workErr, finishedAt)
 }

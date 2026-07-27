@@ -290,7 +290,8 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
 		finishedAt := models.ClockFrom(ctx).Now(ctx)
 		unknown := &classifiedError{cause: ErrUnknownKind, class: ErrorPermanent}
 		r.observe(ctx, raw, jobEv, Result{}, unknown, startedAt, finishedAt)
-		return r.cfg.Driver.Finalize(ctx, raw, runID, Result{}, unknown, finishedAt)
+		_, err := r.cfg.Driver.Finalize(ctx, raw, runID, Result{}, unknown, finishedAt)
+		return err
 	}
 
 	logger := r.cfg.Logger.With("job_id", raw.ID, "kind", raw.Kind, "run_id", runID)
@@ -337,12 +338,18 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
 	r.observe(ctx, raw, jobEv, result, finalErr, startedAt, finishedAt)
 	// Finalize on the parent ctx, not the (possibly expired) workCtx, so a
 	// timed-out attempt still records its outcome.
-	return r.cfg.Driver.Finalize(ctx, raw, runID, result, finalErr, finishedAt)
+	_, err := r.cfg.Driver.Finalize(ctx, raw, runID, result, finalErr, finishedAt)
+	return err
 }
 
 // observe emits the OnFinish event (and OnRetry when the attempt will retry) for
-// one finalized attempt. It reuses planFinalize so the observer sees the same
-// outcome, error class, and retry delay the Driver persists.
+// one finalized attempt.
+//
+// It recomputes planFinalize because it runs before the driver has applied
+// anything, and that is a defect on both counts: the runner and the driver
+// derive the same decision independently and could diverge, and the observer is
+// told an outcome the driver has not yet agreed to. Both are closed by the
+// ordering inversion that follows the supersede event.
 func (r *Runner) observe(
 	ctx context.Context, raw RawJob, ev JobEvent, result Result, finalErr error, startedAt, finishedAt time.Time,
 ) {

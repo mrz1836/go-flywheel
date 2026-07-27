@@ -37,7 +37,14 @@ type Driver interface {
 	// Finalize runs, in one transaction, the run-row outcome update, the
 	// jobs.state advance, and any follow-up inserts. A follow-up colliding with
 	// an existing unique_key is skipped, not fatal.
-	Finalize(ctx context.Context, raw RawJob, runID string, result Result, workErr error, finishedAt time.Time) error
+	//
+	// It reports what it actually persisted, which is not always what the
+	// attempt's result implied: an attempt whose claim was superseded has its
+	// audit row written and nothing else. The caller is expected to report the
+	// returned outcome rather than re-deriving one from the result.
+	Finalize(
+		ctx context.Context, raw RawJob, runID string, result Result, workErr error, finishedAt time.Time,
+	) (FinalizeOutcome, error)
 
 	// RenewLease extends a claimed job's lease, scoped to the claim that holds
 	// it. It reports whether the claim is still held: false means the claim was
@@ -76,8 +83,31 @@ func (e *classifiedError) Error() string { return e.cause.Error() }
 // Unwrap exposes the cause for errors.Is/As.
 func (e *classifiedError) Unwrap() error { return e.cause }
 
-// finalizeOutcome is the state-machine decision for one finalization.
-type finalizeOutcome struct {
+// FinalizeOutcome reports what a finalization actually persisted.
+//
+// It is deliberately not the same type as the internal finalizePlan: the plan is
+// what the attempt's result implied, this is what the database ended up holding,
+// and a superseded finalize is precisely the case where the two differ.
+type FinalizeOutcome struct {
+	// Superseded is true when the attempt no longer held the claim: the audit row
+	// was written and the job's state was left untouched.
+	Superseded bool
+	// State is the job's state after finalization. When Superseded it is the
+	// state the superseding claim left, read back rather than planned — which is
+	// what distinguishes "cancelled underneath the attempt" from "reclaimed and
+	// running again". It is empty only when the job no longer exists.
+	State JobState
+	// RunOutcome is what was written to the audit row. It is the attempt's real
+	// outcome even when Superseded: the attempt happened, and losing the claim
+	// discards its effect on the job, not the record of the work.
+	RunOutcome RunOutcome
+	// EnqueuedChildren is the number of follow-ups enqueued; always zero when
+	// Superseded.
+	EnqueuedChildren int
+}
+
+// finalizePlan is the state-machine decision for one finalization.
+type finalizePlan struct {
 	jobState         JobState
 	runOutcome       RunOutcome
 	scheduledAt      *time.Time
@@ -99,15 +129,15 @@ type finalizeOutcome struct {
 // observable guarantee.
 //
 //nolint:gocognit // one switch over the four mutually exclusive outcomes
-func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time) finalizeOutcome {
+func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time) finalizePlan {
 	switch {
 	case result.Cancel:
-		return finalizeOutcome{
+		return finalizePlan{
 			jobState: StateCancelled, runOutcome: OutcomeCancelled, finalizedAt: &finishedAt,
 		}
 	case result.Snooze != nil:
 		when := finishedAt.Add(*result.Snooze)
-		return finalizeOutcome{
+		return finalizePlan{
 			jobState: StateScheduled, runOutcome: OutcomeSnooze,
 			scheduledAt: &when, maxAttemptsDelta: 1,
 		}
@@ -127,7 +157,7 @@ func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time
 		if class == ErrorTimeout {
 			outcome = OutcomeTimeout
 		}
-		out := finalizeOutcome{runOutcome: outcome, errorClass: &class}
+		out := finalizePlan{runOutcome: outcome, errorClass: &class}
 		permanent := class == ErrorPermanent || class == ErrorValidation
 		if permanent || raw.Attempt >= raw.MaxAttempts {
 			out.jobState = StateDiscarded
@@ -139,7 +169,7 @@ func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time
 		}
 		return out
 	default:
-		return finalizeOutcome{
+		return finalizePlan{
 			jobState: StateSucceeded, runOutcome: OutcomeSuccess,
 			finalizedAt: &finishedAt, followUps: true,
 		}
@@ -255,7 +285,7 @@ func (d *baseDriver) InsertRunStub(
 // every transition a finalization can make leaves the running state — even a
 // snooze or a retry, which return the job to the pool for a fresh claim to take
 // under a fresh token.
-func jobFinalizeUpdate(plan finalizeOutcome, finishedAt time.Time) map[string]any {
+func jobFinalizeUpdate(plan finalizePlan, finishedAt time.Time) map[string]any {
 	upd := map[string]any{
 		"state":        string(plan.jobState),
 		"updated_at":   finishedAt,
@@ -276,7 +306,7 @@ func jobFinalizeUpdate(plan finalizeOutcome, finishedAt time.Time) map[string]an
 
 // runFinalizeUpdate is the job_runs-row column set for a finalization.
 func runFinalizeUpdate(
-	plan finalizeOutcome, result Result, workErr error, finishedAt time.Time, durationMs, enqueued int,
+	plan finalizePlan, result Result, workErr error, finishedAt time.Time, durationMs, enqueued int,
 ) (map[string]any, error) {
 	upd := map[string]any{
 		"outcome":           string(plan.runOutcome),
@@ -340,11 +370,17 @@ func marshalRunOutput(output any) (datatypes.JSON, error) {
 // between the three cannot leave a job succeeded with its children unenqueued or
 // its audit row still reading started.
 //
+// It returns what it persisted rather than what it planned. The two diverge
+// whenever the attempt's claim was superseded, and the caller has no other way
+// to tell: re-deriving the plan on the far side would produce the outcome the
+// attempt *would* have had, which is exactly the wrong answer.
+//
 //nolint:gocognit // one transaction closure with three cohesive steps
 func (d *baseDriver) Finalize(
 	ctx context.Context, raw RawJob, runID string, result Result, workErr error, finishedAt time.Time,
-) error {
+) (FinalizeOutcome, error) {
 	plan := planFinalize(raw, result, workErr, finishedAt)
+	out := FinalizeOutcome{State: plan.jobState, RunOutcome: plan.runOutcome}
 
 	// A recorded outcome must survive shutdown: a drain or cancel that cancels ctx
 	// mid-finalize would otherwise roll back the worker's result. WithoutCancel
@@ -377,15 +413,35 @@ func (d *baseDriver) Finalize(
 		if res.Error != nil {
 			return fmt.Errorf("jobs: advance job state: %w", res.Error)
 		}
-		superseded := res.RowsAffected == 0
+		out.Superseded = res.RowsAffected == 0
+		if out.Superseded {
+			// Read back the state the superseding claim left, inside the same
+			// transaction. Reporting the plan's state would name a state nothing
+			// wrote, and the real one is what tells a caller *how* the claim was
+			// lost — cancelled underneath the attempt, or reclaimed and re-running.
+			// It is one extra SELECT on a path that should be rare.
+			var current jobRow
+			switch err := tx.Model(&jobRow{}).
+				Select("state").Where("id = ?", raw.ID).First(&current).Error; {
+			case err == nil:
+				out.State = JobState(current.State)
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				// Deleted out from under the attempt. There is no state to report,
+				// and the zero value says exactly that.
+				out.State = ""
+			default:
+				return fmt.Errorf("jobs: read superseded job state: %w", err)
+			}
+		}
 
 		enqueued := 0
-		if plan.followUps && !superseded {
+		if plan.followUps && !out.Superseded {
 			var followErr error
 			if enqueued, followErr = d.insertFollowUps(txCtx, tx, result.FollowUps, raw.ID); followErr != nil {
 				return followErr
 			}
 		}
+		out.EnqueuedChildren = enqueued
 
 		runUpd, err := runFinalizeUpdate(plan, result, workErr, finishedAt, durationMs, enqueued)
 		if err != nil {
@@ -397,9 +453,11 @@ func (d *baseDriver) Finalize(
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("jobs: finalize: %w", err)
+		// The transaction rolled back, so nothing was persisted and there is no
+		// outcome to report. The zero value says so.
+		return FinalizeOutcome{}, fmt.Errorf("jobs: finalize: %w", err)
 	}
-	return nil
+	return out, nil
 }
 
 // RenewLease extends a claimed job's lease for as long as the claim still holds

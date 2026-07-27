@@ -162,7 +162,12 @@ func TestFenceSupersededFinalizeAdvancesNothing(t *testing.T) {
 		Output:    map[string]any{"ok": true},
 		FollowUps: []FollowUp{{Kind: "fence.child", Args: map[string]any{}}},
 	}
-	require.NoError(t, d.Finalize(ctx, first[0], runID, result, nil, time.Now()))
+	out, err := d.Finalize(ctx, first[0], runID, result, nil, time.Now())
+	require.NoError(t, err)
+	assert.True(t, out.Superseded, "the finalize reports that it persisted no state advance")
+	assert.Equal(t, StateRunning, out.State, "and reports the state the superseding claim left")
+	assert.Equal(t, OutcomeSuccess, out.RunOutcome, "while still reporting the attempt's real outcome")
+	assert.Zero(t, out.EnqueuedChildren)
 
 	var row jobRow
 	require.NoError(t, db.Where("id = ?", first[0].ID).First(&row).Error)
@@ -235,7 +240,9 @@ func TestFenceOperatorActionsClearTheToken(t *testing.T) {
 			// And the running attempt's finalize is now a true no-op.
 			runID := models.NewID()
 			require.NoError(t, d.InsertRunStub(ctx, runID, batch[0], time.Now(), "local", "exec-1"))
-			require.NoError(t, d.Finalize(ctx, batch[0], runID, Result{}, nil, time.Now()))
+			out, err := d.Finalize(ctx, batch[0], runID, Result{}, nil, time.Now())
+			require.NoError(t, err)
+			assert.True(t, out.Superseded)
 			assert.NotEqual(t, string(StateSucceeded), jobState(t, db, batch[0].ID),
 				"the finishing worker does not overwrite the operator's action")
 		})
