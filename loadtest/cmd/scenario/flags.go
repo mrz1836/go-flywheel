@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/mrz1836/go-flywheel/loadtest"
@@ -44,6 +45,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		opts    options
 		mix     string
 		indexes string
+		fault   string
 	)
 
 	fs.StringVar(&opts.cfg.DSN, "dsn", os.Getenv(dsnEnv),
@@ -58,6 +60,10 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		"schema condition: full, correctness-only")
 	fs.DurationVar(&opts.cfg.WorkDuration, "work", 0, "simulated per-job work time; zero isolates the database path")
 	fs.DurationVar(&opts.cfg.WorkJitter, "jitter", 0, "spread applied to the per-job work time")
+	fs.DurationVar(&opts.cfg.Lease, "lease", 0,
+		"runner lease duration (default: derived from -work; set it below the work time to exercise renewal)")
+	fs.StringVar(&fault, "fault", faultNone,
+		"fault to inject, as name[@fraction][:duration]; one of "+strings.Join(faultNames(), ", "))
 	fs.DurationVar(&opts.cfg.SampleInterval, "sample-interval", time.Second, "storage sampling cadence")
 	fs.DurationVar(&opts.cfg.Timeout, "timeout", 30*time.Minute, "hard bound on the whole run")
 	fs.StringVar(&opts.cfg.Queue, "queue", "", "queue to enqueue onto (default: the harness default)")
@@ -84,6 +90,19 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	}
 	if !opts.cfg.Indexes.Valid() {
 		return options{}, fmt.Errorf("scenario: -indexes %q is not one of full, correctness-only", indexes)
+	}
+	// The fault is built here, not in the harness, for the same reason: an
+	// unknown name costs a message rather than a provisioned schema, and the
+	// message names the flag the operator typed.
+	injected, err := parseFault(fault)
+	if err != nil {
+		return options{}, err
+	}
+	// Only assign a non-nil fault: Config.Faults is an interface, so storing a
+	// typed nil would make the harness's `Faults != nil` check true for a run
+	// that asked for no fault.
+	if injected != nil {
+		opts.cfg.Faults = injected
 	}
 	if opts.cfg.DSN == "" {
 		return options{}, fmt.Errorf("scenario: no target: pass -dsn or set %s", dsnEnv)

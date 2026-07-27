@@ -504,11 +504,69 @@ command, the config reference, and the macOS launchd setup.
 
 <br/>
 
+### Leases, the heartbeat, and the fence
+
+A claimed job carries a **lease**. If its executor dies, the lease expires and the scheduler's sweep
+returns the job to the queue for another runner — which is what makes a crashed process recoverable
+rather than a job lost forever.
+
+**`LeaseDuration` bounds dispatch liveness, not run duration.** It is how long a *crashed* executor's
+job stays stranded before it is reclaimed, not a ceiling on how long a worker may take. Size it to how
+quickly you want a crash noticed — the default is 30 seconds. `DefaultTimeout` is what bounds a hung
+run.
+
+That separation holds because a running job's lease is **renewed automatically** while its worker is
+alive, on a background goroutine, with no worker code:
+
+```go
+flywheel.RunnerConfig{
+    LeaseDuration: 30 * time.Second, // how fast a crash is noticed
+    DefaultTimeout: 10 * time.Minute, // how long a single attempt may run
+
+    // Optional. Zero renews at LeaseDuration/3 — two renewals may fail before
+    // the lease can expire. Negative disables renewal entirely.
+    HeartbeatInterval: 0,
+
+    // Optional. Fires after each successful renewal, so a host holding its own
+    // time-bounded resource for the attempt — an external reservation, a
+    // distributed lock — can extend it on the same cadence.
+    OnLeaseRenewed: func(ctx context.Context, r flywheel.LeaseRenewal) error {
+        return reservations.ExtendTo(ctx, r.JobID, r.ExpiresAt)
+    },
+}
+```
+
+Renewal stops when the attempt ends — normal return, panic, or execution timeout alike — and it stops
+if the claim is lost.
+
+**The fence is what makes renewal safe.** Renewal can still fail: a network blip, a paused process, a
+GC pause longer than the lease. So every claim also stamps a token (`jobs.lease_token`), and both
+`Finalize` and renewal require it. An attempt whose job was reclaimed, cancelled, or retried
+underneath it therefore **advances nothing**: no state change, no follow-ups, no lease extension. Its
+`job_runs` row is still written, because the attempt did happen — what is discarded is its effect on
+the job, not the record of the work.
+
+When that happens the runtime says so, loudly and exactly once:
+
+- `Observer.OnSupersede` fires **in place of** `OnFinish`, carrying the outcome that was discarded.
+- `observers.NewSlog` logs it at **warn** — the one lifecycle event it does not log at debug.
+- `observers.NewMetrics` counts `flywheel_jobs_superseded_total`.
+
+A nonzero supersede rate means work is being executed twice: the lease is too short for the workload,
+or the heartbeat is disabled or failing.
+
+**What this does not give you.** The fence closes the *library's* double-dispatch window. It cannot
+make a non-idempotent external call safe: a worker killed after its side effect and before its
+finalize still re-runs. Write workers that tolerate a re-run — the fence guarantees only one attempt's
+outcome is ever recorded, not that only one attempt ever executes.
+
+<br/>
+
 ### Observability
 
 The runtime is self-diagnosing. The `Observer` seam ([observer.go](observer.go)) reports every
-attempt's lifecycle — claim, start, finish, retry — with no metrics dependency in the core, and the
-[`observers/`](observers) package ships ready adapters that plug straight in:
+attempt's lifecycle — claim, start, finish, retry, supersede — with no metrics dependency in the core,
+and the [`observers/`](observers) package ships ready adapters that plug straight in:
 
 - `observers.NewMetrics(rec)` translates events into a `MetricsRecorder` — a one-method sink you back
   with Prometheus, OpenTelemetry, statsd, or CloudWatch (the core imports none of them).

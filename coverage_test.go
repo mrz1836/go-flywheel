@@ -37,16 +37,17 @@ func TestTruncateCapsAtNBytes(t *testing.T) {
 
 func TestRawFromRowMalformedTagsErrors(t *testing.T) {
 	t.Parallel()
-	_, err := rawFromRow(jobRow{Tags: datatypes.JSON("not json")}, 1)
+	_, err := rawFromRow(jobRow{Tags: datatypes.JSON("not json")}, 1, "tok")
 	require.Error(t, err, "an undecodable tags blob is surfaced as an error")
 }
 
 func TestRawFromRowDecodesTags(t *testing.T) {
 	t.Parallel()
-	rj, err := rawFromRow(jobRow{ID: "x", Tags: datatypes.JSON(`["a","b"]`)}, 3)
+	rj, err := rawFromRow(jobRow{ID: "x", Tags: datatypes.JSON(`["a","b"]`)}, 3, "tok")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a", "b"}, rj.Tags)
 	assert.Equal(t, 3, rj.Attempt)
+	assert.Equal(t, "tok", rj.LeaseToken, "the token comes from the claim, not from the row")
 }
 
 func TestClassifiedErrorUnwrapAndError(t *testing.T) {
@@ -209,6 +210,11 @@ type fakeDriver struct {
 	stubErr     error
 	finalizeErr error
 	finalized   int
+	// renewed counts RenewLease calls; claimLost and renewErr make it report a
+	// superseded claim or fail outright.
+	renewed   int
+	claimLost bool
+	renewErr  error
 }
 
 func (f *fakeDriver) Dequeue(context.Context, []string, ExecutorClass, bool, int, time.Duration) ([]RawJob, error) {
@@ -228,11 +234,28 @@ func (f *fakeDriver) InsertRunStub(context.Context, string, RawJob, time.Time, E
 	return f.stubErr
 }
 
-func (f *fakeDriver) Finalize(context.Context, RawJob, string, Result, error, time.Time) error {
+func (f *fakeDriver) Finalize(
+	context.Context, RawJob, string, Result, error, time.Time,
+) (FinalizeOutcome, error) {
 	f.mu.Lock()
 	f.finalized++
 	f.mu.Unlock()
-	return f.finalizeErr
+	if f.finalizeErr != nil {
+		return FinalizeOutcome{}, f.finalizeErr
+	}
+	return FinalizeOutcome{State: StateSucceeded, RunOutcome: OutcomeSuccess}, nil
+}
+
+// RenewLease reports the claim as held and counts the call, so a dispatch test
+// can assert on the heartbeat's cadence without a database.
+func (f *fakeDriver) RenewLease(context.Context, string, string, time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renewed++
+	if f.renewErr != nil {
+		return false, f.renewErr
+	}
+	return !f.claimLost, nil
 }
 
 func (f *fakeDriver) InsertChild(context.Context, *gorm.DB, FollowUp, string) error { return nil }
@@ -454,7 +477,7 @@ func TestFinalizeOutputMarshalErrors(t *testing.T) {
 	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
 
-	err := d.Finalize(ctx, raw, runID, Result{Output: make(chan int)}, nil, time.Now())
+	_, err := d.Finalize(ctx, raw, runID, Result{Output: make(chan int)}, nil, time.Now())
 	require.Error(t, err, "an unmarshalable worker Output surfaces a finalize error")
 }
 

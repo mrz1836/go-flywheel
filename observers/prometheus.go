@@ -38,6 +38,7 @@ var metricHelp = map[string]string{
 	MetricJobsFinished:     "Total worker attempts finished, by outcome.",
 	MetricJobsErrored:      "Total worker attempts that finished with a classified error.",
 	MetricJobsRetried:      "Total worker attempts scheduled for a retry.",
+	MetricJobsSuperseded:   "Total worker attempts whose outcome was discarded because their claim was lost.",
 	MetricJobDuration:      "Worker attempt duration in seconds (sum and count).",
 	MetricQueueJobs:        "Jobs in the queue by state.",
 	MetricQueueReady:       "Jobs claimable right now.",

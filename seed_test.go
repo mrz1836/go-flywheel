@@ -69,7 +69,8 @@ func TestSeedRunMatchesARuntimeWrittenRow(t *testing.T) {
 	runtimeRunID := models.NewID()
 	raw := RawJob{ID: runtimeJob, Kind: "test.kind", Queue: "default", Attempt: 1, MaxAttempts: 25}
 	require.NoError(t, driver.InsertRunStub(ctx, runtimeRunID, raw, startedAt, "worker", "exec-1"))
-	require.NoError(t, driver.Finalize(ctx, raw, runtimeRunID, Result{Output: output}, errors.New(failure), finishedAt))
+	_, finalizeErr := driver.Finalize(ctx, raw, runtimeRunID, Result{Output: output}, errors.New(failure), finishedAt)
+	require.NoError(t, finalizeErr)
 	want := readRun(t, db, runtimeRunID)
 
 	// The host's path: one call, describing the same attempt.

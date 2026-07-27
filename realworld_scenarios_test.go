@@ -51,11 +51,12 @@ func rwRunner(t testing.TB, db *gorm.DB, reg *Registry, mutators ...func(*Runner
 // recordObserver captures the lifecycle events the Runner emits so a scenario can
 // reconcile observed counters against the driven outcomes.
 type recordObserver struct {
-	mu       sync.Mutex
-	claimed  int
-	starts   int
-	finishes []FinishEvent
-	retries  []RetryEvent
+	mu         sync.Mutex
+	claimed    int
+	starts     int
+	finishes   []FinishEvent
+	retries    []RetryEvent
+	supersedes []SupersedeEvent
 }
 
 func (o *recordObserver) OnClaim(_ context.Context, ev ClaimEvent) {
@@ -80,6 +81,12 @@ func (o *recordObserver) OnRetry(_ context.Context, ev RetryEvent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.retries = append(o.retries, ev)
+}
+
+func (o *recordObserver) OnSupersede(_ context.Context, ev SupersedeEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.supersedes = append(o.supersedes, ev)
 }
 
 func (o *recordObserver) outcomeCount(outcome RunOutcome) int {
@@ -654,13 +661,27 @@ func TestRealWorldSupersededFinalizeIsNoDoubleFinalize(t *testing.T) {
 	// The worker finishes successfully with a follow-up, but the finalize is
 	// superseded by the cancel.
 	result := Result{FollowUps: []FollowUp{{Kind: "rw.recover.child", Args: recoverArgs{V: "child"}}}}
-	require.NoError(t, driver.Finalize(ctx, batch[0], runID, result, nil, base.Add(time.Second)))
+	_, finalizeErr := driver.Finalize(ctx, batch[0], runID, result, nil, base.Add(time.Second))
+	require.NoError(t, finalizeErr)
 
 	assert.Equal(t, string(StateCancelled), jobState(t, db, id), "the cancel is not overwritten by the finishing worker")
 	assert.EqualValues(t, 1, runCount(t, db, id), "the attempt is still audited exactly once")
 	var children int64
 	require.NoError(t, db.Table("jobs").Where("kind = ?", "rw.recover.child").Count(&children).Error)
 	assert.Zero(t, children, "a superseded finalize enqueues no follow-ups")
+
+	// Nothing else on the row moved either. The cancel wrote finalized_at and
+	// cleared the token; a superseded finalize that restamped either would be a
+	// partial write the state assertion above cannot see.
+	var row jobRow
+	require.NoError(t, db.Where("id = ?", id).First(&row).Error)
+	require.NotNil(t, row.FinalizedAt)
+	assert.Equal(t, base.UTC(), row.FinalizedAt.UTC(), "finalized_at still reads the cancel's stamp")
+	assert.Nil(t, row.LeaseToken, "the released claim is not re-taken by the attempt that lost it")
+
+	var outcome string
+	require.NoError(t, db.Table("job_runs").Select("outcome").Where("id = ?", runID).Scan(&outcome).Error)
+	assert.Equal(t, string(OutcomeSuccess), outcome, "the attempt is audited with the outcome it actually had")
 }
 
 // --- idempotent enqueue ------------------------------------------------------

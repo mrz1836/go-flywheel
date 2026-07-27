@@ -178,7 +178,20 @@ type RawJob struct {
 	MaxAttempts int
 	// TimeoutMs, when non-nil, is this job's per-job execution timeout in
 	// milliseconds, applied by the Runner around the worker call.
-	TimeoutMs   *int
+	TimeoutMs *int
+	// LeaseToken is the fence for this claim. The Runner carries it back into
+	// Finalize and every lease renewal; a claim superseded by a sweep or a
+	// concurrent operator action no longer matches, so its finalize is a true
+	// no-op rather than a race the first finisher wins.
+	//
+	// One token is minted per claim call, not per row: the claim stamps a single
+	// value on every job in the batch. That is sufficient because every guard is
+	// `id = ? AND lease_token = ?` — two jobs sharing a token are still
+	// disambiguated by id, and a job cannot appear in two concurrent claims,
+	// since it must be released and re-claimed first, which is a new call and a
+	// new token. Stated explicitly because "the token is not unique per row"
+	// reads like a bug to a reader who has not worked it through.
+	LeaseToken  string
 	ParentJobID *string
 	Tags        []string
 	ScheduledAt time.Time

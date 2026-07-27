@@ -41,6 +41,9 @@ func (d *sqliteDriver) Dequeue(
 	var claimed []RawJob
 	err := d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		now := models.ClockFrom(ctx).Now(ctx)
+		// One token per claim call, stamped on every row in the batch. See
+		// RawJob.LeaseToken for why per-row generation would buy nothing.
+		token := models.NewID()
 
 		query := tx.Model(&jobRow{}).
 			Where("state IN ?", claimableStates).
@@ -68,6 +71,7 @@ func (d *sqliteDriver) Dequeue(
 			"state":        string(StateRunning),
 			"attempt":      gorm.Expr("attempt + 1"),
 			"leased_until": now.Add(lease),
+			"lease_token":  token,
 			"updated_at":   now,
 		}).Error; err != nil {
 			return fmt.Errorf("claim jobs: %w", err)
@@ -75,7 +79,9 @@ func (d *sqliteDriver) Dequeue(
 
 		claimed = make([]RawJob, 0, len(rows))
 		for _, r := range rows {
-			rj, convErr := rawFromRow(r, r.Attempt+1)
+			// rows were selected before the claim, so the attempt and the token
+			// both come from this call rather than from the row.
+			rj, convErr := rawFromRow(r, r.Attempt+1, token)
 			if convErr != nil {
 				return convErr
 			}

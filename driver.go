@@ -37,7 +37,25 @@ type Driver interface {
 	// Finalize runs, in one transaction, the run-row outcome update, the
 	// jobs.state advance, and any follow-up inserts. A follow-up colliding with
 	// an existing unique_key is skipped, not fatal.
-	Finalize(ctx context.Context, raw RawJob, runID string, result Result, workErr error, finishedAt time.Time) error
+	//
+	// It reports what it actually persisted, which is not always what the
+	// attempt's result implied: an attempt whose claim was superseded has its
+	// audit row written and nothing else. The caller is expected to report the
+	// returned outcome rather than re-deriving one from the result.
+	Finalize(
+		ctx context.Context, raw RawJob, runID string, result Result, workErr error, finishedAt time.Time,
+	) (FinalizeOutcome, error)
+
+	// RenewLease extends a claimed job's lease, scoped to the claim that holds
+	// it. It reports whether the claim is still held: false means the claim was
+	// superseded — swept, cancelled, or otherwise released — and the caller must
+	// stop renewing.
+	//
+	// It never returns an error for a lost claim. Losing a claim is an outcome,
+	// not a failure: it is the ordinary consequence of a lease expiring, and a
+	// caller that had to distinguish it from a database error by inspecting one
+	// would get it wrong.
+	RenewLease(ctx context.Context, jobID, leaseToken string, until time.Time) (held bool, err error)
 
 	// InsertChild writes one follow-up job on tx, skipping a unique_key
 	// collision without error.
@@ -65,8 +83,37 @@ func (e *classifiedError) Error() string { return e.cause.Error() }
 // Unwrap exposes the cause for errors.Is/As.
 func (e *classifiedError) Unwrap() error { return e.cause }
 
-// finalizeOutcome is the state-machine decision for one finalization.
-type finalizeOutcome struct {
+// FinalizeOutcome reports what a finalization actually persisted.
+//
+// It is deliberately not the same type as the internal finalizePlan: the plan is
+// what the attempt's result implied, this is what the database ended up holding,
+// and a superseded finalize is precisely the case where the two differ.
+type FinalizeOutcome struct {
+	// Superseded is true when the attempt no longer held the claim: the audit row
+	// was written and the job's state was left untouched.
+	Superseded bool
+	// State is the job's state after finalization. When Superseded it is the
+	// state the superseding claim left, read back rather than planned — which is
+	// what distinguishes "cancelled underneath the attempt" from "reclaimed and
+	// running again". It is empty only when the job no longer exists.
+	State JobState
+	// RunOutcome is what was written to the audit row. It is the attempt's real
+	// outcome even when Superseded: the attempt happened, and losing the claim
+	// discards its effect on the job, not the record of the work.
+	RunOutcome RunOutcome
+	// ErrorClass is the classification written to the audit row, empty when the
+	// attempt carried no error.
+	ErrorClass ErrorClass
+	// ScheduledAt is when the job next becomes claimable — set only for a retry
+	// or a snooze, nil for a terminal state and when Superseded.
+	ScheduledAt *time.Time
+	// EnqueuedChildren is the number of follow-ups enqueued; always zero when
+	// Superseded.
+	EnqueuedChildren int
+}
+
+// finalizePlan is the state-machine decision for one finalization.
+type finalizePlan struct {
 	jobState         JobState
 	runOutcome       RunOutcome
 	scheduledAt      *time.Time
@@ -88,15 +135,15 @@ type finalizeOutcome struct {
 // observable guarantee.
 //
 //nolint:gocognit // one switch over the four mutually exclusive outcomes
-func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time) finalizeOutcome {
+func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time) finalizePlan {
 	switch {
 	case result.Cancel:
-		return finalizeOutcome{
+		return finalizePlan{
 			jobState: StateCancelled, runOutcome: OutcomeCancelled, finalizedAt: &finishedAt,
 		}
 	case result.Snooze != nil:
 		when := finishedAt.Add(*result.Snooze)
-		return finalizeOutcome{
+		return finalizePlan{
 			jobState: StateScheduled, runOutcome: OutcomeSnooze,
 			scheduledAt: &when, maxAttemptsDelta: 1,
 		}
@@ -116,7 +163,7 @@ func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time
 		if class == ErrorTimeout {
 			outcome = OutcomeTimeout
 		}
-		out := finalizeOutcome{runOutcome: outcome, errorClass: &class}
+		out := finalizePlan{runOutcome: outcome, errorClass: &class}
 		permanent := class == ErrorPermanent || class == ErrorValidation
 		if permanent || raw.Attempt >= raw.MaxAttempts {
 			out.jobState = StateDiscarded
@@ -128,7 +175,7 @@ func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time
 		}
 		return out
 	default:
-		return finalizeOutcome{
+		return finalizePlan{
 			jobState: StateSucceeded, runOutcome: OutcomeSuccess,
 			finalizedAt: &finishedAt, followUps: true,
 		}
@@ -162,8 +209,15 @@ var claimableStates = []string{ //nolint:gochecknoglobals // intentional shared 
 	string(StateAvailable), string(StateRetryable), string(StateScheduled),
 }
 
-// rawFromRow converts a claimed jobs row into a RawJob with the given attempt.
-func rawFromRow(r jobRow, attempt int) (RawJob, error) {
+// rawFromRow converts a claimed jobs row into a RawJob with the given attempt
+// and lease token.
+//
+// Both are parameters rather than fields read off r because neither dialect
+// hands them back: SQLite converts the row it selected *before* the claim
+// updated it, and the Postgres claim deliberately does not name lease_token in
+// its RETURNING list — the caller minted the token, so returning it would be
+// dead weight in the one statement on the hot path.
+func rawFromRow(r jobRow, attempt int, leaseToken string) (RawJob, error) {
 	var tags []string
 	if len(r.Tags) > 0 {
 		if err := json.Unmarshal(r.Tags, &tags); err != nil {
@@ -178,6 +232,7 @@ func rawFromRow(r jobRow, attempt int) (RawJob, error) {
 		Attempt:     attempt,
 		MaxAttempts: r.MaxAttempts,
 		TimeoutMs:   r.TimeoutMs,
+		LeaseToken:  leaseToken,
 		ParentJobID: r.ParentJobID,
 		Tags:        tags,
 		ScheduledAt: r.ScheduledAt,
@@ -231,11 +286,17 @@ func (d *baseDriver) InsertRunStub(
 }
 
 // jobFinalizeUpdate is the jobs-row column set for a finalization.
-func jobFinalizeUpdate(plan finalizeOutcome, finishedAt time.Time) map[string]any {
+//
+// The lease token is cleared alongside leased_until on every transition, because
+// every transition a finalization can make leaves the running state — even a
+// snooze or a retry, which return the job to the pool for a fresh claim to take
+// under a fresh token.
+func jobFinalizeUpdate(plan finalizePlan, finishedAt time.Time) map[string]any {
 	upd := map[string]any{
 		"state":        string(plan.jobState),
 		"updated_at":   finishedAt,
 		"leased_until": nil,
+		"lease_token":  nil,
 	}
 	if plan.scheduledAt != nil {
 		upd["scheduled_at"] = *plan.scheduledAt
@@ -251,7 +312,7 @@ func jobFinalizeUpdate(plan finalizeOutcome, finishedAt time.Time) map[string]an
 
 // runFinalizeUpdate is the job_runs-row column set for a finalization.
 func runFinalizeUpdate(
-	plan finalizeOutcome, result Result, workErr error, finishedAt time.Time, durationMs, enqueued int,
+	plan finalizePlan, result Result, workErr error, finishedAt time.Time, durationMs, enqueued int,
 ) (map[string]any, error) {
 	upd := map[string]any{
 		"outcome":           string(plan.runOutcome),
@@ -315,11 +376,24 @@ func marshalRunOutput(output any) (datatypes.JSON, error) {
 // between the three cannot leave a job succeeded with its children unenqueued or
 // its audit row still reading started.
 //
+// It returns what it persisted rather than what it planned. The two diverge
+// whenever the attempt's claim was superseded, and the caller has no other way
+// to tell: re-deriving the plan on the far side would produce the outcome the
+// attempt *would* have had, which is exactly the wrong answer.
+//
 //nolint:gocognit // one transaction closure with three cohesive steps
 func (d *baseDriver) Finalize(
 	ctx context.Context, raw RawJob, runID string, result Result, workErr error, finishedAt time.Time,
-) error {
+) (FinalizeOutcome, error) {
 	plan := planFinalize(raw, result, workErr, finishedAt)
+	out := FinalizeOutcome{
+		State:       plan.jobState,
+		RunOutcome:  plan.runOutcome,
+		ScheduledAt: plan.scheduledAt,
+	}
+	if plan.errorClass != nil {
+		out.ErrorClass = *plan.errorClass
+	}
 
 	// A recorded outcome must survive shutdown: a drain or cancel that cancels ctx
 	// mid-finalize would otherwise roll back the worker's result. WithoutCancel
@@ -340,20 +414,49 @@ func (d *baseDriver) Finalize(
 		// running and supersedes this finalize, so the UPDATE matches no row. We
 		// honor that — no state advance, no follow-up enqueue — but still write the
 		// job_runs audit row so the attempt is not lost, then return nil.
-		res := tx.Model(&jobRow{}).Where("id = ? AND state = ?", raw.ID, string(StateRunning)).
+		//
+		// The token is what makes the guard mean "this job is running under my
+		// claim" rather than "this job is running". Without it a reclaimed job is
+		// running again under a *different* attempt, the original attempt's
+		// finalize still matches, and whichever attempt finishes first wins
+		// regardless of which one holds the lease.
+		res := tx.Model(&jobRow{}).
+			Where("id = ? AND state = ? AND lease_token = ?", raw.ID, string(StateRunning), raw.LeaseToken).
 			Updates(jobFinalizeUpdate(plan, finishedAt))
 		if res.Error != nil {
 			return fmt.Errorf("jobs: advance job state: %w", res.Error)
 		}
-		superseded := res.RowsAffected == 0
+		out.Superseded = res.RowsAffected == 0
+		if out.Superseded {
+			// Nothing was scheduled, because nothing was written to the job at all.
+			out.ScheduledAt = nil
+			// Read back the state the superseding claim left, inside the same
+			// transaction. Reporting the plan's state would name a state nothing
+			// wrote, and the real one is what tells a caller *how* the claim was
+			// lost — cancelled underneath the attempt, or reclaimed and re-running.
+			// It is one extra SELECT on a path that should be rare.
+			var current jobRow
+			switch err := tx.Model(&jobRow{}).
+				Select("state").Where("id = ?", raw.ID).First(&current).Error; {
+			case err == nil:
+				out.State = JobState(current.State)
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				// Deleted out from under the attempt. There is no state to report,
+				// and the zero value says exactly that.
+				out.State = ""
+			default:
+				return fmt.Errorf("jobs: read superseded job state: %w", err)
+			}
+		}
 
 		enqueued := 0
-		if plan.followUps && !superseded {
+		if plan.followUps && !out.Superseded {
 			var followErr error
 			if enqueued, followErr = d.insertFollowUps(txCtx, tx, result.FollowUps, raw.ID); followErr != nil {
 				return followErr
 			}
 		}
+		out.EnqueuedChildren = enqueued
 
 		runUpd, err := runFinalizeUpdate(plan, result, workErr, finishedAt, durationMs, enqueued)
 		if err != nil {
@@ -365,9 +468,37 @@ func (d *baseDriver) Finalize(
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("jobs: finalize: %w", err)
+		// The transaction rolled back, so nothing was persisted and there is no
+		// outcome to report. The zero value says so.
+		return FinalizeOutcome{}, fmt.Errorf("jobs: finalize: %w", err)
 	}
-	return nil
+	return out, nil
+}
+
+// RenewLease extends a claimed job's lease for as long as the claim still holds
+// it. There is no dialect split: it is a single guarded UPDATE, and both drivers
+// express it identically.
+//
+// The guard is the same one Finalize uses, for the same reason — an attempt that
+// no longer holds the claim must not extend a lease the next claim is relying
+// on. That makes a lost claim indistinguishable from a lost race here, which is
+// correct: both mean "stop renewing".
+//
+// until is an absolute expiry rather than an extension, so a caller that renews
+// to now+lease cannot bank an ever-growing lease out of a stalled heartbeat.
+func (d *baseDriver) RenewLease(
+	ctx context.Context, jobID, leaseToken string, until time.Time,
+) (bool, error) {
+	res := d.db.WithContext(ctx).Model(&jobRow{}).
+		Where("id = ? AND state = ? AND lease_token = ?", jobID, string(StateRunning), leaseToken).
+		Updates(map[string]any{
+			"leased_until": until,
+			"updated_at":   models.ClockFrom(ctx).Now(ctx),
+		})
+	if res.Error != nil {
+		return false, fmt.Errorf("jobs: renew lease: %w", res.Error)
+	}
+	return res.RowsAffected == 1, nil
 }
 
 // InsertChild writes one follow-up job on tx. A unique_key collision is
@@ -432,7 +563,11 @@ func (d *baseDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
 		if err := tx.Model(&jobRow{}).Where("id IN ?", ids).Updates(map[string]any{
 			"state":        string(StateAvailable),
 			"leased_until": nil,
-			"updated_at":   now,
+			// Clearing the token is what makes the reclaim final: the attempt whose
+			// lease just expired can no longer finalize over the next claim, and it
+			// cannot renew the lease it no longer holds either.
+			"lease_token": nil,
+			"updated_at":  now,
 		}).Error; err != nil {
 			return fmt.Errorf("jobs: reclaim jobs: %w", err)
 		}

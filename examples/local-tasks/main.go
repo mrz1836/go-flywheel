@@ -153,6 +153,14 @@ func (o runLogObserver) OnRetry(ctx context.Context, ev flywheel.RetryEvent) {
 	o.log.WarnContext(ctx, "job retry scheduled", "kind", ev.Kind, "next_attempt", ev.NextAttempt, "delay", ev.Delay.String())
 }
 
+// OnSupersede fires in OnFinish's place when an attempt's claim was lost, so its
+// outcome was discarded. In this single-runner demo it should never fire; if it
+// does, the same work ran twice.
+func (o runLogObserver) OnSupersede(ctx context.Context, ev flywheel.SupersedeEvent) {
+	o.log.WarnContext(ctx, "job attempt superseded; its outcome was discarded",
+		"kind", ev.Kind, "discarded_outcome", ev.Outcome, "duration_ms", ev.Duration.Milliseconds())
+}
+
 // scriptsDir resolves the bundled scripts directory from this source file so the
 // example runs from any working directory.
 func scriptsDir() string {

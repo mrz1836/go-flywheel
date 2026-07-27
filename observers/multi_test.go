@@ -29,6 +29,9 @@ func (o orderObs) OnClaim(context.Context, flywheel.ClaimEvent)   { o.record("cl
 func (o orderObs) OnStart(context.Context, flywheel.JobEvent)     { o.record("start") }
 func (o orderObs) OnFinish(context.Context, flywheel.FinishEvent) { o.record("finish") }
 func (o orderObs) OnRetry(context.Context, flywheel.RetryEvent)   { o.record("retry") }
+func (o orderObs) OnSupersede(context.Context, flywheel.SupersedeEvent) {
+	o.record("supersede")
+}
 
 func TestMultiFansEveryEventToAllInOrder(t *testing.T) {
 	t.Parallel()
@@ -43,12 +46,14 @@ func TestMultiFansEveryEventToAllInOrder(t *testing.T) {
 	m.OnStart(ctx, flywheel.JobEvent{})
 	m.OnFinish(ctx, flywheel.FinishEvent{})
 	m.OnRetry(ctx, flywheel.RetryEvent{})
+	m.OnSupersede(ctx, flywheel.SupersedeEvent{})
 
 	assert.Equal(t, []string{
 		"a:claim", "b:claim",
 		"a:start", "b:start",
 		"a:finish", "b:finish",
 		"a:retry", "b:retry",
+		"a:supersede", "b:supersede",
 	}, sink, "each event reaches both children, parent order preserved")
 }
 
@@ -61,6 +66,7 @@ func TestMultiWithNoObserversIsANoOp(t *testing.T) {
 		m.OnStart(ctx, flywheel.JobEvent{})
 		m.OnFinish(ctx, flywheel.FinishEvent{})
 		m.OnRetry(ctx, flywheel.RetryEvent{})
+		m.OnSupersede(ctx, flywheel.SupersedeEvent{})
 	}, "an empty Multi swallows every event without panicking")
 }
 
@@ -89,10 +95,11 @@ func TestMultiImplementsObserver(t *testing.T) {
 // measure Multi's fan-out cost without per-child work distorting the result.
 type countObs struct{ finishes int }
 
-func (c *countObs) OnClaim(context.Context, flywheel.ClaimEvent)   {}
-func (c *countObs) OnStart(context.Context, flywheel.JobEvent)     {}
-func (c *countObs) OnFinish(context.Context, flywheel.FinishEvent) { c.finishes++ }
-func (c *countObs) OnRetry(context.Context, flywheel.RetryEvent)   {}
+func (c *countObs) OnClaim(context.Context, flywheel.ClaimEvent)         {}
+func (c *countObs) OnStart(context.Context, flywheel.JobEvent)           {}
+func (c *countObs) OnFinish(context.Context, flywheel.FinishEvent)       { c.finishes++ }
+func (c *countObs) OnRetry(context.Context, flywheel.RetryEvent)         {}
+func (c *countObs) OnSupersede(context.Context, flywheel.SupersedeEvent) {}
 
 // BenchmarkMultiObserverOnFinish measures the per-event fan-out cost of
 // dispatching one finish event across N child observers.

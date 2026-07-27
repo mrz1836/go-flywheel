@@ -265,6 +265,10 @@ func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
 	res := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id).Updates(map[string]any{
 		"state":        string(StateAvailable),
 		"leased_until": nil,
+		// An attempt may still be running against this job. Clearing its token is
+		// what stops that attempt finalizing over the re-run the operator just
+		// asked for.
+		"lease_token":  nil,
 		"finalized_at": nil,
 		"scheduled_at": now,
 		"updated_at":   now,
@@ -298,6 +302,9 @@ func CancelJob(ctx context.Context, db *gorm.DB, id string) error {
 		Updates(map[string]any{
 			"state":        string(StateCancelled),
 			"leased_until": nil,
+			// The running attempt is not interrupted, but its claim is: clearing
+			// the token is what keeps its finalize from overwriting the cancel.
+			"lease_token":  nil,
 			"finalized_at": now,
 			"updated_at":   now,
 		})

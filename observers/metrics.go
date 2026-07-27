@@ -38,6 +38,10 @@ const (
 	MetricJobsErrored  = "flywheel_jobs_errored_total"
 	MetricJobsRetried  = "flywheel_jobs_retried_total"
 	MetricJobDuration  = "flywheel_job_duration_seconds"
+	// MetricJobsSuperseded counts attempts whose outcome was discarded because
+	// their claim was lost. It is the double-execution signal: every increment is
+	// work that ran and did not count.
+	MetricJobsSuperseded = "flywheel_jobs_superseded_total"
 )
 
 // Tag keys. They are the label dimensions the taxonomy slices each metric by.
@@ -59,6 +63,14 @@ const (
 //	            and, when the attempt carried a classified error,
 //	            Count(flywheel_jobs_errored_total, 1, {kind, error_class})
 //	OnRetry  -> Count(flywheel_jobs_retried_total, 1, {kind, error_class})
+//	OnSupersede -> Count(flywheel_jobs_superseded_total, 1, {kind, queue})
+//
+// Note what OnSupersede does *not* do: it does not count into
+// flywheel_jobs_finished_total. A superseded attempt advanced nothing, so
+// counting it as finished would report two successes for one job — the exact
+// blindness the supersede event exists to remove. flywheel_jobs_finished_total
+// is therefore a count of state-advancing finalizations, and the two families
+// sum to the attempts that ran.
 //
 // It holds no state of its own; all accumulation lives in the recorder.
 type MetricsObserver struct {
@@ -114,6 +126,18 @@ func (m *MetricsObserver) OnRetry(_ context.Context, ev flywheel.RetryEvent) {
 	m.rec.Count(MetricJobsRetried, 1, map[string]string{
 		TagKind:       ev.Kind,
 		TagErrorClass: string(ev.ErrorClass),
+	})
+}
+
+// OnSupersede counts each discarded attempt, sliced by kind and queue.
+//
+// The discarded outcome is deliberately not a label. A supersede is a supersede
+// whatever the attempt would have recorded, and slicing by it would split the
+// one series an operator alerts on into five that each look small.
+func (m *MetricsObserver) OnSupersede(_ context.Context, ev flywheel.SupersedeEvent) {
+	m.rec.Count(MetricJobsSuperseded, 1, map[string]string{
+		TagKind:  ev.Kind,
+		TagQueue: ev.Queue,
 	})
 }
 
