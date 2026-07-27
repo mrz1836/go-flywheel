@@ -46,7 +46,7 @@ func TestRenewLeaseExtendsAHeldClaim(t *testing.T) {
 	assert.WithinDuration(t, until, *after, time.Second, "renewal writes the absolute expiry it was given")
 }
 
-// TestRenewLeaseReportsALostClaim covers FR-05-04 and FR-05-10 at the driver
+// TestRenewLeaseReportsALostClaim is the lost-claim contract at the driver
 // seam: an attempt whose claim was superseded is told so, and — critically —
 // does not extend the lease the *new* claim is relying on.
 //

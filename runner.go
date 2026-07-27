@@ -320,8 +320,8 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
 	r.cfg.Observer.OnStart(ctx, jobEv)
 
 	// Renewal runs for the whole attempt, finalize included. The deferred stop is
-	// what makes FR-05-03 hold on every exit path — normal return, recovered
-	// panic, and execution timeout alike.
+	// what stops renewal on every exit path — normal return, recovered panic,
+	// and execution timeout alike.
 	defer r.startHeartbeat(ctx, raw, runID)()
 
 	workCtx := ctx

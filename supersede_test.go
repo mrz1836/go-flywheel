@@ -101,7 +101,7 @@ func TestSupersedeIsNotEmittedForAHeldClaim(t *testing.T) {
 }
 
 // TestSupersedeOnFinishReportsThePersistedOutcome closes the remaining half of
-// FR-05-13. OnSupersede covers the case where nothing was persisted; this covers
+// the contract. OnSupersede covers the case where nothing was persisted; this covers
 // the case where something was, and asserts the observer's view matches it
 // rather than a plan computed independently.
 //

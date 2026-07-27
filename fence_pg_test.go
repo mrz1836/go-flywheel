@@ -12,7 +12,7 @@ import (
 )
 
 // TestFenceClaimStampsATokenPostgres is the dialect-parity half of the fence
-// claim (FR-05-06). The two Dequeues share no SQL — one is a single CTE with
+// claim. The two Dequeues share no SQL — one is a single CTE with
 // RETURNING, the other a SELECT-then-UPDATE — so "the claim stamps a token"
 // proven on SQLite proves nothing about the statement that runs in production.
 func TestFenceClaimStampsATokenPostgres(t *testing.T) {

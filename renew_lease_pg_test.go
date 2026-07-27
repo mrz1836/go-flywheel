@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestRenewLeasePostgres is FR-05-06's Postgres half. RenewLease has no dialect
+// TestRenewLeasePostgres is the dialect-parity half. RenewLease has no dialect
 // split — it is one guarded UPDATE both drivers inherit — so this proves the
 // claim it is guarded against is the one Postgres actually wrote, not that the
 // SQL differs.

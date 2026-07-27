@@ -42,7 +42,7 @@ func leaseToken(t testing.TB, db *gorm.DB, jobID string) *string {
 	return row.LeaseToken
 }
 
-// TestFenceClaimStampsATokenOnEveryRow covers FR-05-07's per-batch half: one
+// TestFenceClaimStampsATokenOnEveryRow covers the per-batch half of the token: one
 // claim mints one token and stamps it on every row it took, and what the driver
 // hands back matches what it wrote.
 func TestFenceClaimStampsATokenOnEveryRow(t *testing.T) {
@@ -67,7 +67,7 @@ func TestFenceClaimStampsATokenOnEveryRow(t *testing.T) {
 	}
 }
 
-// TestFenceEachClaimMintsAFreshToken covers FR-05-07's across-claims half: the
+// TestFenceEachClaimMintsAFreshToken covers the across-claims half: the
 // token distinguishes a claim from any prior or subsequent claim of the same
 // job. Without this, a reclaimed job would still match its previous attempt's
 // finalize and the fence would be decorative.
@@ -187,7 +187,7 @@ func TestFenceSupersededFinalizeAdvancesNothing(t *testing.T) {
 	assert.Equal(t, string(OutcomeSuccess), outcome, "the attempt is audited with the outcome it actually had")
 }
 
-// TestFenceSweepClearsTheToken covers FR-05-11 directly. The sweep is the one
+// TestFenceSweepClearsTheToken covers the reclaim path. The sweep is the one
 // reclaim path with no attempt on the other side of it to clear the token, so a
 // sweep that returned the job to available while leaving its token set would
 // leave the previous attempt able to finalize over the next claim.
