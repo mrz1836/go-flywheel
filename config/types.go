@@ -13,7 +13,11 @@ type JobsConfig struct {
 	// Queues are the logical queues this host claims work from.
 	Queues []string `json:"queues" env:"JOB_QUEUES"`
 
-	// LeaseDuration is the visibility timeout on a claimed job.
+	// LeaseDuration bounds dispatch liveness: how long a crashed executor's job
+	// stays stranded before the sweep reclaims it. It is not a ceiling on how
+	// long a worker may take — a running job's lease is renewed on the runner's
+	// heartbeat for as long as its worker is alive. Size it to how quickly a
+	// crash should be noticed.
 	LeaseDuration time.Duration `json:"lease_duration" env:"JOB_LEASE_DURATION"`
 
 	// Concurrency is the number of jobs claimed and run per poll.
