@@ -323,9 +323,8 @@ for _, idx := range must(flywheel.IndexSet("postgres")) {
 > shared database wants versioned mode.)
 
 A host that owns its schema history but still wants the installer can have both:
-`MigrateWithOptions(db, MigrateOpts{SkipColumnReconcile: true})` skips the pre-1.0 routing-column rename
-pass, so the runtime issues no `ALTER TABLE` of its own inside a versioned schema. That reconciliation
-is removed in v1.0.0.
+`MigrateWithOptions(db, MigrateOpts{SkipColumnReconcile: true})` skips the routing-column reconciliation
+pass, so the runtime issues no `ALTER TABLE` of its own inside a versioned schema.
 
 > Only PostgreSQL and SQLite are supported, because both express the partial indexes the runtime relies
 > on. Every entry point returns `flywheel.ErrUnsupportedDialect` for anything else rather than silently
