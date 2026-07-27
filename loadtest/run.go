@@ -274,6 +274,29 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 
 	if report.Duration > 0 {
 		report.DrainThroughput = float64(h.prog.terminal()) / report.Duration.Seconds()
+		// Capacity is slots × wall time: every runner's pool, for the whole measured
+		// window. Dividing attempt-time by it is what makes the number comparable
+		// across configurations rather than only against itself.
+		capacity := float64(h.cfg.Runners) * float64(h.cfg.Workers) * float64(report.Duration.Nanoseconds())
+		if capacity > 0 {
+			report.SlotUtilization = float64(h.prog.busyNanos.Load()) / capacity
+		}
+		h.notes.add(
+			"SlotUtilization is attempt time over slots × wall time, and it is a floor: an attempt's "+
+				"duration runs from its run stub to its finalize, so the claim, stub, and finalize round "+
+				"trips around it are capacity the pool was using and this does not count. It read %.1f%% "+
+				"over %d runners × %d workers.",
+			report.SlotUtilization*100, h.cfg.Runners, h.cfg.Workers,
+		)
+	}
+	report.BlockedClaims = h.blockedClaims()
+	if report.BlockedClaims > 0 {
+		h.notes.add(
+			"A fault's gate refused %d claim attempts. That is the runners' poll cadence through the "+
+				"outage: with the poll backoff it follows the exponential ladder, so a count near "+
+				"outage ÷ PollInterval would mean the ladder did not engage.",
+			report.BlockedClaims,
+		)
 	}
 	report.Enqueued = h.prog.enqueued.Load()
 	report.Retried = h.prog.retried.Load()

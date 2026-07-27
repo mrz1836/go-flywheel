@@ -82,6 +82,10 @@ type gate struct {
 	// orphaned counts finalizes blocked by kill mode, so a scenario can assert
 	// the fault produced what it was injected to produce.
 	orphaned atomic.Int64
+	// blockedClaims counts Dequeues refused while the gate was shut. It is the
+	// report's evidence of a runner's poll cadence during an outage — nothing else
+	// measures it, because a gated call deliberately records no latency.
+	blockedClaims atomic.Int64
 }
 
 // shutGate closes the gate. Every subsequent driver call fails with ErrGated.
@@ -137,6 +141,7 @@ func (d *gateDriver) Dequeue(
 	claimAny bool, limit int, lease time.Duration,
 ) ([]flywheel.RawJob, error) {
 	if err := d.gate.check(); err != nil {
+		d.gate.blockedClaims.Add(1)
 		return nil, err
 	}
 	return d.inner.Dequeue(ctx, queues, class, claimAny, limit, lease)

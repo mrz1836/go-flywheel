@@ -99,6 +99,11 @@ type progress struct {
 	// their claim was lost. It is the direct measurement of double execution,
 	// fed by the Observer rather than inferred from row residue after the fact.
 	superseded atomic.Int64
+	// busyNanos accumulates the duration of every decided attempt, which is what
+	// turns the run into a slot-utilization number. Superseded attempts count: the
+	// work ran and held a slot for as long as it took, whatever the runtime then
+	// did with its outcome.
+	busyNanos atomic.Int64
 }
 
 // terminal estimates how many jobs have reached a terminal state.
@@ -152,6 +157,7 @@ func (harnessObserver) OnStart(context.Context, flywheel.JobEvent) {}
 // job permanently unsuccessfully.
 func (o harnessObserver) OnFinish(_ context.Context, ev flywheel.FinishEvent) {
 	o.prog.finished.Add(1)
+	o.prog.busyNanos.Add(ev.Duration.Nanoseconds())
 	if ev.Outcome == flywheel.OutcomeError && ev.ErrorClass == flywheel.ErrorPermanent {
 		o.prog.discarded.Add(1)
 	}
@@ -169,8 +175,11 @@ func (o harnessObserver) OnRetry(context.Context, flywheel.RetryEvent) {
 // nothing, so the job it ran is still in flight and folding it into finished
 // would make the drain fraction — which schedules every fault — report a run as
 // further along than it is.
-func (o harnessObserver) OnSupersede(context.Context, flywheel.SupersedeEvent) {
+func (o harnessObserver) OnSupersede(_ context.Context, ev flywheel.SupersedeEvent) {
 	o.prog.superseded.Add(1)
+	// It occupied a slot even though it advanced nothing, so it counts toward
+	// utilization while staying out of the drain fraction above.
+	o.prog.busyNanos.Add(ev.Duration.Nanoseconds())
 }
 
 // noteset collects measurement caveats. It is a type rather than a slice because
@@ -503,6 +512,20 @@ func (h *Harness) orphanedByFaults() int64 {
 	var n int64
 	for _, g := range h.gates {
 		n += g.orphaned.Load()
+	}
+	return n
+}
+
+// blockedClaims reports how many claim attempts the gates refused.
+//
+// It is the only evidence a paused-database run leaves of how hard its runners
+// hammered the gate: a gated call records no latency observation by design, so
+// without counting it the report cannot distinguish a runner that backed off from
+// one that retried at its poll interval throughout.
+func (h *Harness) blockedClaims() int64 {
+	var n int64
+	for _, g := range h.gates {
+		n += g.blockedClaims.Load()
 	}
 	return n
 }

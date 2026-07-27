@@ -100,8 +100,13 @@ func printSummary(w *os.File, r loadtest.Report) {
 	p("workload digest: %s\n", r.WorkloadDigest)
 	p("duration: %s   enqueue: %.0f jobs/s   drain: %.0f jobs/s\n",
 		r.Duration.Round(time.Millisecond), r.EnqueueThroughput, r.DrainThroughput)
+	p("slot utilization: %.1f%% of %d runners × %d workers\n",
+		r.SlotUtilization*100, r.Config.Runners, r.Config.Workers)
 	p("enqueued=%d drained=%d retried=%d discarded=%d superseded=%d\n",
 		r.Enqueued, r.Drained, r.Retried, r.Discarded, r.Superseded)
+	if r.BlockedClaims > 0 {
+		p("blocked claims (refused by a fault's gate): %d\n", r.BlockedClaims)
+	}
 
 	for name, l := range map[string]loadtest.Latency{
 		"claim": r.Claim, "finalize": r.Finalize, "sweep": r.Sweep,
