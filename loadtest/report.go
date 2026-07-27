@@ -188,7 +188,11 @@ type configJSON struct {
 	// report whose lease was derived and one whose lease was set must be
 	// distinguishable, because the whole point of setting it is to make the lease
 	// shorter than the work.
-	Lease          string `json:"lease"`
+	Lease string `json:"lease"`
+	// Heartbeat is the configured renewal interval verbatim: "0s" means derived
+	// from the lease, a negative value means renewal was off. A report of a run
+	// with the heartbeat disabled must be identifiable as one.
+	Heartbeat      string `json:"heartbeat"`
 	SampleInterval string `json:"sample_interval"`
 	Timeout        string `json:"timeout"`
 	Queue          string `json:"queue"`
@@ -314,6 +318,7 @@ func configToJSON(c Config) configJSON {
 		WorkDuration:   c.WorkDuration.String(),
 		WorkJitter:     c.WorkJitter.String(),
 		Lease:          leaseFor(c).String(),
+		Heartbeat:      c.Heartbeat.String(),
 		SampleInterval: c.SampleInterval.String(),
 		Timeout:        c.Timeout.String(),
 		Queue:          c.Queue,
@@ -344,6 +349,7 @@ func configFromJSON(c configJSON) Config {
 		WorkDuration:   mustParseDuration(c.WorkDuration),
 		WorkJitter:     mustParseDuration(c.WorkJitter),
 		Lease:          mustParseDuration(c.Lease),
+		Heartbeat:      mustParseDuration(c.Heartbeat),
 		SampleInterval: mustParseDuration(c.SampleInterval),
 		Timeout:        mustParseDuration(c.Timeout),
 		Queue:          c.Queue,

@@ -76,6 +76,12 @@ var faultBuilders = map[string]faultBuilder{
 		}
 		return loadtest.PauseDatabase{Fraction: spec.fraction, For: window}, nil
 	},
+	"mass-lease-expiry": func(spec faultSpec) (loadtest.Fault, error) {
+		if spec.window != 0 {
+			return nil, fmt.Errorf("scenario: -fault mass-lease-expiry takes no duration: the expiry is instantaneous")
+		}
+		return loadtest.MassLeaseExpiry{Fraction: spec.fraction}, nil
+	},
 }
 
 // faultNames returns the accepted names, sorted, for a usage or error message.

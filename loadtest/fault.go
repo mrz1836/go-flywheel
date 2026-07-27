@@ -330,6 +330,81 @@ func (p PauseDatabase) Inject(_ context.Context, h *Harness) (func(), error) {
 	}, nil
 }
 
+// MassLeaseExpiry expires every in-flight lease at once, so the next sweep
+// reclaims the whole set rather than the one or two a natural expiry produces.
+//
+// # What it is testing
+//
+// Not the sweep's throughput — that is the bounded-sweep work, and this fault
+// runs against whatever sweep the runtime has. It is testing the fence at scale:
+// thousands of jobs are simultaneously reclaimed and re-dispatched under fresh
+// tokens while their original attempts are still running, so every one of those
+// attempts finalizes into a claim it no longer holds. If the fence has a hole,
+// this is the shape that finds it, because it multiplies a rare race by the
+// queue depth.
+//
+// # Why it sweeps rather than waiting to be swept
+//
+// The first version expired the leases and left the harness's own sweeper to
+// notice on its next tick, up to a second later. That reclaimed almost nothing
+// and the reason is arithmetic: an attempt is in flight for the length of one
+// job, so the chance the sweeper ticks inside that window is the job duration
+// divided by the sweep interval. At a 25 ms job and a 1 s sweep it is 2.5%, and
+// a fault that fires correctly and then reclaims one row out of thirty-two is
+// indistinguishable from one that did not fire.
+//
+// Injecting the sweep makes the reclaim part of the fault instead of a race
+// against a ticker, so what the scenario measures is the fence under a mass
+// reclaim rather than the sampling luck of the sweep interval.
+type MassLeaseExpiry struct {
+	// Fraction is the drain progress at which every held lease is expired.
+	Fraction float64
+}
+
+// At reports when the fault fires.
+func (m MassLeaseExpiry) At() float64 { return m.Fraction }
+
+// Describe renders the fault for a report.
+func (m MassLeaseExpiry) Describe() string {
+	return fmt.Sprintf("expire every held lease at %.0f%% drained", 100*m.Fraction)
+}
+
+// Validate rejects a run with nothing in flight to expire.
+func (m MassLeaseExpiry) Validate(cfg Config) error {
+	if cfg.Mix == WorkloadEnqueueOnly {
+		return fmt.Errorf(
+			"loadtest: MassLeaseExpiry needs a mix that drains, got %q: the enqueue mix starts no runner, "+
+				"so there is no lease to expire: %w",
+			cfg.Mix, ErrInvalidConfig,
+		)
+	}
+	return nil
+}
+
+// Inject expires every held lease and sweeps immediately. The fault is permanent
+// — both have already happened by the time it returns — so revert is nil.
+//
+// The sweep runs on the undecorated driver rather than through a timing one. The
+// harness's sweeper owns the sweep histogram's last shard and is running
+// concurrently, and a second writer to one shard would race; an untimed sweep
+// costs one observation out of a run's worth and keeps the histogram honest.
+func (m MassLeaseExpiry) Inject(ctx context.Context, h *Harness) (func(), error) {
+	expired, err := h.expireLeases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	reclaimed, err := h.reclaimExpired(ctx)
+	if err != nil {
+		return nil, err
+	}
+	h.notes.add(
+		"MassLeaseExpiry expired %d held leases and immediately reclaimed %d. The gap is attempts "+
+			"whose heartbeat renewed the lease back, or which finalized, between the two statements.",
+		expired, reclaimed,
+	)
+	return nil, nil //nolint:nilnil // a permanent fault has no revert; the interface documents nil
+}
+
 // --- scheduling -------------------------------------------------------------
 
 // runFaultScheduler fires the configured fault when the run reaches its

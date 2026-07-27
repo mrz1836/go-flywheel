@@ -133,6 +133,11 @@ type Config struct {
 	// is the only way to exercise renewal — a job that never outlives its lease
 	// never asks the heartbeat for anything.
 	Lease time.Duration
+	// Heartbeat is the runners' lease-renewal interval, passed through verbatim:
+	// zero derives it from the lease, negative disables renewal. Disabling it is
+	// what makes a with/without comparison of the heartbeat's write cost a
+	// same-binary A/B rather than a comparison across two builds.
+	Heartbeat time.Duration
 	// SampleInterval is the cadence of the storage and OS sampler.
 	SampleInterval time.Duration
 	// Timeout bounds the whole run. A drain that cannot finish — a fault that

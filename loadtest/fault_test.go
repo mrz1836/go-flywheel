@@ -226,12 +226,60 @@ func TestFaultSchedulingAndValidation(t *testing.T) {
 		for _, f := range []Fault{
 			KillWorker{Fraction: 0.4, Runner: 1},
 			PauseDatabase{Fraction: 0.6, For: 2 * time.Second},
+			MassLeaseExpiry{Fraction: 0.5},
 		} {
 			if f.Describe() == "" {
 				t.Errorf("%T does not describe itself, so a report of it identifies nothing", f)
 			}
 		}
 	})
+
+	t.Run("MassLeaseExpiry needs a mix that drains", func(t *testing.T) {
+		t.Parallel()
+		_, err := Config{
+			DSN: testDSN, Jobs: 10, Mix: WorkloadEnqueueOnly,
+			Faults: MassLeaseExpiry{Fraction: 0.5},
+		}.validate()
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("error = %v, want ErrInvalidConfig: the enqueue mix holds no lease to expire", err)
+		}
+
+		if _, err := (Config{
+			DSN: testDSN, Jobs: 10, Mix: WorkloadDrainOnly,
+			Faults: MassLeaseExpiry{Fraction: 0.5},
+		}).validate(); err != nil {
+			t.Fatalf("a draining mix was rejected: %v", err)
+		}
+	})
+}
+
+// TestWindowedFaultIsDeclaredNotInferred pins the scheduler's revert rule to the
+// interface rather than to a type switch.
+//
+// The rule it encodes: a fault that declares a window is reverted when the
+// window closes, and one that does not is reverted at the end of the run. Under
+// the type switch this file used to rely on, a new windowed fault would silently
+// take the second branch — compiling, running, and quietly ignoring its own
+// duration.
+func TestWindowedFaultIsDeclaredNotInferred(t *testing.T) {
+	t.Parallel()
+
+	pause := PauseDatabase{Fraction: 0.5, For: 2 * time.Second}
+	windowed, ok := any(pause).(windowedFault)
+	if !ok {
+		t.Fatal("PauseDatabase does not declare a window, so the scheduler would never close it")
+	}
+	if got := windowed.Window(); got != pause.For {
+		t.Errorf("Window() = %s, want %s", got, pause.For)
+	}
+
+	// The permanent faults must not declare one: a window on a fault with no
+	// revert would be a duration nothing acts on.
+	for _, f := range []Fault{KillWorker{Fraction: 0.4, Runner: 1}, MassLeaseExpiry{Fraction: 0.5}} {
+		if _, isWindowed := f.(windowedFault); isWindowed {
+			t.Errorf("%T declares a window but is permanent, so nothing would ever close it", f)
+		}
+	}
 }
 
 // TestGateBlocksTheDriver proves the gate stops every method that reaches the
