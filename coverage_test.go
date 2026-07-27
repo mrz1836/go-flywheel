@@ -215,11 +215,21 @@ type fakeDriver struct {
 	renewed   int
 	claimLost bool
 	renewErr  error
+	// limits records the limit every Dequeue was asked for and dequeues counts
+	// the calls. They are what turns "the claim never asks for more than the pool
+	// has free" and "a failing poll is retried a bounded number of times" into
+	// assertions rather than readings of the code.
+	limits   []int
+	dequeues int
 }
 
-func (f *fakeDriver) Dequeue(context.Context, []string, ExecutorClass, bool, int, time.Duration) ([]RawJob, error) {
+func (f *fakeDriver) Dequeue(
+	_ context.Context, _ []string, _ ExecutorClass, _ bool, limit int, _ time.Duration,
+) ([]RawJob, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.dequeues++
+	f.limits = append(f.limits, limit)
 	if f.dequeueErr != nil {
 		return nil, f.dequeueErr
 	}
@@ -228,6 +238,20 @@ func (f *fakeDriver) Dequeue(context.Context, []string, ExecutorClass, bool, int
 	}
 	f.served = true
 	return f.batch, nil
+}
+
+// dequeueLimits returns the limit every claim so far was asked for, in order.
+func (f *fakeDriver) dequeueLimits() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.limits...)
+}
+
+// dequeueCalls reports how many claims were attempted.
+func (f *fakeDriver) dequeueCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dequeues
 }
 
 func (f *fakeDriver) InsertRunStub(context.Context, string, RawJob, time.Time, ExecutorClass, string) error {

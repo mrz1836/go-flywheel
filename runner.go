@@ -87,9 +87,20 @@ type RunnerConfig struct {
 	OnLeaseRenewed func(ctx context.Context, renewal LeaseRenewal) error
 	// PollInterval is the pause between empty polls.
 	PollInterval time.Duration
-	// Concurrency is the number of jobs claimed and run per poll. A SQLite
-	// driver requires 1.
+	// Concurrency is the maximum number of jobs this Runner runs at once — its
+	// pool size. The Runner claims to fill its free slots and dispatches each
+	// job independently, so a slow job occupies one slot rather than stalling
+	// the others. A SQLite driver requires 1.
+	//
+	// At 1 the Runner dispatches inline on its own loop goroutine: one job in
+	// flight, sequential, no goroutine per job.
 	Concurrency int
+	// ClaimBatchSize caps how many jobs one Dequeue asks for. Zero (the default)
+	// claims exactly the number of free slots, which is right for almost every
+	// deployment. Set it below Concurrency to smooth claim bursts across a fleet;
+	// it is never raised above the free-slot count, since a claimed job the
+	// Runner cannot start is a job leased and not running.
+	ClaimBatchSize int
 	// RetryBackoffBase is the base delay for the exponential retry backoff.
 	// Optional; defaults to one second.
 	RetryBackoffBase time.Duration
@@ -125,6 +136,10 @@ type LeaseRenewal struct {
 type Runner struct {
 	cfg        RunnerConfig
 	executorID string
+	// pool bounds how many dispatches run at once. It is built in NewRunner, not
+	// in the dispatch loop, so every method that consults it is total: callable
+	// before Run, concurrently with it, and after it returns.
+	pool *pool
 }
 
 // NewRunner validates cfg and returns a Runner. It returns ErrSQLiteConcurrency
@@ -169,7 +184,230 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 		cfg.Logger = slog.Default()
 	}
 
-	return &Runner{cfg: cfg, executorID: executorIdentity()}, nil
+	return &Runner{
+		cfg:        cfg,
+		executorID: executorIdentity(),
+		pool:       newPool(cfg.Concurrency),
+	}, nil
+}
+
+// --- worker pool -------------------------------------------------------------
+
+// pool bounds how many dispatches run at once and broadcasts when it is empty.
+//
+// It is a counting semaphore, not a goroutine pool: each dispatch runs on its
+// own goroutine and releases its slot on completion, so a slot's lifetime is
+// exactly one job's lifetime and a slow job holds one slot rather than the loop.
+//
+// # Reserve before claiming
+//
+// The load-bearing choice is that the loop takes its slots *before* issuing
+// Dequeue, so a claimed job always has somewhere to run. A claimed job is
+// leased, and a leased job the runner has not started is a lease burning in a
+// queue. held therefore counts the claim window as well as the running jobs.
+//
+// # Why there is no sync.WaitGroup
+//
+// Drain calls the wait from a different goroutine than the loop that starts
+// jobs, so a wg.Add with the counter at zero can race a wg.Wait — documented
+// misuse that lets Wait return early, which for Drain means reporting a clean
+// drain while a job is still running. The close-and-replace idle channel
+// releases any number of concurrent waiters from one close, under the same
+// mutex that decrements the counter.
+type pool struct {
+	// limit is the pool size. inline is set when limit is 1, which makes start
+	// run its function on the caller's goroutine.
+	limit  int
+	inline bool
+
+	mu sync.Mutex
+	// held counts outstanding reservations: the claim window plus the running
+	// jobs. running counts the dispatches actually executing.
+	held    int
+	running int
+	// idle is closed while held is zero and replaced when held rises from zero.
+	// It keys on held rather than running so a waiter cannot slip through the
+	// window between Dequeue returning a batch and the first start.
+	idle chan struct{}
+	// freed is a capacity-1 nudge, sent without blocking whenever held drops, so
+	// a waiter in reserve rechecks.
+	freed chan struct{}
+	errs  errCollector
+}
+
+// newPool builds a pool of the given size, initially idle. A size below 1 is
+// treated as 1, matching the config's own defaulting.
+func newPool(limit int) *pool {
+	if limit < 1 {
+		limit = 1
+	}
+	p := &pool{
+		limit:  limit,
+		inline: limit == 1,
+		idle:   make(chan struct{}),
+		freed:  make(chan struct{}, 1),
+	}
+	close(p.idle)
+	return p
+}
+
+// reserve takes between 1 and want slots, blocking until at least one is free or
+// ctx ends, and reports how many it took. The caller owns every slot it returns
+// and must pass each one to start or hand it back with release.
+func (p *pool) reserve(ctx context.Context, want int) (int, error) {
+	if want < 1 {
+		want = 1
+	}
+	for {
+		p.mu.Lock()
+		if free := p.limit - p.held; free > 0 {
+			n := min(want, free)
+			p.admitLocked(n)
+			p.mu.Unlock()
+			return n, nil
+		}
+		p.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-p.freed:
+		}
+	}
+}
+
+// admit takes n slots unconditionally, past the limit if need be. It is the
+// escape hatch for a Driver that serves more jobs than the limit it was given:
+// those jobs are leased and must run, and starting a dispatch the pool has not
+// accounted for would let a Drain report empty while it is still executing.
+func (p *pool) admit(n int) {
+	if n <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.admitLocked(n)
+}
+
+// admitLocked records n reservations. The caller holds mu.
+func (p *pool) admitLocked(n int) {
+	if p.held == 0 {
+		p.idle = make(chan struct{})
+	}
+	p.held += n
+}
+
+// release hands n unused reservations back and wakes a waiter.
+func (p *pool) release(n int) {
+	if n <= 0 {
+		return
+	}
+	p.mu.Lock()
+	n = min(n, p.held)
+	p.held -= n
+	if n > 0 && p.held == 0 {
+		close(p.idle)
+	}
+	p.mu.Unlock()
+
+	if n > 0 {
+		select {
+		case p.freed <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// start runs fn against one reservation the caller already holds, collecting its
+// error and releasing the slot when it returns.
+//
+// At limit 1 it runs fn on the calling goroutine: no goroutine, no channel
+// handoff, and a dispatch error deposited before the caller reads the collector.
+// It still takes the slot and counts the job, because Drain has to be correct at
+// the concurrency most deployments actually run.
+func (p *pool) start(fn func() error) {
+	p.mu.Lock()
+	p.running++
+	p.mu.Unlock()
+
+	run := func() {
+		defer func() {
+			p.mu.Lock()
+			p.running--
+			p.mu.Unlock()
+			p.release(1)
+		}()
+		p.errs.add(fn())
+	}
+
+	if p.inline {
+		run()
+		return
+	}
+	go run()
+}
+
+// waitIdle blocks until the pool holds nothing — no reservation and no running
+// job — or ctx ends, in which case it returns ctx's error.
+func (p *pool) waitIdle(ctx context.Context) error {
+	p.mu.Lock()
+	idle := p.idle
+	p.mu.Unlock()
+
+	select {
+	case <-idle:
+		return nil
+	default:
+	}
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// inFlight reports how many dispatches are executing. It reports running rather
+// than held so a drain warning names actual jobs, not a claim window.
+func (p *pool) inFlight() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.running
+}
+
+// takeErr returns the dispatch errors collected since the last call, joined, and
+// clears them.
+func (p *pool) takeErr() error { return p.errs.take() }
+
+// errCollector accumulates dispatch errors from the pool's goroutines. It
+// replaces the errors.Join over one batch: with independent slots there is no
+// batch to scope the aggregation to, so errors are collected as they land and
+// drained by whoever asks.
+type errCollector struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+// add records one non-nil error.
+func (c *errCollector) add(err error) {
+	if err == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errs = append(c.errs, err)
+}
+
+// take joins and clears what has been collected, returning nil when nothing has.
+func (c *errCollector) take() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.errs) == 0 {
+		return nil
+	}
+	joined := errors.Join(c.errs...)
+	c.errs = nil
+	return joined
 }
 
 // Run drives the dispatch loop until ctx is cancelled.
@@ -186,18 +424,38 @@ func (r *Runner) RunUntilIdle(ctx context.Context) error { return r.run(ctx, tru
 //   - Run polls forever. A poll failure is logged and the loop carries on.
 //   - RunUntilIdle stops the moment nothing is claimable and no job is in a
 //     non-terminal state. A poll failure is returned to the caller.
+//
+// Each iteration reserves at most the free-slot count, claims into those
+// reservations, and dispatches every claimed job into the pool without waiting
+// for it. A slow job therefore holds one slot, not the loop: the remaining slots
+// keep claiming.
 func (r *Runner) run(ctx context.Context, untilIdle bool) error {
+	// Every dispatch this invocation started is finished before it returns, so a
+	// Runner reused for a second invocation starts from an empty pool.
+	defer func() { _ = r.pool.waitIdle(context.WithoutCancel(ctx)) }()
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return r.stopped(untilIdle, err)
 		}
 
-		claimed, err := r.pollOnce(ctx)
+		reserved, err := r.pool.reserve(ctx, r.claimLimit())
 		if err != nil {
+			return r.stopped(untilIdle, err)
+		}
+
+		claimed, claimErr := r.claimAndDispatch(ctx, reserved)
+		if dispatchErr := r.pool.takeErr(); dispatchErr != nil {
 			if untilIdle {
-				return err
+				return dispatchErr
 			}
-			r.cfg.Logger.ErrorContext(ctx, "jobs: poll failed", "error", err)
+			r.cfg.Logger.ErrorContext(ctx, "jobs: dispatch failed", "error", dispatchErr)
+		}
+		if claimErr != nil {
+			if untilIdle {
+				return claimErr
+			}
+			r.cfg.Logger.ErrorContext(ctx, "jobs: poll failed", "error", claimErr)
 		}
 		if claimed > 0 {
 			continue
@@ -241,40 +499,85 @@ func (r *Runner) pendingCount(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
-// pollOnce claims one batch and dispatches it, returning the batch size.
-func (r *Runner) pollOnce(ctx context.Context) (int, error) {
+// claimLimit is the largest batch one Dequeue may ask for, before the free-slot
+// count reserve applies on top. ClaimBatchSize can only lower it: raising it
+// above the pool size would claim a job the Runner has no slot to start, and a
+// claimed job the Runner has not started is a lease burning in a queue.
+func (r *Runner) claimLimit() int {
+	if r.cfg.ClaimBatchSize > 0 && r.cfg.ClaimBatchSize < r.cfg.Concurrency {
+		return r.cfg.ClaimBatchSize
+	}
+	return r.cfg.Concurrency
+}
+
+// claimAndDispatch claims into reserved slots and starts every claimed job in
+// the pool without waiting for any of it, returning how many were claimed.
+//
+// Its error is the Dequeue error and nothing else: per-job errors land in the
+// pool's collector, where the loop drains them separately. That keeps a poll
+// failure — which feeds the backoff ladder and, for RunUntilIdle, the give-up
+// rule — distinct from a job that failed to finalize.
+//
+// Every reservation the claim does not use is released here, so a short claim
+// frees its slots immediately rather than at the end of the iteration.
+func (r *Runner) claimAndDispatch(ctx context.Context, reserved int) (int, error) {
 	batch, err := r.cfg.Driver.Dequeue(
-		ctx, r.cfg.Queues, r.cfg.ExecutorClass, r.cfg.ClaimAnyClass, r.cfg.Concurrency, r.cfg.LeaseDuration,
+		ctx, r.cfg.Queues, r.cfg.ExecutorClass, r.cfg.ClaimAnyClass, reserved, r.cfg.LeaseDuration,
 	)
 	if err != nil {
+		r.pool.release(reserved)
 		return 0, err
 	}
 	if len(batch) == 0 {
+		r.pool.release(reserved)
 		return 0, nil
 	}
+
+	switch {
+	case len(batch) < reserved:
+		r.pool.release(reserved - len(batch))
+	case len(batch) > reserved:
+		// A Driver that served past its limit still handed back leased jobs. They
+		// run, and the pool accounts for them, because a dispatch the pool has not
+		// counted is one Drain would report as finished.
+		r.pool.admit(len(batch) - reserved)
+	}
+
 	r.cfg.Observer.OnClaim(ctx, ClaimEvent{
 		ExecutorClass: r.cfg.ExecutorClass,
 		Queues:        r.cfg.Queues,
 		Claimed:       len(batch),
 	})
-	if r.cfg.Concurrency == 1 {
-		for i := range batch {
-			if dispatchErr := r.dispatch(ctx, batch[i]); dispatchErr != nil {
-				return len(batch), dispatchErr
-			}
-		}
-		return len(batch), nil
+	for i := range batch {
+		raw := batch[i]
+		r.pool.start(func() error { return r.dispatch(ctx, raw) })
+	}
+	return len(batch), nil
+}
+
+// pollOnce claims one batch and dispatches it *to completion*, returning the
+// batch size and the first error the attempt produced.
+//
+// It is a synchronous seam for tests, and the dispatch loop deliberately does
+// not call it: waiting for the whole batch is precisely the barrier the pool
+// exists to remove. It survives because half a dozen tests use it as "run one
+// attempt to completion" to pin heartbeat and supersede invariants, and
+// rewriting those to poll a running loop would trade a sharp assertion for a
+// timing-dependent one.
+func (r *Runner) pollOnce(ctx context.Context) (int, error) {
+	reserved, err := r.pool.reserve(ctx, r.claimLimit())
+	if err != nil {
+		return 0, err
 	}
 
-	errs := make([]error, len(batch))
-	var wg sync.WaitGroup
-	for i := range batch {
-		wg.Go(func() {
-			errs[i] = r.dispatch(ctx, batch[i])
-		})
+	claimed, claimErr := r.claimAndDispatch(ctx, reserved)
+	if waitErr := r.pool.waitIdle(ctx); waitErr != nil {
+		return claimed, waitErr
 	}
-	wg.Wait()
-	return len(batch), errors.Join(errs...)
+	if claimErr != nil {
+		return claimed, claimErr
+	}
+	return claimed, r.pool.takeErr()
 }
 
 // dispatch runs one claimed job: it pre-allocates the audit stub, runs the
