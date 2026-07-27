@@ -173,56 +173,62 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 }
 
 // Run drives the dispatch loop until ctx is cancelled.
-func (r *Runner) Run(ctx context.Context) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("jobs: runner stopped: %w", err)
-		}
-		claimed, err := r.pollOnce(ctx)
-		if err != nil {
-			r.cfg.Logger.ErrorContext(ctx, "jobs: poll failed", "error", err)
-		}
-		if claimed == 0 {
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("jobs: runner stopped: %w", ctx.Err())
-			case <-time.After(r.cfg.PollInterval):
-			}
-		}
-	}
-}
+func (r *Runner) Run(ctx context.Context) error { return r.run(ctx, false) }
 
 // RunUntilIdle drives the dispatch loop until every job has reached a terminal
 // state, then returns. It is the deterministic test driver.
+func (r *Runner) RunUntilIdle(ctx context.Context) error { return r.run(ctx, true) }
+
+// run is the dispatch loop both entry points share. The untilIdle flag selects
+// between the two contracts that differ only in how the loop ends and how a poll
+// failure is treated:
 //
-//nolint:gocognit // a single poll-drain-wait loop; splitting it obscures the flow
-func (r *Runner) RunUntilIdle(ctx context.Context) error {
+//   - Run polls forever. A poll failure is logged and the loop carries on.
+//   - RunUntilIdle stops the moment nothing is claimable and no job is in a
+//     non-terminal state. A poll failure is returned to the caller.
+func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 	for {
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("jobs: run-until-idle stopped: %w", err)
+			return r.stopped(untilIdle, err)
 		}
+
 		claimed, err := r.pollOnce(ctx)
 		if err != nil {
-			return err
+			if untilIdle {
+				return err
+			}
+			r.cfg.Logger.ErrorContext(ctx, "jobs: poll failed", "error", err)
 		}
 		if claimed > 0 {
 			continue
 		}
-		pending, err := r.pendingCount(ctx)
-		if err != nil {
-			return err
+
+		if untilIdle {
+			pending, countErr := r.pendingCount(ctx)
+			if countErr != nil {
+				return countErr
+			}
+			if pending == 0 {
+				return nil
+			}
+			// Jobs remain but none are claimable yet (retry/snooze backoff);
+			// wait one interval and poll again.
 		}
-		if pending == 0 {
-			return nil
-		}
-		// Jobs remain but none are claimable yet (retry/snooze backoff);
-		// wait one interval and poll again.
+
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("jobs: run-until-idle stopped: %w", ctx.Err())
+			return r.stopped(untilIdle, ctx.Err())
 		case <-time.After(r.cfg.PollInterval):
 		}
 	}
+}
+
+// stopped wraps the reason the loop ended, naming which entry point ended.
+func (r *Runner) stopped(untilIdle bool, err error) error {
+	if untilIdle {
+		return fmt.Errorf("jobs: run-until-idle stopped: %w", err)
+	}
+	return fmt.Errorf("jobs: runner stopped: %w", err)
 }
 
 // pendingCount reports how many jobs are still in a non-terminal state.
