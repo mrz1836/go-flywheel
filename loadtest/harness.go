@@ -444,7 +444,14 @@ func (h *Harness) startRunners(ctx context.Context) error {
 // simulated work so an ordinary slow job is never reclaimed mid-flight, but
 // short enough that a deliberately orphaned job is reclaimed inside the run
 // rather than after it.
+//
+// An explicit Config.Lease wins outright, including when it is shorter than the
+// work. That is not a misconfiguration to be corrected — it is the only way to
+// put a job past its lease, and therefore the only way to exercise renewal.
 func leaseFor(cfg Config) time.Duration {
+	if cfg.Lease > 0 {
+		return cfg.Lease
+	}
 	const minLease = 5 * time.Second
 	lease := 4 * (cfg.WorkDuration + cfg.WorkJitter)
 	if lease < minLease {

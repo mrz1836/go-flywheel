@@ -125,6 +125,14 @@ type Config struct {
 	// runtime's own ceiling rather than the workload's.
 	WorkDuration time.Duration
 	WorkJitter   time.Duration
+	// Lease overrides the runners' LeaseDuration. Zero derives it from the work
+	// duration (see leaseFor), which is the right default for a run measuring
+	// throughput: no ordinary job is ever reclaimed mid-flight.
+	//
+	// Setting it is how a scenario makes the lease *shorter* than the work, which
+	// is the only way to exercise renewal — a job that never outlives its lease
+	// never asks the heartbeat for anything.
+	Lease time.Duration
 	// SampleInterval is the cadence of the storage and OS sampler.
 	SampleInterval time.Duration
 	// Timeout bounds the whole run. A drain that cannot finish — a fault that
@@ -192,6 +200,11 @@ func (c Config) validate() (Config, error) {
 		return Config{}, fmt.Errorf(
 			"loadtest: WorkDuration and WorkJitter must not be negative, got %s and %s: %w",
 			c.WorkDuration, c.WorkJitter, ErrInvalidConfig,
+		)
+	}
+	if c.Lease < 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: Lease must not be negative, got %s: %w", c.Lease, ErrInvalidConfig,
 		)
 	}
 	if c.SampleInterval <= 0 {

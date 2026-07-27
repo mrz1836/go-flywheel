@@ -41,6 +41,19 @@ type Fault interface {
 	Inject(ctx context.Context, h *Harness) (revert func(), err error)
 }
 
+// windowedFault is the optional half of Fault: a reversible fault that lasts a
+// bounded time rather than until the run ends.
+//
+// The scheduler asks for it through this interface rather than type-switching on
+// the concrete faults, which it used to do. A type switch means every new
+// windowed fault silently gets "reverted at end of run" — it compiles, it runs,
+// and its window is quietly wrong — whereas an unimplemented interface is the
+// author's explicit statement that the fault has no window.
+type windowedFault interface {
+	// Window reports how long the fault stays injected before it is reverted.
+	Window() time.Duration
+}
+
 // gate blocks a driver's access to the database.
 //
 // It is two atomic bools, which matters: a fault fires from its own goroutine
@@ -288,6 +301,10 @@ type PauseDatabase struct {
 // At reports when the fault fires.
 func (p PauseDatabase) At() float64 { return p.Fraction }
 
+// Window reports how long the pause lasts, which is what makes this the one
+// shipped fault the scheduler reverts before the run ends.
+func (p PauseDatabase) Window() time.Duration { return p.For }
+
 // Describe renders the fault for a report.
 func (p PauseDatabase) Describe() string {
 	return fmt.Sprintf("gate every runner's driver for %s at %.0f%% drained", p.For, 100*p.Fraction)
@@ -351,8 +368,8 @@ func (h *Harness) runFaultScheduler(ctx context.Context, fault Fault) {
 		// A reversible fault is reversed either when its window closes or when
 		// the run ends, whichever comes first. A run that ended without reverting
 		// would leave the next assertion looking at a gated harness.
-		if pause, ok := fault.(PauseDatabase); ok {
-			timer := time.NewTimer(pause.For)
+		if windowed, ok := fault.(windowedFault); ok {
+			timer := time.NewTimer(windowed.Window())
 			defer timer.Stop()
 			select {
 			case <-timer.C:
