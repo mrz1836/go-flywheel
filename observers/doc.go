@@ -14,7 +14,9 @@
 //
 //   - MetricsObserver translates lifecycle events into MetricsRecorder calls (the
 //     metric taxonomy lives on MetricsObserver).
-//   - SlogObserver logs each event at debug level for `--log debug` diagnosis.
+//   - SlogObserver logs each event at debug level for `--log debug` diagnosis —
+//     except a supersede, which is logged at warn because it means work was
+//     executed and its outcome thrown away.
 //   - Multi fans one event out to several observers, so a Node can run metrics and
 //     logging side by side: NewMulti(NewSlog(logger), NewMetrics(rec)).
 //
@@ -24,4 +26,9 @@
 // Every method runs synchronously on the dispatch path and must not block, the
 // same contract as flywheel.Observer: MemRecorder takes a short mutex-guarded map
 // write and SlogObserver defaults to debug, so neither stalls a worker.
+//
+// One series is worth an alert rather than a dashboard:
+// flywheel_jobs_superseded_total counts attempts whose outcome was discarded
+// because their claim was lost. Every increment is work that ran and did not
+// count, which means it ran twice.
 package observers
