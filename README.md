@@ -114,7 +114,8 @@ The runtime is built from focused, composable pieces:
 - **Typed workers** — generic `Worker[A]` interface, registered by `Kind()` ([registry.go](registry.go))
 - **One-call lifecycle** — `Node` runs N runners + the scheduler + an optional health/metrics server and drains cleanly on shutdown ([node.go](node.go))
 - **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `UpsertPeriodic` ([scheduler.go](scheduler.go), [schedule.go](schedule.go))
-- **Retries with backoff** — exponential backoff with jitter, overridable per worker ([runner.go](runner.go))
+- **Bounded worker pool** — `Concurrency` slots that refill independently, so one slow job never idles the rest; explicit `Stop`/`Drain` with an in-flight count ([runner.go](runner.go))
+- **Retries with backoff** — exponential backoff with jitter, overridable per worker; consecutive poll failures climb their own ladder so a failing database is not hammered ([runner.go](runner.go))
 - **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](runner.go))
 - **Lease-based recovery** — orphaned, crashed jobs reclaimed via `leased_until` sweeps ([scheduler.go](scheduler.go))
 - **Per-run audit** — append-only `job_runs` table records every attempt, outcome, timing, and cost ([read.go](read.go))
@@ -425,9 +426,12 @@ default:
 ```
 
 **What `RunUntilIdle` guarantees.** It returns `nil` **only when no job is in a non-terminal state** —
-not merely when this runner found nothing to claim. A job another pool is still running, or one waiting
-out a retry backoff, keeps it looping. That is why the deadline branch is separate: `context.DeadlineExceeded`
-means "budget spent", not "something broke".
+not merely when this runner found nothing to claim. A job another pool is still running, one this
+runner has in flight in its own worker pool, or one waiting out a retry backoff all keep it looping.
+That is why the deadline branch is separate: `context.DeadlineExceeded` means "budget spent", not
+"something broke". A transient database error does not end it either — see
+[the poll backoff](#concurrency-claim-batching-and-drain) — and `flywheel.ErrRunnerStopped` is what it
+returns if `Stop` ended it before the queue drained.
 
 **Routing rules:**
 
@@ -501,6 +505,87 @@ them with `flywheel jobs inspect <id>`. Prefer to wire it from Go? The
 [examples/local-tasks](examples/local-tasks) program registers the shell, python, and mage
 workers and schedules one of each. See the [CLI README](cmd/flywheel/README.md) for every
 command, the config reference, and the macOS launchd setup.
+
+<br/>
+
+### Concurrency, claim batching, and drain
+
+**`Concurrency` is the pool size.** A runner keeps up to that many jobs in flight, claims to fill
+whatever slots are free, and dispatches each job independently — so a slot becomes claimable the moment
+*its own* job finalizes, with no reference to its siblings. One slow job holds one slot, not the loop.
+
+> **Changed in v0.8.0.** `Concurrency` used to mean "claim exactly N, run all N, wait for the slowest,
+> claim N again". At `Concurrency: 8`, one 60-second job among seven 1-second jobs left seven slots idle
+> for 59 seconds. Nothing in your config changes; the field now means what most readers already assumed
+> it meant. If you were relying on the old batch-and-barrier behavior to serialize batches, set
+> `Concurrency: 1`.
+
+At `Concurrency: 1` nothing changed at all: one job in flight, dispatched sequentially on the loop's own
+goroutine, with no goroutine per job. A SQLite driver still requires 1 — `NewRunner` returns
+`ErrSQLiteConcurrency` otherwise, because the SQLite claim is a serialized SELECT-then-UPDATE with no
+`SKIP LOCKED`.
+
+```go
+flywheel.RunnerConfig{
+    // Up to eight jobs in flight. Slots refill independently.
+    Concurrency: 8,
+
+    // Optional. Caps how many jobs one claim asks for. Zero claims exactly the
+    // free-slot count, which is right for almost every deployment; set it lower to
+    // smooth claim bursts across a fleet of runners hitting one database. It is
+    // never raised *above* the free-slot count — a claimed job the runner has no
+    // slot to start is a lease burning in a queue.
+    ClaimBatchSize: 2,
+
+    // Optional. Ceiling on the delay between polls after consecutive failures;
+    // zero selects 30s. The delay starts at PollInterval, doubles per consecutive
+    // failure with jitter, and resets on the first success.
+    MaxPollBackoff: 30 * time.Second,
+}
+```
+
+**A failing database is not polled at the empty-queue rate.** Consecutive poll failures climb an
+exponential ladder from `PollInterval` to `MaxPollBackoff`, and each attempt logs once — so the log rate
+follows the backoff rather than the poll interval. Without it, a fleet of runners against a database that
+is restarting or failing over polls it ten times a second forever and writes an error line each time:
+a retry storm aimed at a recovering database, plus an unbounded log volume.
+
+`Run` never gives up; it backs off at the ceiling until the database returns. `RunUntilIdle` tolerates a
+blip and gives up once the ladder saturates — `⌈log₂(MaxPollBackoff / PollInterval)⌉ + 1` attempts, about
+51 seconds at the defaults. The bound is the ladder, not the context, so a caller that passes no deadline
+still gets an answer.
+
+**Drain is explicit.** `Stop` and `Drain` are safe before `Run`, concurrently with it, and after it
+returns:
+
+```go
+runner.Stop()                    // claim nothing further; non-blocking, idempotent, final
+n := runner.InFlight()           // how many jobs are executing right now
+
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := runner.Drain(ctx); err != nil {
+    var timeout *flywheel.DrainTimeoutError
+    if errors.As(err, &timeout) {
+        log.Warn("drain timed out", "in_flight", timeout.InFlight)
+    }
+}
+```
+
+`Stop` bounds *when the next claim is issued*, not what happens to a claim already in flight: a batch
+that came back from `Dequeue` after `Stop` landed is already leased, so it is dispatched rather than
+stranded until the sweep, and `Drain` waits for it too. `Drain` **does not cancel in-flight work** — a
+worker that must be interrupted should respect the context it was given, and `DefaultTimeout` already
+bounds a hung attempt. Its contract is "no new claims, then wait", which is what makes a rolling deploy
+lose no work. On timeout the still-running jobs keep their leases and are recovered by the lease sweep,
+exactly as they would be after a process kill.
+
+**A `Node` does this for you.** Cancelling a `Node`'s context is a *drain* request, not an abort: every
+runner is told to stop claiming, each is drained against `NodeConfig.DrainTimeout`, the timeout warning
+names how many jobs were still in flight, and only then is the scheduler and health server torn down.
+A zero `DrainTimeout` waits for in-flight work however long it takes — genuinely unbounded, since the
+heartbeat renews a running job's lease indefinitely. Size it to the longest drain your deployment will
+tolerate.
 
 <br/>
 
