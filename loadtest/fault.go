@@ -41,6 +41,19 @@ type Fault interface {
 	Inject(ctx context.Context, h *Harness) (revert func(), err error)
 }
 
+// windowedFault is the optional half of Fault: a reversible fault that lasts a
+// bounded time rather than until the run ends.
+//
+// The scheduler asks for it through this interface rather than type-switching on
+// the concrete faults, which it used to do. A type switch means every new
+// windowed fault silently gets "reverted at end of run" — it compiles, it runs,
+// and its window is quietly wrong — whereas an unimplemented interface is the
+// author's explicit statement that the fault has no window.
+type windowedFault interface {
+	// Window reports how long the fault stays injected before it is reverted.
+	Window() time.Duration
+}
+
 // gate blocks a driver's access to the database.
 //
 // It is two atomic bools, which matters: a fault fires from its own goroutine
@@ -149,11 +162,26 @@ func (d *gateDriver) InsertRunStub(
 func (d *gateDriver) Finalize(
 	ctx context.Context, raw flywheel.RawJob, runID string,
 	result flywheel.Result, workErr error, finishedAt time.Time,
-) error {
+) (flywheel.FinalizeOutcome, error) {
 	if err := d.gate.checkFinalize(); err != nil {
-		return err
+		return flywheel.FinalizeOutcome{}, err
 	}
 	return d.inner.Finalize(ctx, raw, runID, result, workErr, finishedAt)
+}
+
+// RenewLease extends a claim's lease unless gated.
+//
+// Gating it is what makes a killed runner's jobs actually expire. A gate that
+// blocked finalize but let the heartbeat through would keep the orphan's lease
+// alive for as long as the process lived, and the sweep — the thing the fault
+// exists to exercise — would never see it.
+func (d *gateDriver) RenewLease(
+	ctx context.Context, jobID, leaseToken string, until time.Time,
+) (bool, error) {
+	if err := d.gate.check(); err != nil {
+		return false, err
+	}
+	return d.inner.RenewLease(ctx, jobID, leaseToken, until)
 }
 
 // InsertChild delegates. It is unreachable through a decorator — see
@@ -273,6 +301,10 @@ type PauseDatabase struct {
 // At reports when the fault fires.
 func (p PauseDatabase) At() float64 { return p.Fraction }
 
+// Window reports how long the pause lasts, which is what makes this the one
+// shipped fault the scheduler reverts before the run ends.
+func (p PauseDatabase) Window() time.Duration { return p.For }
+
 // Describe renders the fault for a report.
 func (p PauseDatabase) Describe() string {
 	return fmt.Sprintf("gate every runner's driver for %s at %.0f%% drained", p.For, 100*p.Fraction)
@@ -296,6 +328,121 @@ func (p PauseDatabase) Inject(_ context.Context, h *Harness) (func(), error) {
 			g.openGate()
 		}
 	}, nil
+}
+
+// MassLeaseExpiry expires every in-flight lease at once, so the next sweep
+// reclaims the whole set rather than the one or two a natural expiry produces.
+//
+// # What it is testing
+//
+// Not the sweep's throughput — that is the bounded-sweep work, and this fault
+// runs against whatever sweep the runtime has. It is testing the fence at scale:
+// thousands of jobs are simultaneously reclaimed and re-dispatched under fresh
+// tokens while their original attempts are still running, so every one of those
+// attempts finalizes into a claim it no longer holds. If the fence has a hole,
+// this is the shape that finds it, because it multiplies a rare race by the
+// queue depth.
+//
+// # Why it sweeps rather than waiting to be swept
+//
+// The first version expired the leases and left the harness's own sweeper to
+// notice on its next tick, up to a second later. That reclaimed almost nothing
+// and the reason is arithmetic: an attempt is in flight for the length of one
+// job, so the chance the sweeper ticks inside that window is the job duration
+// divided by the sweep interval. At a 25 ms job and a 1 s sweep it is 2.5%, and
+// a fault that fires correctly and then reclaims one row out of thirty-two is
+// indistinguishable from one that did not fire.
+//
+// Injecting the sweep makes the reclaim part of the fault instead of a race
+// against a ticker, so what the scenario measures is the fence under a mass
+// reclaim rather than the sampling luck of the sweep interval.
+//
+// # Why it retries rather than firing once
+//
+// The trigger is anti-correlated with the state the fault needs, which took a
+// measurement to notice. Drain progress is counted from OnFinish, and OnFinish
+// is exactly the event that empties the running set: at Runners 4 × Workers 8
+// the whole in-flight batch finalizes together, so the instant progress crosses
+// the threshold is an instant when *nothing* is running. Fired once, this fault
+// expired zero leases on three consecutive 50,000-job runs while a concurrent
+// poll of the same table showed 32 rows running throughout.
+//
+// So it retries on the scheduler's own interval until it catches a non-empty
+// in-flight set, and reports plainly when it never does. "At 50% drained" is
+// approximate either way; a fault that silently expires nothing is not.
+type MassLeaseExpiry struct {
+	// Fraction is the drain progress at which every held lease is expired.
+	Fraction float64
+}
+
+// massExpiryAttempts bounds the retry. At faultPollInterval it is a window of
+// about a second — long enough to span several claim cycles at any realistic
+// work duration, short enough that a run whose queue has genuinely drained does
+// not spend meaningful time looking for it.
+const massExpiryAttempts = 100
+
+// At reports when the fault fires.
+func (m MassLeaseExpiry) At() float64 { return m.Fraction }
+
+// Describe renders the fault for a report.
+func (m MassLeaseExpiry) Describe() string {
+	return fmt.Sprintf("expire every held lease at %.0f%% drained", 100*m.Fraction)
+}
+
+// Validate rejects a run with nothing in flight to expire.
+func (m MassLeaseExpiry) Validate(cfg Config) error {
+	if cfg.Mix == WorkloadEnqueueOnly {
+		return fmt.Errorf(
+			"loadtest: MassLeaseExpiry needs a mix that drains, got %q: the enqueue mix starts no runner, "+
+				"so there is no lease to expire: %w",
+			cfg.Mix, ErrInvalidConfig,
+		)
+	}
+	return nil
+}
+
+// Inject expires every held lease and sweeps immediately. The fault is permanent
+// — both have already happened by the time it returns — so revert is nil.
+//
+// The sweep runs on the undecorated driver rather than through a timing one. The
+// harness's sweeper owns the sweep histogram's last shard and is running
+// concurrently, and a second writer to one shard would race; an untimed sweep
+// costs one observation out of a run's worth and keeps the histogram honest.
+func (m MassLeaseExpiry) Inject(ctx context.Context, h *Harness) (func(), error) {
+	var expired int64
+	for attempt := range massExpiryAttempts {
+		n, err := h.expireLeases(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if expired = n; expired > 0 {
+			break
+		}
+		if attempt == massExpiryAttempts-1 {
+			h.notes.add(
+				"MassLeaseExpiry found no held lease in %d attempts over %s and expired nothing. "+
+					"The run drained before it could catch an in-flight batch.",
+				massExpiryAttempts, massExpiryAttempts*faultPollInterval,
+			)
+			return nil, nil //nolint:nilnil // nothing was injected, so there is nothing to revert
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil //nolint:nilnil // the run ended before the fault could fire
+		case <-time.After(faultPollInterval):
+		}
+	}
+
+	reclaimed, err := h.reclaimExpired(ctx)
+	if err != nil {
+		return nil, err
+	}
+	h.notes.add(
+		"MassLeaseExpiry expired %d held leases and immediately reclaimed %d. The gap is attempts "+
+			"whose heartbeat renewed the lease back, or which finalized, between the two statements.",
+		expired, reclaimed,
+	)
+	return nil, nil //nolint:nilnil // a permanent fault has no revert; the interface documents nil
 }
 
 // --- scheduling -------------------------------------------------------------
@@ -336,8 +483,8 @@ func (h *Harness) runFaultScheduler(ctx context.Context, fault Fault) {
 		// A reversible fault is reversed either when its window closes or when
 		// the run ends, whichever comes first. A run that ended without reverting
 		// would leave the next assertion looking at a gated harness.
-		if pause, ok := fault.(PauseDatabase); ok {
-			timer := time.NewTimer(pause.For)
+		if windowed, ok := fault.(windowedFault); ok {
+			timer := time.NewTimer(windowed.Window())
 			defer timer.Stop()
 			select {
 			case <-timer.C:

@@ -19,9 +19,10 @@ func TestFinalizePersistsThroughCancelledContext(t *testing.T) {
 	d := baseDriver{db: db}
 	now := time.Now().UTC().Truncate(time.Second)
 
-	raw := RawJob{ID: "job-cancel-ctx", Kind: "k", Attempt: 1, MaxAttempts: 5}
+	token := models.NewID()
+	raw := RawJob{ID: "job-cancel-ctx", Kind: "k", Attempt: 1, MaxAttempts: 5, LeaseToken: token}
 	seedJob(t, db, jobRow{
-		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning),
+		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning), LeaseToken: &token,
 		Attempt: 1, MaxAttempts: 5, CreatedAt: now, UpdatedAt: now, ScheduledAt: now,
 	})
 	runID := models.NewID()
@@ -30,9 +31,12 @@ func TestFinalizePersistsThroughCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	require.NoError(t, d.Finalize(
+	out, finalizeErr := d.Finalize(
 		ctx, raw, runID, Result{Output: map[string]any{"ok": true}}, nil, now.Add(time.Second),
-	))
+	)
+	require.NoError(t, finalizeErr)
+	assert.False(t, out.Superseded, "the claim was held throughout")
+	assert.Equal(t, StateSucceeded, out.State, "the reported state is the one persisted")
 
 	assert.Equal(t, string(StateSucceeded), jobState(t, db, raw.ID), "the job state persists despite the cancelled ctx")
 	var outcome string
@@ -51,9 +55,10 @@ func TestFinalizeSkipsSupersededCancel(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
 
-	raw := RawJob{ID: "job-superseded", Kind: "k", Attempt: 1, MaxAttempts: 5}
+	token := models.NewID()
+	raw := RawJob{ID: "job-superseded", Kind: "k", Attempt: 1, MaxAttempts: 5, LeaseToken: token}
 	seedJob(t, db, jobRow{
-		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning),
+		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning), LeaseToken: &token,
 		Attempt: 1, MaxAttempts: 5, CreatedAt: now, UpdatedAt: now, ScheduledAt: now, LeasedUntil: &now,
 	})
 	runID := models.NewID()
@@ -67,7 +72,12 @@ func TestFinalizeSkipsSupersededCancel(t *testing.T) {
 		Output:    map[string]any{"ok": true},
 		FollowUps: []FollowUp{{Kind: "child", Args: map[string]any{}}},
 	}
-	require.NoError(t, d.Finalize(ctx, raw, runID, result, nil, now.Add(time.Second)))
+	out, finalizeErr := d.Finalize(ctx, raw, runID, result, nil, now.Add(time.Second))
+	require.NoError(t, finalizeErr)
+	assert.True(t, out.Superseded, "the cancel took the claim away")
+	assert.Equal(t, StateCancelled, out.State, "the reported state is the one the cancel left, not the one planned")
+	assert.Equal(t, OutcomeSuccess, out.RunOutcome, "the audit row still records the attempt's real outcome")
+	assert.Zero(t, out.EnqueuedChildren)
 
 	assert.Equal(t, string(StateCancelled), jobState(t, db, raw.ID), "cancel is not overwritten by the finishing worker")
 	assert.EqualValues(t, 1, runCount(t, db, raw.ID), "the attempt is still audited exactly once")
@@ -90,16 +100,20 @@ func TestFinalizeSuccessPathEnqueuesFollowUps(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
 
-	raw := RawJob{ID: "job-success", Kind: "k", Attempt: 1, MaxAttempts: 5}
+	token := models.NewID()
+	raw := RawJob{ID: "job-success", Kind: "k", Attempt: 1, MaxAttempts: 5, LeaseToken: token}
 	seedJob(t, db, jobRow{
-		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning),
+		ID: raw.ID, Kind: raw.Kind, State: string(StateRunning), LeaseToken: &token,
 		Attempt: 1, MaxAttempts: 5, CreatedAt: now, UpdatedAt: now, ScheduledAt: now,
 	})
 	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, now, ExecutorClass("local"), "h1"))
 
 	result := Result{FollowUps: []FollowUp{{Kind: "child", Args: map[string]any{}}}}
-	require.NoError(t, d.Finalize(ctx, raw, runID, result, nil, now.Add(time.Second)))
+	out, finalizeErr := d.Finalize(ctx, raw, runID, result, nil, now.Add(time.Second))
+	require.NoError(t, finalizeErr)
+	assert.False(t, out.Superseded)
+	assert.Equal(t, 1, out.EnqueuedChildren, "the outcome reports the follow-up it enqueued")
 
 	assert.Equal(t, string(StateSucceeded), jobState(t, db, raw.ID))
 	var children int64

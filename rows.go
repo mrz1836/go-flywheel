@@ -14,6 +14,14 @@ import (
 // is NOT NULL with a matching default, and the table is soft-deletable through
 // gorm.DeletedAt so a host can retire a job without losing its audit trail. The
 // constraints are flywheel's own — no host/foundation base model is imported.
+//
+// LeaseToken is the exception to "every column the runtime relies on is NOT
+// NULL": it identifies the claim that currently holds the job, so it is null
+// for exactly as long as no claim does. It is stamped by the claim, required by
+// finalize and lease renewal, and cleared on every transition out of running —
+// which is what makes "this attempt still holds the job" answerable, as distinct
+// from "this job is running". It carries no index: it is only ever read in a
+// predicate already anchored by id, the primary key.
 type jobRow struct {
 	ID              string         `gorm:"column:id;primaryKey"`
 	CreatedAt       time.Time      `gorm:"column:created_at;not null"`
@@ -29,6 +37,7 @@ type jobRow struct {
 	TimeoutMs       *int           `gorm:"column:timeout_ms"`
 	ScheduledAt     time.Time      `gorm:"column:scheduled_at;not null"`
 	LeasedUntil     *time.Time     `gorm:"column:leased_until"`
+	LeaseToken      *string        `gorm:"column:lease_token"`
 	UniqueKey       *string        `gorm:"column:unique_key"`
 	UniqueActiveKey *string        `gorm:"column:unique_active_key"`
 	ParentJobID     *string        `gorm:"column:parent_job_id"`

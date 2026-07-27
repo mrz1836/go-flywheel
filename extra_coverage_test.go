@@ -145,7 +145,7 @@ func TestFinalizeSurfacesLoadStubError(t *testing.T) {
 	require.NoError(t, db.Migrator().DropTable(&jobRunRow{}), "drop job_runs so the stub load fails")
 
 	raw := RawJob{ID: "job-x", Attempt: 1, MaxAttempts: 5}
-	err := d.Finalize(context.Background(), raw, models.NewID(), Result{}, nil, time.Now())
+	_, err := d.Finalize(context.Background(), raw, models.NewID(), Result{}, nil, time.Now())
 	require.ErrorContains(t, err, "load run stub", "a failed run-stub load surfaces a finalize error")
 }
 
@@ -164,7 +164,7 @@ func TestFinalizeSurfacesAdvanceError(t *testing.T) {
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
 	require.NoError(t, db.Migrator().DropTable(&jobRow{}), "drop jobs so only the state advance fails")
 
-	err := d.Finalize(ctx, raw, runID, Result{}, nil, time.Now())
+	_, err := d.Finalize(ctx, raw, runID, Result{}, nil, time.Now())
 	require.ErrorContains(t, err, "advance job state", "a failed state advance surfaces a finalize error")
 }
 
@@ -177,12 +177,19 @@ func TestFinalizeRecordsErrorPayload(t *testing.T) {
 	d := baseDriver{db: db}
 	ctx := context.Background()
 
-	raw := RawJob{ID: "job-e", Attempt: 1, MaxAttempts: 5}
-	seedJob(t, db, jobRow{ID: raw.ID, Kind: "k", State: string(StateRunning), ScheduledAt: time.Now()})
+	// The token matches the seeded row's, so this exercises the finalize that
+	// lands rather than the superseded one — which writes the same audit row and
+	// would let the assertion pass for the wrong reason.
+	token := models.NewID()
+	raw := RawJob{ID: "job-e", Attempt: 1, MaxAttempts: 5, LeaseToken: token}
+	seedJob(t, db, jobRow{
+		ID: raw.ID, Kind: "k", State: string(StateRunning), LeaseToken: &token, ScheduledAt: time.Now(),
+	})
 	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, raw, time.Now(), ExecutorClass("local"), "h1"))
 
-	require.NoError(t, d.Finalize(ctx, raw, runID, Result{}, errors.New("boom"), time.Now()))
+	_, finalizeErr := d.Finalize(ctx, raw, runID, Result{}, errors.New("boom"), time.Now())
+	require.NoError(t, finalizeErr)
 
 	var payload string
 	require.NoError(t, db.Table("job_runs").

@@ -56,3 +56,10 @@ func (m *Multi) OnRetry(ctx context.Context, ev flywheel.RetryEvent) {
 		o.OnRetry(ctx, ev)
 	}
 }
+
+// OnSupersede delivers the supersede event to every child in order.
+func (m *Multi) OnSupersede(ctx context.Context, ev flywheel.SupersedeEvent) {
+	for _, o := range m.observers {
+		o.OnSupersede(ctx, ev)
+	}
+}

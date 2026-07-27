@@ -88,11 +88,24 @@ func (d *timingDriver) InsertRunStub(
 func (d *timingDriver) Finalize(
 	ctx context.Context, raw flywheel.RawJob, runID string,
 	result flywheel.Result, workErr error, finishedAt time.Time,
-) error {
+) (flywheel.FinalizeOutcome, error) {
 	start := time.Now()
-	err := d.inner.Finalize(ctx, raw, runID, result, workErr, finishedAt)
+	out, err := d.inner.Finalize(ctx, raw, runID, result, workErr, finishedAt)
 	d.final.record(d.shard, time.Since(start))
-	return err
+	return out, err
+}
+
+// RenewLease delegates without timing.
+//
+// It is a single guarded UPDATE off the dispatch path, on a cadence set by the
+// lease rather than by the workload, so it is not one of the three operations
+// the report names. Its cost shows up where it belongs — in the drain
+// throughput, and in the storage sampler's WAL and dead-tuple series, which is
+// where an extra UPDATE per job per third-of-lease is actually visible.
+func (d *timingDriver) RenewLease(
+	ctx context.Context, jobID, leaseToken string, until time.Time,
+) (bool, error) {
+	return d.inner.RenewLease(ctx, jobID, leaseToken, until)
 }
 
 // InsertChild delegates. It is structurally unreachable through this decorator.

@@ -198,6 +198,47 @@ func runEnqueueBenchmark(b *testing.B, cfg Config) {
 	}
 }
 
+// heartbeatBenchConfig is the shape both halves of the A/B derive from.
+//
+// The work duration and the lease are the whole design. At 25 ms of work against
+// a 1 s lease the heartbeat's default interval is one third of a second, so a
+// job lives a fraction of an interval and most attempts pay *nothing* — which is
+// the honest common case and would measure a difference of zero. The 4-runner ×
+// 8-worker drain is what makes the difference visible: at that concurrency there
+// are always 32 attempts in flight, so renewals land continuously even though no
+// single attempt outlives its lease.
+func heartbeatBenchConfig(dsn string) Config {
+	cfg := baselineConfig(dsn)
+	cfg.WorkDuration = 25 * time.Millisecond
+	cfg.Lease = time.Second
+	return cfg
+}
+
+// BenchmarkDrainWithHeartbeatOff and BenchmarkDrainWithHeartbeatOn are the two
+// halves of the heartbeat's write-cost measurement (run them together with
+// -bench 'BenchmarkDrainWithHeartbeat' and compare with benchstat).
+//
+// They are a same-binary A/B and not a comparison against the published
+// baseline, which would be neither: the baseline was taken on a different
+// commit, at a different work duration, with a derived lease. The only field
+// that differs between these two is Heartbeat, so the delta is attributable to
+// renewal and to nothing else.
+//
+// Read the result as write amplification, not as a slowdown. A workload whose
+// jobs are shorter than the lease pays roughly nothing; one whose jobs are
+// longer pays one UPDATE per job per third-of-lease and buys a correctness
+// guarantee it did not previously have. See docs/BENCHMARKS.md.
+func BenchmarkDrainWithHeartbeatOff(b *testing.B) {
+	cfg := heartbeatBenchConfig(benchDSN(b))
+	cfg.Heartbeat = -1 // renewal disabled: the pre-v0.7.0 fixed-lease behavior
+	runBenchmark(b, cfg)
+}
+
+// BenchmarkDrainWithHeartbeatOn is the other half; see the Off half's comment.
+func BenchmarkDrainWithHeartbeatOn(b *testing.B) {
+	runBenchmark(b, heartbeatBenchConfig(benchDSN(b)))
+}
+
 // BenchmarkSweep100k measures a sweep that reclaims nothing.
 //
 // That is deliberate and the doc comment has to say so, because "sweep with

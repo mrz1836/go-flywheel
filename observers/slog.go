@@ -69,6 +69,26 @@ func (s *SlogObserver) OnFinish(ctx context.Context, ev flywheel.FinishEvent) {
 	s.logger.LogAttrs(ctx, s.level, "flywheel: job finished", attrs...)
 }
 
+// OnSupersede logs a discarded attempt at warn.
+//
+// It is the one lifecycle event this observer does not log at its configured
+// level. Every other event is routine enough that a daemon at info should stay
+// quiet about it; this one means a job's work was executed and thrown away,
+// which an operator wants to see without having turned debug on first.
+func (s *SlogObserver) OnSupersede(ctx context.Context, ev flywheel.SupersedeEvent) {
+	s.logger.LogAttrs(
+		ctx, slog.LevelWarn, "flywheel: job attempt superseded; its outcome was discarded",
+		slog.String("job_id", ev.JobID),
+		slog.String("run_id", ev.RunID),
+		slog.String("kind", ev.Kind),
+		slog.String("queue", ev.Queue),
+		slog.String("discarded_outcome", string(ev.Outcome)),
+		slog.String("job_state", string(ev.State)),
+		slog.Int("attempt", ev.Attempt),
+		slog.Duration("duration", ev.Duration),
+	)
+}
+
 // OnRetry logs a scheduled retry.
 func (s *SlogObserver) OnRetry(ctx context.Context, ev flywheel.RetryEvent) {
 	s.logger.LogAttrs(

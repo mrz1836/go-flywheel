@@ -95,6 +95,10 @@ type progress struct {
 	// reclaimed counts jobs the harness's sweeper returned to available. A
 	// reclaimed job runs again, so it is progress undone.
 	reclaimed atomic.Int64
+	// superseded counts attempts whose outcome the runtime discarded because
+	// their claim was lost. It is the direct measurement of double execution,
+	// fed by the Observer rather than inferred from row residue after the fact.
+	superseded atomic.Int64
 }
 
 // terminal estimates how many jobs have reached a terminal state.
@@ -157,6 +161,16 @@ func (o harnessObserver) OnFinish(_ context.Context, ev flywheel.FinishEvent) {
 // what makes finished − retried the terminal count.
 func (o harnessObserver) OnRetry(context.Context, flywheel.RetryEvent) {
 	o.prog.retried.Add(1)
+}
+
+// OnSupersede counts attempts whose outcome the runtime discarded.
+//
+// It is deliberately not counted as progress. A superseded attempt advanced
+// nothing, so the job it ran is still in flight and folding it into finished
+// would make the drain fraction — which schedules every fault — report a run as
+// further along than it is.
+func (o harnessObserver) OnSupersede(context.Context, flywheel.SupersedeEvent) {
+	o.prog.superseded.Add(1)
 }
 
 // noteset collects measurement caveats. It is a type rather than a slice because
@@ -386,10 +400,11 @@ func (h *Harness) startRunners(ctx context.Context) error {
 			// A short poll keeps an idle runner from sitting out the tail of a
 			// drain; it is not on the hot path, which never sleeps while work
 			// remains.
-			PollInterval:  5 * time.Millisecond,
-			LeaseDuration: leaseFor(h.cfg),
-			Observer:      harnessObserver{prog: h.prog},
-			Logger:        discardLogger(),
+			PollInterval:      5 * time.Millisecond,
+			LeaseDuration:     leaseFor(h.cfg),
+			HeartbeatInterval: h.cfg.Heartbeat,
+			Observer:          harnessObserver{prog: h.prog},
+			Logger:            discardLogger(),
 		})
 		if err != nil {
 			return fmt.Errorf("loadtest: build runner %d: %w", i, err)
@@ -430,13 +445,52 @@ func (h *Harness) startRunners(ctx context.Context) error {
 // simulated work so an ordinary slow job is never reclaimed mid-flight, but
 // short enough that a deliberately orphaned job is reclaimed inside the run
 // rather than after it.
+//
+// An explicit Config.Lease wins outright, including when it is shorter than the
+// work. That is not a misconfiguration to be corrected — it is the only way to
+// put a job past its lease, and therefore the only way to exercise renewal.
 func leaseFor(cfg Config) time.Duration {
+	if cfg.Lease > 0 {
+		return cfg.Lease
+	}
 	const minLease = 5 * time.Second
 	lease := 4 * (cfg.WorkDuration + cfg.WorkJitter)
 	if lease < minLease {
 		return minLease
 	}
 	return lease
+}
+
+// expireLeases pushes every held lease into the past and reports how many rows
+// it touched, so the next sweep sees the whole in-flight set as expired.
+//
+// It runs on the probe pool, not the work pool, for the same reason the sampler
+// does: a fault the harness cannot inject through a gate is a fault that cannot
+// be combined with one. It writes the jobs table directly rather than going
+// through the Driver because there is no Driver method for "expire a lease" —
+// and there should not be: it is a failure to be simulated, not an operation the
+// runtime offers.
+func (h *Harness) expireLeases(ctx context.Context) (int64, error) {
+	res := h.probe.WithContext(ctx).Exec(
+		`UPDATE jobs SET leased_until = ? WHERE state = 'running' AND leased_until IS NOT NULL`,
+		time.Now().Add(-time.Hour),
+	)
+	if res.Error != nil {
+		return 0, fmt.Errorf("loadtest: expire leases: %w", res.Error)
+	}
+	return res.RowsAffected, nil
+}
+
+// reclaimExpired runs one sweep on the undecorated driver and counts it toward
+// the run's reclaim total, for a fault that needs the reclaim to be part of the
+// injection rather than a race against the sweeper's ticker.
+func (h *Harness) reclaimExpired(ctx context.Context) (int, error) {
+	reclaimed, err := h.inner.Sweep(ctx, time.Now())
+	if err != nil {
+		return 0, fmt.Errorf("loadtest: reclaim expired leases: %w", err)
+	}
+	h.prog.reclaimed.Add(int64(reclaimed))
+	return reclaimed, nil
 }
 
 // orphanedByFaults reports how many finalizes a kill fault blocked — how many

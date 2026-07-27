@@ -16,7 +16,7 @@ with the numbers it qualifies.
 | **Machine** | Apple M4, 10 cores, 16 GB, macOS 26.5.2 (arm64) |
 | **Go** | go1.26.5 darwin/arm64 |
 | **PostgreSQL** | 17.10 (Homebrew), local loopback, same machine as the harness |
-| **Commit** | `1ecb5e9` |
+| **Commit** | `1ecb5e9` (baseline, index comparison) · `c7dba1b` (heartbeat cost, sigkill and slow-job chaos) · `5ba4a08` (mass-expiry chaos, re-run after the fault's retry fix) |
 | **Seed** | `1` (every run) |
 | **Workload digest** | `c111170f7509817c…` — identical across all three 100k runs |
 
@@ -216,9 +216,12 @@ numbers rather than living only here.
   that there was no contention.
 - **WAL is cluster-wide.** `pg_stat_wal` has no per-database breakdown, so any other activity on the
   server is included. These runs had a quiet server.
-- **Superseded is an inference, not a measurement.** The runtime computes the supersede signal during
-  finalize and discards it, so it is unobservable through both the driver and the observer interface.
-  The harness infers it from the audit table and labels it. It was zero in every run here.
+- **Superseded is a measurement, and was not always.** Before v0.7.0 the runtime computed the supersede
+  signal during finalize and discarded it, so it was unobservable through both the driver and the
+  observer interface, and the harness inferred it from audit-table residue. It now counts
+  `OnSupersede` events. The residue query survives as an independent cross-check: the two count
+  different things — the residue misses a superseded attempt whose job later succeeded on a retry —
+  and a report notes a disagreement rather than asserting one.
 - **The sweep numbers come from the harness's own sweeper.** The runner does not sweep; nothing in its
   dispatch loop calls `Sweep`. The harness runs a sweeper on a one-second interval, which is what a
   scheduler would do.
@@ -237,6 +240,106 @@ job overlapping in time, and an in-process execution tracker). It runs in CI on 
 
 ```bash
 go test -tags=loadtest -run TestWorkerKillMidDrainReclaimsEveryJob ./loadtest/
+```
+
+<br/>
+
+## Chaos: the lease, the heartbeat, and the fence
+
+Three scenarios, each committed as a report under `docs/benchmarks/`. Every one of them ends with
+`concurrent_executions: 0` and an empty `errors` array.
+
+| Scenario | Report | Jobs | Shape | Reclaimed | Superseded | Drained |
+|---|---|---|---|---|---|---|
+| Runner killed at 40 % | `chaos-sigkill.json` | 100,000 | drain, 5 s lease | 8 | 0 | 100,000 |
+| Jobs that outlive their lease | `chaos-slow-job.json` | 10,000 | mixed-speed, 4 s jobs vs. 2 s lease | **0** | **0** | 10,000 |
+| Every lease expired at once | `chaos-mass-expiry.json` | 50,000 | drain, 25 ms jobs, 1 s lease | 16 | 16 | 50,000 |
+
+```bash
+export FLYWHEEL_LOADTEST_DATABASE_URL="postgres://localhost:5432/flywheel_test?sslmode=disable"
+
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix drain \
+  -fault kill-worker@0.4 -out docs/benchmarks/chaos-sigkill.json
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 10000 -mix mixed-speed \
+  -work 200ms -lease 2s -out docs/benchmarks/chaos-slow-job.json
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 50000 -mix drain \
+  -work 25ms -lease 1s -fault mass-lease-expiry -out docs/benchmarks/chaos-mass-expiry.json
+```
+
+**The slow-job run is the one to read first, and its interesting number is a zero.** The mixed-speed
+mix gives a tenth of its jobs twenty times the base work duration, so at `-work 200ms` the slow decile
+runs for four seconds — against a **two-second lease**. Before renewal every one of those thousand
+jobs would have been reclaimed mid-flight and handed to a second runner. Measured: `reclaimed: 0`,
+`superseded: 0`, ten thousand jobs drained, nothing run twice. The heartbeat held every lease across
+two full lease-lengths of work.
+
+Its throughput — 13 jobs/s — is not a heartbeat cost. It is the batch barrier meeting a bimodal
+workload: a poll waits for its whole claimed batch, and at eight workers most batches contain one of
+the four-second jobs. That is the effect the mix exists to expose; see *Throughput is barrier-bound*
+above.
+
+**The mass-expiry run is the fence under load.** Half way through the drain every held lease is pushed
+into the past and swept immediately, so sixteen in-flight jobs are reclaimed and re-dispatched under
+fresh tokens while their original attempts are still running. All sixteen originals then finalized
+into a claim they no longer held: `superseded: 16`, and not one of them advanced a job's state,
+enqueued a follow-up, or extended a lease. Every one of the fifty thousand jobs still reached
+`succeeded`.
+
+Two details of that scenario are worth recording, because both were measurement bugs first.
+
+- **The fault sweeps as part of its own injection** rather than leaving the reclaim to the harness's
+  one-second sweeper. An attempt is in flight only for the length of one job, so the chance the
+  sweeper ticks inside that window is the job duration over the sweep interval — 2.5 % at a 25 ms job.
+- **It retries until it catches a non-empty in-flight set.** Drain progress is counted from
+  `OnFinish`, which is exactly the event that empties the running set, so the instant progress crosses
+  the threshold is an instant when nothing is running. Fired once, the fault expired **zero** leases on
+  three consecutive 50,000-job runs while a concurrent poll of the same table showed 32 rows running
+  throughout.
+
+<br/>
+
+## What the heartbeat costs
+
+Renewal is an `UPDATE` per running job per interval, against an indexed table. That is real write
+amplification and it deserves a number rather than a reassurance.
+
+**The arithmetic first, because it is the part that generalizes.** An attempt pays roughly
+`duration / interval` extra `UPDATE`s, where the interval is `max(1s, LeaseDuration/3)`:
+
+| Job duration | Lease | Interval | Extra `UPDATE`s |
+|---|---|---|---|
+| 25 ms | 1 s | 1 s | 0.025 — *an attempt usually ends before an interval elapses* |
+| 30 s | 30 s (default) | 10 s | 3 |
+| 10 min | 30 s (default) | 10 s | 60 |
+| 10 min | 5 min | 100 s | 6 |
+
+A workload whose jobs are shorter than the interval pays essentially nothing. A workload whose jobs
+are much longer pays proportionally — and a longer lease reduces the bill linearly, which is the knob
+to reach for if the write volume matters more than how fast a crash is noticed.
+
+**The measurement.** A same-binary A/B over a 100,000-job drain at 25 ms per job against a one-second
+lease, `-count=5`, differing only in `Config.Heartbeat`:
+
+| | Median throughput | Median wall clock |
+|---|---|---|
+| Renewal disabled | 486.6 jobs/s | 205.5 s |
+| Renewal enabled (default) | 481.3 jobs/s | 207.8 s |
+
+**Read that as "no resolvable difference", not as "1 % slower".** The run-to-run spread within the
+disabled set alone is 421.5–492.6 jobs/s — 17 % — so a 1 % gap between the two medians is well inside
+the noise, and `benchstat` declines to put a confidence interval on five samples at all. What the
+table actually shows is the first row of the arithmetic above: at 25 ms per job against a 1 s
+interval, only about one attempt in forty lives long enough to renew even once, so there is almost no
+extra write to measure.
+
+This is the honest shape of the cost, and it is why the A/B is published alongside the arithmetic
+rather than instead of it. **A workload where the heartbeat is expensive is a workload where it is
+also load-bearing** — jobs that run for minutes are exactly the ones that were being reclaimed and
+re-executed before it existed. The `UPDATE`s buy a correctness guarantee that was not previously
+available at any price.
+
+```bash
+go test -tags=loadtest -run='^$' -bench=BenchmarkDrainWithHeartbeat -benchtime=1x -count=5 ./loadtest/
 ```
 
 <br/>

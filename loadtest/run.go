@@ -288,10 +288,11 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 			report.ConcurrentExecutions, ErrExactlyOnceViolated,
 		))
 	}
-	if report.Reclaimed > 0 {
+	if report.Reclaimed > 0 && h.cfg.Faults == nil {
 		h.notes.add(
-			"The sweeper reclaimed %d expired leases. With no injected fault that is a finding: "+
-				"it means an attempt outlived its lease.", report.Reclaimed,
+			"The sweeper reclaimed %d expired leases in a run with no injected fault. That is a finding: "+
+				"an attempt outlived its lease, which with renewal enabled means the heartbeat did not keep up.",
+			report.Reclaimed,
 		)
 	}
 
@@ -302,10 +303,6 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 	report.Drained = counts[string(flywheel.StateSucceeded)]
 	report.Discarded = counts[string(flywheel.StateDiscarded)] + counts[string(flywheel.StateCancelled)]
 
-	superseded, err := h.supersededCount(ctx)
-	if err != nil {
-		return err
-	}
 	// Record what the target actually carried, not what was asked for. The
 	// index-condition delta is the point of two of these runs, and a report that
 	// only echoed its own Config could not tell a real delta from a schema that
@@ -317,12 +314,45 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 		h.errs.add(err)
 	}
 
-	report.Superseded = superseded
-	if superseded > 0 {
+	// Superseded is a measurement now: the runtime reports every discarded
+	// attempt through the Observer, so the harness counts events rather than
+	// inferring from row residue after the fact.
+	report.Superseded = h.prog.superseded.Load()
+	if err := h.crossCheckSuperseded(ctx, report.Superseded); err != nil {
+		return err
+	}
+	if report.Superseded > 0 {
+		note := "%d attempts were superseded: their work ran and its outcome was discarded because the " +
+			"claim was lost."
+		if h.cfg.Faults == nil {
+			note += " No fault was injected, so this is a finding rather than the experiment."
+		}
+		h.notes.add(note, report.Superseded)
+	}
+	return nil
+}
+
+// crossCheckSuperseded compares the observed supersede count against the row
+// residue the old inference used, and notes a disagreement.
+//
+// The residue query is kept precisely because the event replaced it. The two
+// count different things and are expected to differ — the residue misses a
+// superseded attempt whose job later succeeded on a retry, and counts a
+// successful run row against a job an operator cancelled afterwards — so this is
+// a smoke check on the event plumbing, not an assertion. A wildly larger residue
+// than event count is the signal that supersedes are happening somewhere the
+// Observer does not see.
+func (h *Harness) crossCheckSuperseded(ctx context.Context, observed int64) error {
+	residue, err := h.supersededCount(ctx)
+	if err != nil {
+		return err
+	}
+	if residue != observed {
 		h.notes.add(
-			"Superseded (%d) is an inference, not a measurement: the runtime's finalize computes the "+
-				"supersede signal and discards it, so it is unobservable through the Driver and the Observer. "+
-				"The number counts successful run rows whose job did not end succeeded.", superseded,
+			"Superseded is %d by observed event and %d by row residue (a successful run row against a job "+
+				"that did not end succeeded). The two count different things and are expected to differ; a "+
+				"large gap means supersedes are occurring where the Observer does not see them.",
+			observed, residue,
 		)
 	}
 	return nil
@@ -346,14 +376,14 @@ func (h *Harness) stateCounts(ctx context.Context) (map[string]int64, error) {
 	return out, nil
 }
 
-// supersededCount infers how many finalizations were superseded.
+// supersededCount counts the row residue a supersede leaves behind: a run row
+// that recorded success against a job that did not end up succeeded.
 //
-// It is an inference and is labelled as one wherever it is reported. The runtime
-// computes the signal — a finalize whose state advance matched no row, because a
-// cancel or a lease reclaim moved the job out of running underneath it — and
-// then returns nil regardless, so neither an Observer nor a Driver decorator can
-// see it. What is observable is the residue: a run row that recorded success
-// against a job that did not end up succeeded.
+// This used to be the *only* way to see a supersede — the runtime computed the
+// signal and returned nil regardless, so neither an Observer nor a Driver
+// decorator could observe it. It is now the cross-check rather than the number,
+// and it is kept for exactly that: an independent view, derived from the
+// database rather than from the event stream the plumbing under test produces.
 func (h *Harness) supersededCount(ctx context.Context) (int64, error) {
 	var n int64
 	if err := h.probe.WithContext(ctx).Raw(

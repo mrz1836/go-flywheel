@@ -158,6 +158,12 @@ func TestReportRoundTripsThroughJSON(t *testing.T) {
 	}
 	want := src
 	want.Config.DSN = ""
+	// The lease is the other deliberate asymmetry, and it goes the opposite way to
+	// the DSN: the report records the lease the runners *used*, so a src that left
+	// it derived comes back with the derived value spelled out. The reconstructed
+	// Config is behaviorally identical — leaseFor returns an explicit lease
+	// unchanged — which is the property that matters for re-running a report.
+	want.Config.Lease = leaseFor(src.Config)
 	want.Errors = nil
 	gotErrs := got.Errors
 	got.Errors = nil

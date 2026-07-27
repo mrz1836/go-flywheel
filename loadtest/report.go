@@ -175,15 +175,24 @@ type latencyNanosJSON struct {
 // configJSON is Config's wire form: the DSN redacted, durations readable, and
 // any configured fault reduced to its description.
 type configJSON struct {
-	Target         string `json:"target"`
-	Jobs           int    `json:"jobs"`
-	Seed           int64  `json:"seed"`
-	Runners        int    `json:"runners"`
-	Workers        int    `json:"workers"`
-	Mix            string `json:"mix"`
-	Indexes        string `json:"indexes"`
-	WorkDuration   string `json:"work_duration"`
-	WorkJitter     string `json:"work_jitter"`
+	Target       string `json:"target"`
+	Jobs         int    `json:"jobs"`
+	Seed         int64  `json:"seed"`
+	Runners      int    `json:"runners"`
+	Workers      int    `json:"workers"`
+	Mix          string `json:"mix"`
+	Indexes      string `json:"indexes"`
+	WorkDuration string `json:"work_duration"`
+	WorkJitter   string `json:"work_jitter"`
+	// Lease is the resolved lease the runners used, not the configured zero. A
+	// report whose lease was derived and one whose lease was set must be
+	// distinguishable, because the whole point of setting it is to make the lease
+	// shorter than the work.
+	Lease string `json:"lease"`
+	// Heartbeat is the configured renewal interval verbatim: "0s" means derived
+	// from the lease, a negative value means renewal was off. A report of a run
+	// with the heartbeat disabled must be identifiable as one.
+	Heartbeat      string `json:"heartbeat"`
 	SampleInterval string `json:"sample_interval"`
 	Timeout        string `json:"timeout"`
 	Queue          string `json:"queue"`
@@ -256,10 +265,14 @@ func (r Report) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON reads a report back from its wire form.
 //
-// The round trip is lossy in exactly one direction, and deliberately: Config.DSN
-// comes back redacted, because the credentials were never written. A reader that
-// wants to re-run a report supplies its own DSN, which is the only safe way for
-// a committed artifact to work.
+// Two fields do not survive as written, both deliberately, and in opposite
+// directions. Config.DSN comes back redacted, because the credentials were never
+// written — a reader that wants to re-run a report supplies its own DSN, which
+// is the only safe way for a committed artifact to work. Config.Lease comes back
+// *resolved*: the report records the lease the runners actually used, so a run
+// that left it derived reads back with the derived value spelled out. The
+// reconstructed Config is behaviorally identical either way, since leaseFor
+// returns an explicit lease unchanged.
 func (r *Report) UnmarshalJSON(data []byte) error {
 	var in reportJSON
 	if err := json.Unmarshal(data, &in); err != nil {
@@ -304,6 +317,8 @@ func configToJSON(c Config) configJSON {
 		Indexes:        string(c.Indexes),
 		WorkDuration:   c.WorkDuration.String(),
 		WorkJitter:     c.WorkJitter.String(),
+		Lease:          leaseFor(c).String(),
+		Heartbeat:      c.Heartbeat.String(),
 		SampleInterval: c.SampleInterval.String(),
 		Timeout:        c.Timeout.String(),
 		Queue:          c.Queue,
@@ -333,6 +348,8 @@ func configFromJSON(c configJSON) Config {
 		Indexes:        IndexCondition(c.Indexes),
 		WorkDuration:   mustParseDuration(c.WorkDuration),
 		WorkJitter:     mustParseDuration(c.WorkJitter),
+		Lease:          mustParseDuration(c.Lease),
+		Heartbeat:      mustParseDuration(c.Heartbeat),
 		SampleInterval: mustParseDuration(c.SampleInterval),
 		Timeout:        mustParseDuration(c.Timeout),
 		Queue:          c.Queue,

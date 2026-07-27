@@ -32,6 +32,9 @@ func (d *postgresDriver) Dequeue(
 		return nil, nil
 	}
 	now := models.ClockFrom(ctx).Now(ctx)
+	// One token per claim call, stamped on every row in the batch. See
+	// RawJob.LeaseToken for why per-row generation would buy nothing.
+	token := models.NewID()
 
 	classFilter := ""
 	args := []any{now, queues}
@@ -39,7 +42,7 @@ func (d *postgresDriver) Dequeue(
 		classFilter = "AND (executor_class = ? OR executor_class = '')"
 		args = append(args, string(class))
 	}
-	args = append(args, limit, now.Add(lease), now)
+	args = append(args, limit, now.Add(lease), token, now)
 
 	sql := fmt.Sprintf(`
 WITH claimed AS (
@@ -54,7 +57,7 @@ WITH claimed AS (
     FOR UPDATE SKIP LOCKED
 )
 UPDATE jobs
-SET state = 'running', attempt = attempt + 1, leased_until = ?, updated_at = ?
+SET state = 'running', attempt = attempt + 1, leased_until = ?, lease_token = ?, updated_at = ?
 FROM claimed
 WHERE jobs.id = claimed.id
 RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
@@ -67,8 +70,9 @@ RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_atte
 
 	claimed := make([]RawJob, 0, len(rows))
 	for _, r := range rows {
-		// The RETURNING attempt is already incremented by the UPDATE.
-		rj, err := rawFromRow(r, r.Attempt)
+		// The RETURNING attempt is already incremented by the UPDATE. lease_token
+		// is deliberately absent from RETURNING: this call minted it.
+		rj, err := rawFromRow(r, r.Attempt, token)
 		if err != nil {
 			return nil, err
 		}

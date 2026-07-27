@@ -38,6 +38,7 @@ func TestParseFlagsDefaults(t *testing.T) {
 		{"Mix", opts.cfg.Mix, loadtest.WorkloadDrainOnly},
 		{"Indexes", opts.cfg.Indexes, loadtest.IndexesFull},
 		{"WorkDuration", opts.cfg.WorkDuration, time.Duration(0)},
+		{"Lease", opts.cfg.Lease, time.Duration(0)},
 		{"SampleInterval", opts.cfg.SampleInterval, time.Second},
 		{"Timeout", opts.cfg.Timeout, 30 * time.Minute},
 		{"out", opts.out, ""},
@@ -47,6 +48,12 @@ func TestParseFlagsDefaults(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
 		}
+	}
+	// The default must be *no* fault, and it must be an untyped nil: Config.Faults
+	// is an interface, so a typed nil stored here would make the harness's
+	// `Faults != nil` check true for a run that asked for none.
+	if opts.cfg.Faults != nil {
+		t.Errorf("Faults = %v, want nil by default", opts.cfg.Faults)
 	}
 }
 
@@ -65,6 +72,7 @@ func TestParseFlagsMapsEveryFlag(t *testing.T) {
 		"-indexes", "correctness-only",
 		"-work", "5ms",
 		"-jitter", "2ms",
+		"-lease", "2s",
 		"-sample-interval", "250ms",
 		"-timeout", "90s",
 		"-queue", "bench",
@@ -88,6 +96,7 @@ func TestParseFlagsMapsEveryFlag(t *testing.T) {
 		{"Indexes", opts.cfg.Indexes, loadtest.IndexesCorrectness},
 		{"WorkDuration", opts.cfg.WorkDuration, 5 * time.Millisecond},
 		{"WorkJitter", opts.cfg.WorkJitter, 2 * time.Millisecond},
+		{"Lease", opts.cfg.Lease, 2 * time.Second},
 		{"SampleInterval", opts.cfg.SampleInterval, 250 * time.Millisecond},
 		{"Timeout", opts.cfg.Timeout, 90 * time.Second},
 		{"Queue", opts.cfg.Queue, "bench"},
