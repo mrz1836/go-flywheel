@@ -16,8 +16,14 @@ import (
 //
 //nolint:gochecknoglobals // shared expectation fixtures for the migrate tests
 var (
-	migrateTables  = []string{"jobs", "job_runs", "job_periodics"}
-	migrateIndexes = []string{
+	migrateTables = []string{"jobs", "job_runs", "job_periodics"}
+	// migrateJobColumns are jobs columns whose absence is silent rather than
+	// loud: the runtime writes them through a map-valued Updates, which a missing
+	// column turns into a query error at the first claim rather than a failure at
+	// install time. lease_token is the fence, so a schema without it is one in
+	// which finalize matches no row and every attempt reads as superseded.
+	migrateJobColumns = []string{"lease_token"}
+	migrateIndexes    = []string{
 		"jobs_unique_key",
 		"jobs_unique_active_key",
 		"jobs_ready",
@@ -56,6 +62,11 @@ func TestMigrateSQLite(t *testing.T) {
 			t.Errorf("expected table %q to exist after Migrate", table)
 		}
 	}
+	for _, col := range migrateJobColumns {
+		if !db.Migrator().HasColumn("jobs", col) {
+			t.Errorf("expected column jobs.%s to exist after Migrate", col)
+		}
+	}
 	for _, idx := range migrateIndexes {
 		if !sqliteHasIndex(t, db, idx) {
 			t.Errorf("expected index %q to exist after Migrate", idx)
@@ -66,6 +77,29 @@ func TestMigrateSQLite(t *testing.T) {
 	// EXISTS indexes).
 	if err := Migrate(db); err != nil {
 		t.Fatalf("Migrate (second call): %v", err)
+	}
+}
+
+// TestModelsCarryJobColumns proves the host-owned install mode delivers the
+// same jobs columns the library-owned one does.
+//
+// The two modes are separate delivery paths for one schema (see Migrate's
+// contract), and only one of them is exercised by the rest of this package. A
+// host whose loader reads Models() gets whatever the row structs declare, so a
+// column added to the runtime's SQL but not to jobRow would pass every test
+// here and fail at the first claim against a host-owned database.
+func TestModelsCarryJobColumns(t *testing.T) {
+	t.Parallel()
+	db := newBareSQLite(t)
+
+	// AutoMigrate over Models is what a host's loader does, minus the index half.
+	if err := db.AutoMigrate(Models()...); err != nil {
+		t.Fatalf("AutoMigrate(Models()): %v", err)
+	}
+	for _, col := range migrateJobColumns {
+		if !db.Migrator().HasColumn("jobs", col) {
+			t.Errorf("expected column jobs.%s to reach a host-owned schema through Models()", col)
+		}
 	}
 }
 

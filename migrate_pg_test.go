@@ -81,6 +81,11 @@ func TestMigratePostgres(t *testing.T) {
 			t.Errorf("expected table %q to exist after Migrate", table)
 		}
 	}
+	for _, col := range migrateJobColumns {
+		if !db.Migrator().HasColumn("jobs", col) {
+			t.Errorf("expected column jobs.%s to exist after Migrate", col)
+		}
+	}
 	for _, idx := range migrateIndexes {
 		if !pgHasIndex(t, db, idx) {
 			t.Errorf("expected index %q to exist after Migrate", idx)
