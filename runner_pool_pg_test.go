@@ -19,15 +19,24 @@ type pgPoolArgs struct{ Slow bool }
 
 func (pgPoolArgs) Kind() string { return "pg.pool" }
 
-// pgPoolWorker sleeps for one of two durations and accumulates the time it spent
-// executing, so a run can be turned into a slot-utilization number.
+// pgPoolWorker runs fast jobs quickly and holds the straggler open until the test
+// releases it, tracking concurrency and completions.
 type pgPoolWorker struct {
-	fast, slow time.Duration
+	fast time.Duration
+	// stragglerIn closes when the straggler enters Work; release lets it finish.
+	stragglerIn chan struct{}
+	release     chan struct{}
 
-	busyNanos atomic.Int64
-	current   atomic.Int32
-	peak      atomic.Int32
-	done      atomic.Int32
+	current atomic.Int32
+	peak    atomic.Int32
+	// fastDone counts completed fast jobs. The straggler is excluded so the count
+	// is a clean "everything else drained around it".
+	fastDone atomic.Int32
+	// stragglerDone records that the straggler's Work returned. It is the
+	// deterministic form of "it is still holding its slot": InFlight can read 2 for
+	// the moment the last fast job spends between its worker returning and its
+	// finalize committing.
+	stragglerDone atomic.Bool
 }
 
 func (*pgPoolWorker) Kind() string { return "pg.pool" }
@@ -40,62 +49,83 @@ func (w *pgPoolWorker) Work(_ context.Context, job *Job[pgPoolArgs]) (Result, er
 			break
 		}
 	}
+	defer w.current.Add(-1)
 
-	d := w.fast
 	if job.Args.Slow {
-		d = w.slow
+		close(w.stragglerIn)
+		<-w.release
+		w.stragglerDone.Store(true)
+		return Result{}, nil
 	}
-	started := time.Now()
-	time.Sleep(d)
-	w.busyNanos.Add(time.Since(started).Nanoseconds())
-
-	w.current.Add(-1)
-	w.done.Add(1)
+	time.Sleep(w.fast)
+	w.fastDone.Add(1)
 	return Result{}, nil
 }
 
-// seedPoolJobs enqueues n jobs of which every stride-th is slow, and returns how
-// many slow ones it wrote.
-func seedPoolJobs(t *testing.T, db *gorm.DB, n, stride int) int {
+// seedStraggler enqueues the one job that will not finish until released, at a
+// priority that puts it at the head of the claim order.
+//
+// Ordering is load-bearing. The claim is ORDER BY priority, scheduled_at, so a
+// lower priority number is claimed first — and the straggler has to land in the
+// *first* batch for this to test anything. If it were claimed last, a
+// batch-and-barrier loop would have already finished every other job and the
+// assertion would pass against the very behavior it exists to reject.
+func seedStraggler(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	_, err := Insert(context.Background(), NewClient(db), pgPoolArgs{Slow: true},
+		InsertOpts{Priority: -1})
+	require.NoError(t, err)
+}
+
+// seedFastJobs enqueues n jobs that finish on their own.
+func seedFastJobs(t *testing.T, db *gorm.DB, n int) {
 	t.Helper()
 	ctx := context.Background()
 	client := NewClient(db)
-	slow := 0
-	for i := range n {
-		isSlow := stride > 0 && i%stride == 0
-		if isSlow {
-			slow++
-		}
-		_, err := Insert(ctx, client, pgPoolArgs{Slow: isSlow}, InsertOpts{})
+	for range n {
+		_, err := Insert(ctx, client, pgPoolArgs{}, InsertOpts{})
 		require.NoError(t, err)
 	}
-	return slow
 }
 
-// TestRunnerPGSlotUtilizationUnderMixedSpeed is A1 against real SKIP LOCKED: with
-// one job in ten running twenty times longer than the rest, the pool must keep its
-// slots busy rather than idling them behind a straggler.
+// TestRunnerPGKeepsClaimingAroundAStragglerPostgres is A1 against real SKIP
+// LOCKED: one job that will not finish must not stop the others.
 //
-// It is the barrier stated as a number. Under the old semantics the loop claimed
-// eight, waited for the slowest of the eight, and claimed eight more — so a batch
-// containing a 20× job left seven slots idle for the whole of it, and utilization
-// could not exceed roughly 1/8 on the batches that contained one. Measured as
-// worker-busy time over slots × wall time, that ceiling is what this asserts is
-// gone.
-func TestRunnerPGSlotUtilizationUnderMixedSpeed(t *testing.T) {
+// It asserts the property rather than a percentage, and that choice came from a
+// failure. The first version measured slot utilization — worker-busy time over
+// slots × wall time — and required it to clear 50 %. That passed at 76 % on a
+// developer laptop and failed at 27.7 % on CI, where a containerized PostgreSQL
+// makes each job's stub and finalize round trips large relative to a 5 ms sleep.
+// The pool was behaving identically in both; the threshold was measuring the
+// runner's hardware. Absolute utilization is published in docs/BENCHMARKS.md from
+// a deliberate run on a named machine, which is the only place a number like that
+// means anything.
+//
+// What is left is hardware-independent and still rejects the batch-and-barrier
+// loop outright. The straggler is claimed in the first batch, so a loop that
+// waited for its whole batch before claiming again would stop there: at
+// Concurrency 4 it would finish at most three more jobs, never forty.
+func TestRunnerPGKeepsClaimingAroundAStragglerPostgres(t *testing.T) {
 	db := NewPostgresIsolatedDB(t)
 	const (
-		concurrency = 8
-		jobs        = 240
-		stride      = 10 // one job in ten is slow
-		fast        = 5 * time.Millisecond
-		slow        = 20 * fast
+		concurrency = 4
+		fastJobs    = 40
 	)
 
-	w := &pgPoolWorker{fast: fast, slow: slow}
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	w := &pgPoolWorker{
+		fast:        time.Millisecond,
+		stragglerIn: make(chan struct{}),
+		release:     release,
+	}
 	reg := NewRegistry()
 	Register(reg, w)
-	slowJobs := seedPoolJobs(t, db, jobs, stride)
+
+	seedStraggler(t, db)
+	seedFastJobs(t, db, fastJobs)
 
 	r, err := NewRunner(RunnerConfig{
 		DB:            db,
@@ -109,26 +139,36 @@ func TestRunnerPGSlotUtilizationUnderMixedSpeed(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	start := time.Now()
-	require.NoError(t, r.RunUntilIdle(context.Background()))
-	elapsed := time.Since(start)
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	runErr := make(chan error, 1)
+	go func() { runErr <- r.Run(runCtx) }()
 
-	require.EqualValues(t, jobs, w.done.Load(), "every job ran exactly once")
+	// The straggler is confirmed in flight before anything is asserted about the
+	// rest, so "they drained around it" cannot be satisfied by it having finished.
+	<-w.stragglerIn
 
-	// Slot utilization: worker-busy time over the capacity the run had available.
-	// It understates true occupancy — the stub, finalize, and claim windows are
-	// capacity the pool was using and this does not count — so it is a floor.
-	capacity := float64(concurrency) * float64(elapsed.Nanoseconds())
-	utilization := float64(w.busyNanos.Load()) / capacity
-	t.Logf("slot utilization %.1f%% over %s (%d jobs, %d slow, peak in flight %d)",
-		utilization*100, elapsed, jobs, slowJobs, w.peak.Load())
+	require.Eventually(t, func() bool { return w.fastDone.Load() == fastJobs },
+		60*time.Second, 10*time.Millisecond,
+		"every other job drained while the straggler held its slot")
 
-	// The serial lower bound: the barrier could not have beaten this.
-	assert.Greater(t, utilization, 0.5,
-		"the pool kept its slots busy through the stragglers rather than idling behind them")
-	assert.LessOrEqual(t, w.peak.Load(), int32(concurrency),
-		"and never exceeded its bound while doing it")
-	assert.Greater(t, w.peak.Load(), int32(1), "the run was genuinely concurrent")
+	assert.False(t, w.stragglerDone.Load(), "the straggler is still holding its slot")
+	require.Eventually(t, func() bool { return r.InFlight() == 1 },
+		10*time.Second, 10*time.Millisecond,
+		"exactly the straggler remains in flight once the last fast job finalizes")
+	assert.LessOrEqual(t, w.peak.Load(), int32(concurrency), "the pool bound held throughout")
+	assert.Greater(t, w.peak.Load(), int32(1), "and the run was genuinely concurrent")
+
+	releaseOnce.Do(func() { close(release) })
+	require.NoError(t, r.Drain(context.Background()), "the straggler finishes on the drain")
+
+	var unfinished int64
+	require.NoError(t, db.Model(&jobRow{}).
+		Where("state <> ?", string(StateSucceeded)).Count(&unfinished).Error)
+	assert.Zero(t, unfinished, "every job reached a terminal success")
+
+	cancelRun()
+	<-runErr
 }
 
 // TestRunnerPGDrainStrandsNothingTheSweepCannotReclaim is A7's durability half
@@ -153,7 +193,7 @@ func TestRunnerPGDrainStrandsNothingTheSweepCannotReclaim(t *testing.T) {
 	blocked := &pgBlockedWorker{started: started, release: release}
 	reg := NewRegistry()
 	Register(reg, blocked)
-	seedPoolJobs(t, db, jobs, 0)
+	seedFastJobs(t, db, jobs)
 
 	driver := NewPostgresDriver(db)
 	r, err := NewRunner(RunnerConfig{
