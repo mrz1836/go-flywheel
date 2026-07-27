@@ -52,8 +52,14 @@ type NodeConfig struct {
 	// slog.Default(). It does not override a RunnerConfig.Logger.
 	Logger *slog.Logger
 	// DrainTimeout bounds how long Run waits for in-flight work after ctx is
-	// cancelled before returning regardless. Zero waits for the natural,
-	// lease-bounded drain.
+	// cancelled before returning regardless. Zero waits for in-flight work however
+	// long it takes.
+	//
+	// Zero is genuinely unbounded, not lease-bounded: a running job's lease is
+	// renewed on the heartbeat for as long as its worker is alive, so there is no
+	// expiry to fall back on. Set it to the longest drain the deployment will
+	// tolerate — on timeout the still-running jobs keep their leases and are
+	// recovered by the lease sweep, and the warning names how many there were.
 	DrainTimeout time.Duration
 }
 
@@ -104,13 +110,20 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	return &Node{cfg: cfg, runners: runners, scheduler: scheduler, logger: logger}, nil
 }
 
-// Run starts every component and blocks until ctx is cancelled and all
-// components have drained (lease-bounded, or DrainTimeout if it is shorter). It
-// returns the first non-cancellation error any component reported, or nil on a
-// clean drain. Signal handling stays with the caller: pass a context from
-// signal.NotifyContext.
+// Run starts every component and blocks until ctx is cancelled and all components
+// have drained, bounded by DrainTimeout when one is set. It returns the first
+// non-cancellation error any component reported, or nil on a clean drain. Signal
+// handling stays with the caller: pass a context from signal.NotifyContext.
+//
+// Cancelling ctx is a *drain* request, not an abort. Every runner is told to stop
+// claiming, then drained; only once the drain has finished — or run out of
+// DrainTimeout — is the rest of the node torn down.
 func (n *Node) Run(ctx context.Context) error {
-	runCtx, cancel := context.WithCancel(ctx)
+	// The components run on a context detached from the caller's. That is what
+	// makes the drain above real: a runner's run context reaches every worker it
+	// dispatches, so deriving it from ctx would abort in-flight work the instant
+	// the host cancelled and leave the drain that follows with nothing to wait for.
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -158,7 +171,15 @@ func (n *Node) Run(ctx context.Context) error {
 	select {
 	case <-done:
 	case <-ctx.Done():
-		n.awaitDrain(ctx, done)
+		drainCtx, cancelDrain := n.drainContext()
+		defer cancelDrain()
+
+		n.drainRunners(ctx, drainCtx)
+		// The runners have stopped claiming and have had their whole drain budget.
+		// What is left is the scheduler and the health server, which have no
+		// in-flight work to protect and stop on the run context.
+		cancel()
+		n.awaitComponents(drainCtx, done)
 	}
 
 	if firstErr := drainErrors(errCh); firstErr != nil {
@@ -169,18 +190,58 @@ func (n *Node) Run(ctx context.Context) error {
 	return nil
 }
 
-// awaitDrain waits for every component goroutine to exit after a shutdown
-// signal, bounded by DrainTimeout when one is set.
-func (n *Node) awaitDrain(ctx context.Context, done <-chan struct{}) {
+// drainContext bounds the whole shutdown sequence. It is built on a fresh
+// background context rather than the caller's, which is already cancelled by the
+// time it is needed.
+//
+// A zero DrainTimeout waits for in-flight work however long it takes.
+func (n *Node) drainContext() (context.Context, context.CancelFunc) {
 	if n.cfg.DrainTimeout <= 0 {
-		<-done
-		return
+		return context.Background(), func() {}
 	}
+	return context.WithTimeout(context.Background(), n.cfg.DrainTimeout)
+}
+
+// drainRunners expresses the Node's drain in terms of the Runner's (FR-04-13)
+// rather than duplicating it: waiting on component goroutines conflates "the
+// loop returned" with "in-flight work finished".
+//
+// Every runner is stopped before any is drained, so none picks up fresh work
+// while a sibling is still finishing — the alternative drains runner 0 while
+// runner 1 keeps claiming. The Drain calls then share one deadline, because
+// DrainTimeout bounds the node's shutdown and not each runner's separately.
+func (n *Node) drainRunners(logCtx, drainCtx context.Context) {
+	for _, r := range n.runners {
+		r.Stop()
+	}
+	for i, r := range n.runners {
+		err := r.Drain(drainCtx)
+		if err == nil {
+			continue
+		}
+		// The count comes off the error, taken at the instant the deadline arrived,
+		// rather than from a second InFlight call that would race the jobs finishing.
+		inFlight := -1
+		var timeout *DrainTimeoutError
+		if errors.As(err, &timeout) {
+			inFlight = timeout.InFlight
+		}
+		n.logger.WarnContext(logCtx, "flywheel: node drain timed out with jobs still in flight",
+			"runner", i,
+			"in_flight", inFlight,
+			"drain_timeout", n.cfg.DrainTimeout.String(),
+			"error", err)
+	}
+}
+
+// awaitComponents waits for the scheduler and health server to exit, bounded by
+// the same deadline the runners' drain spent. A runner whose drain timed out may
+// still be parked on its own in-flight job, which is why this wait is bounded
+// too: the drain budget has already been spent once and must not be spent twice.
+func (n *Node) awaitComponents(drainCtx context.Context, done <-chan struct{}) {
 	select {
 	case <-done:
-	case <-time.After(n.cfg.DrainTimeout):
-		n.logger.WarnContext(ctx, "flywheel: node drain timed out; some in-flight jobs may not have finished",
-			"drain_timeout", n.cfg.DrainTimeout.String())
+	case <-drainCtx.Done():
 	}
 }
 
