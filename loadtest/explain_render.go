@@ -32,7 +32,24 @@ func (r ExplainReport) Text() string {
 	r.writeStatements(&b)
 	r.writePlans(&b)
 
-	return b.String()
+	return trimLineEnds(b.String())
+}
+
+// trimLineEnds strips trailing whitespace from every line.
+//
+// It is applied once, here, rather than pushed back into each writer. The
+// summary table pads its columns to align them, and padding the last column of
+// a row leaves trailing spaces on it — invisible in review, and rejected by the
+// repository's whitespace check. Several other lines have the same hazard the
+// moment a field they interpolate is empty. Stating the property once, at the
+// only place the artifact is assembled, is what makes it hold for writers that
+// do not exist yet.
+func trimLineEnds(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimRight(line, " \t")
+	}
+	return strings.Join(lines, "\n")
 }
 
 // writeHeader states what was measured and against what.
