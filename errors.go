@@ -58,6 +58,38 @@ var ErrUnsupportedDialect = errors.New("flywheel: unsupported dialect")
 // concurrent dequeue would deadlock.
 var ErrSQLiteConcurrency = errors.New("jobs: sqlite driver requires concurrency 1")
 
+// ErrRunnerStopped is returned by RunUntilIdle when Stop ended the dispatch loop
+// before the queue reached a terminal state. It promised a drained queue and did
+// not deliver one, so it says so rather than returning nil.
+//
+// Run returns nil for the same event: a requested stop is how Run is meant to
+// end.
+var ErrRunnerStopped = errors.New("flywheel: runner stopped before the queue drained")
+
+// DrainTimeoutError is what Drain returns when its deadline arrives before the
+// pool empties, carrying how many jobs were still executing at that instant.
+//
+// The count is the point. "Some in-flight jobs may not have finished" is a
+// warning; "3 jobs still in flight" is a diagnostic, and it is the number a host
+// needs to decide whether its drain budget is sized for its workload. Those jobs
+// keep their leases and are recovered by the lease sweep, exactly as they would
+// be after a process kill.
+type DrainTimeoutError struct {
+	// InFlight is how many jobs were executing when the deadline arrived.
+	InFlight int
+	// Err is the deadline's own error, so errors.Is reaches
+	// context.DeadlineExceeded and context.Canceled through it.
+	Err error
+}
+
+// Error renders the count alongside the deadline that cut the drain short.
+func (e *DrainTimeoutError) Error() string {
+	return fmt.Sprintf("flywheel: runner drain left %d jobs in flight: %v", e.InFlight, e.Err)
+}
+
+// Unwrap exposes the deadline error for errors.Is.
+func (e *DrainTimeoutError) Unwrap() error { return e.Err }
+
 // ErrMissingKind is returned by Insert when the args value does not name its
 // job kind. An args type used with Insert must implement Kind() string.
 var ErrMissingKind = errors.New("jobs: args value must implement Kind() string")

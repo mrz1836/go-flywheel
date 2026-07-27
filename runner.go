@@ -151,8 +151,15 @@ type Runner struct {
 	executorID string
 	// pool bounds how many dispatches run at once. It is built in NewRunner, not
 	// in the dispatch loop, so every method that consults it is total: callable
-	// before Run, concurrently with it, and after it returns.
+	// before Run, concurrently with it, and after it returns — which is exactly
+	// when a host wants InFlight for a drain warning. A pool created inside the
+	// loop would leave Drain reporting "drained" in the window before the loop
+	// assigned it.
 	pool *pool
+	// stopCh is closed by Stop, once. The loop checks it before claiming and every
+	// wait inside the loop is derived from it.
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewRunner validates cfg and returns a Runner. It returns ErrSQLiteConcurrency
@@ -211,7 +218,107 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 		cfg:        cfg,
 		executorID: executorIdentity(),
 		pool:       newPool(cfg.Concurrency),
+		stopCh:     make(chan struct{}),
 	}, nil
+}
+
+// --- stop and drain ----------------------------------------------------------
+
+// Stop signals the dispatch loop to claim nothing further. It does not block, it
+// is idempotent, and it is final — there is no restart.
+//
+// It bounds *when the next claim is issued*, not what happens to a claim already
+// in flight. A batch that came back from Dequeue after Stop landed is already
+// leased, so the Runner dispatches it rather than stranding it until the lease
+// sweep reclaims it; Drain waits for that batch too.
+//
+// Run returns nil once the loop notices, because a requested stop is how Run is
+// meant to end. RunUntilIdle returns ErrRunnerStopped, because it promised a
+// drained queue and did not deliver one.
+//
+// Stop is safe before Run, concurrently with it, and after it returns.
+func (r *Runner) Stop() {
+	r.stopOnce.Do(func() { close(r.stopCh) })
+}
+
+// Drain stops claiming and waits for in-flight jobs to finish, bounded by ctx.
+//
+// It returns nil when the pool is empty, or a *DrainTimeoutError naming the
+// still-running count when ctx ends first — in which case those jobs keep their
+// leases and are recovered by the lease sweep, exactly as they would be after a
+// process kill.
+//
+// Drain does not cancel in-flight work. A worker that must be interrupted should
+// respect the context it was given, and per-job timeouts already exist; Drain's
+// contract is "no new claims, then wait", which is what makes a rolling deploy
+// lose no work.
+//
+// Like Stop, it is safe before Run, concurrently with it, and after it returns.
+func (r *Runner) Drain(ctx context.Context) error {
+	r.Stop()
+	if err := r.pool.waitIdle(ctx); err != nil {
+		return &DrainTimeoutError{InFlight: r.pool.inFlight(), Err: err}
+	}
+	return nil
+}
+
+// InFlight reports how many jobs this Runner is executing right now.
+func (r *Runner) InFlight() int { return r.pool.inFlight() }
+
+// stopping reports whether Stop has been called. A nil stopCh — a Runner built as
+// a bare struct literal rather than through NewRunner, which some unit tests do
+// for the pure helpers — reads as "not stopping" rather than blocking, because a
+// receive on a nil channel falls through to the default arm.
+func (r *Runner) stopping() bool {
+	select {
+	case <-r.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// loopContext derives the context backing every *wait* inside the dispatch loop:
+// the slot reservation, the poll sleep, the backoff sleep, the drain wait. It
+// ends when ctx does or when Stop is called.
+//
+// Dequeue, dispatch, and pendingCount deliberately take the caller's ctx instead.
+// Stop must not cancel work already running — that is Drain's whole contract —
+// and it must not cancel a Dequeue mid-transaction: on a one-connection SQLite
+// pool that makes database/sql discard the connection, which for a :memory:
+// database destroys the database.
+func (r *Runner) loopContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	loopCtx, cancel := context.WithCancel(ctx)
+	watching := make(chan struct{})
+	go func() {
+		defer close(watching)
+		select {
+		case <-r.stopCh:
+			cancel()
+		case <-loopCtx.Done():
+		}
+	}()
+	return loopCtx, func() {
+		cancel()
+		<-watching
+	}
+}
+
+// stopResult is what the loop returns when Stop ended it.
+func (r *Runner) stopResult(untilIdle bool) error {
+	if untilIdle {
+		return ErrRunnerStopped
+	}
+	return nil
+}
+
+// ended names why a wait inside the loop was cut short — the caller's context, or
+// Stop — and returns what the loop should report for it.
+func (r *Runner) ended(ctx context.Context, untilIdle bool) error {
+	if err := ctx.Err(); err != nil {
+		return r.stopped(untilIdle, err)
+	}
+	return r.stopResult(untilIdle)
 }
 
 // --- worker pool -------------------------------------------------------------
@@ -453,8 +560,13 @@ func (r *Runner) RunUntilIdle(ctx context.Context) error { return r.run(ctx, tru
 // for it. A slow job therefore holds one slot, not the loop: the remaining slots
 // keep claiming.
 func (r *Runner) run(ctx context.Context, untilIdle bool) error {
+	loopCtx, endLoop := r.loopContext(ctx)
+	defer endLoop()
+
 	// Every dispatch this invocation started is finished before it returns, so a
-	// Runner reused for a second invocation starts from an empty pool.
+	// Runner reused for a second invocation starts from an empty pool. The wait is
+	// unbounded and on a context of its own: Stop and a host cancel both mean
+	// "stop claiming", never "abandon a running job".
 	defer func() { _ = r.pool.waitIdle(context.WithoutCancel(ctx)) }()
 
 	var backoff pollBackoff
@@ -462,10 +574,20 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 		if err := ctx.Err(); err != nil {
 			return r.stopped(untilIdle, err)
 		}
+		if r.stopping() {
+			return r.stopResult(untilIdle)
+		}
 
-		reserved, err := r.pool.reserve(ctx, r.claimLimit())
+		reserved, err := r.pool.reserve(loopCtx, r.claimLimit())
 		if err != nil {
-			return r.stopped(untilIdle, err)
+			return r.ended(ctx, untilIdle)
+		}
+		// Stop may have landed while the reservation waited for a slot. Checking
+		// again here is what keeps "Stop bounds when the next claim is issued" true
+		// for a loop that was parked in a full pool.
+		if r.stopping() {
+			r.pool.release(reserved)
+			return r.stopResult(untilIdle)
 		}
 
 		claimed, claimErr := r.claimAndDispatch(ctx, reserved)
@@ -476,7 +598,7 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			r.cfg.Logger.ErrorContext(ctx, "jobs: dispatch failed", "error", dispatchErr)
 		}
 		if claimErr != nil {
-			if stop := r.onPollError(ctx, &backoff, untilIdle, claimErr); stop != nil {
+			if stop := r.onPollError(ctx, loopCtx, &backoff, untilIdle, claimErr); stop != nil {
 				return stop
 			}
 			continue
@@ -503,8 +625,8 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			// Finalize has not committed.
 			//
 			// It costs nothing in the common case: the pool is already empty.
-			if waitErr := r.pool.waitIdle(ctx); waitErr != nil {
-				return r.stopped(untilIdle, waitErr)
+			if waitErr := r.pool.waitIdle(loopCtx); waitErr != nil {
+				return r.ended(ctx, untilIdle)
 			}
 			if dispatchErr := r.pool.takeErr(); dispatchErr != nil {
 				return dispatchErr
@@ -514,7 +636,7 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			// transient as a blip on the claim and takes the same ladder.
 			pending, countErr := r.pendingCount(ctx)
 			if countErr != nil {
-				if stop := r.onPollError(ctx, &backoff, untilIdle, countErr); stop != nil {
+				if stop := r.onPollError(ctx, loopCtx, &backoff, untilIdle, countErr); stop != nil {
 					return stop
 				}
 				continue
@@ -527,8 +649,8 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			// wait one interval and poll again.
 		}
 
-		if err := r.sleep(ctx, r.cfg.PollInterval); err != nil {
-			return r.stopped(untilIdle, err)
+		if err := r.sleep(loopCtx, r.cfg.PollInterval); err != nil {
+			return r.ended(ctx, untilIdle)
 		}
 	}
 }
@@ -587,7 +709,9 @@ func (b *pollBackoff) next(base, maxDelay time.Duration) (time.Duration, bool) {
 //
 // A wait cut short returns nil, leaving the loop's own top-of-iteration checks to
 // own the exit.
-func (r *Runner) onPollError(ctx context.Context, b *pollBackoff, untilIdle bool, err error) error {
+func (r *Runner) onPollError(
+	ctx, loopCtx context.Context, b *pollBackoff, untilIdle bool, err error,
+) error {
 	delay, saturated := b.next(r.cfg.PollInterval, r.cfg.MaxPollBackoff)
 	r.cfg.Logger.ErrorContext(
 		ctx, "jobs: poll failed",
@@ -598,7 +722,7 @@ func (r *Runner) onPollError(ctx context.Context, b *pollBackoff, untilIdle bool
 	if untilIdle && saturated {
 		return fmt.Errorf("jobs: run-until-idle: poll failed %d consecutive times: %w", b.failures, err)
 	}
-	_ = r.sleep(ctx, delay)
+	_ = r.sleep(loopCtx, delay)
 	return nil
 }
 
