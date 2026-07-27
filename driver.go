@@ -101,6 +101,12 @@ type FinalizeOutcome struct {
 	// outcome even when Superseded: the attempt happened, and losing the claim
 	// discards its effect on the job, not the record of the work.
 	RunOutcome RunOutcome
+	// ErrorClass is the classification written to the audit row, empty when the
+	// attempt carried no error.
+	ErrorClass ErrorClass
+	// ScheduledAt is when the job next becomes claimable — set only for a retry
+	// or a snooze, nil for a terminal state and when Superseded.
+	ScheduledAt *time.Time
 	// EnqueuedChildren is the number of follow-ups enqueued; always zero when
 	// Superseded.
 	EnqueuedChildren int
@@ -380,7 +386,14 @@ func (d *baseDriver) Finalize(
 	ctx context.Context, raw RawJob, runID string, result Result, workErr error, finishedAt time.Time,
 ) (FinalizeOutcome, error) {
 	plan := planFinalize(raw, result, workErr, finishedAt)
-	out := FinalizeOutcome{State: plan.jobState, RunOutcome: plan.runOutcome}
+	out := FinalizeOutcome{
+		State:       plan.jobState,
+		RunOutcome:  plan.runOutcome,
+		ScheduledAt: plan.scheduledAt,
+	}
+	if plan.errorClass != nil {
+		out.ErrorClass = *plan.errorClass
+	}
 
 	// A recorded outcome must survive shutdown: a drain or cancel that cancels ctx
 	// mid-finalize would otherwise roll back the worker's result. WithoutCancel
@@ -415,6 +428,8 @@ func (d *baseDriver) Finalize(
 		}
 		out.Superseded = res.RowsAffected == 0
 		if out.Superseded {
+			// Nothing was scheduled, because nothing was written to the job at all.
+			out.ScheduledAt = nil
 			// Read back the state the superseding claim left, inside the same
 			// transaction. Reporting the plan's state would name a state nothing
 			// wrote, and the real one is what tells a caller *how* the claim was

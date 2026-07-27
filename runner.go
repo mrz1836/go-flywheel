@@ -289,9 +289,12 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
 	if !known {
 		finishedAt := models.ClockFrom(ctx).Now(ctx)
 		unknown := &classifiedError{cause: ErrUnknownKind, class: ErrorPermanent}
-		r.observe(ctx, raw, jobEv, Result{}, unknown, startedAt, finishedAt)
-		_, err := r.cfg.Driver.Finalize(ctx, raw, runID, Result{}, unknown, finishedAt)
-		return err
+		out, err := r.cfg.Driver.Finalize(ctx, raw, runID, Result{}, unknown, finishedAt)
+		if err != nil {
+			return err
+		}
+		r.observe(ctx, raw, jobEv, out, unknown, startedAt, finishedAt)
+		return nil
 	}
 
 	logger := r.cfg.Logger.With("job_id", raw.ID, "kind", raw.Kind, "run_id", runID)
@@ -335,46 +338,64 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
 	if workErr != nil {
 		finalErr = r.classify(entry, workErr, raw)
 	}
-	r.observe(ctx, raw, jobEv, result, finalErr, startedAt, finishedAt)
-	// Finalize on the parent ctx, not the (possibly expired) workCtx, so a
+	// Finalize first, then report what was actually persisted. Emitting the
+	// outcome before the driver has applied it means a superseded attempt is
+	// reported as a success it never had.
+	//
+	// Finalize runs on the parent ctx, not the (possibly expired) workCtx, so a
 	// timed-out attempt still records its outcome.
-	_, err := r.cfg.Driver.Finalize(ctx, raw, runID, result, finalErr, finishedAt)
-	return err
+	out, err := r.cfg.Driver.Finalize(ctx, raw, runID, result, finalErr, finishedAt)
+	if err != nil {
+		// Nothing was persisted, so there is nothing to report. Emitting an event
+		// here would describe an outcome the database does not hold.
+		return err
+	}
+	r.observe(ctx, raw, jobEv, out, finalErr, startedAt, finishedAt)
+	return nil
 }
 
-// observe emits the OnFinish event (and OnRetry when the attempt will retry) for
-// one finalized attempt.
+// observe reports one finalized attempt: OnSupersede when the driver persisted
+// nothing, otherwise OnFinish and — when the job will run again — OnRetry.
 //
-// It recomputes planFinalize because it runs before the driver has applied
-// anything, and that is a defect on both counts: the runner and the driver
-// derive the same decision independently and could diverge, and the observer is
-// told an outcome the driver has not yet agreed to. Both are closed by the
-// ordering inversion that follows the supersede event.
+// It is a projection of what the driver persisted and derives nothing of its
+// own. It used to call planFinalize a second time, which was a latent bug as
+// well as a blind spot: the runner and the driver computed the same state-machine
+// decision independently and could diverge, and the observer was told an outcome
+// before the driver had agreed to it.
 func (r *Runner) observe(
-	ctx context.Context, raw RawJob, ev JobEvent, result Result, finalErr error, startedAt, finishedAt time.Time,
+	ctx context.Context, raw RawJob, ev JobEvent, out FinalizeOutcome, finalErr error, startedAt, finishedAt time.Time,
 ) {
-	plan := planFinalize(raw, result, finalErr, finishedAt)
-	finish := FinishEvent{
-		JobEvent: ev,
-		Outcome:  plan.runOutcome,
-		Err:      finalErr,
-		Duration: finishedAt.Sub(startedAt),
-	}
-	if plan.errorClass != nil {
-		finish.ErrorClass = *plan.errorClass
-	}
-	r.cfg.Observer.OnFinish(ctx, finish)
+	duration := finishedAt.Sub(startedAt)
 
-	if plan.jobState == StateRetryable {
+	if out.Superseded {
+		r.cfg.Observer.OnSupersede(ctx, SupersedeEvent{
+			JobEvent:   ev,
+			Outcome:    out.RunOutcome,
+			State:      out.State,
+			Duration:   duration,
+			LeaseToken: raw.LeaseToken,
+		})
+		return
+	}
+
+	r.cfg.Observer.OnFinish(ctx, FinishEvent{
+		JobEvent:   ev,
+		Outcome:    out.RunOutcome,
+		ErrorClass: out.ErrorClass,
+		Err:        finalErr,
+		Duration:   duration,
+	})
+
+	if out.State == StateRetryable {
 		var delay time.Duration
-		if plan.scheduledAt != nil {
-			delay = plan.scheduledAt.Sub(finishedAt)
+		if out.ScheduledAt != nil {
+			delay = out.ScheduledAt.Sub(finishedAt)
 		}
 		r.cfg.Observer.OnRetry(ctx, RetryEvent{
 			JobEvent:    ev,
 			NextAttempt: ev.Attempt + 1,
 			Delay:       delay,
-			ErrorClass:  finish.ErrorClass,
+			ErrorClass:  out.ErrorClass,
 		})
 	}
 }

@@ -51,6 +51,15 @@ func (o *recordingObserver) OnSupersede(_ context.Context, ev SupersedeEvent) {
 	o.supersedes = append(o.supersedes, ev)
 }
 
+// snapshotSupersedes returns the supersede events recorded so far. It is
+// separate from snapshot because a supersede is the absence of a finish, and a
+// test asserting that pairing reads the two independently.
+func (o *recordingObserver) snapshotSupersedes() []SupersedeEvent {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]SupersedeEvent(nil), o.supersedes...)
+}
+
 func (o *recordingObserver) snapshot() (claims []ClaimEvent, starts []JobEvent, finishes []FinishEvent, retries []RetryEvent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
