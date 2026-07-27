@@ -51,11 +51,12 @@ func rwRunner(t testing.TB, db *gorm.DB, reg *Registry, mutators ...func(*Runner
 // recordObserver captures the lifecycle events the Runner emits so a scenario can
 // reconcile observed counters against the driven outcomes.
 type recordObserver struct {
-	mu       sync.Mutex
-	claimed  int
-	starts   int
-	finishes []FinishEvent
-	retries  []RetryEvent
+	mu         sync.Mutex
+	claimed    int
+	starts     int
+	finishes   []FinishEvent
+	retries    []RetryEvent
+	supersedes []SupersedeEvent
 }
 
 func (o *recordObserver) OnClaim(_ context.Context, ev ClaimEvent) {
@@ -80,6 +81,12 @@ func (o *recordObserver) OnRetry(_ context.Context, ev RetryEvent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.retries = append(o.retries, ev)
+}
+
+func (o *recordObserver) OnSupersede(_ context.Context, ev SupersedeEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.supersedes = append(o.supersedes, ev)
 }
 
 func (o *recordObserver) outcomeCount(outcome RunOutcome) int {

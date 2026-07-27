@@ -95,6 +95,10 @@ type progress struct {
 	// reclaimed counts jobs the harness's sweeper returned to available. A
 	// reclaimed job runs again, so it is progress undone.
 	reclaimed atomic.Int64
+	// superseded counts attempts whose outcome the runtime discarded because
+	// their claim was lost. It is the direct measurement of double execution,
+	// fed by the Observer rather than inferred from row residue after the fact.
+	superseded atomic.Int64
 }
 
 // terminal estimates how many jobs have reached a terminal state.
@@ -157,6 +161,16 @@ func (o harnessObserver) OnFinish(_ context.Context, ev flywheel.FinishEvent) {
 // what makes finished − retried the terminal count.
 func (o harnessObserver) OnRetry(context.Context, flywheel.RetryEvent) {
 	o.prog.retried.Add(1)
+}
+
+// OnSupersede counts attempts whose outcome the runtime discarded.
+//
+// It is deliberately not counted as progress. A superseded attempt advanced
+// nothing, so the job it ran is still in flight and folding it into finished
+// would make the drain fraction — which schedules every fault — report a run as
+// further along than it is.
+func (o harnessObserver) OnSupersede(context.Context, flywheel.SupersedeEvent) {
+	o.prog.superseded.Add(1)
 }
 
 // noteset collects measurement caveats. It is a type rather than a slice because

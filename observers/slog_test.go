@@ -121,6 +121,33 @@ func TestSlogObserverDebugSuppressedAtInfoLevel(t *testing.T) {
 	assert.Empty(t, h.snapshot(), "at info level the debug lifecycle events are suppressed")
 }
 
+// TestSlogObserverSupersedeLogsAtWarn is the one deviation from "every lifecycle
+// event at debug", and the test states why: a supersede means work was executed
+// and thrown away, which an operator must see without having turned debug on
+// first. The handler here is set to info precisely so that a debug-level
+// supersede would produce no record and fail.
+func TestSlogObserverSupersedeLogsAtWarn(t *testing.T) {
+	t.Parallel()
+	h := &capturingHandler{level: slog.LevelInfo}
+	NewSlog(slog.New(h)).OnSupersede(context.Background(), flywheel.SupersedeEvent{
+		JobEvent:   flywheel.JobEvent{JobID: "j1", RunID: "r1", Kind: "k", Queue: "q", Attempt: 2},
+		Outcome:    flywheel.OutcomeSuccess,
+		State:      flywheel.StateRunning,
+		Duration:   1500 * time.Millisecond,
+		LeaseToken: "stale-token",
+	})
+
+	records := h.snapshot()
+	require.Len(t, records, 1, "a supersede survives an info-level handler")
+	assert.Equal(t, slog.LevelWarn, records[0].Level)
+
+	attrs := attrsOf(records[0])
+	assert.Equal(t, "j1", attrs["job_id"].String())
+	assert.Equal(t, "success", attrs["discarded_outcome"].String(),
+		"the line names the outcome that was thrown away, not a placeholder")
+	assert.Equal(t, "running", attrs["job_state"].String())
+}
+
 func TestNewSlogNilLoggerDoesNotPanic(t *testing.T) {
 	t.Parallel()
 	obs := NewSlog(nil)

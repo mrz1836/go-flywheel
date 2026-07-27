@@ -154,6 +154,53 @@ func TestMetricsObserverOnRetryCountsByKindAndErrorClass(t *testing.T) {
 	assert.Equal(t, map[string]string{TagKind: "k", TagErrorClass: "transient"}, c.tags)
 }
 
+// TestMetricsObserverOnSupersedeCountsByKindAndQueue asserts the supersede
+// mapping, including what it deliberately omits: the discarded outcome is not a
+// label. A supersede is a supersede whatever the attempt would have recorded,
+// and slicing by outcome would split the one series an operator alerts on into
+// five that each look small.
+func TestMetricsObserverOnSupersedeCountsByKindAndQueue(t *testing.T) {
+	t.Parallel()
+	rec := &fakeRecorder{}
+	NewMetrics(rec).OnSupersede(context.Background(), flywheel.SupersedeEvent{
+		JobEvent:   flywheel.JobEvent{Kind: "k", Queue: "q", Attempt: 2},
+		Outcome:    flywheel.OutcomeSuccess,
+		State:      flywheel.StateRunning,
+		Duration:   time.Second,
+		LeaseToken: "stale-token",
+	})
+
+	require.Len(t, rec.calls, 1, "a supersede counts once and nothing else")
+	c := rec.only(t, "count", MetricJobsSuperseded)
+	assert.EqualValues(t, 1, c.delta)
+	assert.Equal(t, map[string]string{TagKind: "k", TagQueue: "q"}, c.tags)
+}
+
+// TestMetricsObserverSupersedeIsNotCountedAsFinished is the taxonomy guarantee
+// stated as a test: a discarded attempt must not land in
+// flywheel_jobs_finished_total, or an operator watching success counts during a
+// double-execution incident sees two successes for one job — the exact blindness
+// the event exists to remove.
+func TestMetricsObserverSupersedeIsNotCountedAsFinished(t *testing.T) {
+	t.Parallel()
+	rec := &fakeRecorder{}
+	m := NewMetrics(rec)
+	ev := flywheel.JobEvent{Kind: "k", Queue: "q"}
+
+	m.OnFinish(context.Background(), flywheel.FinishEvent{JobEvent: ev, Outcome: flywheel.OutcomeSuccess})
+	m.OnSupersede(context.Background(), flywheel.SupersedeEvent{JobEvent: ev, Outcome: flywheel.OutcomeSuccess})
+
+	finished := 0
+	for _, c := range rec.calls {
+		if c.method == "count" && c.name == MetricJobsFinished {
+			finished++
+		}
+	}
+	assert.Equal(t, 1, finished,
+		"only the state-advancing finalization counts as finished; the discarded one has its own series")
+	assert.EqualValues(t, 1, rec.only(t, "count", MetricJobsSuperseded).delta)
+}
+
 func TestMetricsObserverImplementsObserver(t *testing.T) {
 	t.Parallel()
 	var obs flywheel.Observer = NewMetrics(NewMemRecorder())

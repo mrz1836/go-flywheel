@@ -17,19 +17,42 @@ import (
 //
 // OnStart fires only for a registered kind; a job whose kind has no worker goes
 // straight to OnFinish (with a permanent error) and never OnStart.
+//
+// # What follows an OnStart
+//
+// Exactly one of OnFinish or OnSupersede, never both. An attempt whose claim was
+// superseded did not advance the job, so reporting it as finished would count an
+// outcome the database never took — which is precisely the double-execution
+// signal these events exist to surface. OnRetry cannot follow a supersede
+// either: no retry was scheduled.
+//
+// That makes an OnFinish count a count of *state-advancing* finalizations, and
+// it makes a nonzero OnSupersede rate the thing to alert on.
+//
+// OnFinish fires only when the finalize succeeded. A finalize that errored
+// persisted nothing, so there is no outcome to report and neither event fires.
 type Observer interface {
 	// OnClaim fires once per non-empty claimed batch, after Dequeue and before
 	// any dispatch.
 	OnClaim(ctx context.Context, ev ClaimEvent)
 	// OnStart fires immediately before a worker's Work runs.
 	OnStart(ctx context.Context, ev JobEvent)
-	// OnFinish fires after each attempt is decided, for every terminal-or-retry
-	// outcome.
+	// OnFinish fires after each attempt is decided and persisted, for every
+	// terminal-or-retry outcome the driver actually applied.
 	OnFinish(ctx context.Context, ev FinishEvent)
 	// OnRetry fires when an attempt is scheduled for another try — a subset of
 	// OnFinish — so a metric can count retries without re-deriving the state
 	// machine.
 	OnRetry(ctx context.Context, ev RetryEvent)
+	// OnSupersede fires in OnFinish's place when a finished attempt could not
+	// advance the job's state because its claim was no longer held: the job was
+	// reclaimed by the lease sweep, cancelled, or retried while the attempt was
+	// running. The attempt's audit row is still written; its outcome is
+	// discarded.
+	//
+	// A nonzero rate here means work is being executed twice. The lease is too
+	// short for the workload, or the heartbeat is disabled or failing.
+	OnSupersede(ctx context.Context, ev SupersedeEvent)
 }
 
 // ClaimEvent describes one claimed batch.
@@ -73,11 +96,33 @@ type RetryEvent struct {
 	ErrorClass ErrorClass
 }
 
+// SupersedeEvent reports one attempt whose outcome was discarded because its
+// claim was no longer held.
+type SupersedeEvent struct {
+	JobEvent
+	// Outcome is what the attempt recorded in its audit row — its real outcome,
+	// not a placeholder. The attempt happened; what was discarded is its effect
+	// on the job.
+	Outcome RunOutcome
+	// State is the job's state as the superseding claim left it: running when the
+	// job was reclaimed and is being retried, cancelled when it was cancelled
+	// out from under the attempt. It is empty when the job no longer exists.
+	State JobState
+	// Duration is the wall time the attempt took before finishing into a lost
+	// claim. It is the same measurement OnFinish carries, so a discarded attempt
+	// still contributes to a duration distribution rather than vanishing from it.
+	Duration time.Duration
+	// LeaseToken is the token the attempt held. The job's current token differs —
+	// that difference is what made this a supersede.
+	LeaseToken string
+}
+
 // noopObserver is the default Observer when RunnerConfig.Observer is nil: every
 // method is a no-op, so the dispatch hot path never needs a nil check.
 type noopObserver struct{}
 
-func (noopObserver) OnClaim(context.Context, ClaimEvent)   {}
-func (noopObserver) OnStart(context.Context, JobEvent)     {}
-func (noopObserver) OnFinish(context.Context, FinishEvent) {}
-func (noopObserver) OnRetry(context.Context, RetryEvent)   {}
+func (noopObserver) OnClaim(context.Context, ClaimEvent)         {}
+func (noopObserver) OnStart(context.Context, JobEvent)           {}
+func (noopObserver) OnFinish(context.Context, FinishEvent)       {}
+func (noopObserver) OnRetry(context.Context, RetryEvent)         {}
+func (noopObserver) OnSupersede(context.Context, SupersedeEvent) {}

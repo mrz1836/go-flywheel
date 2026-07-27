@@ -13,11 +13,12 @@ import (
 // recordingObserver captures every lifecycle event for assertion. It is
 // concurrency-safe so it can be shared across a concurrent dispatch batch.
 type recordingObserver struct {
-	mu       sync.Mutex
-	claims   []ClaimEvent
-	starts   []JobEvent
-	finishes []FinishEvent
-	retries  []RetryEvent
+	mu         sync.Mutex
+	claims     []ClaimEvent
+	starts     []JobEvent
+	finishes   []FinishEvent
+	retries    []RetryEvent
+	supersedes []SupersedeEvent
 }
 
 func (o *recordingObserver) OnClaim(_ context.Context, ev ClaimEvent) {
@@ -42,6 +43,12 @@ func (o *recordingObserver) OnRetry(_ context.Context, ev RetryEvent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.retries = append(o.retries, ev)
+}
+
+func (o *recordingObserver) OnSupersede(_ context.Context, ev SupersedeEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.supersedes = append(o.supersedes, ev)
 }
 
 func (o *recordingObserver) snapshot() (claims []ClaimEvent, starts []JobEvent, finishes []FinishEvent, retries []RetryEvent) {
@@ -163,5 +170,6 @@ func TestNoopObserverMethodsDoNotPanic(t *testing.T) {
 		o.OnStart(ctx, JobEvent{})
 		o.OnFinish(ctx, FinishEvent{})
 		o.OnRetry(ctx, RetryEvent{})
+		o.OnSupersede(ctx, SupersedeEvent{})
 	})
 }
