@@ -38,92 +38,92 @@ index variants (every one installed under the name jobs_ready)
 
 summary
 ----------------------------------------------------------------------------------------------------------------------
-cell      scan node                               scan rows sort removed   buf hit  buf read exec ms  
+cell      scan node                               scan rows sort removed   buf hit  buf read exec ms
 ----------------------------------------------------------------------------------------------------------------------
-A/P0/V-   Seq Scan on jobs jobs_1                 166,667   YES  833,333   16,352   39,317   170.949  
+A/P0/V-   Seq Scan on jobs jobs_1                 166,667   YES  833,333   16,352   39,317   170.949
           sort method: external merge  Disk: 11760kB
-A/P0/V0   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,480   153.566  
+A/P0/V0   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,480   153.566
           sort method: external merge  Disk: 11760kB
-A/P0/V1   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,480   144.692  
+A/P0/V1   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,480   144.692
           sort method: external merge  Disk: 11760kB
-A/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   7         122      8        0.193    
-A/P0/V3   Index Scan using jobs_ready on jobs jo… 8         no   7         118      3        0.185    
-A/P0/V4   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         106      57,390   144.321  
+A/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   7         122      8        0.193
+A/P0/V3   Index Scan using jobs_ready on jobs jo… 8         no   7         118      3        0.185
+A/P0/V4   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         106      57,390   144.321
           sort method: external merge  Disk: 11760kB
-A/P1/V-   Seq Scan on jobs jobs_1                 166,667   YES  833,333   16,351   39,318   175.293  
+A/P1/V-   Seq Scan on jobs jobs_1                 166,667   YES  833,333   16,351   39,318   175.293
           sort method: external merge  Disk: 11760kB
-A/P1/V0   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,479   143.083  
+A/P1/V0   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,479   143.083
           sort method: external merge  Disk: 11760kB
-A/P1/V1   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,479   142.016  
+A/P1/V1   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,479   142.016
           sort method: external merge  Disk: 11760kB
-A/P1/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         121      0        0.152    
-A/P1/V3   Index Scan using jobs_ready on jobs jo… 8         no   7         124      0        0.148    
-A/P1/V4   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      57,393   139.415  
+A/P1/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         121      0        0.152
+A/P1/V3   Index Scan using jobs_ready on jobs jo… 8         no   7         124      0        0.148
+A/P1/V4   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      57,393   139.415
           sort method: external merge  Disk: 11760kB
 
-B/P0/V-   Seq Scan on jobs jobs_1                 500,000   YES  500,000   16,380   39,286   321.573  
+B/P0/V-   Seq Scan on jobs jobs_1                 500,000   YES  500,000   16,380   39,286   321.573
           sort method: external merge  Disk: 35264kB
-B/P0/V0   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         111      58,308   317.229  
+B/P0/V0   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         111      58,308   317.229
           sort method: external merge  Disk: 35264kB
-B/P0/V1   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         114      58,308   317.109  
+B/P0/V1   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         114      58,308   317.109
           sort method: external merge  Disk: 35264kB
-B/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   11        115      0        0.129    
-B/P0/V3   Seq Scan on jobs jobs_1                 500,000   YES  500,000   10,926   44,752   338.069  
+B/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   11        115      0        0.129
+B/P0/V3   Seq Scan on jobs jobs_1                 500,000   YES  500,000   10,926   44,752   338.069
           sort method: external merge  Disk: 35264kB
-B/P1/V-   Seq Scan on jobs jobs_1                 500,000   YES  500,000   16,413   39,256   307.672  
+B/P1/V-   Seq Scan on jobs jobs_1                 500,000   YES  500,000   16,413   39,256   307.672
           sort method: external merge  Disk: 35264kB
-B/P1/V0   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         103      58,309   293.998  
+B/P1/V0   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         103      58,309   293.998
           sort method: external merge  Disk: 35264kB
-B/P1/V1   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         111      58,307   287.963  
+B/P1/V1   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         111      58,307   287.963
           sort method: external merge  Disk: 35264kB
-B/P1/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.161    
-B/P1/V3   Seq Scan on jobs jobs_1                 500,000   YES  500,000   10,961   44,720   314.864  
+B/P1/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.161
+B/P1/V3   Seq Scan on jobs jobs_1                 500,000   YES  500,000   10,961   44,720   314.864
           sort method: external merge  Disk: 35264kB
 
-C/P0/V-   Seq Scan on jobs jobs_1                 333,334   YES  666,666   16,422   39,246   221.145  
+C/P0/V-   Seq Scan on jobs jobs_1                 333,334   YES  666,666   16,422   39,246   221.145
           sort method: external merge  Disk: 23512kB
-C/P0/V0   Bitmap Heap Scan on jobs jobs_1         333,334   YES  0         102      57,482   219.635  
+C/P0/V0   Bitmap Heap Scan on jobs jobs_1         333,334   YES  0         102      57,482   219.635
           sort method: external merge  Disk: 23512kB
-C/P0/V1   Bitmap Heap Scan on jobs jobs_1         333,334   YES  0         102      57,482   217.005  
+C/P0/V1   Bitmap Heap Scan on jobs jobs_1         333,334   YES  0         102      57,482   217.005
           sort method: external merge  Disk: 23512kB
-C/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.121    
-C/P0/V3   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.133    
+C/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.121
+C/P0/V3   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.133
 
-D/P0/V-   Seq Scan on jobs jobs_1                 1,000,000 YES  0         16,433   39,238   553.939  
+D/P0/V-   Seq Scan on jobs jobs_1                 1,000,000 YES  0         16,433   39,238   553.939
           sort method: external merge  Disk: 70520kB
-D/P0/V0   Seq Scan on jobs jobs_1                 1,000,000 YES  0         16,450   39,224   560.633  
+D/P0/V0   Seq Scan on jobs jobs_1                 1,000,000 YES  0         16,450   39,224   560.633
           sort method: external merge  Disk: 70520kB
-D/P0/V1   Seq Scan on jobs jobs_1                 1,000,000 YES  0         16,450   39,227   566.534  
+D/P0/V1   Seq Scan on jobs jobs_1                 1,000,000 YES  0         16,450   39,227   566.534
           sort method: external merge  Disk: 70520kB
-D/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.133    
-D/P0/V3   Seq Scan on jobs jobs_1                 1,000,000 YES  0         10,995   44,688   565.979  
+D/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.133
+D/P0/V3   Seq Scan on jobs jobs_1                 1,000,000 YES  0         10,995   44,688   565.979
           sort method: external merge  Disk: 70520kB
 
-E/P0/V-   Seq Scan on jobs jobs_1                 0         YES  1,000,000 16,338   39,223   100.906  
+E/P0/V-   Seq Scan on jobs jobs_1                 0         YES  1,000,000 16,338   39,223   100.906
           sort method: quicksort  Memory: 25kB
-E/P0/V0   Index Scan using jobs_ready on jobs jo… 0         YES  0         0        3        0.019    
+E/P0/V0   Index Scan using jobs_ready on jobs jo… 0         YES  0         0        3        0.019
           sort method: quicksort  Memory: 25kB
-E/P0/V1   Index Scan using jobs_ready on jobs jo… 0         YES  0         0        3        0.020    
+E/P0/V1   Index Scan using jobs_ready on jobs jo… 0         YES  0         0        3        0.020
           sort method: quicksort  Memory: 25kB
-E/P0/V2   Index Scan using jobs_ready on jobs jo… 0         no   0         3        5,749    21.398   
-E/P0/V3   Index Scan using jobs_ready on jobs jo… 0         no   0         3        0        0.014    
-E/P1/V-   Seq Scan on jobs jobs_1                 0         YES  1,000,000 16,340   39,221   112.993  
+E/P0/V2   Index Scan using jobs_ready on jobs jo… 0         no   0         3        5,749    21.398
+E/P0/V3   Index Scan using jobs_ready on jobs jo… 0         no   0         3        0        0.014
+E/P1/V-   Seq Scan on jobs jobs_1                 0         YES  1,000,000 16,340   39,221   112.993
           sort method: quicksort  Memory: 25kB
-E/P1/V0   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.010    
+E/P1/V0   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.010
           sort method: quicksort  Memory: 25kB
-E/P1/V1   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.010    
+E/P1/V1   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.010
           sort method: quicksort  Memory: 25kB
-E/P1/V2   Index Scan using jobs_ready on jobs jo… 0         no   0         5,752    0        17.815   
-E/P1/V3   Index Scan using jobs_ready on jobs jo… 0         no   0         3        0        0.008    
+E/P1/V2   Index Scan using jobs_ready on jobs jo… 0         no   0         5,752    0        17.815
+E/P1/V3   Index Scan using jobs_ready on jobs jo… 0         no   0         3        0        0.008
 
-F/P0/V-   Seq Scan on jobs jobs_1                 0         YES  1,000,000 16,342   39,219   93.520   
+F/P0/V-   Seq Scan on jobs jobs_1                 0         YES  1,000,000 16,342   39,219   93.520
           sort method: quicksort  Memory: 25kB
-F/P0/V0   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.012    
+F/P0/V0   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.012
           sort method: quicksort  Memory: 25kB
-F/P0/V1   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.008    
+F/P0/V1   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.008
           sort method: quicksort  Memory: 25kB
-F/P0/V2   Index Scan using jobs_ready on jobs jo… 0         no   0         5,752    0        16.564   
-F/P0/V3   Index Scan using jobs_ready on jobs jo… 0         no   0         3        0        0.007    
+F/P0/V2   Index Scan using jobs_ready on jobs jo… 0         no   0         5,752    0        16.564
+F/P0/V3   Index Scan using jobs_ready on jobs jo… 0         no   0         3        0        0.007
 ----------------------------------------------------------------------------------------------------------------------
 
 notes
@@ -226,7 +226,7 @@ WITH claimed AS (
       AND deleted_at IS NULL
       AND scheduled_at <= '2026-07-27 14:39:23.231'
       AND queue IN ('q0')
-      
+
     ORDER BY priority, scheduled_at
     LIMIT 8
     FOR UPDATE SKIP LOCKED
@@ -245,7 +245,7 @@ WITH claimed AS (
       AND deleted_at IS NULL
       AND scheduled_at <= '2026-07-27 14:39:23.449'
       AND queue IN ('q0','q1','q2')
-      
+
     ORDER BY priority, scheduled_at
     LIMIT 8
     FOR UPDATE SKIP LOCKED
@@ -302,7 +302,7 @@ WITH claimed AS (
       AND deleted_at IS NULL
       AND scheduled_at <= '2026-07-27 14:39:23.991'
       AND queue IN ('q-idle')
-      
+
     ORDER BY priority, scheduled_at
     LIMIT 8
     FOR UPDATE SKIP LOCKED

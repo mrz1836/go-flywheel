@@ -602,6 +602,53 @@ func TestExplainReportTextCarriesEveryCell(t *testing.T) {
 	}
 }
 
+// TestExplainReportTextHasNoTrailingWhitespace pins a property of the committed
+// file rather than of the code that writes it.
+//
+// The summary table pads its columns to align them, and padding a row's last
+// column leaves trailing spaces on it. That is invisible in review, survives
+// gofmt and the linters — neither looks inside a generated .txt — and is caught
+// only by the repository's whitespace check, which auto-fixes rather than
+// reporting, so the artifact and the renderer silently disagree from then on.
+//
+// The report here is deliberately built with an empty Server and Schema: those
+// interpolate into a padded header line, which is the other way a line acquires
+// trailing whitespace.
+func TestExplainReportTextHasNoTrailingWhitespace(t *testing.T) {
+	t.Parallel()
+
+	variants, err := explainVariants()
+	if err != nil {
+		t.Fatalf("explainVariants: %v", err)
+	}
+	report := ExplainReport{
+		Target: "postgres://localhost:5432/flywheel_test", Jobs: 10,
+		Queues: explainQueues(1), Classes: explainClasses("loadtest"), Limit: 8,
+		Conditions: explainConditions(), Variants: variants,
+		Statements: []ExplainStatement{{Condition: "A", Predicate: predicateEmitted, SQL: capturedRoutedSQL}},
+		Cells: []ExplainCell{
+			{Condition: "A", Predicate: predicateEmitted, Variant: "V-", Summary: parsePlan(seqScanPlan), Plan: seqScanPlan},
+			{Condition: "A", Predicate: predicateInList, Variant: "V1", Summary: parsePlan(indexScanPlan), Plan: indexScanPlan},
+		},
+		Notes: []string{"a note long enough that the bullet wrapper has to break it across more than one line of output"},
+	}
+
+	for i, line := range strings.Split(report.Text(), "\n") {
+		if line != strings.TrimRight(line, " \t") {
+			t.Errorf("line %d ends in whitespace: %q", i+1, line)
+		}
+	}
+}
+
+func TestTrimLineEnds(t *testing.T) {
+	t.Parallel()
+
+	got := trimLineEnds("a  \nb\t\n\tc\nd \t \n")
+	if want := "a\nb\n\tc\nd\n"; got != want {
+		t.Errorf("trimLineEnds = %q, want %q (leading whitespace must survive)", got, want)
+	}
+}
+
 // TestExplainClaimCapturesTheDriversOwnSQL is the fidelity check the whole tool
 // rests on, and the one thing no fixture can stand in for: that GORM's Trace
 // really hands back a literal, re-executable statement for the Raw call the
