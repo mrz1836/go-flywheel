@@ -85,6 +85,22 @@ type Report struct {
 	EnqueueThroughput float64 // jobs/second
 	DrainThroughput   float64 // jobs/second
 
+	// SlotUtilization is the fraction of the run's worker capacity that was
+	// occupied by an attempt: the summed duration of every finished and superseded
+	// attempt, over Runners × Workers × Duration.
+	//
+	// It is the number the worker pool exists to move. A dispatch loop that claims
+	// a fixed batch and waits for the slowest of it leaves the rest of its slots
+	// idle for the difference, and with a mixed-speed workload that difference is
+	// most of the run.
+	//
+	// It understates true occupancy, and by a knowable amount: an attempt's
+	// duration is measured from the run stub to the finalize, so the claim, stub,
+	// and finalize round trips around it are capacity the pool was using and this
+	// does not count. Treat it as a floor, and treat a before/after comparison at
+	// the same configuration as what carries the claim.
+	SlotUtilization float64
+
 	Claim    Latency
 	Finalize Latency
 	Sweep    Latency
@@ -98,6 +114,13 @@ type Report struct {
 	// their lease expired. A non-zero value in a run with no injected fault is a
 	// finding, not noise.
 	Reclaimed int64
+
+	// BlockedClaims counts claim attempts a fault's gate refused before they
+	// reached the database. It is how "the runner backed off during the outage"
+	// becomes a number in the report rather than a narration: a gated call
+	// deliberately records no latency observation, so without this a pause-database
+	// run has no evidence of how hard the runners hammered the gate.
+	BlockedClaims int64
 
 	// ConcurrentExecutions counts times the same job was observed running in two
 	// workers at once. It must be zero: it is the exactly-once guarantee stated
@@ -210,12 +233,14 @@ type reportJSON struct {
 	DurationNanos  int64           `json:"duration_nanos"`
 	Enqueue        float64         `json:"enqueue_throughput_per_sec"`
 	Drain          float64         `json:"drain_throughput_per_sec"`
+	SlotUtil       float64         `json:"slot_utilization"`
 	Claim          *latencyJSON    `json:"claim,omitempty"`
 	Finalize       *latencyJSON    `json:"finalize,omitempty"`
 	Sweep          *latencyJSON    `json:"sweep,omitempty"`
 	Storage        []StorageSample `json:"storage,omitempty"`
 	PeakRSS        uint64          `json:"peak_rss_bytes"`
 	Reclaimed      int64           `json:"reclaimed"`
+	BlockedClaims  int64           `json:"blocked_claims,omitempty"`
 	Concurrent     int64           `json:"concurrent_executions"`
 	Enqueued       int64           `json:"enqueued"`
 	Drained        int64           `json:"drained"`
@@ -238,12 +263,14 @@ func (r Report) MarshalJSON() ([]byte, error) {
 		DurationNanos:  r.Duration.Nanoseconds(),
 		Enqueue:        r.EnqueueThroughput,
 		Drain:          r.DrainThroughput,
+		SlotUtil:       r.SlotUtilization,
 		Claim:          latencyToJSON(r.Claim),
 		Finalize:       latencyToJSON(r.Finalize),
 		Sweep:          latencyToJSON(r.Sweep),
 		Storage:        r.Storage,
 		PeakRSS:        r.PeakRSS,
 		Reclaimed:      r.Reclaimed,
+		BlockedClaims:  r.BlockedClaims,
 		Concurrent:     r.ConcurrentExecutions,
 		Enqueued:       r.Enqueued,
 		Drained:        r.Drained,
@@ -284,12 +311,14 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 		Duration:             time.Duration(in.DurationNanos),
 		EnqueueThroughput:    in.Enqueue,
 		DrainThroughput:      in.Drain,
+		SlotUtilization:      in.SlotUtil,
 		Claim:                latencyFromJSON(in.Claim),
 		Finalize:             latencyFromJSON(in.Finalize),
 		Sweep:                latencyFromJSON(in.Sweep),
 		Storage:              in.Storage,
 		PeakRSS:              in.PeakRSS,
 		Reclaimed:            in.Reclaimed,
+		BlockedClaims:        in.BlockedClaims,
 		ConcurrentExecutions: in.Concurrent,
 		Enqueued:             in.Enqueued,
 		Drained:              in.Drained,

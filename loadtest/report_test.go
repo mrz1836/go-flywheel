@@ -112,6 +112,7 @@ func TestReportRoundTripsThroughJSON(t *testing.T) {
 		Duration:          92 * time.Second,
 		EnqueueThroughput: 5123.5,
 		DrainThroughput:   1088.25,
+		SlotUtilization:   0.9612,
 		Claim: Latency{
 			Count: 12_500, Min: 80 * time.Microsecond, P50: 900 * time.Microsecond,
 			P95: 4 * time.Millisecond, P99: 11 * time.Millisecond, Max: 210 * time.Millisecond,
@@ -125,12 +126,13 @@ func TestReportRoundTripsThroughJSON(t *testing.T) {
 			Count: 90, Min: time.Millisecond, P50: time.Millisecond, P95: 2 * time.Millisecond,
 			P99: 3 * time.Millisecond, Max: 4 * time.Millisecond, Mean: time.Millisecond,
 		},
-		PeakRSS:    412 * 1024 * 1024,
-		Enqueued:   100_000,
-		Drained:    99_998,
-		Retried:    41,
-		Discarded:  2,
-		Superseded: 1,
+		PeakRSS:       412 * 1024 * 1024,
+		Enqueued:      100_000,
+		Drained:       99_998,
+		Retried:       41,
+		Discarded:     2,
+		Superseded:    1,
+		BlockedClaims: 11,
 		Errors: []error{
 			errors.New("loadtest: seed job 4: context deadline exceeded"),
 			errors.New("loadtest: completion check: connection refused (×2201)"),
@@ -177,6 +179,7 @@ func TestReportRoundTripsThroughJSON(t *testing.T) {
 	}
 	if got.Duration != want.Duration || got.PeakRSS != want.PeakRSS ||
 		got.Drained != want.Drained || got.Superseded != want.Superseded ||
+		got.SlotUtilization != want.SlotUtilization || got.BlockedClaims != want.BlockedClaims ||
 		got.WorkloadDigest != want.WorkloadDigest || got.Histogram != want.Histogram ||
 		got.Schema != want.Schema {
 		t.Errorf("scalar round trip:\n got %+v\nwant %+v", got, want)
