@@ -462,6 +462,22 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 		}
 
 		if untilIdle {
+			// FR-04-06: "no job is in a non-terminal state" includes this runner's
+			// own in-flight jobs, and with independent slots the claim going empty
+			// no longer implies the pool is empty. Waiting for it here makes the
+			// guarantee hold by construction rather than by the accident that
+			// 'running' happens to be one of nonTerminalStates — and it also pins
+			// down the narrower window where a worker body has returned but its
+			// Finalize has not committed.
+			//
+			// It costs nothing in the common case: the pool is already empty.
+			if waitErr := r.pool.waitIdle(ctx); waitErr != nil {
+				return r.stopped(untilIdle, waitErr)
+			}
+			if dispatchErr := r.pool.takeErr(); dispatchErr != nil {
+				return dispatchErr
+			}
+
 			pending, countErr := r.pendingCount(ctx)
 			if countErr != nil {
 				return countErr

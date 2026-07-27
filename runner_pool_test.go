@@ -2,6 +2,7 @@ package flywheel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -380,6 +381,71 @@ func TestDequeueLimitNeverExceedsFreeSlots(t *testing.T) {
 
 	assert.Zero(t, overclaims.Load(),
 		"no claim asked for more than the pool had free at that instant")
+}
+
+// --- FR-04-06: RunUntilIdle still means "every job is terminal" -------------
+
+// TestRunUntilIdleDoesNotReturnWhileAJobIsStillRunning is A4, and it is written
+// to fail against an implementation that counts pending rows without draining
+// the pool first.
+//
+// The setup is what makes it sharp: the poolDriver's jobs never reach the
+// runner's own database, so pendingCount reads zero from the very first poll. An
+// implementation that trusted that count would declare the queue idle while a
+// job was mid-worker — which is exactly the regression this guards, since
+// 'running' being one of nonTerminalStates is what would otherwise be quietly
+// doing the work.
+//
+// The load-bearing assertion is therefore not on the return value — the loop
+// drains its pool on the way out regardless, so a caller cannot observe the
+// difference there. It is on *when the decision was taken*: a query callback on
+// the runner's own database records how many jobs were executing each time the
+// pending count ran, and the invariant is that the runner never asks "is the
+// queue idle?" while its own pool is busy.
+func TestRunUntilIdleDoesNotReturnWhileAJobIsStillRunning(t *testing.T) {
+	t.Parallel()
+
+	w := &peakWorker{hold: func(context.Context, int) { time.Sleep(150 * time.Millisecond) }}
+	d := newPoolDriver(1)
+	r := newPoolRunner(t, d, w, 2, 0)
+
+	// Nothing else queries this database during the run, so every callback here
+	// is a pending count. It reads the pool rather than the worker's own counter
+	// because the pool is incremented synchronously by the dispatching loop,
+	// where the worker's counter is only incremented once the worker body has
+	// been entered — a marker that arrives too late to catch the window.
+	var busyAtCount atomic.Int32
+	require.NoError(t, r.cfg.DB.Callback().Query().Before("gorm:query").
+		Register("test:pending_count_probe", func(*gorm.DB) {
+			if n := r.pool.inFlight(); n > 0 {
+				busyAtCount.Add(int32(n)) //nolint:gosec // a pool size, bounded by Concurrency
+			}
+		}))
+
+	require.NoError(t, r.RunUntilIdle(context.Background()))
+
+	assert.Zero(t, busyAtCount.Load(),
+		"the queue was declared idle while this runner's own pool still had a job in flight")
+	assert.EqualValues(t, 1, w.done.Load(), "the job reached a terminal state")
+	assert.Zero(t, w.current.Load(), "nothing is still executing")
+}
+
+// TestRunUntilIdleSurfacesADispatchErrorFromAPoolGoroutine proves a per-job
+// failure raised on a pool goroutine — not on the loop's own — still reaches the
+// caller. It is deterministic rather than racy because the drain wait happens
+// before the collector is read, and a dispatch deposits its error before it
+// releases its slot.
+func TestRunUntilIdleSurfacesADispatchErrorFromAPoolGoroutine(t *testing.T) {
+	t.Parallel()
+	fd := &fakeDriver{
+		batch:   []RawJob{{ID: "a", Kind: "test.success", Args: []byte(`{}`)}},
+		stubErr: errors.New("stub failed"),
+	}
+	r := newFakeRunner(t, fd, 2)
+
+	err := r.RunUntilIdle(context.Background())
+	require.ErrorContains(t, err, "stub failed",
+		"a dispatch error raised on a pool goroutine reaches the caller")
 }
 
 // --- FR-04-04 / FR-04-05: Concurrency 1 is unchanged ------------------------
