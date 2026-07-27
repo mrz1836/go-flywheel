@@ -824,6 +824,15 @@ claim, finalize, and sweep against real PostgreSQL at 100,000 jobs, with the ful
 commands that produced every number, and a full-index versus correctness-index-only comparison. The
 JSON reports behind it are committed under [`docs/benchmarks/`](docs/benchmarks/).
 
+Two findings there are worth knowing before you size a deployment:
+
+- **The claim's index.** `jobs_ready` was measurably inert in both routing modes — every claim scanned
+  the whole ready set and spilled to disk. Re-keying it took claim p50 from 38.7 ms to **0.96 ms**.
+- **The worker pool.** On a mixed-speed workload (10 % of jobs at 20× the rest), slot utilization went
+  from 24.4 % to **95.4 %** and drain throughput from 247 to **1,036 jobs/s**. On a *uniform* workload
+  it is worth nothing measurable, and that is published too — the number to compare against depends on
+  which of the two your queue looks like.
+
 The hot paths are measured by a load harness in [`loadtest/`](loadtest/), behind its own build tag so
 its runs never join an ordinary `go test ./...`:
 
