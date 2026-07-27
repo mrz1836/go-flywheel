@@ -61,13 +61,24 @@
 <table align="center">
   <tr>
     <td align="center" width="33%">
-       🚀&nbsp;<a href="#-installation"><code>Installation</code></a>
+       📦&nbsp;<a href="#-installation"><code>Installation</code></a>
     </td>
     <td align="center" width="33%">
+       🚀&nbsp;<a href="#-quick-start"><code>Quick&nbsp;start</code></a>
+    </td>
+    <td align="center" width="33%">
+       📖&nbsp;<a href="#-guides"><code>Guides</code></a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
        🧪&nbsp;<a href="#-examples--tests"><code>Examples&nbsp;&&nbsp;Tests</code></a>
     </td>
-    <td align="center" width="33%">
+    <td align="center">
        📚&nbsp;<a href="#-documentation"><code>Documentation</code></a>
+    </td>
+    <td align="center">
+       ⚡&nbsp;<a href="#-benchmarks"><code>Benchmarks</code></a>
     </td>
   </tr>
   <tr>
@@ -78,18 +89,17 @@
       🛠️&nbsp;<a href="#-code-standards"><code>Code&nbsp;Standards</code></a>
     </td>
     <td align="center">
-      ⚡&nbsp;<a href="#-benchmarks"><code>Benchmarks</code></a>
+      🤖&nbsp;<a href="#-ai-usage--assistant-guidelines"><code>AI&nbsp;Usage</code></a>
     </td>
   </tr>
   <tr>
     <td align="center">
-      🤖&nbsp;<a href="#-ai-usage--assistant-guidelines"><code>AI&nbsp;Usage</code></a>
+       👥&nbsp;<a href="#-maintainers"><code>Maintainers</code></a>
     </td>
     <td align="center">
        ⚖️&nbsp;<a href="#-license"><code>License</code></a>
     </td>
     <td align="center">
-       👥&nbsp;<a href="#-maintainers"><code>Maintainers</code></a>
     </td>
   </tr>
 </table>
@@ -129,88 +139,21 @@ The runtime is built from focused, composable pieces:
 
 <br/>
 
-### Schema setup
+## 📦 Installation
 
-`go-flywheel` owns three tables — `jobs`, `job_runs`, `job_periodics` — and there are **two ways to
-install them. Pick exactly one.** They are not layers; running both means two migration authorities
-against one database.
-
-| Question | **Library-owned** | **Host-owned** |
-|---|---|---|
-| Who creates the three tables? | `Migrate(db)` | your loader, from `Models()` |
-| Who creates the indexes? | `Migrate(db)` | you, from `IndexSet(dialect)` / `InstallIndexes` |
-| Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
-| Does the runtime run DDL at startup? | yes, every start | no |
-| Is a co-located host schema safe? | only if the host's tooling excludes the three tables | yes — the tables are in your loader |
-| **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
-
-**The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
-same database, your migration tool must know about `jobs`, `job_runs`, and `job_periodics` — a tool that
-cannot see them will happily propose dropping them.
-
-**Library-owned** — one call, no external tooling:
-
-```go
-import "github.com/mrz1836/go-flywheel"
-
-if err := flywheel.Migrate(db); err != nil { // db is a *gorm.DB
-    return err
-}
+**go-flywheel** requires a [supported release of Go](https://golang.org/doc/devel/release.html#policy).
+```shell script
+go get -u github.com/mrz1836/go-flywheel
 ```
 
-`Migrate` runs `AutoMigrate` over the row structs and then applies the partial/unique indexes GORM
-cannot express from struct tags. It is idempotent (`AutoMigrate` no-op + `CREATE INDEX IF NOT EXISTS`),
-so repeated calls are safe.
-
-**Host-owned** — your loader creates the tables, you apply the indexes:
-
-```go
-// 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
-//    so your migration tool knows the three tables exist and never proposes dropping them.
-stmts, err := gormschema.New("postgres").Load(
-    append(myapp.AllModels(), flywheel.Models()...)...,
-)
-
-// 2. In your install/deploy path, right where you apply your migrations.
-if err := flywheel.InstallIndexes(ctx, db); err != nil {
-    return err
-}
+Get the [MAGE-X](https://github.com/mrz1836/mage-x) build tool for development:
+```shell script
+go install github.com/mrz1836/mage-x/cmd/magex@latest
 ```
-
-Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
-it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
-GORM struct tag cannot express. Four of the eight are correctness-bearing — without `jobs_unique_key`
-and `jobs_unique_active_key` the database accepts duplicate enqueues and **`ErrAlreadyEnqueued` is never
-returned.** Use `flywheel.IndexSet(dialect)` when you want them classified:
-
-```go
-for _, idx := range must(flywheel.IndexSet("postgres")) {
-    if idx.Kind == flywheel.IndexCorrectness {
-        // omitting this one does not cost throughput — it removes a guarantee
-    }
-}
-```
-
-> **Apply the indexes to a database; do not paste them into a generated migration.** Your loader still
-> does not describe them, so a migration that creates them has its *next* diff see indexes in the
-> migration directory that are absent from the desired state — and propose dropping them back out. Run
-> them as an install step instead: a versioned diff compares the directory against the loader and never
-> inspects the live database, so indexes created outside the directory are invisible to it. (A
-> declarative `schema apply` *does* inspect the database and would drop them, which is one more reason a
-> shared database wants versioned mode.)
-
-A host that owns its schema history but still wants the installer can have both:
-`MigrateWithOptions(db, MigrateOpts{SkipColumnReconcile: true})` skips the pre-1.0 routing-column rename
-pass, so the runtime issues no `ALTER TABLE` of its own inside a versioned schema. That reconciliation
-is removed in v1.0.0.
-
-> Only PostgreSQL and SQLite are supported, because both express the partial indexes the runtime relies
-> on. Every entry point returns `flywheel.ErrUnsupportedDialect` for anything else rather than silently
-> dropping idempotency. The module takes **no** hard dependency on Atlas or any external migration tool.
 
 <br/>
 
-### Quick start (embedded)
+## 🚀 Quick start
 
 A job runtime earns its keep when work is **slow, flaky, costly, or must-not-be-lost** —
 which in 2026 describes almost every LLM and third-party API call your app makes. Blocking
@@ -297,9 +240,240 @@ documents at a time, a failed model call retries itself with backoff, and every 
 including what it cost — lands in the `job_runs` audit table. Need periodic or cron-style
 runs too? Add a `Scheduler` to the `Node` (see [`examples/`](examples) for the full set).
 
+`Migrate` above is the right call when the database is the runtime's alone. If flywheel's three tables
+will share a database with your own application schema, use the host-owned path instead — see
+**Schema setup** below, and pick exactly one of the two.
+
 <br/>
 
-### Recording what an attempt did
+## 📖 Guides
+
+Each section below is self-contained; open the ones you need.
+
+<details>
+<summary><strong><code>Schema setup — pick exactly one install path</code></strong></summary>
+<br>
+
+`go-flywheel` owns three tables — `jobs`, `job_runs`, `job_periodics` — and there are **two ways to
+install them. Pick exactly one.** They are not layers; running both means two migration authorities
+against one database.
+
+| Question | **Library-owned** | **Host-owned** |
+|---|---|---|
+| Who creates the three tables? | `Migrate(db)` | your loader, from `Models()` |
+| Who creates the indexes? | `Migrate(db)` | you, from `IndexSet(dialect)` / `InstallIndexes` |
+| Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
+| Does the runtime run DDL at startup? | yes, every start | no |
+| Is a co-located host schema safe? | only if the host's tooling excludes the three tables | yes — the tables are in your loader |
+| **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
+
+**The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
+same database, your migration tool must know about `jobs`, `job_runs`, and `job_periodics` — a tool that
+cannot see them will happily propose dropping them.
+
+**Library-owned** — one call, no external tooling:
+
+```go
+import "github.com/mrz1836/go-flywheel"
+
+if err := flywheel.Migrate(db); err != nil { // db is a *gorm.DB
+    return err
+}
+```
+
+`Migrate` runs `AutoMigrate` over the row structs and then applies the partial/unique indexes GORM
+cannot express from struct tags. It is idempotent (`AutoMigrate` no-op + `CREATE INDEX IF NOT EXISTS`),
+so repeated calls are safe.
+
+**Host-owned** — your loader creates the tables, you apply the indexes:
+
+```go
+// 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
+//    so your migration tool knows the three tables exist and never proposes dropping them.
+stmts, err := gormschema.New("postgres").Load(
+    append(myapp.AllModels(), flywheel.Models()...)...,
+)
+
+// 2. In your install/deploy path, right where you apply your migrations.
+if err := flywheel.InstallIndexes(ctx, db); err != nil {
+    return err
+}
+```
+
+Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
+it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
+GORM struct tag cannot express. Four of the eight are correctness-bearing — without `jobs_unique_key`
+and `jobs_unique_active_key` the database accepts duplicate enqueues and **`ErrAlreadyEnqueued` is never
+returned.** Use `flywheel.IndexSet(dialect)` when you want them classified:
+
+```go
+for _, idx := range must(flywheel.IndexSet("postgres")) {
+    if idx.Kind == flywheel.IndexCorrectness {
+        // omitting this one does not cost throughput — it removes a guarantee
+    }
+}
+```
+
+> **Apply the indexes to a database; do not paste them into a generated migration.** Your loader still
+> does not describe them, so a migration that creates them has its *next* diff see indexes in the
+> migration directory that are absent from the desired state — and propose dropping them back out. Run
+> them as an install step instead: a versioned diff compares the directory against the loader and never
+> inspects the live database, so indexes created outside the directory are invisible to it. (A
+> declarative `schema apply` *does* inspect the database and would drop them, which is one more reason a
+> shared database wants versioned mode.)
+
+A host that owns its schema history but still wants the installer can have both:
+`MigrateWithOptions(db, MigrateOpts{SkipColumnReconcile: true})` skips the pre-1.0 routing-column rename
+pass, so the runtime issues no `ALTER TABLE` of its own inside a versioned schema. That reconciliation
+is removed in v1.0.0.
+
+> Only PostgreSQL and SQLite are supported, because both express the partial indexes the runtime relies
+> on. Every entry point returns `flywheel.ErrUnsupportedDialect` for anything else rather than silently
+> dropping idempotency. The module takes **no** hard dependency on Atlas or any external migration tool.
+
+</details>
+
+<details>
+<summary><strong><code>Concurrency, claim batching, and graceful drain</code></strong></summary>
+<br>
+
+**`Concurrency` is the pool size.** A runner keeps up to that many jobs in flight, claims to fill
+whatever slots are free, and dispatches each job independently — so a slot becomes claimable the moment
+*its own* job finalizes, with no reference to its siblings. One slow job holds one slot, never the loop:
+at `Concurrency: 8`, a single 60-second job leaves the other seven slots claiming and running throughout.
+
+At `Concurrency: 1` a runner dispatches inline on its own loop goroutine — one job in flight, strictly
+sequential, no goroutine per job. A SQLite driver requires it: `NewRunner` returns
+`ErrSQLiteConcurrency` otherwise, because the SQLite claim is a serialized SELECT-then-UPDATE with no
+`SKIP LOCKED`.
+
+```go
+flywheel.RunnerConfig{
+    // Up to eight jobs in flight. Slots refill independently.
+    Concurrency: 8,
+
+    // Optional. Caps how many jobs one claim asks for. Zero claims exactly the
+    // free-slot count, which is right for almost every deployment; set it lower to
+    // smooth claim bursts across a fleet of runners hitting one database. It is
+    // never raised *above* the free-slot count — a claimed job the runner has no
+    // slot to start is a lease burning in a queue.
+    ClaimBatchSize: 2,
+
+    // Optional. Ceiling on the delay between polls after consecutive failures;
+    // zero selects 30s. The delay starts at PollInterval, doubles per consecutive
+    // failure with jitter, and resets on the first success.
+    MaxPollBackoff: 30 * time.Second,
+}
+```
+
+**A failing database is not polled at the empty-queue rate.** Consecutive poll failures climb an
+exponential ladder from `PollInterval` to `MaxPollBackoff`, and each attempt logs once — so the log rate
+follows the backoff rather than the poll interval. Without it, a fleet of runners against a database that
+is restarting or failing over polls it ten times a second forever and writes an error line each time:
+a retry storm aimed at a recovering database, plus an unbounded log volume.
+
+`Run` never gives up; it backs off at the ceiling until the database returns. `RunUntilIdle` tolerates a
+blip and gives up once the ladder saturates — `⌈log₂(MaxPollBackoff / PollInterval)⌉ + 1` attempts, about
+51 seconds at the defaults. The bound is the ladder, not the context, so a caller that passes no deadline
+still gets an answer.
+
+**Drain is explicit.** `Stop` and `Drain` are safe before `Run`, concurrently with it, and after it
+returns:
+
+```go
+runner.Stop()                    // claim nothing further; non-blocking, idempotent, final
+n := runner.InFlight()           // how many jobs are executing right now
+
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := runner.Drain(ctx); err != nil {
+    var timeout *flywheel.DrainTimeoutError
+    if errors.As(err, &timeout) {
+        log.Warn("drain timed out", "in_flight", timeout.InFlight)
+    }
+}
+```
+
+`Stop` bounds *when the next claim is issued*, not what happens to a claim already in flight: a batch
+that came back from `Dequeue` after `Stop` landed is already leased, so it is dispatched rather than
+stranded until the sweep, and `Drain` waits for it too. `Drain` **does not cancel in-flight work** — a
+worker that must be interrupted should respect the context it was given, and `DefaultTimeout` already
+bounds a hung attempt. Its contract is "no new claims, then wait", which is what makes a rolling deploy
+lose no work. On timeout the still-running jobs keep their leases and are recovered by the lease sweep,
+exactly as they would be after a process kill.
+
+**A `Node` does this for you.** Cancelling a `Node`'s context is a *drain* request, not an abort: every
+runner is told to stop claiming, each is drained against `NodeConfig.DrainTimeout`, the timeout warning
+names how many jobs were still in flight, and only then is the scheduler and health server torn down.
+A zero `DrainTimeout` waits for in-flight work however long it takes — genuinely unbounded, since the
+heartbeat renews a running job's lease indefinitely. Size it to the longest drain your deployment will
+tolerate.
+
+</details>
+
+<details>
+<summary><strong><code>Leases, the heartbeat, and the fence</code></strong></summary>
+<br>
+
+A claimed job carries a **lease**. If its executor dies, the lease expires and the scheduler's sweep
+returns the job to the queue for another runner — which is what makes a crashed process recoverable
+rather than a job lost forever.
+
+**`LeaseDuration` bounds dispatch liveness, not run duration.** It is how long a *crashed* executor's
+job stays stranded before it is reclaimed, not a ceiling on how long a worker may take. Size it to how
+quickly you want a crash noticed — the default is 30 seconds. `DefaultTimeout` is what bounds a hung
+run.
+
+That separation holds because a running job's lease is **renewed automatically** while its worker is
+alive, on a background goroutine, with no worker code:
+
+```go
+flywheel.RunnerConfig{
+    LeaseDuration: 30 * time.Second, // how fast a crash is noticed
+    DefaultTimeout: 10 * time.Minute, // how long a single attempt may run
+
+    // Optional. Zero renews at LeaseDuration/3 — two renewals may fail before
+    // the lease can expire. Negative disables renewal entirely.
+    HeartbeatInterval: 0,
+
+    // Optional. Fires after each successful renewal, so a host holding its own
+    // time-bounded resource for the attempt — an external reservation, a
+    // distributed lock — can extend it on the same cadence.
+    OnLeaseRenewed: func(ctx context.Context, r flywheel.LeaseRenewal) error {
+        return reservations.ExtendTo(ctx, r.JobID, r.ExpiresAt)
+    },
+}
+```
+
+Renewal stops when the attempt ends — normal return, panic, or execution timeout alike — and it stops
+if the claim is lost.
+
+**The fence is what makes renewal safe.** Renewal can still fail: a network blip, a paused process, a
+GC pause longer than the lease. So every claim also stamps a token (`jobs.lease_token`), and both
+`Finalize` and renewal require it. An attempt whose job was reclaimed, cancelled, or retried
+underneath it therefore **advances nothing**: no state change, no follow-ups, no lease extension. Its
+`job_runs` row is still written, because the attempt did happen — what is discarded is its effect on
+the job, not the record of the work.
+
+When that happens the runtime says so, loudly and exactly once:
+
+- `Observer.OnSupersede` fires **in place of** `OnFinish`, carrying the outcome that was discarded.
+- `observers.NewSlog` logs it at **warn** — the one lifecycle event it does not log at debug.
+- `observers.NewMetrics` counts `flywheel_jobs_superseded_total`.
+
+A nonzero supersede rate means work is being executed twice: the lease is too short for the workload,
+or the heartbeat is disabled or failing.
+
+**What this does not give you.** The fence closes the *library's* double-dispatch window. It cannot
+make a non-idempotent external call safe: a worker killed after its side effect and before its
+finalize still re-runs. Write workers that tolerate a re-run — the fence guarantees only one attempt's
+outcome is ever recorded, not that only one attempt ever executes.
+
+</details>
+
+<details>
+<summary><strong><code>Recording what an attempt did</code></strong></summary>
+<br>
 
 **You do not need your own job-lifecycle table.** Every attempt already gets a row in `job_runs`, and
 that row has a stable id you can hang a foreign key off. Two fields are the whole seam:
@@ -368,9 +542,11 @@ runID, err := flywheel.SeedRun(ctx, db, flywheel.RunSeed{
 > nothing can answer "which attempt wrote this?". If you have domain columns to store, keep the table
 > and give it a `job_run_id` — the lifecycle columns belong to `job_runs`.
 
-<br/>
+</details>
 
-### Running one registry across two executors
+<details>
+<summary><strong><code>Running one registry across two executors</code></strong></summary>
+<br>
 
 One `Registry`, one database, two very different processes: a long-running pool and a bounded one that
 must finish inside an invocation budget (Lambda, a Kubernetes Job, a CI step). `ExecutorClass` is what
@@ -429,9 +605,8 @@ default:
 not merely when this runner found nothing to claim. A job another pool is still running, one this
 runner has in flight in its own worker pool, or one waiting out a retry backoff all keep it looping.
 That is why the deadline branch is separate: `context.DeadlineExceeded` means "budget spent", not
-"something broke". A transient database error does not end it either — see
-[the poll backoff](#concurrency-claim-batching-and-drain) — and `flywheel.ErrRunnerStopped` is what it
-returns if `Stop` ended it before the queue drained.
+"something broke". A transient database error does not end it either — it backs off and retries — and
+`flywheel.ErrRunnerStopped` is what it returns if `Stop` ended it before the queue drained.
 
 **Routing rules:**
 
@@ -449,9 +624,11 @@ Leave a job unpinned unless it genuinely needs one pool's hardware, credentials,
 
 A complete, runnable version of this is [`examples/split-executors`](examples/split-executors).
 
-<br/>
+</details>
 
-### Local daemon & cron replacement
+<details>
+<summary><strong><code>Local daemon & cron replacement</code></strong></summary>
+<br>
 
 The [`flywheel` CLI](cmd/flywheel/README.md) runs the runtime as a local daemon over a SQLite file
 (zero-ops) or Postgres, and replaces cron with durable scheduled jobs — no custom Go required:
@@ -506,148 +683,11 @@ them with `flywheel jobs inspect <id>`. Prefer to wire it from Go? The
 workers and schedules one of each. See the [CLI README](cmd/flywheel/README.md) for every
 command, the config reference, and the macOS launchd setup.
 
-<br/>
+</details>
 
-### Concurrency, claim batching, and drain
-
-**`Concurrency` is the pool size.** A runner keeps up to that many jobs in flight, claims to fill
-whatever slots are free, and dispatches each job independently — so a slot becomes claimable the moment
-*its own* job finalizes, with no reference to its siblings. One slow job holds one slot, not the loop.
-
-> **Changed in v0.8.0.** `Concurrency` used to mean "claim exactly N, run all N, wait for the slowest,
-> claim N again". At `Concurrency: 8`, one 60-second job among seven 1-second jobs left seven slots idle
-> for 59 seconds. Nothing in your config changes; the field now means what most readers already assumed
-> it meant. If you were relying on the old batch-and-barrier behavior to serialize batches, set
-> `Concurrency: 1`.
-
-At `Concurrency: 1` nothing changed at all: one job in flight, dispatched sequentially on the loop's own
-goroutine, with no goroutine per job. A SQLite driver still requires 1 — `NewRunner` returns
-`ErrSQLiteConcurrency` otherwise, because the SQLite claim is a serialized SELECT-then-UPDATE with no
-`SKIP LOCKED`.
-
-```go
-flywheel.RunnerConfig{
-    // Up to eight jobs in flight. Slots refill independently.
-    Concurrency: 8,
-
-    // Optional. Caps how many jobs one claim asks for. Zero claims exactly the
-    // free-slot count, which is right for almost every deployment; set it lower to
-    // smooth claim bursts across a fleet of runners hitting one database. It is
-    // never raised *above* the free-slot count — a claimed job the runner has no
-    // slot to start is a lease burning in a queue.
-    ClaimBatchSize: 2,
-
-    // Optional. Ceiling on the delay between polls after consecutive failures;
-    // zero selects 30s. The delay starts at PollInterval, doubles per consecutive
-    // failure with jitter, and resets on the first success.
-    MaxPollBackoff: 30 * time.Second,
-}
-```
-
-**A failing database is not polled at the empty-queue rate.** Consecutive poll failures climb an
-exponential ladder from `PollInterval` to `MaxPollBackoff`, and each attempt logs once — so the log rate
-follows the backoff rather than the poll interval. Without it, a fleet of runners against a database that
-is restarting or failing over polls it ten times a second forever and writes an error line each time:
-a retry storm aimed at a recovering database, plus an unbounded log volume.
-
-`Run` never gives up; it backs off at the ceiling until the database returns. `RunUntilIdle` tolerates a
-blip and gives up once the ladder saturates — `⌈log₂(MaxPollBackoff / PollInterval)⌉ + 1` attempts, about
-51 seconds at the defaults. The bound is the ladder, not the context, so a caller that passes no deadline
-still gets an answer.
-
-**Drain is explicit.** `Stop` and `Drain` are safe before `Run`, concurrently with it, and after it
-returns:
-
-```go
-runner.Stop()                    // claim nothing further; non-blocking, idempotent, final
-n := runner.InFlight()           // how many jobs are executing right now
-
-ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-defer cancel()
-if err := runner.Drain(ctx); err != nil {
-    var timeout *flywheel.DrainTimeoutError
-    if errors.As(err, &timeout) {
-        log.Warn("drain timed out", "in_flight", timeout.InFlight)
-    }
-}
-```
-
-`Stop` bounds *when the next claim is issued*, not what happens to a claim already in flight: a batch
-that came back from `Dequeue` after `Stop` landed is already leased, so it is dispatched rather than
-stranded until the sweep, and `Drain` waits for it too. `Drain` **does not cancel in-flight work** — a
-worker that must be interrupted should respect the context it was given, and `DefaultTimeout` already
-bounds a hung attempt. Its contract is "no new claims, then wait", which is what makes a rolling deploy
-lose no work. On timeout the still-running jobs keep their leases and are recovered by the lease sweep,
-exactly as they would be after a process kill.
-
-**A `Node` does this for you.** Cancelling a `Node`'s context is a *drain* request, not an abort: every
-runner is told to stop claiming, each is drained against `NodeConfig.DrainTimeout`, the timeout warning
-names how many jobs were still in flight, and only then is the scheduler and health server torn down.
-A zero `DrainTimeout` waits for in-flight work however long it takes — genuinely unbounded, since the
-heartbeat renews a running job's lease indefinitely. Size it to the longest drain your deployment will
-tolerate.
-
-<br/>
-
-### Leases, the heartbeat, and the fence
-
-A claimed job carries a **lease**. If its executor dies, the lease expires and the scheduler's sweep
-returns the job to the queue for another runner — which is what makes a crashed process recoverable
-rather than a job lost forever.
-
-**`LeaseDuration` bounds dispatch liveness, not run duration.** It is how long a *crashed* executor's
-job stays stranded before it is reclaimed, not a ceiling on how long a worker may take. Size it to how
-quickly you want a crash noticed — the default is 30 seconds. `DefaultTimeout` is what bounds a hung
-run.
-
-That separation holds because a running job's lease is **renewed automatically** while its worker is
-alive, on a background goroutine, with no worker code:
-
-```go
-flywheel.RunnerConfig{
-    LeaseDuration: 30 * time.Second, // how fast a crash is noticed
-    DefaultTimeout: 10 * time.Minute, // how long a single attempt may run
-
-    // Optional. Zero renews at LeaseDuration/3 — two renewals may fail before
-    // the lease can expire. Negative disables renewal entirely.
-    HeartbeatInterval: 0,
-
-    // Optional. Fires after each successful renewal, so a host holding its own
-    // time-bounded resource for the attempt — an external reservation, a
-    // distributed lock — can extend it on the same cadence.
-    OnLeaseRenewed: func(ctx context.Context, r flywheel.LeaseRenewal) error {
-        return reservations.ExtendTo(ctx, r.JobID, r.ExpiresAt)
-    },
-}
-```
-
-Renewal stops when the attempt ends — normal return, panic, or execution timeout alike — and it stops
-if the claim is lost.
-
-**The fence is what makes renewal safe.** Renewal can still fail: a network blip, a paused process, a
-GC pause longer than the lease. So every claim also stamps a token (`jobs.lease_token`), and both
-`Finalize` and renewal require it. An attempt whose job was reclaimed, cancelled, or retried
-underneath it therefore **advances nothing**: no state change, no follow-ups, no lease extension. Its
-`job_runs` row is still written, because the attempt did happen — what is discarded is its effect on
-the job, not the record of the work.
-
-When that happens the runtime says so, loudly and exactly once:
-
-- `Observer.OnSupersede` fires **in place of** `OnFinish`, carrying the outcome that was discarded.
-- `observers.NewSlog` logs it at **warn** — the one lifecycle event it does not log at debug.
-- `observers.NewMetrics` counts `flywheel_jobs_superseded_total`.
-
-A nonzero supersede rate means work is being executed twice: the lease is too short for the workload,
-or the heartbeat is disabled or failing.
-
-**What this does not give you.** The fence closes the *library's* double-dispatch window. It cannot
-make a non-idempotent external call safe: a worker killed after its side effect and before its
-finalize still re-runs. Write workers that tolerate a re-run — the fence guarantees only one attempt's
-outcome is ever recorded, not that only one attempt ever executes.
-
-<br/>
-
-### Observability
+<details>
+<summary><strong><code>Observability, health, and metrics</code></strong></summary>
+<br>
 
 The runtime is self-diagnosing. The `Observer` seam ([observer.go](observer.go)) reports every
 attempt's lifecycle — claim, start, finish, retry, supersede — with no metrics dependency in the core,
@@ -684,19 +724,7 @@ node, _ := flywheel.NewNode(flywheel.NodeConfig{
 The [`flywheel` CLI](cmd/flywheel/README.md) turns all of this on by default and adds `flywheel status`
 for an at-a-glance report of queue health, schedules, and recent failures.
 
-<br/>
-
-## 📦 Installation
-
-**go-flywheel** requires a [supported release of Go](https://golang.org/doc/devel/release.html#policy).
-```shell script
-go get -u github.com/mrz1836/go-flywheel
-```
-
-Get the [MAGE-X](https://github.com/mrz1836/mage-x) build tool for development:
-```shell script
-go install github.com/mrz1836/mage-x/cmd/magex@latest
-```
+</details>
 
 <br/>
 
@@ -824,14 +852,17 @@ claim, finalize, and sweep against real PostgreSQL at 100,000 jobs, with the ful
 commands that produced every number, and a full-index versus correctness-index-only comparison. The
 JSON reports behind it are committed under [`docs/benchmarks/`](docs/benchmarks/).
 
-Two findings there are worth knowing before you size a deployment:
+Three numbers to size a deployment against, all at 100,000 jobs on a developer laptop sharing its
+cores with the database — so treat them as floors:
 
-- **The claim's index.** `jobs_ready` was measurably inert in both routing modes — every claim scanned
-  the whole ready set and spilled to disk. Re-keying it took claim p50 from 38.7 ms to **0.96 ms**.
-- **The worker pool.** On a mixed-speed workload (10 % of jobs at 20× the rest), slot utilization went
-  from 24.4 % to **95.4 %** and drain throughput from 247 to **1,036 jobs/s**. On a *uniform* workload
-  it is worth nothing measurable, and that is published too — the number to compare against depends on
-  which of the two your queue looks like.
+| | |
+|---|---|
+| **Claim p50 / p99** | 0.96 ms / 1.91 ms — served by an ordered index scan, not a scan-and-sort |
+| **Drain throughput** | ~9,900 jobs/s at `-runners 4 -workers 8` with no simulated work |
+| **Slot utilization** | 95 % at `Concurrency: 8` on a workload where 10 % of jobs run 20× longer |
+
+That last one is the property to design against: throughput on a real workload is bounded by the work
+itself, not by the dispatch loop, because a slow job occupies one slot instead of stalling its siblings.
 
 The hot paths are measured by a load harness in [`loadtest/`](loadtest/), behind its own build tag so
 its runs never join an ordinary `go test ./...`:
