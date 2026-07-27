@@ -23,6 +23,15 @@ const (
 	defaultRetryBackoffBase = time.Second
 	maxRetryBackoff         = time.Minute
 	backoffJitterSpread     = 0.5 // ±25% — the jitter multiplier spans [0.75, 1.25).
+	// heartbeatDivisor derives the renewal interval from the lease: renewing at
+	// one third means two consecutive renewals may fail before the lease can
+	// expire.
+	heartbeatDivisor = 3
+	// minHeartbeatInterval floors the derived interval. A lease short enough to
+	// want sub-second renewal is a lease being used as a timeout, and renewing
+	// faster than this would cost more write amplification than the lease is
+	// worth.
+	minHeartbeatInterval = time.Second
 )
 
 // nonTerminalStates are the job states that keep RunUntilIdle polling.
@@ -48,8 +57,34 @@ type RunnerConfig struct {
 	// class, not only its own class and the wildcard. A single-node local
 	// deployment typically sets it so one Runner drains the whole queue.
 	ClaimAnyClass bool
-	// LeaseDuration is the visibility timeout on a claimed job.
+	// LeaseDuration is the visibility timeout on a claimed job. It bounds
+	// *dispatch liveness*, not run duration: a running job's lease is renewed on
+	// the heartbeat below for as long as its worker is alive, so this is how long
+	// a crashed executor's job stays stranded before the sweep reclaims it — not
+	// a ceiling on how long a worker may take. Size it to how quickly you want a
+	// crash noticed. DefaultTimeout is what bounds a hung run.
 	LeaseDuration time.Duration
+	// HeartbeatInterval is how often a running job's lease is renewed. Zero (the
+	// default) derives it from LeaseDuration, renewing at one third of it, so two
+	// renewals may fail before the lease can expire.
+	//
+	// Set it negative to disable renewal entirely, restoring the fixed-lease
+	// behavior in which a job slower than its lease is reclaimed and
+	// re-dispatched while it is still running. Disabling it is a choice about a
+	// specific workload — one whose jobs are reliably shorter than the lease and
+	// whose write budget is tight — never a default.
+	HeartbeatInterval time.Duration
+	// OnLeaseRenewed, when set, is called after each successful renewal with the
+	// job and its new expiry. It is the seam for a host that holds its own
+	// time-bounded resource for the duration of an attempt — an external
+	// reservation, a distributed lock, an advisory claim — and needs to extend it
+	// on the same cadence, and for exactly as long as the job actually runs.
+	//
+	// It is called from the heartbeat goroutine, not the worker's, and must not
+	// block for long. An error is logged and does not stop renewal: the lease was
+	// already extended by the time it is called, so refusing to renew afterwards
+	// would strand a job whose worker is still running.
+	OnLeaseRenewed func(ctx context.Context, renewal LeaseRenewal) error
 	// PollInterval is the pause between empty polls.
 	PollInterval time.Duration
 	// Concurrency is the number of jobs claimed and run per poll. A SQLite
@@ -67,6 +102,23 @@ type RunnerConfig struct {
 	Observer Observer
 	// Logger is the base logger bound onto each Job. Optional.
 	Logger *slog.Logger
+}
+
+// LeaseRenewal describes one successful lease extension. It is what
+// RunnerConfig.OnLeaseRenewed receives.
+type LeaseRenewal struct {
+	JobID   string
+	RunID   string
+	Kind    string
+	Attempt int
+	// LeaseToken is the claim this renewal extended.
+	LeaseToken string
+	// RenewedAt is when the renewal was applied; ExpiresAt is the lease's new
+	// expiry. A host extending its own resource wants ExpiresAt, not an
+	// interval — the runtime renews to an absolute time so a stalled heartbeat
+	// cannot bank an ever-growing lease.
+	RenewedAt time.Time
+	ExpiresAt time.Time
 }
 
 // Runner claims jobs from a Driver and dispatches them to registered workers.
@@ -262,6 +314,11 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
 	}
 
 	r.cfg.Observer.OnStart(ctx, jobEv)
+
+	// Renewal runs for the whole attempt, finalize included. The deferred stop is
+	// what makes FR-05-03 hold on every exit path — normal return, recovered
+	// panic, and execution timeout alike.
+	defer r.startHeartbeat(ctx, raw, runID)()
 
 	workCtx := ctx
 	if d := r.resolveTimeout(entry, raw); d > 0 {
