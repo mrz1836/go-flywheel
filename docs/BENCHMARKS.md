@@ -1,7 +1,8 @@
 # Benchmarks
 
-The runtime's first measured baseline: enqueue, claim, finalize, and sweep against real PostgreSQL at
-100,000 jobs, plus a full-index versus correctness-index-only comparison.
+The runtime's measured baseline: enqueue, claim, finalize, and sweep against real PostgreSQL at
+100,000 jobs, plus a full-index versus correctness-index-only comparison, and the characterization at
+1,000,000 rows of why the claim never reached its index.
 
 Every number here was produced by a committed command line against a committed JSON report under
 [`docs/benchmarks/`](benchmarks/). Nothing is estimated, and every caveat a run discovered travels
@@ -52,6 +53,10 @@ go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -runners 4 -workers 8
 # 100k inserts through the producer API.
 go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix enqueue \
   -out docs/benchmarks/baseline-100k-enqueue.json
+
+# The claim-predicate matrix: every claim shape against every candidate index, at 1M rows.
+go run -tags=loadtest ./loadtest/cmd/explain -jobs 1000000 -queues 3 \
+  -out docs/benchmarks/claim-plans-1m-before.txt
 ```
 
 The two drain runs generate a byte-identical workload — same seed, same digest — so the only variable
@@ -126,6 +131,89 @@ in either of its two modes:
 Every claim therefore sorts the whole claimable set and spills 3.9 MB to disk, and that sort is
 essentially all of the 38.7 ms claim latency. This is a finding, recorded here and not fixed here; it
 is the single largest lever the baseline exposes.
+
+### Characterizing it: the claim predicate at 1,000,000 rows
+
+The 100k plans above were captured by hand in `psql`, which is fine for a finding and not enough to
+choose a fix by. `loadtest/cmd/explain` does it reproducibly and at depth. It does not contain a copy
+of the claim SQL — the statement lives once, built by `fmt.Sprintf` inside an unexported driver method,
+and a re-typed copy would drift from the runtime silently. Instead the tool **captures what the driver
+emits**: it opens a pool with a recording `gorm/logger.Interface`, calls `Dequeue` inside a transaction,
+takes the SQL back out of `Trace` with its bind values already interpolated, rolls the transaction back,
+and `EXPLAIN (ANALYZE, BUFFERS)`-es that string. Every candidate spelling is derived from the captured
+statement by one documented `strings.Replace`, so everything except the clause under test is
+byte-identical.
+
+```bash
+go run -tags=loadtest ./loadtest/cmd/explain \
+  -jobs 1000000 -queues 3 -out docs/benchmarks/claim-plans-1m-before.txt
+```
+
+One million rows, all claimable, spread evenly across three queues and four executor classes — so a
+routed claim matches half the table, and a seed in which every row matched would flatter any candidate
+that drops the class from the key. `LIMIT` is 8, a runner's `Concurrency` at the baseline's settings.
+**A `Sort` over more than `LIMIT` rows is the failure signature.**
+
+Six claim shapes:
+
+| | Shape |
+|---|---|
+| A | 1 queue, routed by `executor_class` |
+| B | 3 queues, routed |
+| C | 1 queue, `ClaimAnyClass` |
+| D | 3 queues, `ClaimAnyClass` |
+| E | **idle** queue, routed — the empty poll |
+| F | **idle** queue, `ClaimAnyClass` — the empty poll |
+
+E and F are additions to the plan of record, and they turned out to decide the outcome. A runner polls
+on a fixed interval whether or not there is work, so on any quiet queue the overwhelming majority of
+claims a deployment ever issues return nothing. An index that answers a hit quickly and a miss slowly
+is a worse deployment than the one it replaced.
+
+Five index definitions, every one installed under the name `jobs_ready` so the plans are comparable.
+V0 is pulled from `flywheel.IndexSet("postgres")` rather than re-typed:
+
+| | Definition |
+|---|---|
+| V− | absent |
+| V0 | as shipped: `(queue, executor_class, priority, scheduled_at)` |
+| V1 | V0 + `AND deleted_at IS NULL` in the predicate |
+| V2 | `(priority, scheduled_at, queue, executor_class)` + V1's predicate |
+| V3 | `(queue, priority, scheduled_at)` + V1's predicate — class dropped from the key |
+| V4 | V1 + `INCLUDE (id)`, under A only |
+
+Execution time in milliseconds, `P0` = the predicate as the driver emits it:
+
+| Cell | V− | V0 | V1 | V2 | V3 | V4 |
+|---|---|---|---|---|---|---|
+| A — 1 queue, routed | 170.9 | 153.6 | 144.7 | **0.19** | **0.19** | 144.3 |
+| B — 3 queues, routed | 321.6 | 317.2 | 317.1 | **0.13** | 338.1 | — |
+| C — 1 queue, any class | 221.1 | 219.6 | 217.0 | **0.12** | **0.13** | — |
+| D — 3 queues, any class | 553.9 | 560.6 | 566.5 | **0.13** | 566.0 | — |
+| E — idle queue, routed | 100.9 | 0.019 | 0.020 | **21.4** | 0.014 | — |
+| F — idle queue, any class | 93.5 | 0.012 | 0.008 | **16.6** | 0.007 | — |
+
+Every cell in the V−, V0, V1 and V4 columns sorts above its scan. No cell in the V2 or V3 columns does.
+The full plans, both predicate spellings, and the buffer counts are in
+[`claim-plans-1m-before.txt`](benchmarks/claim-plans-1m-before.txt).
+
+Four things fall out of it:
+
+- **The `IN` spelling changes nothing.** `executor_class IN (?, '')` — what the SQLite driver already
+  writes — produces the same plan as the `OR` in every one of the 47 cells. PostgreSQL 17's btree
+  `ScalarArrayOp` execution does not preserve the index ordering here. There is no one-line driver fix.
+- **`deleted_at IS NULL` in the predicate is not a plan change.** V1 matches V0's shape everywhere; it
+  buys about 6% on A's bitmap path and nothing elsewhere.
+- **`INCLUDE (id)` cannot help.** V4 is within noise of V1 (144.3 vs 144.7 ms). The claim is
+  `FOR UPDATE`, so it must visit the heap tuple to lock it no matter what the index carries. This is
+  measured, not argued from the manual.
+- **No single index wins every shape**, and the two that win anything win opposite halves.
+
+The reason is one irreconcilable tension. To answer a selective or empty queue quickly, `queue` has to
+lead the key. To satisfy `ORDER BY priority, scheduled_at` across *several* queues without a sort, the
+ordering columns have to lead. V2 takes the second option and pays for it: on an empty poll it reads
+**5,749 buffers — 45 MB of index — to return zero rows**, because `queue = 'q-idle'` can only be
+applied as a non-leading index condition and the scan walks the whole thing.
 
 ### Where the performance indexes do pay: the sweep
 

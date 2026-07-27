@@ -1,0 +1,1629 @@
+go-flywheel — claim predicate characterization
+======================================================================================================================
+
+target:        postgres://localhost:5432/flywheel_test
+server:        PostgreSQL 17.10 (Homebrew) on aarch64-apple-darwin25.4.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+schema:        lt_dk9kmll3aiyo_1hg7_1
+jobs seeded:   1,000,000, all claimable
+queues:        q0, q1, q2
+classes:       loadtest, (empty wildcard), loadtest-b, loadtest-c
+claim limit:   8
+seed:          1
+jobs relation: 571.2 MB (table plus indexes, at measurement time)
+
+conditions
+  A    1 queue,  routed by executor_class
+  B    3 queues, routed by executor_class
+  C    1 queue,  ClaimAnyClass (no class predicate)
+  D    3 queues, ClaimAnyClass (no class predicate)
+  E    idle queue, routed — the empty poll
+  F    idle queue, ClaimAnyClass — the empty poll
+
+predicate spellings
+  P0   as the driver emits it: (executor_class = ? OR executor_class = '')
+  P1   executor_class IN (?, '') — the spelling the SQLite driver already writes
+
+index variants (every one installed under the name jobs_ready)
+  V-   absent — reproduces the baseline's index-absent row
+  V0   as shipped, from flywheel.IndexSet("postgres")
+       CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (queue, executor_class, priority, scheduled_at) WHERE state IN ('available', 'retryable', 'scheduled')
+  V1   V0 + deleted_at IS NULL in the predicate
+       CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (queue, executor_class, priority, scheduled_at) WHERE state IN ('available', 'retryable', 'scheduled') AND deleted_at IS NULL
+  V2   ordering columns first: (priority, scheduled_at, queue, executor_class)
+       CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (priority, scheduled_at, queue, executor_class) WHERE state IN ('available', 'retryable', 'scheduled') AND deleted_at IS NULL
+  V3   class dropped from the key: (queue, priority, scheduled_at)
+       CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (queue, priority, scheduled_at) WHERE state IN ('available', 'retryable', 'scheduled') AND deleted_at IS NULL
+  V4   V1 + INCLUDE (id), measured under condition A only
+       CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (queue, executor_class, priority, scheduled_at) INCLUDE (id) WHERE state IN ('available', 'retryable', 'scheduled') AND deleted_at IS NULL
+
+summary
+----------------------------------------------------------------------------------------------------------------------
+cell      scan node                               scan rows sort removed   buf hit  buf read exec ms  
+----------------------------------------------------------------------------------------------------------------------
+A/P0/V-   Seq Scan on jobs jobs_1                 166,667   YES  833,333   16,352   39,317   170.949  
+          sort method: external merge  Disk: 11760kB
+A/P0/V0   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,480   153.566  
+          sort method: external merge  Disk: 11760kB
+A/P0/V1   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,480   144.692  
+          sort method: external merge  Disk: 11760kB
+A/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   7         122      8        0.193    
+A/P0/V3   Index Scan using jobs_ready on jobs jo… 8         no   7         118      3        0.185    
+A/P0/V4   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         106      57,390   144.321  
+          sort method: external merge  Disk: 11760kB
+A/P1/V-   Seq Scan on jobs jobs_1                 166,667   YES  833,333   16,351   39,318   175.293  
+          sort method: external merge  Disk: 11760kB
+A/P1/V0   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,479   143.083  
+          sort method: external merge  Disk: 11760kB
+A/P1/V1   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      56,479   142.016  
+          sort method: external merge  Disk: 11760kB
+A/P1/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         121      0        0.152    
+A/P1/V3   Index Scan using jobs_ready on jobs jo… 8         no   7         124      0        0.148    
+A/P1/V4   Bitmap Heap Scan on jobs jobs_1         166,667   YES  0         103      57,393   139.415  
+          sort method: external merge  Disk: 11760kB
+
+B/P0/V-   Seq Scan on jobs jobs_1                 500,000   YES  500,000   16,380   39,286   321.573  
+          sort method: external merge  Disk: 35264kB
+B/P0/V0   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         111      58,308   317.229  
+          sort method: external merge  Disk: 35264kB
+B/P0/V1   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         114      58,308   317.109  
+          sort method: external merge  Disk: 35264kB
+B/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   11        115      0        0.129    
+B/P0/V3   Seq Scan on jobs jobs_1                 500,000   YES  500,000   10,926   44,752   338.069  
+          sort method: external merge  Disk: 35264kB
+B/P1/V-   Seq Scan on jobs jobs_1                 500,000   YES  500,000   16,413   39,256   307.672  
+          sort method: external merge  Disk: 35264kB
+B/P1/V0   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         103      58,309   293.998  
+          sort method: external merge  Disk: 35264kB
+B/P1/V1   Bitmap Heap Scan on jobs jobs_1         500,000   YES  0         111      58,307   287.963  
+          sort method: external merge  Disk: 35264kB
+B/P1/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.161    
+B/P1/V3   Seq Scan on jobs jobs_1                 500,000   YES  500,000   10,961   44,720   314.864  
+          sort method: external merge  Disk: 35264kB
+
+C/P0/V-   Seq Scan on jobs jobs_1                 333,334   YES  666,666   16,422   39,246   221.145  
+          sort method: external merge  Disk: 23512kB
+C/P0/V0   Bitmap Heap Scan on jobs jobs_1         333,334   YES  0         102      57,482   219.635  
+          sort method: external merge  Disk: 23512kB
+C/P0/V1   Bitmap Heap Scan on jobs jobs_1         333,334   YES  0         102      57,482   217.005  
+          sort method: external merge  Disk: 23512kB
+C/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.121    
+C/P0/V3   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.133    
+
+D/P0/V-   Seq Scan on jobs jobs_1                 1,000,000 YES  0         16,433   39,238   553.939  
+          sort method: external merge  Disk: 70520kB
+D/P0/V0   Seq Scan on jobs jobs_1                 1,000,000 YES  0         16,450   39,224   560.633  
+          sort method: external merge  Disk: 70520kB
+D/P0/V1   Seq Scan on jobs jobs_1                 1,000,000 YES  0         16,450   39,227   566.534  
+          sort method: external merge  Disk: 70520kB
+D/P0/V2   Index Scan using jobs_ready on jobs jo… 8         no   0         117      0        0.133    
+D/P0/V3   Seq Scan on jobs jobs_1                 1,000,000 YES  0         10,995   44,688   565.979  
+          sort method: external merge  Disk: 70520kB
+
+E/P0/V-   Seq Scan on jobs jobs_1                 0         YES  1,000,000 16,338   39,223   100.906  
+          sort method: quicksort  Memory: 25kB
+E/P0/V0   Index Scan using jobs_ready on jobs jo… 0         YES  0         0        3        0.019    
+          sort method: quicksort  Memory: 25kB
+E/P0/V1   Index Scan using jobs_ready on jobs jo… 0         YES  0         0        3        0.020    
+          sort method: quicksort  Memory: 25kB
+E/P0/V2   Index Scan using jobs_ready on jobs jo… 0         no   0         3        5,749    21.398   
+E/P0/V3   Index Scan using jobs_ready on jobs jo… 0         no   0         3        0        0.014    
+E/P1/V-   Seq Scan on jobs jobs_1                 0         YES  1,000,000 16,340   39,221   112.993  
+          sort method: quicksort  Memory: 25kB
+E/P1/V0   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.010    
+          sort method: quicksort  Memory: 25kB
+E/P1/V1   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.010    
+          sort method: quicksort  Memory: 25kB
+E/P1/V2   Index Scan using jobs_ready on jobs jo… 0         no   0         5,752    0        17.815   
+E/P1/V3   Index Scan using jobs_ready on jobs jo… 0         no   0         3        0        0.008    
+
+F/P0/V-   Seq Scan on jobs jobs_1                 0         YES  1,000,000 16,342   39,219   93.520   
+          sort method: quicksort  Memory: 25kB
+F/P0/V0   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.012    
+          sort method: quicksort  Memory: 25kB
+F/P0/V1   Index Scan using jobs_ready on jobs jo… 0         YES  0         3        0        0.008    
+          sort method: quicksort  Memory: 25kB
+F/P0/V2   Index Scan using jobs_ready on jobs jo… 0         no   0         5,752    0        16.564   
+F/P0/V3   Index Scan using jobs_ready on jobs jo… 0         no   0         3        0        0.007    
+----------------------------------------------------------------------------------------------------------------------
+
+notes
+  - Rows are spread evenly across 4 executor classes (loadtest, (empty wildcard), loadtest-b, loadtest-c), so a routed
+    claim matches half the table. A seed in which every row matched would flatter any variant that drops the class
+    from the key.
+  - Every row is claimable: state='available', deleted_at IS NULL, scheduled_at in the past. The claim's LIMIT is 8,
+    so any Sort over more than 8 rows is work the plan did not need to do.
+  - Conditions E and F name "q-idle", which the seed never writes to, so they measure an empty poll. That is the case
+    a deployment spends most of its wall clock in — a runner polls on a fixed interval whether or not there is work
+    — and an index that answers a hit quickly and a miss slowly would be worse than the one it replaced.
+  - Every statement was captured from postgresDriver.Dequeue through a recording GORM logger and explained verbatim;
+    P1 differs from P0 by exactly one documented Replace of the class clause.
+  - EXPLAIN (ANALYZE) executes the claim, so every capture ran inside a transaction that was rolled back. The seeded
+    table is identical for every cell.
+
+statements, as captured from postgresDriver.Dequeue
+======================================================================================================================
+
+--- A/P0 ---
+WITH claimed AS (
+    SELECT id FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2026-07-27 14:39:22.653'
+      AND queue IN ('q0')
+      AND (executor_class = 'loadtest' OR executor_class = '')
+    ORDER BY priority, scheduled_at
+    LIMIT 8
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET state = 'running', attempt = attempt + 1, leased_until = '2026-07-27 14:40:22.653', lease_token = '00000000-0000-7000-8000-000000000000', updated_at = '2026-07-27 14:39:22.653'
+FROM claimed
+WHERE jobs.id = claimed.id
+RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata
+
+--- A/P1 ---
+WITH claimed AS (
+    SELECT id FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2026-07-27 14:39:22.653'
+      AND queue IN ('q0')
+      AND executor_class IN ('loadtest', '')
+    ORDER BY priority, scheduled_at
+    LIMIT 8
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET state = 'running', attempt = attempt + 1, leased_until = '2026-07-27 14:40:22.653', lease_token = '00000000-0000-7000-8000-000000000000', updated_at = '2026-07-27 14:39:22.653'
+FROM claimed
+WHERE jobs.id = claimed.id
+RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata
+
+--- B/P0 ---
+WITH claimed AS (
+    SELECT id FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2026-07-27 14:39:22.899'
+      AND queue IN ('q0','q1','q2')
+      AND (executor_class = 'loadtest' OR executor_class = '')
+    ORDER BY priority, scheduled_at
+    LIMIT 8
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET state = 'running', attempt = attempt + 1, leased_until = '2026-07-27 14:40:22.899', lease_token = '00000000-0000-7000-8000-000000000000', updated_at = '2026-07-27 14:39:22.899'
+FROM claimed
+WHERE jobs.id = claimed.id
+RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata
+
+--- B/P1 ---
+WITH claimed AS (
+    SELECT id FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2026-07-27 14:39:22.899'
+      AND queue IN ('q0','q1','q2')
+      AND executor_class IN ('loadtest', '')
+    ORDER BY priority, scheduled_at
+    LIMIT 8
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET state = 'running', attempt = attempt + 1, leased_until = '2026-07-27 14:40:22.899', lease_token = '00000000-0000-7000-8000-000000000000', updated_at = '2026-07-27 14:39:22.899'
+FROM claimed
+WHERE jobs.id = claimed.id
+RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata
+
+--- C/P0 ---
+WITH claimed AS (
+    SELECT id FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2026-07-27 14:39:23.231'
+      AND queue IN ('q0')
+      
+    ORDER BY priority, scheduled_at
+    LIMIT 8
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET state = 'running', attempt = attempt + 1, leased_until = '2026-07-27 14:40:23.231', lease_token = '00000000-0000-7000-8000-000000000000', updated_at = '2026-07-27 14:39:23.231'
+FROM claimed
+WHERE jobs.id = claimed.id
+RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata
+
+--- D/P0 ---
+WITH claimed AS (
+    SELECT id FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2026-07-27 14:39:23.449'
+      AND queue IN ('q0','q1','q2')
+      
+    ORDER BY priority, scheduled_at
+    LIMIT 8
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET state = 'running', attempt = attempt + 1, leased_until = '2026-07-27 14:40:23.449', lease_token = '00000000-0000-7000-8000-000000000000', updated_at = '2026-07-27 14:39:23.449'
+FROM claimed
+WHERE jobs.id = claimed.id
+RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata
+
+--- E/P0 ---
+WITH claimed AS (
+    SELECT id FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2026-07-27 14:39:23.99'
+      AND queue IN ('q-idle')
+      AND (executor_class = 'loadtest' OR executor_class = '')
+    ORDER BY priority, scheduled_at
+    LIMIT 8
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET state = 'running', attempt = attempt + 1, leased_until = '2026-07-27 14:40:23.99', lease_token = '00000000-0000-7000-8000-000000000000', updated_at = '2026-07-27 14:39:23.99'
+FROM claimed
+WHERE jobs.id = claimed.id
+RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata
+
+--- E/P1 ---
+WITH claimed AS (
+    SELECT id FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2026-07-27 14:39:23.99'
+      AND queue IN ('q-idle')
+      AND executor_class IN ('loadtest', '')
+    ORDER BY priority, scheduled_at
+    LIMIT 8
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET state = 'running', attempt = attempt + 1, leased_until = '2026-07-27 14:40:23.99', lease_token = '00000000-0000-7000-8000-000000000000', updated_at = '2026-07-27 14:39:23.99'
+FROM claimed
+WHERE jobs.id = claimed.id
+RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata
+
+--- F/P0 ---
+WITH claimed AS (
+    SELECT id FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2026-07-27 14:39:23.991'
+      AND queue IN ('q-idle')
+      
+    ORDER BY priority, scheduled_at
+    LIMIT 8
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET state = 'running', attempt = attempt + 1, leased_until = '2026-07-27 14:40:23.991', lease_token = '00000000-0000-7000-8000-000000000000', updated_at = '2026-07-27 14:39:23.991'
+FROM claimed
+WHERE jobs.id = claimed.id
+RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata
+
+
+plans
+======================================================================================================================
+
+--- A/P0/V- ---
+Update on jobs  (cost=82206.41..82273.71 rows=8 width=150) (actual time=169.751..169.907 rows=8 loops=1)
+  Buffers: shared hit=16352 read=39317 dirtied=1 written=1, temp read=484 written=1474
+  CTE claimed
+    ->  Limit  (cost=82205.89..82205.99 rows=8 width=59) (actual time=169.658..169.662 rows=8 loops=1)
+          Buffers: shared hit=16249 read=39317, temp read=484 written=1474
+          ->  LockRows  (cost=82205.89..84016.64 rows=144860 width=59) (actual time=169.658..169.661 rows=8 loops=1)
+                Buffers: shared hit=16249 read=39317, temp read=484 written=1474
+                ->  Sort  (cost=82205.89..82568.04 rows=144860 width=59) (actual time=169.651..169.653 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 11760kB
+                      Buffers: shared hit=16241 read=39317, temp read=484 written=1474
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..79308.69 rows=144860 width=59) (actual time=0.003..114.638 rows=166667 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (queue = 'q0'::text) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                            Rows Removed by Filter: 833333
+                            Buffers: shared hit=16241 read=39317
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=169.676..169.720 rows=8 loops=1)
+        Buffers: shared hit=16281 read=39317, temp read=484 written=1474
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=169.663..169.668 rows=8 loops=1)
+              Buffers: shared hit=16249 read=39317, temp read=484 written=1474
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=69 read=21 dirtied=1
+Planning Time: 0.190 ms
+Execution Time: 170.949 ms
+
+--- A/P0/V0 ---
+Update on jobs  (cost=68433.85..68501.15 rows=8 width=150) (actual time=152.772..152.875 rows=8 loops=1)
+  Buffers: shared hit=103 read=56480 dirtied=10 written=6068, temp read=484 written=1474
+  CTE claimed
+    ->  Limit  (cost=68433.33..68433.43 rows=8 width=59) (actual time=152.657..152.667 rows=8 loops=1)
+          Buffers: shared hit=10 read=56472 dirtied=6 written=6068, temp read=484 written=1474
+          ->  LockRows  (cost=68433.33..70252.59 rows=145541 width=59) (actual time=152.656..152.666 rows=8 loops=1)
+                Buffers: shared hit=10 read=56472 dirtied=6 written=6068, temp read=484 written=1474
+                ->  Sort  (cost=68433.33..68797.18 rows=145541 width=59) (actual time=152.647..152.648 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 11760kB
+                      Buffers: shared hit=8 read=56466 written=6068, temp read=484 written=1474
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=6012.33..65522.51 rows=145541 width=59) (actual time=12.550..97.016 rows=166667 loops=1)
+                            Recheck Cond: (((queue = 'q0'::text) AND (executor_class = 'loadtest'::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[]))) OR ((queue = 'q0'::text) AND (executor_class = ''::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[]))))
+                            Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=8 read=56466 written=6068
+                            ->  BitmapOr  (cost=6012.33..6012.33 rows=166281 width=0) (actual time=8.491..8.492 rows=0 loops=1)
+                                  Buffers: shared hit=2 read=916 written=164
+                                  ->  Bitmap Index Scan on jobs_ready  (cost=0.00..2967.44 rows=83113 width=0) (actual time=5.034..5.034 rows=83334 loops=1)
+                                        Index Cond: ((queue = 'q0'::text) AND (executor_class = 'loadtest'::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                                        Buffers: shared read=505
+                                  ->  Bitmap Index Scan on jobs_ready  (cost=0.00..2972.13 rows=83168 width=0) (actual time=3.457..3.457 rows=83333 loops=1)
+                                        Index Cond: ((queue = 'q0'::text) AND (executor_class = ''::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                                        Buffers: shared hit=2 read=411 written=164
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=152.678..152.728 rows=8 loops=1)
+        Buffers: shared hit=38 read=56476 dirtied=6 written=6068, temp read=484 written=1474
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=152.661..152.672 rows=8 loops=1)
+              Buffers: shared hit=10 read=56472 dirtied=6 written=6068, temp read=484 written=1474
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.007..0.007 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=28 read=4
+Planning:
+  Buffers: shared hit=73 read=3
+Planning Time: 0.245 ms
+Execution Time: 153.566 ms
+
+--- A/P0/V1 ---
+Update on jobs  (cost=68331.00..68398.30 rows=8 width=150) (actual time=143.874..143.980 rows=8 loops=1)
+  Buffers: shared hit=103 read=56480 dirtied=12 written=25, temp read=484 written=1474
+  CTE claimed
+    ->  Limit  (cost=68330.48..68330.58 rows=8 width=59) (actual time=143.756..143.765 rows=8 loops=1)
+          Buffers: shared hit=10 read=56472 dirtied=8 written=25, temp read=484 written=1474
+          ->  LockRows  (cost=68330.48..70134.33 rows=144308 width=59) (actual time=143.755..143.764 rows=8 loops=1)
+                Buffers: shared hit=10 read=56472 dirtied=8 written=25, temp read=484 written=1474
+                ->  Sort  (cost=68330.48..68691.25 rows=144308 width=59) (actual time=143.746..143.747 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 11760kB
+                      Buffers: shared hit=8 read=56466 dirtied=2 written=25, temp read=484 written=1474
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=5962.97..65444.32 rows=144308 width=59) (actual time=12.314..88.385 rows=166667 loops=1)
+                            Recheck Cond: (((queue = 'q0'::text) AND (executor_class = 'loadtest'::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL)) OR ((queue = 'q0'::text) AND (executor_class = ''::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL)))
+                            Filter: (state = ANY ('{available,retryable,scheduled}'::text[]))
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=8 read=56466 dirtied=2 written=25
+                            ->  BitmapOr  (cost=5962.97..5962.97 rows=164941 width=0) (actual time=8.205..8.205 rows=0 loops=1)
+                                  Buffers: shared hit=2 read=916
+                                  ->  Bitmap Index Scan on jobs_ready  (cost=0.00..2948.58 rows=82564 width=0) (actual time=5.070..5.070 rows=83334 loops=1)
+                                        Index Cond: ((queue = 'q0'::text) AND (executor_class = 'loadtest'::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                                        Buffers: shared read=505
+                                  ->  Bitmap Index Scan on jobs_ready  (cost=0.00..2942.24 rows=82377 width=0) (actual time=3.135..3.135 rows=83333 loops=1)
+                                        Index Cond: ((queue = 'q0'::text) AND (executor_class = ''::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                                        Buffers: shared hit=2 read=411
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=143.779..143.828 rows=8 loops=1)
+        Buffers: shared hit=38 read=56476 dirtied=8 written=25, temp read=484 written=1474
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=143.760..143.770 rows=8 loops=1)
+              Buffers: shared hit=10 read=56472 dirtied=8 written=25, temp read=484 written=1474
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.007..0.007 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=28 read=4
+Planning:
+  Buffers: shared hit=67 read=2
+Planning Time: 0.217 ms
+Execution Time: 144.692 ms
+
+--- A/P0/V2 ---
+Update on jobs  (cost=15.17..82.46 rows=8 width=150) (actual time=0.067..0.179 rows=8 loops=1)
+  Buffers: shared hit=122 read=8 dirtied=6
+  CTE claimed
+    ->  Limit  (cost=0.42..14.74 rows=8 width=59) (actual time=0.012..0.025 rows=8 loops=1)
+          Buffers: shared hit=13 read=7 dirtied=5
+          ->  LockRows  (cost=0.42..258961.31 rows=144672 width=59) (actual time=0.012..0.025 rows=8 loops=1)
+                Buffers: shared hit=13 read=7 dirtied=5
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..257514.59 rows=144672 width=59) (actual time=0.011..0.022 rows=8 loops=1)
+                      Index Cond: ((scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (queue = 'q0'::text))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                      Rows Removed by Filter: 7
+                      Buffers: shared hit=5 read=7 dirtied=1
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=0.021..0.073 rows=8 loops=1)
+        Buffers: shared hit=44 read=8 dirtied=5
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=0.014..0.029 rows=8 loops=1)
+              Buffers: shared hit=13 read=7 dirtied=5
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.005..0.005 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=31 read=1
+Planning:
+  Buffers: shared hit=63 read=2
+Planning Time: 0.218 ms
+Execution Time: 0.193 ms
+
+--- A/P0/V3 ---
+Update on jobs  (cost=13.40..80.70 rows=8 width=150) (actual time=0.072..0.172 rows=8 loops=1)
+  Buffers: shared hit=118 read=3
+  CTE claimed
+    ->  Limit  (cost=0.42..12.98 rows=8 width=59) (actual time=0.015..0.024 rows=8 loops=1)
+          Buffers: shared hit=17 read=3
+          ->  LockRows  (cost=0.42..227599.50 rows=145071 width=59) (actual time=0.015..0.024 rows=8 loops=1)
+                Buffers: shared hit=17 read=3
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..226148.79 rows=145071 width=59) (actual time=0.014..0.021 rows=8 loops=1)
+                      Index Cond: ((queue = 'q0'::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                      Rows Removed by Filter: 7
+                      Buffers: shared hit=9 read=3
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=0.024..0.072 rows=8 loops=1)
+        Buffers: shared hit=49 read=3
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=0.017..0.028 rows=8 loops=1)
+              Buffers: shared hit=17 read=3
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.005..0.005 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=65 read=1
+Planning Time: 0.207 ms
+Execution Time: 0.185 ms
+
+--- A/P0/V4 ---
+Update on jobs  (cost=71919.60..71986.89 rows=8 width=150) (actual time=143.528..143.631 rows=8 loops=1)
+  Buffers: shared hit=106 read=57390 dirtied=10 written=36, temp read=484 written=1474
+  CTE claimed
+    ->  Limit  (cost=71919.07..71919.17 rows=8 width=59) (actual time=143.355..143.365 rows=8 loops=1)
+          Buffers: shared hit=14 read=57381 dirtied=6 written=36, temp read=484 written=1474
+          ->  LockRows  (cost=71919.07..73716.36 rows=143783 width=59) (actual time=143.355..143.364 rows=8 loops=1)
+                Buffers: shared hit=14 read=57381 dirtied=6 written=36, temp read=484 written=1474
+                ->  Sort  (cost=71919.07..72278.53 rows=143783 width=59) (actual time=143.348..143.349 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 11760kB
+                      Buffers: shared hit=12 read=57375 written=36, temp read=484 written=1474
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=9567.24..69043.41 rows=143783 width=59) (actual time=13.948..87.606 rows=166667 loops=1)
+                            Recheck Cond: (((queue = 'q0'::text) AND (executor_class = 'loadtest'::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL)) OR ((queue = 'q0'::text) AND (executor_class = ''::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL)))
+                            Filter: (state = ANY ('{available,retryable,scheduled}'::text[]))
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=12 read=57375 written=36
+                            ->  BitmapOr  (cost=9567.24..9567.24 rows=164344 width=0) (actual time=9.901..9.901 rows=0 loops=1)
+                                  Buffers: shared hit=2 read=1829
+                                  ->  Bitmap Index Scan on jobs_ready  (cost=0.00..4686.54 rows=81121 width=0) (actual time=5.742..5.742 rows=83334 loops=1)
+                                        Index Cond: ((queue = 'q0'::text) AND (executor_class = 'loadtest'::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                                        Buffers: shared read=960
+                                  ->  Bitmap Index Scan on jobs_ready  (cost=0.00..4808.81 rows=83223 width=0) (actual time=4.158..4.158 rows=83333 loops=1)
+                                        Index Cond: ((queue = 'q0'::text) AND (executor_class = ''::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                                        Buffers: shared hit=2 read=869
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=143.376..143.425 rows=8 loops=1)
+        Buffers: shared hit=42 read=57385 dirtied=6 written=36, temp read=484 written=1474
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=143.359..143.369 rows=8 loops=1)
+              Buffers: shared hit=14 read=57381 dirtied=6 written=36, temp read=484 written=1474
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.007..0.007 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=28 read=4
+Planning:
+  Buffers: shared hit=65 read=1
+Planning Time: 0.211 ms
+Execution Time: 144.321 ms
+
+--- A/P1/V- ---
+Update on jobs  (cost=80120.82..80188.12 rows=8 width=150) (actual time=174.478..174.578 rows=8 loops=1)
+  Buffers: shared hit=16351 read=39318, temp read=484 written=1474
+  CTE claimed
+    ->  Limit  (cost=80120.30..80120.40 rows=8 width=59) (actual time=174.439..174.443 rows=8 loops=1)
+          Buffers: shared hit=16249 read=39318, temp read=484 written=1474
+          ->  LockRows  (cost=80120.30..82189.24 rows=165515 width=59) (actual time=174.438..174.442 rows=8 loops=1)
+                Buffers: shared hit=16249 read=39318, temp read=484 written=1474
+                ->  Sort  (cost=80120.30..80534.09 rows=165515 width=59) (actual time=174.432..174.433 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 11760kB
+                      Buffers: shared hit=16241 read=39318, temp read=484 written=1474
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..76810.00 rows=165515 width=59) (actual time=0.003..120.700 rows=166667 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (queue = 'q0'::text) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Rows Removed by Filter: 833333
+                            Buffers: shared hit=16241 read=39318
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=174.456..174.498 rows=8 loops=1)
+        Buffers: shared hit=16281 read=39318, temp read=484 written=1474
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=174.442..174.447 rows=8 loops=1)
+              Buffers: shared hit=16249 read=39318, temp read=484 written=1474
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.104 ms
+Execution Time: 175.293 ms
+
+--- A/P1/V0 ---
+Update on jobs  (cost=68101.76..68169.06 rows=8 width=150) (actual time=142.234..142.361 rows=8 loops=1)
+  Buffers: shared hit=103 read=56479 dirtied=12 written=11, temp read=484 written=1474
+  CTE claimed
+    ->  Limit  (cost=68101.24..68101.34 rows=8 width=59) (actual time=142.179..142.190 rows=8 loops=1)
+          Buffers: shared hit=8 read=56471 dirtied=6 written=10, temp read=484 written=1474
+          ->  LockRows  (cost=68101.24..70179.75 rows=166281 width=59) (actual time=142.179..142.189 rows=8 loops=1)
+                Buffers: shared hit=8 read=56471 dirtied=6 written=10, temp read=484 written=1474
+                ->  Sort  (cost=68101.24..68516.94 rows=166281 width=59) (actual time=142.171..142.172 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 11760kB
+                      Buffers: shared hit=6 read=56465 written=10, temp read=484 written=1474
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=5681.15..64775.62 rows=166281 width=59) (actual time=12.450..86.862 rows=166667 loops=1)
+                            Recheck Cond: ((queue = 'q0'::text) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Filter: (deleted_at IS NULL)
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=6 read=56465 written=10
+                            ->  Bitmap Index Scan on jobs_ready  (cost=0.00..5639.58 rows=166281 width=0) (actual time=8.414..8.414 rows=166667 loops=1)
+                                  Index Cond: ((queue = 'q0'::text) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                                  Buffers: shared read=915
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=142.203..142.254 rows=8 loops=1)
+        Buffers: shared hit=36 read=56475 dirtied=6 written=10, temp read=484 written=1474
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=142.183..142.195 rows=8 loops=1)
+              Buffers: shared hit=8 read=56471 dirtied=6 written=10, temp read=484 written=1474
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.007..0.007 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=28 read=4
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.116 ms
+Execution Time: 143.083 ms
+
+--- A/P1/V1 ---
+Update on jobs  (cost=68008.40..68075.70 rows=8 width=150) (actual time=141.195..141.324 rows=8 loops=1)
+  Buffers: shared hit=103 read=56479 dirtied=12 written=11, temp read=484 written=1474
+  CTE claimed
+    ->  Limit  (cost=68007.88..68007.98 rows=8 width=59) (actual time=141.142..141.152 rows=8 loops=1)
+          Buffers: shared hit=8 read=56471 dirtied=6 written=10, temp read=484 written=1474
+          ->  LockRows  (cost=68007.88..70069.64 rows=164941 width=59) (actual time=141.141..141.151 rows=8 loops=1)
+                Buffers: shared hit=8 read=56471 dirtied=6 written=10, temp read=484 written=1474
+                ->  Sort  (cost=68007.88..68420.23 rows=164941 width=59) (actual time=141.133..141.134 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 11760kB
+                      Buffers: shared hit=6 read=56465 written=10, temp read=484 written=1474
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=5640.06..64709.06 rows=164941 width=59) (actual time=12.596..84.755 rows=166667 loops=1)
+                            Recheck Cond: ((queue = 'q0'::text) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL))
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=6 read=56465 written=10
+                            ->  Bitmap Index Scan on jobs_ready  (cost=0.00..5598.83 rows=164941 width=0) (actual time=8.525..8.525 rows=166667 loops=1)
+                                  Index Cond: ((queue = 'q0'::text) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                                  Buffers: shared read=915
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=141.164..141.214 rows=8 loops=1)
+        Buffers: shared hit=36 read=56475 dirtied=6 written=10, temp read=484 written=1474
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=141.145..141.156 rows=8 loops=1)
+              Buffers: shared hit=8 read=56471 dirtied=6 written=10, temp read=484 written=1474
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.007..0.007 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=28 read=4
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.118 ms
+Execution Time: 142.016 ms
+
+--- A/P1/V2 ---
+Update on jobs  (cost=13.32..80.62 rows=8 width=150) (actual time=0.035..0.145 rows=8 loops=1)
+  Buffers: shared hit=121 dirtied=2 written=1
+  CTE claimed
+    ->  Limit  (cost=0.42..12.90 rows=8 width=59) (actual time=0.016..0.020 rows=8 loops=1)
+          Buffers: shared hit=17
+          ->  LockRows  (cost=0.42..257519.98 rows=165204 width=59) (actual time=0.016..0.020 rows=8 loops=1)
+                Buffers: shared hit=17
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..255867.94 rows=165204 width=59) (actual time=0.015..0.018 rows=8 loops=1)
+                      Index Cond: ((scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (queue = 'q0'::text) AND (executor_class = ANY ('{loadtest,""}'::text[])))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                      Buffers: shared hit=9
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=0.023..0.065 rows=8 loops=1)
+        Buffers: shared hit=49
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=0.017..0.023 rows=8 loops=1)
+              Buffers: shared hit=17
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.005..0.005 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.079 ms
+Execution Time: 0.152 ms
+
+--- A/P1/V3 ---
+Update on jobs  (cost=11.80..79.09 rows=8 width=150) (actual time=0.027..0.141 rows=8 loops=1)
+  Buffers: shared hit=124 dirtied=1 written=1
+  CTE claimed
+    ->  Limit  (cost=0.42..11.37 rows=8 width=59) (actual time=0.009..0.014 rows=8 loops=1)
+          Buffers: shared hit=20
+          ->  LockRows  (cost=0.42..226980.34 rows=165857 width=59) (actual time=0.009..0.014 rows=8 loops=1)
+                Buffers: shared hit=20
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..225321.77 rows=165857 width=59) (actual time=0.008..0.012 rows=8 loops=1)
+                      Index Cond: ((queue = 'q0'::text) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                      Filter: ((deleted_at IS NULL) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                      Rows Removed by Filter: 7
+                      Buffers: shared hit=12
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=0.015..0.059 rows=8 loops=1)
+        Buffers: shared hit=52
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=0.009..0.016 rows=8 loops=1)
+              Buffers: shared hit=20
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.005..0.005 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.080 ms
+Execution Time: 0.148 ms
+
+--- A/P1/V4 ---
+Update on jobs  (cost=71325.15..71392.45 rows=8 width=150) (actual time=138.570..138.701 rows=8 loops=1)
+  Buffers: shared hit=103 read=57393 dirtied=12 written=11, temp read=484 written=1474
+  CTE claimed
+    ->  Limit  (cost=71324.63..71324.73 rows=8 width=59) (actual time=138.516..138.527 rows=8 loops=1)
+          Buffers: shared hit=8 read=57384 dirtied=6 written=10, temp read=484 written=1474
+          ->  LockRows  (cost=71324.63..73378.93 rows=164344 width=59) (actual time=138.516..138.526 rows=8 loops=1)
+                Buffers: shared hit=8 read=57384 dirtied=6 written=10, temp read=484 written=1474
+                ->  Sort  (cost=71324.63..71735.49 rows=164344 width=59) (actual time=138.507..138.508 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 11760kB
+                      Buffers: shared hit=6 read=57378 written=10, temp read=484 written=1474
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=8972.44..68037.75 rows=164344 width=59) (actual time=13.239..83.270 rows=166667 loops=1)
+                            Recheck Cond: ((queue = 'q0'::text) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL))
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=6 read=57378 written=10
+                            ->  Bitmap Index Scan on jobs_ready  (cost=0.00..8931.35 rows=164344 width=0) (actual time=9.212..9.212 rows=166667 loops=1)
+                                  Index Cond: ((queue = 'q0'::text) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:22.653-04'::timestamp with time zone))
+                                  Buffers: shared read=1828
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=138.539..138.590 rows=8 loops=1)
+        Buffers: shared hit=36 read=57388 dirtied=6 written=10, temp read=484 written=1474
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=138.520..138.532 rows=8 loops=1)
+              Buffers: shared hit=8 read=57384 dirtied=6 written=10, temp read=484 written=1474
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.007..0.007 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=28 read=4
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.114 ms
+Execution Time: 139.415 ms
+
+--- B/P0/V- ---
+Update on jobs  (cost=86709.12..86776.42 rows=8 width=150) (actual time=320.809..320.898 rows=8 loops=1)
+  Buffers: shared hit=16380 read=39286 written=4, temp read=494 written=4420
+  CTE claimed
+    ->  Limit  (cost=86708.60..86708.70 rows=8 width=59) (actual time=320.770..320.773 rows=8 loops=1)
+          Buffers: shared hit=16281 read=39286 written=4, temp read=494 written=4420
+          ->  LockRows  (cost=86708.60..90551.36 rows=307421 width=59) (actual time=320.770..320.773 rows=8 loops=1)
+                Buffers: shared hit=16281 read=39286 written=4, temp read=494 written=4420
+                ->  Sort  (cost=86708.60..87477.15 rows=307421 width=59) (actual time=320.763..320.764 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 35264kB
+                      Buffers: shared hit=16273 read=39286 written=4, temp read=494 written=4420
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..80560.18 rows=307421 width=59) (actual time=0.003..157.226 rows=500000 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (queue = ANY ('{q0,q1,q2}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                            Rows Removed by Filter: 500000
+                            Buffers: shared hit=16273 read=39286 written=4
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=320.787..320.828 rows=8 loops=1)
+        Buffers: shared hit=16313 read=39286 written=4, temp read=494 written=4420
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=320.774..320.778 rows=8 loops=1)
+              Buffers: shared hit=16281 read=39286 written=4, temp read=494 written=4420
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.108 ms
+Execution Time: 321.573 ms
+
+--- B/P0/V0 ---
+Update on jobs  (cost=82520.43..82587.73 rows=8 width=150) (actual time=316.448..316.547 rows=8 loops=1)
+  Buffers: shared hit=111 read=58308 dirtied=8 written=11, temp read=494 written=4420
+  CTE claimed
+    ->  Limit  (cost=82519.91..82520.01 rows=8 width=59) (actual time=316.394..316.400 rows=8 loops=1)
+          Buffers: shared hit=18 read=58301 dirtied=4 written=11, temp read=494 written=4420
+          ->  LockRows  (cost=82519.91..86360.65 rows=307259 width=59) (actual time=316.393..316.400 rows=8 loops=1)
+                Buffers: shared hit=18 read=58301 dirtied=4 written=11, temp read=494 written=4420
+                ->  Sort  (cost=82519.91..83288.06 rows=307259 width=59) (actual time=316.384..316.385 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 35264kB
+                      Buffers: shared hit=14 read=58297 written=11, temp read=494 written=4420
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=12036.65..76374.73 rows=307259 width=59) (actual time=24.257..149.786 rows=500000 loops=1)
+                            Recheck Cond: (((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = 'loadtest'::text) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[]))) OR ((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = ''::text) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[]))))
+                            Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (queue = ANY ('{q0,q1,q2}'::text[])))
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=14 read=58297 written=11
+                            ->  BitmapOr  (cost=12036.65..12036.65 rows=351043 width=0) (actual time=20.137..20.137 rows=0 loops=1)
+                                  Buffers: shared hit=8 read=2747
+                                  ->  Bitmap Index Scan on jobs_ready  (cost=0.00..5934.76 rows=175463 width=0) (actual time=11.383..11.384 rows=250000 loops=1)
+                                        Index Cond: ((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = 'loadtest'::text) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone))
+                                        Buffers: shared hit=2 read=1513
+                                  ->  Bitmap Index Scan on jobs_ready  (cost=0.00..5948.26 rows=175580 width=0) (actual time=8.753..8.753 rows=250000 loops=1)
+                                        Index Cond: ((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = ''::text) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone))
+                                        Buffers: shared hit=6 read=1234
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=316.417..316.462 rows=8 loops=1)
+        Buffers: shared hit=47 read=58304 dirtied=4 written=11, temp read=494 written=4420
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=316.398..316.405 rows=8 loops=1)
+              Buffers: shared hit=18 read=58301 dirtied=4 written=11, temp read=494 written=4420
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.007..0.007 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=29 read=3
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.142 ms
+Execution Time: 317.229 ms
+
+--- B/P0/V1 ---
+Update on jobs  (cost=82603.13..82670.43 rows=8 width=150) (actual time=316.412..316.519 rows=8 loops=1)
+  Buffers: shared hit=114 read=58308 dirtied=8 written=8, temp read=494 written=4420
+  CTE claimed
+    ->  Limit  (cost=82602.61..82602.71 rows=8 width=59) (actual time=316.360..316.368 rows=8 loops=1)
+          Buffers: shared hit=18 read=58301 dirtied=4 written=8, temp read=494 written=4420
+          ->  LockRows  (cost=82602.61..86453.25 rows=308051 width=59) (actual time=316.360..316.367 rows=8 loops=1)
+                Buffers: shared hit=18 read=58301 dirtied=4 written=8, temp read=494 written=4420
+                ->  Sort  (cost=82602.61..83372.74 rows=308051 width=59) (actual time=316.351..316.352 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 35264kB
+                      Buffers: shared hit=14 read=58297 written=8, temp read=494 written=4420
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=12074.21..76441.59 rows=308051 width=59) (actual time=24.297..145.092 rows=500000 loops=1)
+                            Recheck Cond: (((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = 'loadtest'::text) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL)) OR ((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = ''::text) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL)))
+                            Filter: ((state = ANY ('{available,retryable,scheduled}'::text[])) AND (queue = ANY ('{q0,q1,q2}'::text[])))
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=14 read=58297 written=8
+                            ->  BitmapOr  (cost=12074.21..12074.21 rows=352095 width=0) (actual time=20.144..20.144 rows=0 loops=1)
+                                  Buffers: shared hit=8 read=2747
+                                  ->  Bitmap Index Scan on jobs_ready  (cost=0.00..5968.59 rows=176247 width=0) (actual time=11.456..11.456 rows=250000 loops=1)
+                                        Index Cond: ((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = 'loadtest'::text) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone))
+                                        Buffers: shared hit=2 read=1513
+                                  ->  Bitmap Index Scan on jobs_ready  (cost=0.00..5951.60 rows=175848 width=0) (actual time=8.687..8.687 rows=250000 loops=1)
+                                        Index Cond: ((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = ''::text) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone))
+                                        Buffers: shared hit=6 read=1234
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=316.382..316.428 rows=8 loops=1)
+        Buffers: shared hit=47 read=58304 dirtied=4 written=8, temp read=494 written=4420
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=316.364..316.372 rows=8 loops=1)
+              Buffers: shared hit=18 read=58301 dirtied=4 written=8, temp read=494 written=4420
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.007..0.007 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=29 read=3
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.141 ms
+Execution Time: 317.109 ms
+
+--- B/P0/V2 ---
+Update on jobs  (cost=5.91..73.20 rows=8 width=150) (actual time=0.032..0.124 rows=8 loops=1)
+  Buffers: shared hit=115
+  CTE claimed
+    ->  Limit  (cost=0.42..5.48 rows=8 width=59) (actual time=0.015..0.021 rows=8 loops=1)
+          Buffers: shared hit=16
+          ->  LockRows  (cost=0.42..275135.59 rows=435286 width=59) (actual time=0.015..0.020 rows=8 loops=1)
+                Buffers: shared hit=16
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..270782.73 rows=435286 width=59) (actual time=0.015..0.019 rows=8 loops=1)
+                      Index Cond: ((scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (queue = ANY ('{q0,q1,q2}'::text[])))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                      Rows Removed by Filter: 11
+                      Buffers: shared hit=8
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=0.022..0.064 rows=8 loops=1)
+        Buffers: shared hit=48
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=0.016..0.022 rows=8 loops=1)
+              Buffers: shared hit=16
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.005..0.005 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.083 ms
+Execution Time: 0.129 ms
+
+--- B/P0/V3 ---
+Update on jobs  (cost=89339.43..89406.73 rows=8 width=150) (actual time=337.376..337.466 rows=8 loops=1)
+  Buffers: shared hit=10926 read=44752, temp read=494 written=4420
+  CTE claimed
+    ->  Limit  (cost=89338.90..89339.01 rows=8 width=59) (actual time=337.336..337.339 rows=8 loops=1)
+          Buffers: shared hit=10827 read=44752, temp read=494 written=4420
+          ->  LockRows  (cost=89338.90..94819.71 rows=438464 width=59) (actual time=337.335..337.338 rows=8 loops=1)
+                Buffers: shared hit=10827 read=44752, temp read=494 written=4420
+                ->  Sort  (cost=89338.90..90435.07 rows=438464 width=59) (actual time=337.330..337.331 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 35264kB
+                      Buffers: shared hit=10819 read=44752, temp read=494 written=4420
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..80569.62 rows=438464 width=59) (actual time=0.002..166.782 rows=500000 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (queue = ANY ('{q0,q1,q2}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                            Rows Removed by Filter: 500000
+                            Buffers: shared hit=10819 read=44752
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=337.352..337.393 rows=8 loops=1)
+        Buffers: shared hit=10859 read=44752, temp read=494 written=4420
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=337.339..337.343 rows=8 loops=1)
+              Buffers: shared hit=10827 read=44752, temp read=494 written=4420
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.075 ms
+Execution Time: 338.069 ms
+
+--- B/P1/V- ---
+Update on jobs  (cost=85085.56..85152.86 rows=8 width=150) (actual time=306.936..307.032 rows=8 loops=1)
+  Buffers: shared hit=16413 read=39256 dirtied=1 written=3, temp read=494 written=4420
+  CTE claimed
+    ->  Limit  (cost=85085.04..85085.14 rows=8 width=59) (actual time=306.880..306.883 rows=8 loops=1)
+          Buffers: shared hit=16313 read=39254 written=2, temp read=494 written=4420
+          ->  LockRows  (cost=85085.04..89475.65 rows=351249 width=59) (actual time=306.879..306.883 rows=8 loops=1)
+                Buffers: shared hit=16313 read=39254 written=2, temp read=494 written=4420
+                ->  Sort  (cost=85085.04..85963.16 rows=351249 width=59) (actual time=306.874..306.875 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 35264kB
+                      Buffers: shared hit=16305 read=39254 written=2, temp read=494 written=4420
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..78060.06 rows=351249 width=59) (actual time=0.002..141.508 rows=500000 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (queue = ANY ('{q0,q1,q2}'::text[])))
+                            Rows Removed by Filter: 500000
+                            Buffers: shared hit=16305 read=39254 written=2
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=306.898..306.940 rows=8 loops=1)
+        Buffers: shared hit=16345 read=39254 written=2, temp read=494 written=4420
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=306.884..306.888 rows=8 loops=1)
+              Buffers: shared hit=16313 read=39254 written=2, temp read=494 written=4420
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.100 ms
+Execution Time: 307.672 ms
+
+--- B/P1/V0 ---
+Update on jobs  (cost=81900.64..81967.93 rows=8 width=150) (actual time=293.166..293.286 rows=8 loops=1)
+  Buffers: shared hit=103 read=58309 dirtied=8 written=6, temp read=494 written=4420
+  CTE claimed
+    ->  Limit  (cost=81900.11..81900.21 rows=8 width=59) (actual time=293.106..293.118 rows=8 loops=1)
+          Buffers: shared hit=10 read=58300 dirtied=4 written=5, temp read=494 written=4420
+          ->  LockRows  (cost=81900.11..86288.15 rows=351043 width=59) (actual time=293.105..293.117 rows=8 loops=1)
+                Buffers: shared hit=10 read=58300 dirtied=4 written=5, temp read=494 written=4420
+                ->  Sort  (cost=81900.11..82777.72 rows=351043 width=59) (actual time=293.096..293.098 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 35264kB
+                      Buffers: shared hit=6 read=58296 written=5, temp read=494 written=4420
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=11418.79..74879.25 rows=351043 width=59) (actual time=24.299..126.112 rows=500000 loops=1)
+                            Recheck Cond: ((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Filter: (deleted_at IS NULL)
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=6 read=58296 written=5
+                            ->  Bitmap Index Scan on jobs_ready  (cost=0.00..11331.02 rows=351043 width=0) (actual time=20.248..20.248 rows=500000 loops=1)
+                                  Index Cond: ((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone))
+                                  Buffers: shared hit=2 read=2744
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=293.127..293.179 rows=8 loops=1)
+        Buffers: shared hit=39 read=58303 dirtied=4 written=5, temp read=494 written=4420
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=293.109..293.122 rows=8 loops=1)
+              Buffers: shared hit=10 read=58300 dirtied=4 written=5, temp read=494 written=4420
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.007..0.007 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=29 read=3
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.127 ms
+Execution Time: 293.998 ms
+
+--- B/P1/V1 ---
+Update on jobs  (cost=81981.74..82049.03 rows=8 width=150) (actual time=287.139..287.259 rows=8 loops=1)
+  Buffers: shared hit=111 read=58307 dirtied=8 written=6, temp read=494 written=4420
+  CTE claimed
+    ->  Limit  (cost=81981.21..81981.31 rows=8 width=59) (actual time=287.088..287.096 rows=8 loops=1)
+          Buffers: shared hit=10 read=58300 dirtied=4 written=5, temp read=494 written=4420
+          ->  LockRows  (cost=81981.21..86382.40 rows=352095 width=59) (actual time=287.088..287.095 rows=8 loops=1)
+                Buffers: shared hit=10 read=58300 dirtied=4 written=5, temp read=494 written=4420
+                ->  Sort  (cost=81981.21..82861.45 rows=352095 width=59) (actual time=287.079..287.080 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 35264kB
+                      Buffers: shared hit=6 read=58296 written=5, temp read=494 written=4420
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=11452.17..74939.31 rows=352095 width=59) (actual time=24.377..119.536 rows=500000 loops=1)
+                            Recheck Cond: ((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL))
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=6 read=58296 written=5
+                            ->  Bitmap Index Scan on jobs_ready  (cost=0.00..11364.15 rows=352095 width=0) (actual time=20.314..20.314 rows=500000 loops=1)
+                                  Index Cond: ((queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone))
+                                  Buffers: shared hit=2 read=2744
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=287.110..287.156 rows=8 loops=1)
+        Buffers: shared hit=39 read=58303 dirtied=4 written=5, temp read=494 written=4420
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=287.092..287.101 rows=8 loops=1)
+              Buffers: shared hit=10 read=58300 dirtied=4 written=5, temp read=494 written=4420
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=29 read=3
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.120 ms
+Execution Time: 287.963 ms
+
+--- B/P1/V2 ---
+Update on jobs  (cost=5.13..72.42 rows=8 width=150) (actual time=0.055..0.157 rows=8 loops=1)
+  Buffers: shared hit=117 dirtied=1 written=1
+  CTE claimed
+    ->  Limit  (cost=0.42..4.70 rows=8 width=59) (actual time=0.039..0.042 rows=8 loops=1)
+          Buffers: shared hit=15
+          ->  LockRows  (cost=0.42..265777.26 rows=497062 width=59) (actual time=0.039..0.042 rows=8 loops=1)
+                Buffers: shared hit=15
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..260806.64 rows=497062 width=59) (actual time=0.039..0.041 rows=8 loops=1)
+                      Index Cond: ((scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (queue = ANY ('{q0,q1,q2}'::text[])) AND (executor_class = ANY ('{loadtest,""}'::text[])))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                      Buffers: shared hit=7
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=0.045..0.087 rows=8 loops=1)
+        Buffers: shared hit=47
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=0.040..0.044 rows=8 loops=1)
+              Buffers: shared hit=15
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.005..0.005 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.069 ms
+Execution Time: 0.161 ms
+
+--- B/P1/V3 ---
+Update on jobs  (cost=88096.07..88163.36 rows=8 width=150) (actual time=314.062..314.186 rows=8 loops=1)
+  Buffers: shared hit=10961 read=44720 dirtied=1 written=1, temp read=494 written=4420
+  CTE claimed
+    ->  Limit  (cost=88095.54..88095.64 rows=8 width=59) (actual time=314.001..314.006 rows=8 loops=1)
+          Buffers: shared hit=10859 read=44720, temp read=494 written=4420
+          ->  LockRows  (cost=88095.54..94361.65 rows=501289 width=59) (actual time=314.001..314.005 rows=8 loops=1)
+                Buffers: shared hit=10859 read=44720, temp read=494 written=4420
+                ->  Sort  (cost=88095.54..89348.76 rows=501289 width=59) (actual time=313.979..313.980 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 35264kB
+                      Buffers: shared hit=10851 read=44720, temp read=494 written=4420
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..78069.76 rows=501289 width=59) (actual time=0.003..146.573 rows=500000 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:22.899-04'::timestamp with time zone) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (queue = ANY ('{q0,q1,q2}'::text[])))
+                            Rows Removed by Filter: 500000
+                            Buffers: shared hit=10851 read=44720
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=314.035..314.086 rows=8 loops=1)
+        Buffers: shared hit=10891 read=44720, temp read=494 written=4420
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=314.017..314.023 rows=8 loops=1)
+              Buffers: shared hit=10859 read=44720, temp read=494 written=4420
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.007..0.007 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.105 ms
+Execution Time: 314.864 ms
+
+--- C/P0/V- ---
+Update on jobs  (cost=80943.50..81010.80 rows=8 width=150) (actual time=217.986..218.080 rows=8 loops=1)
+  Buffers: shared hit=16422 read=39246, temp read=486 written=2947
+  CTE claimed
+    ->  Limit  (cost=80942.98..80943.08 rows=8 width=59) (actual time=217.945..217.949 rows=8 loops=1)
+          Buffers: shared hit=16322 read=39246, temp read=486 written=2947
+          ->  LockRows  (cost=80942.98..85087.83 rows=331588 width=59) (actual time=217.944..217.948 rows=8 loops=1)
+                Buffers: shared hit=16322 read=39246, temp read=486 written=2947
+                ->  Sort  (cost=80942.98..81771.95 rows=331588 width=59) (actual time=217.939..217.940 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 23512kB
+                      Buffers: shared hit=16314 read=39246, temp read=486 written=2947
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..74311.22 rows=331588 width=59) (actual time=0.002..107.849 rows=333334 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:23.231-04'::timestamp with time zone) AND (queue = 'q0'::text) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Rows Removed by Filter: 666666
+                            Buffers: shared hit=16314 read=39246
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=217.962..218.004 rows=8 loops=1)
+        Buffers: shared hit=16354 read=39246, temp read=486 written=2947
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=217.949..217.953 rows=8 loops=1)
+              Buffers: shared hit=16322 read=39246, temp read=486 written=2947
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.103 ms
+Execution Time: 221.145 ms
+
+--- C/P0/V0 ---
+Update on jobs  (cost=79624.28..79691.58 rows=8 width=150) (actual time=218.301..218.403 rows=8 loops=1)
+  Buffers: shared hit=102 read=57482 dirtied=9 written=8, temp read=486 written=2947
+  CTE claimed
+    ->  Limit  (cost=79623.76..79623.86 rows=8 width=59) (actual time=218.250..218.258 rows=8 loops=1)
+          Buffers: shared hit=7 read=57476 dirtied=5 written=8, temp read=486 written=2947
+          ->  LockRows  (cost=79623.76..83790.08 rows=333306 width=59) (actual time=218.250..218.258 rows=8 loops=1)
+                Buffers: shared hit=7 read=57476 dirtied=5 written=8, temp read=486 written=2947
+                ->  Sort  (cost=79623.76..80457.02 rows=333306 width=59) (actual time=218.242..218.243 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 23512kB
+                      Buffers: shared hit=4 read=57471 written=8, temp read=486 written=2947
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=11145.15..72957.64 rows=333306 width=59) (actual time=17.504..105.514 rows=333334 loops=1)
+                            Recheck Cond: ((queue = 'q0'::text) AND (scheduled_at <= '2026-07-27 14:39:23.231-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Filter: (deleted_at IS NULL)
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=4 read=57471 written=8
+                            ->  Bitmap Index Scan on jobs_ready  (cost=0.00..11061.82 rows=333306 width=0) (actual time=13.508..13.508 rows=333334 loops=1)
+                                  Index Cond: ((queue = 'q0'::text) AND (scheduled_at <= '2026-07-27 14:39:23.231-04'::timestamp with time zone))
+                                  Buffers: shared read=1919
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=218.271..218.317 rows=8 loops=1)
+        Buffers: shared hit=36 read=57479 dirtied=5 written=8, temp read=486 written=2947
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=218.254..218.263 rows=8 loops=1)
+              Buffers: shared hit=7 read=57476 dirtied=5 written=8, temp read=486 written=2947
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=29 read=3
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.120 ms
+Execution Time: 219.635 ms
+
+--- C/P0/V1 ---
+Update on jobs  (cost=79364.23..79431.52 rows=8 width=150) (actual time=215.639..215.742 rows=8 loops=1)
+  Buffers: shared hit=102 read=57482 dirtied=9 written=8, temp read=486 written=2947
+  CTE claimed
+    ->  Limit  (cost=79363.70..79363.80 rows=8 width=59) (actual time=215.589..215.598 rows=8 loops=1)
+          Buffers: shared hit=7 read=57476 dirtied=5 written=8, temp read=486 written=2947
+          ->  LockRows  (cost=79363.70..83484.35 rows=329652 width=59) (actual time=215.589..215.597 rows=8 loops=1)
+                Buffers: shared hit=7 read=57476 dirtied=5 written=8, temp read=486 written=2947
+                ->  Sort  (cost=79363.70..80187.83 rows=329652 width=59) (actual time=215.579..215.580 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 23512kB
+                      Buffers: shared hit=4 read=57471 written=8, temp read=486 written=2947
+                      ->  Bitmap Heap Scan on jobs jobs_1  (cost=11023.69..72770.66 rows=329652 width=59) (actual time=17.612..103.133 rows=333334 loops=1)
+                            Recheck Cond: ((queue = 'q0'::text) AND (scheduled_at <= '2026-07-27 14:39:23.231-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL))
+                            Heap Blocks: exact=55556
+                            Buffers: shared hit=4 read=57471 written=8
+                            ->  Bitmap Index Scan on jobs_ready  (cost=0.00..10941.27 rows=329652 width=0) (actual time=13.601..13.601 rows=333334 loops=1)
+                                  Index Cond: ((queue = 'q0'::text) AND (scheduled_at <= '2026-07-27 14:39:23.231-04'::timestamp with time zone))
+                                  Buffers: shared read=1919
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=215.610..215.657 rows=8 loops=1)
+        Buffers: shared hit=36 read=57479 dirtied=5 written=8, temp read=486 written=2947
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=215.593..215.603 rows=8 loops=1)
+              Buffers: shared hit=7 read=57476 dirtied=5 written=8, temp read=486 written=2947
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=29 read=3
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.117 ms
+Execution Time: 217.005 ms
+
+--- C/P0/V2 ---
+Update on jobs  (cost=7.09..74.38 rows=8 width=150) (actual time=0.021..0.116 rows=8 loops=1)
+  Buffers: shared hit=117 dirtied=1
+  CTE claimed
+    ->  Limit  (cost=0.42..6.66 rows=8 width=59) (actual time=0.005..0.009 rows=8 loops=1)
+          Buffers: shared hit=16 dirtied=1
+          ->  LockRows  (cost=0.42..259184.30 rows=332325 width=59) (actual time=0.005..0.008 rows=8 loops=1)
+                Buffers: shared hit=16 dirtied=1
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..255861.05 rows=332325 width=59) (actual time=0.005..0.007 rows=8 loops=1)
+                      Index Cond: ((scheduled_at <= '2026-07-27 14:39:23.231-04'::timestamp with time zone) AND (queue = 'q0'::text))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                      Buffers: shared hit=8
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=0.011..0.052 rows=8 loops=1)
+        Buffers: shared hit=48 dirtied=1
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=0.005..0.010 rows=8 loops=1)
+              Buffers: shared hit=16 dirtied=1
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.005..0.005 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.065 ms
+Execution Time: 0.121 ms
+
+--- C/P0/V3 ---
+Update on jobs  (cost=6.36..73.65 rows=8 width=150) (actual time=0.029..0.124 rows=8 loops=1)
+  Buffers: shared hit=117
+  CTE claimed
+    ->  Limit  (cost=0.42..5.93 rows=8 width=59) (actual time=0.010..0.015 rows=8 loops=1)
+          Buffers: shared hit=16
+          ->  LockRows  (cost=0.42..227810.81 rows=330821 width=59) (actual time=0.010..0.014 rows=8 loops=1)
+                Buffers: shared hit=16
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..224502.60 rows=330821 width=59) (actual time=0.009..0.012 rows=8 loops=1)
+                      Index Cond: ((queue = 'q0'::text) AND (scheduled_at <= '2026-07-27 14:39:23.231-04'::timestamp with time zone))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                      Buffers: shared hit=8
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=0.017..0.059 rows=8 loops=1)
+        Buffers: shared hit=48
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=0.011..0.017 rows=8 loops=1)
+              Buffers: shared hit=16
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.005..0.005 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.117 ms
+Execution Time: 0.133 ms
+
+--- D/P0/V- ---
+Update on jobs  (cost=89635.49..89702.78 rows=8 width=150) (actual time=542.281..542.460 rows=8 loops=1)
+  Buffers: shared hit=16433 read=39238 dirtied=1 written=2, temp read=9307 written=17648
+  CTE claimed
+    ->  Limit  (cost=89634.96..89635.06 rows=8 width=59) (actual time=542.232..542.237 rows=8 loops=1)
+          Buffers: shared hit=16332 read=39236, temp read=9307 written=17648
+          ->  LockRows  (cost=89634.96..98431.00 rows=703683 width=59) (actual time=542.232..542.236 rows=8 loops=1)
+                Buffers: shared hit=16332 read=39236, temp read=9307 written=17648
+                ->  Sort  (cost=89634.96..91394.17 rows=703683 width=59) (actual time=542.224..542.225 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 70520kB
+                      Buffers: shared hit=16324 read=39236, temp read=9307 written=17648
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..75561.30 rows=703683 width=59) (actual time=0.002..152.129 rows=1000000 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:23.449-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (queue = ANY ('{q0,q1,q2}'::text[])))
+                            Buffers: shared hit=16324 read=39236
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=542.254..542.298 rows=8 loops=1)
+        Buffers: shared hit=16364 read=39236, temp read=9307 written=17648
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=542.238..542.244 rows=8 loops=1)
+              Buffers: shared hit=16332 read=39236, temp read=9307 written=17648
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.102 ms
+Execution Time: 553.939 ms
+
+--- D/P0/V0 ---
+Update on jobs  (cost=89636.85..89704.14 rows=8 width=150) (actual time=548.960..549.134 rows=8 loops=1)
+  Buffers: shared hit=16450 read=39224 dirtied=3 written=1, temp read=9307 written=17648
+  CTE claimed
+    ->  Limit  (cost=89636.32..89636.42 rows=8 width=59) (actual time=548.917..548.923 rows=8 loops=1)
+          Buffers: shared hit=16349 read=39222 dirtied=1, temp read=9307 written=17648
+          ->  LockRows  (cost=89636.32..98431.91 rows=703647 width=59) (actual time=548.916..548.922 rows=8 loops=1)
+                Buffers: shared hit=16349 read=39222 dirtied=1, temp read=9307 written=17648
+                ->  Sort  (cost=89636.32..91395.44 rows=703647 width=59) (actual time=548.909..548.911 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 70520kB
+                      Buffers: shared hit=16342 read=39221, temp read=9307 written=17648
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..75563.38 rows=703647 width=59) (actual time=0.003..152.755 rows=1000000 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:23.449-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (queue = ANY ('{q0,q1,q2}'::text[])))
+                            Buffers: shared hit=16342 read=39221
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=548.936..548.980 rows=8 loops=1)
+        Buffers: shared hit=16381 read=39222 dirtied=1, temp read=9307 written=17648
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=548.921..548.928 rows=8 loops=1)
+              Buffers: shared hit=16349 read=39222 dirtied=1, temp read=9307 written=17648
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.115 ms
+Execution Time: 560.633 ms
+
+--- D/P0/V1 ---
+Update on jobs  (cost=89641.35..89708.64 rows=8 width=150) (actual time=554.842..555.023 rows=8 loops=1)
+  Buffers: shared hit=16450 read=39227 dirtied=3 written=1, temp read=9307 written=17648
+  CTE claimed
+    ->  Limit  (cost=89640.82..89640.92 rows=8 width=59) (actual time=554.800..554.863 rows=8 loops=1)
+          Buffers: shared hit=16349 read=39225 dirtied=1, temp read=9307 written=17648
+          ->  LockRows  (cost=89640.82..98436.90 rows=703686 width=59) (actual time=554.800..554.862 rows=8 loops=1)
+                Buffers: shared hit=16349 read=39225 dirtied=1, temp read=9307 written=17648
+                ->  Sort  (cost=89640.82..91400.04 rows=703686 width=59) (actual time=554.794..554.795 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 70520kB
+                      Buffers: shared hit=16342 read=39224, temp read=9307 written=17648
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..75567.10 rows=703686 width=59) (actual time=0.003..154.456 rows=1000000 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:23.449-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (queue = ANY ('{q0,q1,q2}'::text[])))
+                            Buffers: shared hit=16342 read=39224
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=554.818..554.919 rows=8 loops=1)
+        Buffers: shared hit=16381 read=39225 dirtied=1, temp read=9307 written=17648
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=554.804..554.868 rows=8 loops=1)
+              Buffers: shared hit=16349 read=39225 dirtied=1, temp read=9307 written=17648
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=10 read=6
+Planning Time: 0.114 ms
+Execution Time: 566.534 ms
+
+--- D/P0/V2 ---
+Update on jobs  (cost=3.06..70.35 rows=8 width=150) (actual time=0.030..0.129 rows=8 loops=1)
+  Buffers: shared hit=117 dirtied=1 written=1
+  CTE claimed
+    ->  Limit  (cost=0.42..2.63 rows=8 width=59) (actual time=0.015..0.017 rows=8 loops=1)
+          Buffers: shared hit=14
+          ->  LockRows  (cost=0.42..275786.38 rows=999875 width=59) (actual time=0.014..0.017 rows=8 loops=1)
+                Buffers: shared hit=14
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..265787.63 rows=999875 width=59) (actual time=0.014..0.016 rows=8 loops=1)
+                      Index Cond: ((scheduled_at <= '2026-07-27 14:39:23.449-04'::timestamp with time zone) AND (queue = ANY ('{q0,q1,q2}'::text[])))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                      Buffers: shared hit=6
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=0.021..0.061 rows=8 loops=1)
+        Buffers: shared hit=46
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=0.015..0.019 rows=8 loops=1)
+              Buffers: shared hit=14
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.005..0.005 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.064 ms
+Execution Time: 0.133 ms
+
+--- D/P0/V3 ---
+Update on jobs  (cost=95569.05..95636.34 rows=8 width=150) (actual time=554.274..554.394 rows=8 loops=1)
+  Buffers: shared hit=10995 read=44688 dirtied=1 written=1, temp read=9307 written=17648
+  CTE claimed
+    ->  Limit  (cost=95568.52..95568.62 rows=8 width=59) (actual time=554.228..554.232 rows=8 loops=1)
+          Buffers: shared hit=10892 read=44688, temp read=9307 written=17648
+          ->  LockRows  (cost=95568.52..108066.81 rows=999863 width=59) (actual time=554.227..554.231 rows=8 loops=1)
+                Buffers: shared hit=10892 read=44688, temp read=9307 written=17648
+                ->  Sort  (cost=95568.52..98068.18 rows=999863 width=59) (actual time=554.220..554.221 rows=8 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: external merge  Disk: 70520kB
+                      Buffers: shared hit=10884 read=44688, temp read=9307 written=17648
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..75571.26 rows=999863 width=59) (actual time=0.002..154.821 rows=1000000 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:23.449-04'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (queue = ANY ('{q0,q1,q2}'::text[])))
+                            Buffers: shared hit=10884 read=44688
+  ->  Nested Loop  (cost=0.42..67.72 rows=8 width=150) (actual time=554.248..554.290 rows=8 loops=1)
+        Buffers: shared hit=10924 read=44688, temp read=9307 written=17648
+        ->  CTE Scan on claimed  (cost=0.00..0.16 rows=8 width=88) (actual time=554.232..554.237 rows=8 loops=1)
+              Buffers: shared hit=10892 read=44688, temp read=9307 written=17648
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (actual time=0.006..0.006 rows=1 loops=8)
+              Index Cond: (id = claimed.id)
+              Buffers: shared hit=32
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.072 ms
+Execution Time: 565.979 ms
+
+--- E/P0/V- ---
+Update on jobs  (cost=79313.42..79321.46 rows=1 width=150) (actual time=100.893..100.894 rows=0 loops=1)
+  Buffers: shared hit=16338 read=39223
+  CTE claimed
+    ->  Limit  (cost=79312.98..79313.00 rows=1 width=59) (actual time=100.892..100.892 rows=0 loops=1)
+          Buffers: shared hit=16338 read=39223
+          ->  LockRows  (cost=79312.98..79313.00 rows=1 width=59) (actual time=100.891..100.891 rows=0 loops=1)
+                Buffers: shared hit=16338 read=39223
+                ->  Sort  (cost=79312.98..79312.99 rows=1 width=59) (actual time=100.891..100.891 rows=0 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: quicksort  Memory: 25kB
+                      Buffers: shared hit=16338 read=39223
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..79312.97 rows=1 width=59) (actual time=100.889..100.889 rows=0 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:23.99-04'::timestamp with time zone) AND (queue = 'q-idle'::text) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                            Rows Removed by Filter: 1000000
+                            Buffers: shared hit=16338 read=39223
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=100.892..100.893 rows=0 loops=1)
+        Buffers: shared hit=16338 read=39223
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=100.892..100.892 rows=0 loops=1)
+              Buffers: shared hit=16338 read=39223
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.111 ms
+Execution Time: 100.906 ms
+
+--- E/P0/V0 ---
+Update on jobs  (cost=8.64..16.68 rows=1 width=150) (actual time=0.011..0.012 rows=0 loops=1)
+  Buffers: shared read=3
+  CTE claimed
+    ->  Limit  (cost=8.20..8.22 rows=1 width=59) (actual time=0.011..0.011 rows=0 loops=1)
+          Buffers: shared read=3
+          ->  LockRows  (cost=8.20..8.22 rows=1 width=59) (actual time=0.011..0.011 rows=0 loops=1)
+                Buffers: shared read=3
+                ->  Sort  (cost=8.20..8.21 rows=1 width=59) (actual time=0.011..0.011 rows=0 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: quicksort  Memory: 25kB
+                      Buffers: shared read=3
+                      ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..8.19 rows=1 width=59) (actual time=0.010..0.010 rows=0 loops=1)
+                            Index Cond: ((queue = 'q-idle'::text) AND (scheduled_at <= '2026-07-27 14:39:23.99-04'::timestamp with time zone))
+                            Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                            Buffers: shared read=3
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=0.011..0.011 rows=0 loops=1)
+        Buffers: shared read=3
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=0.011..0.011 rows=0 loops=1)
+              Buffers: shared read=3
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.117 ms
+Execution Time: 0.019 ms
+
+--- E/P0/V1 ---
+Update on jobs  (cost=8.66..16.70 rows=1 width=150) (actual time=0.011..0.011 rows=0 loops=1)
+  Buffers: shared read=3
+  CTE claimed
+    ->  Limit  (cost=8.22..8.24 rows=1 width=59) (actual time=0.011..0.011 rows=0 loops=1)
+          Buffers: shared read=3
+          ->  LockRows  (cost=8.22..8.24 rows=1 width=59) (actual time=0.011..0.011 rows=0 loops=1)
+                Buffers: shared read=3
+                ->  Sort  (cost=8.22..8.23 rows=1 width=59) (actual time=0.011..0.011 rows=0 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: quicksort  Memory: 25kB
+                      Buffers: shared read=3
+                      ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..8.21 rows=1 width=59) (actual time=0.009..0.009 rows=0 loops=1)
+                            Index Cond: ((queue = 'q-idle'::text) AND (scheduled_at <= '2026-07-27 14:39:23.99-04'::timestamp with time zone))
+                            Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                            Buffers: shared read=3
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=0.011..0.011 rows=0 loops=1)
+        Buffers: shared read=3
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=0.011..0.011 rows=0 loops=1)
+              Buffers: shared read=3
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.119 ms
+Execution Time: 0.020 ms
+
+--- E/P0/V2 ---
+Update on jobs  (cost=33128.19..33136.23 rows=1 width=150) (actual time=21.391..21.392 rows=0 loops=1)
+  Buffers: shared hit=3 read=5749
+  CTE claimed
+    ->  Limit  (cost=0.42..33127.76 rows=1 width=59) (actual time=21.390..21.390 rows=0 loops=1)
+          Buffers: shared hit=3 read=5749
+          ->  LockRows  (cost=0.42..33127.76 rows=1 width=59) (actual time=21.390..21.390 rows=0 loops=1)
+                Buffers: shared hit=3 read=5749
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..33127.75 rows=1 width=59) (actual time=21.390..21.390 rows=0 loops=1)
+                      Index Cond: ((scheduled_at <= '2026-07-27 14:39:23.99-04'::timestamp with time zone) AND (queue = 'q-idle'::text))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                      Buffers: shared hit=3 read=5749
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=21.391..21.391 rows=0 loops=1)
+        Buffers: shared hit=3 read=5749
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=21.391..21.391 rows=0 loops=1)
+              Buffers: shared hit=3 read=5749
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.073 ms
+Execution Time: 21.398 ms
+
+--- E/P0/V3 ---
+Update on jobs  (cost=8.65..16.69 rows=1 width=150) (actual time=0.006..0.007 rows=0 loops=1)
+  Buffers: shared hit=3
+  CTE claimed
+    ->  Limit  (cost=0.42..8.22 rows=1 width=59) (actual time=0.006..0.006 rows=0 loops=1)
+          Buffers: shared hit=3
+          ->  LockRows  (cost=0.42..8.22 rows=1 width=59) (actual time=0.006..0.006 rows=0 loops=1)
+                Buffers: shared hit=3
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..8.21 rows=1 width=59) (actual time=0.006..0.006 rows=0 loops=1)
+                      Index Cond: ((queue = 'q-idle'::text) AND (scheduled_at <= '2026-07-27 14:39:23.99-04'::timestamp with time zone))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                      Buffers: shared hit=3
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=0.006..0.006 rows=0 loops=1)
+        Buffers: shared hit=3
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=0.006..0.006 rows=0 loops=1)
+              Buffers: shared hit=3
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.114 ms
+Execution Time: 0.014 ms
+
+--- E/P1/V- ---
+Update on jobs  (cost=76813.21..76821.25 rows=1 width=150) (actual time=112.981..112.982 rows=0 loops=1)
+  Buffers: shared hit=16340 read=39221 written=1
+  CTE claimed
+    ->  Limit  (cost=76812.77..76812.79 rows=1 width=59) (actual time=112.980..112.981 rows=0 loops=1)
+          Buffers: shared hit=16340 read=39221 written=1
+          ->  LockRows  (cost=76812.77..76812.79 rows=1 width=59) (actual time=112.980..112.980 rows=0 loops=1)
+                Buffers: shared hit=16340 read=39221 written=1
+                ->  Sort  (cost=76812.77..76812.78 rows=1 width=59) (actual time=112.980..112.980 rows=0 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: quicksort  Memory: 25kB
+                      Buffers: shared hit=16340 read=39221 written=1
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..76812.76 rows=1 width=59) (actual time=112.978..112.978 rows=0 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:23.99-04'::timestamp with time zone) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (queue = 'q-idle'::text) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Rows Removed by Filter: 1000000
+                            Buffers: shared hit=16340 read=39221 written=1
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=112.981..112.981 rows=0 loops=1)
+        Buffers: shared hit=16340 read=39221 written=1
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=112.981..112.981 rows=0 loops=1)
+              Buffers: shared hit=16340 read=39221 written=1
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.110 ms
+Execution Time: 112.993 ms
+
+--- E/P1/V0 ---
+Update on jobs  (cost=13.08..21.12 rows=1 width=150) (actual time=0.005..0.005 rows=0 loops=1)
+  Buffers: shared hit=3
+  CTE claimed
+    ->  Limit  (cost=12.64..12.65 rows=1 width=59) (actual time=0.005..0.005 rows=0 loops=1)
+          Buffers: shared hit=3
+          ->  LockRows  (cost=12.64..12.65 rows=1 width=59) (actual time=0.005..0.005 rows=0 loops=1)
+                Buffers: shared hit=3
+                ->  Sort  (cost=12.64..12.64 rows=1 width=59) (actual time=0.004..0.005 rows=0 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: quicksort  Memory: 25kB
+                      Buffers: shared hit=3
+                      ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..12.63 rows=1 width=59) (actual time=0.004..0.004 rows=0 loops=1)
+                            Index Cond: ((queue = 'q-idle'::text) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:23.99-04'::timestamp with time zone))
+                            Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Buffers: shared hit=3
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=0.005..0.005 rows=0 loops=1)
+        Buffers: shared hit=3
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=0.005..0.005 rows=0 loops=1)
+              Buffers: shared hit=3
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.072 ms
+Execution Time: 0.010 ms
+
+--- E/P1/V1 ---
+Update on jobs  (cost=13.10..21.14 rows=1 width=150) (actual time=0.005..0.005 rows=0 loops=1)
+  Buffers: shared hit=3
+  CTE claimed
+    ->  Limit  (cost=12.66..12.67 rows=1 width=59) (actual time=0.004..0.004 rows=0 loops=1)
+          Buffers: shared hit=3
+          ->  LockRows  (cost=12.66..12.67 rows=1 width=59) (actual time=0.004..0.004 rows=0 loops=1)
+                Buffers: shared hit=3
+                ->  Sort  (cost=12.66..12.66 rows=1 width=59) (actual time=0.004..0.004 rows=0 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: quicksort  Memory: 25kB
+                      Buffers: shared hit=3
+                      ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..12.65 rows=1 width=59) (actual time=0.004..0.004 rows=0 loops=1)
+                            Index Cond: ((queue = 'q-idle'::text) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (scheduled_at <= '2026-07-27 14:39:23.99-04'::timestamp with time zone))
+                            Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Buffers: shared hit=3
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=0.004..0.005 rows=0 loops=1)
+        Buffers: shared hit=3
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=0.004..0.004 rows=0 loops=1)
+              Buffers: shared hit=3
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.070 ms
+Execution Time: 0.010 ms
+
+--- E/P1/V2 ---
+Update on jobs  (cost=35628.03..35636.07 rows=1 width=150) (actual time=17.807..17.807 rows=0 loops=1)
+  Buffers: shared hit=5752
+  CTE claimed
+    ->  Limit  (cost=0.42..35627.61 rows=1 width=59) (actual time=17.806..17.806 rows=0 loops=1)
+          Buffers: shared hit=5752
+          ->  LockRows  (cost=0.42..35627.61 rows=1 width=59) (actual time=17.806..17.806 rows=0 loops=1)
+                Buffers: shared hit=5752
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..35627.60 rows=1 width=59) (actual time=17.806..17.806 rows=0 loops=1)
+                      Index Cond: ((scheduled_at <= '2026-07-27 14:39:23.99-04'::timestamp with time zone) AND (queue = 'q-idle'::text) AND (executor_class = ANY ('{loadtest,""}'::text[])))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                      Buffers: shared hit=5752
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=17.807..17.807 rows=0 loops=1)
+        Buffers: shared hit=5752
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=17.806..17.806 rows=0 loops=1)
+              Buffers: shared hit=5752
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.098 ms
+Execution Time: 17.815 ms
+
+--- E/P1/V3 ---
+Update on jobs  (cost=8.65..16.69 rows=1 width=150) (actual time=0.003..0.003 rows=0 loops=1)
+  Buffers: shared hit=3
+  CTE claimed
+    ->  Limit  (cost=0.42..8.22 rows=1 width=59) (actual time=0.003..0.003 rows=0 loops=1)
+          Buffers: shared hit=3
+          ->  LockRows  (cost=0.42..8.22 rows=1 width=59) (actual time=0.003..0.003 rows=0 loops=1)
+                Buffers: shared hit=3
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..8.21 rows=1 width=59) (actual time=0.003..0.003 rows=0 loops=1)
+                      Index Cond: ((queue = 'q-idle'::text) AND (scheduled_at <= '2026-07-27 14:39:23.99-04'::timestamp with time zone))
+                      Filter: ((deleted_at IS NULL) AND (executor_class = ANY ('{loadtest,""}'::text[])) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                      Buffers: shared hit=3
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=0.003..0.003 rows=0 loops=1)
+        Buffers: shared hit=3
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=0.003..0.003 rows=0 loops=1)
+              Buffers: shared hit=3
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.071 ms
+Execution Time: 0.008 ms
+
+--- F/P0/V- ---
+Update on jobs  (cost=74313.01..74321.05 rows=1 width=150) (actual time=93.508..93.509 rows=0 loops=1)
+  Buffers: shared hit=16342 read=39219 written=2
+  CTE claimed
+    ->  Limit  (cost=74312.57..74312.58 rows=1 width=59) (actual time=93.506..93.507 rows=0 loops=1)
+          Buffers: shared hit=16342 read=39219 written=2
+          ->  LockRows  (cost=74312.57..74312.58 rows=1 width=59) (actual time=93.506..93.506 rows=0 loops=1)
+                Buffers: shared hit=16342 read=39219 written=2
+                ->  Sort  (cost=74312.57..74312.57 rows=1 width=59) (actual time=93.505..93.506 rows=0 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: quicksort  Memory: 25kB
+                      Buffers: shared hit=16342 read=39219 written=2
+                      ->  Seq Scan on jobs jobs_1  (cost=0.00..74312.56 rows=1 width=59) (actual time=93.504..93.504 rows=0 loops=1)
+                            Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2026-07-27 14:39:23.991-04'::timestamp with time zone) AND (queue = 'q-idle'::text) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Rows Removed by Filter: 1000000
+                            Buffers: shared hit=16342 read=39219 written=2
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=93.507..93.507 rows=0 loops=1)
+        Buffers: shared hit=16342 read=39219 written=2
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=93.507..93.507 rows=0 loops=1)
+              Buffers: shared hit=16342 read=39219 written=2
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.098 ms
+Execution Time: 93.520 ms
+
+--- F/P0/V0 ---
+Update on jobs  (cost=8.64..16.68 rows=1 width=150) (actual time=0.008..0.008 rows=0 loops=1)
+  Buffers: shared hit=3
+  CTE claimed
+    ->  Limit  (cost=8.20..8.21 rows=1 width=59) (actual time=0.007..0.008 rows=0 loops=1)
+          Buffers: shared hit=3
+          ->  LockRows  (cost=8.20..8.21 rows=1 width=59) (actual time=0.007..0.008 rows=0 loops=1)
+                Buffers: shared hit=3
+                ->  Sort  (cost=8.20..8.20 rows=1 width=59) (actual time=0.007..0.007 rows=0 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: quicksort  Memory: 25kB
+                      Buffers: shared hit=3
+                      ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..8.19 rows=1 width=59) (actual time=0.007..0.007 rows=0 loops=1)
+                            Index Cond: ((queue = 'q-idle'::text) AND (scheduled_at <= '2026-07-27 14:39:23.991-04'::timestamp with time zone))
+                            Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Buffers: shared hit=3
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=0.008..0.008 rows=0 loops=1)
+        Buffers: shared hit=3
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=0.008..0.008 rows=0 loops=1)
+              Buffers: shared hit=3
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.063 ms
+Execution Time: 0.012 ms
+
+--- F/P0/V1 ---
+Update on jobs  (cost=8.66..16.70 rows=1 width=150) (actual time=0.003..0.003 rows=0 loops=1)
+  Buffers: shared hit=3
+  CTE claimed
+    ->  Limit  (cost=8.22..8.23 rows=1 width=59) (actual time=0.003..0.003 rows=0 loops=1)
+          Buffers: shared hit=3
+          ->  LockRows  (cost=8.22..8.23 rows=1 width=59) (actual time=0.003..0.003 rows=0 loops=1)
+                Buffers: shared hit=3
+                ->  Sort  (cost=8.22..8.22 rows=1 width=59) (actual time=0.003..0.003 rows=0 loops=1)
+                      Sort Key: jobs_1.priority, jobs_1.scheduled_at
+                      Sort Method: quicksort  Memory: 25kB
+                      Buffers: shared hit=3
+                      ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..8.21 rows=1 width=59) (actual time=0.003..0.003 rows=0 loops=1)
+                            Index Cond: ((queue = 'q-idle'::text) AND (scheduled_at <= '2026-07-27 14:39:23.991-04'::timestamp with time zone))
+                            Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                            Buffers: shared hit=3
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=0.003..0.003 rows=0 loops=1)
+        Buffers: shared hit=3
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=0.003..0.003 rows=0 loops=1)
+              Buffers: shared hit=3
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.063 ms
+Execution Time: 0.008 ms
+
+--- F/P0/V2 ---
+Update on jobs  (cost=33128.18..33136.22 rows=1 width=150) (actual time=16.557..16.557 rows=0 loops=1)
+  Buffers: shared hit=5752
+  CTE claimed
+    ->  Limit  (cost=0.42..33127.76 rows=1 width=59) (actual time=16.557..16.557 rows=0 loops=1)
+          Buffers: shared hit=5752
+          ->  LockRows  (cost=0.42..33127.76 rows=1 width=59) (actual time=16.556..16.557 rows=0 loops=1)
+                Buffers: shared hit=5752
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..33127.75 rows=1 width=59) (actual time=16.556..16.556 rows=0 loops=1)
+                      Index Cond: ((scheduled_at <= '2026-07-27 14:39:23.991-04'::timestamp with time zone) AND (queue = 'q-idle'::text))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                      Buffers: shared hit=5752
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=16.557..16.557 rows=0 loops=1)
+        Buffers: shared hit=5752
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=16.557..16.557 rows=0 loops=1)
+              Buffers: shared hit=5752
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.083 ms
+Execution Time: 16.564 ms
+
+--- F/P0/V3 ---
+Update on jobs  (cost=8.64..16.68 rows=1 width=150) (actual time=0.003..0.003 rows=0 loops=1)
+  Buffers: shared hit=3
+  CTE claimed
+    ->  Limit  (cost=0.42..8.22 rows=1 width=59) (actual time=0.003..0.003 rows=0 loops=1)
+          Buffers: shared hit=3
+          ->  LockRows  (cost=0.42..8.22 rows=1 width=59) (actual time=0.003..0.003 rows=0 loops=1)
+                Buffers: shared hit=3
+                ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..8.21 rows=1 width=59) (actual time=0.003..0.003 rows=0 loops=1)
+                      Index Cond: ((queue = 'q-idle'::text) AND (scheduled_at <= '2026-07-27 14:39:23.991-04'::timestamp with time zone))
+                      Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])))
+                      Buffers: shared hit=3
+  ->  Nested Loop  (cost=0.42..8.47 rows=1 width=150) (actual time=0.003..0.003 rows=0 loops=1)
+        Buffers: shared hit=3
+        ->  CTE Scan on claimed  (cost=0.00..0.02 rows=1 width=88) (actual time=0.003..0.003 rows=0 loops=1)
+              Buffers: shared hit=3
+        ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.44 rows=1 width=51) (never executed)
+              Index Cond: (id = claimed.id)
+Planning:
+  Buffers: shared hit=16
+Planning Time: 0.063 ms
+Execution Time: 0.007 ms
