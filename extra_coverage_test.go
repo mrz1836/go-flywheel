@@ -692,27 +692,34 @@ func TestEnqueueBucketSurfacesInsertError(t *testing.T) {
 // --- runner.go RunUntilIdle error branches ----------------------------------
 
 // TestRunUntilIdleSurfacesPollError proves RunUntilIdle returns the error from a
-// failing pollOnce.
+// failing claim. A poll failure is now retried on the backoff ladder rather than
+// returned on sight, so this asserts the give-up: the ladder is tightened to
+// 1 ms / 4 ms so it saturates in three attempts instead of the ~51 s the shipped
+// defaults take.
 func TestRunUntilIdleSurfacesPollError(t *testing.T) {
 	t.Parallel()
 	fd := &fakeDriver{dequeueErr: errors.New("dequeue boom")}
 	r := newFakeRunner(t, fd, 1)
+	tightenPollLadder(r)
 
 	err := r.RunUntilIdle(context.Background())
-	require.ErrorContains(t, err, "dequeue boom", "a poll failure stops the drain loop")
+	require.ErrorContains(t, err, "dequeue boom", "a persistent poll failure stops the drain loop")
 }
 
 // TestRunUntilIdleSurfacesPendingCountError proves RunUntilIdle returns the error
 // from a failing pendingCount once the queue has nothing claimable. The fake
 // driver claims nothing, and the runner's own DB is closed so pendingCount fails.
+// The count hits the same database the claim does, so it takes the same ladder —
+// tightened here for the same reason.
 func TestRunUntilIdleSurfacesPendingCountError(t *testing.T) {
 	t.Parallel()
 	fd := &fakeDriver{} // serves an empty batch, claims nothing
 	r := newFakeRunner(t, fd, 1)
+	tightenPollLadder(r)
 	closeDB(t, r.cfg.DB)
 
 	err := r.RunUntilIdle(context.Background())
-	require.Error(t, err, "a pendingCount failure stops the drain loop")
+	require.Error(t, err, "a persistently failing pendingCount stops the drain loop")
 }
 
 // TestRunUntilIdleStopsWhenContextCancelledDuringWait proves RunUntilIdle returns

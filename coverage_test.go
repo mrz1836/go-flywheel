@@ -221,6 +221,10 @@ type fakeDriver struct {
 	// assertions rather than readings of the code.
 	limits   []int
 	dequeues int
+	// dequeueFailures, when positive alongside dequeueErr, makes the outage
+	// transient: that many leading claims fail and then the driver recovers. It
+	// is how a test drives a blip and its recovery rather than a permanent fault.
+	dequeueFailures int
 }
 
 func (f *fakeDriver) Dequeue(
@@ -231,7 +235,14 @@ func (f *fakeDriver) Dequeue(
 	f.dequeues++
 	f.limits = append(f.limits, limit)
 	if f.dequeueErr != nil {
-		return nil, f.dequeueErr
+		err := f.dequeueErr
+		if f.dequeueFailures > 0 {
+			f.dequeueFailures--
+			if f.dequeueFailures == 0 {
+				f.dequeueErr = nil // the outage is over
+			}
+		}
+		return nil, err
 	}
 	if f.served {
 		return nil, nil
