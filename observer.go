@@ -31,9 +31,22 @@ import (
 //
 // OnFinish fires only when the finalize succeeded. A finalize that errored
 // persisted nothing, so there is no outcome to report and neither event fires.
+//
+// # What is and is not ordered
+//
+// Per job the order is fixed: OnClaim for its batch, then OnStart, then OnFinish
+// or OnSupersede, then OnRetry if it will run again.
+//
+// Across batches at Concurrency greater than 1 there is no order at all. The
+// Runner claims to fill its free slots rather than waiting for a whole batch, so
+// batch k+1's OnClaim can fire before batch k's last OnFinish. An observer that
+// aggregates — counters, histograms, spans keyed on the job — is unaffected; one
+// that assumes a batch is closed before the next opens is not, and never had that
+// guarantee at any concurrency above 1.
 type Observer interface {
 	// OnClaim fires once per non-empty claimed batch, after Dequeue and before
-	// any dispatch.
+	// any dispatch from that batch. It does not imply the previous batch has
+	// finished — see the ordering note on Observer.
 	OnClaim(ctx context.Context, ev ClaimEvent)
 	// OnStart fires immediately before a worker's Work runs.
 	OnStart(ctx context.Context, ev JobEvent)
