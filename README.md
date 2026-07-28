@@ -262,6 +262,7 @@ against one database.
 |---|---|---|
 | Who creates the three tables? | `Migrate(db)` | your loader, from `Models()` |
 | Who creates the indexes? | `Migrate(db)` | you, from `IndexSet(dialect)` / `InstallIndexes` |
+| Who sets the storage parameters? | `Migrate(db)` | you, from `InstallStorageParameters` |
 | Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
 | Does the runtime run DDL at startup? | yes, every start | no |
 | Is a co-located host schema safe? | only if the host's tooling excludes the three tables | yes — the tables are in your loader |
@@ -281,9 +282,9 @@ if err := flywheel.Migrate(db); err != nil { // db is a *gorm.DB
 }
 ```
 
-`Migrate` runs `AutoMigrate` over the row structs and then applies the partial/unique indexes GORM
-cannot express from struct tags. It is idempotent (`AutoMigrate` no-op + `CREATE INDEX IF NOT EXISTS`),
-so repeated calls are safe.
+`Migrate` runs `AutoMigrate` over the row structs, sets the `jobs` table's storage parameters, and
+applies the partial/unique indexes GORM cannot express from struct tags. It is idempotent
+(`AutoMigrate` no-op + `CREATE INDEX IF NOT EXISTS`), so repeated calls are safe.
 
 **Host-owned** — your loader creates the tables, you apply the indexes:
 
@@ -296,6 +297,9 @@ stmts, err := gormschema.New("postgres").Load(
 
 // 2. In your install/deploy path, right where you apply your migrations.
 if err := flywheel.InstallIndexes(ctx, db); err != nil {
+    return err
+}
+if err := flywheel.InstallStorageParameters(ctx, db); err != nil {
     return err
 }
 ```
@@ -731,6 +735,101 @@ node, _ := flywheel.NewNode(flywheel.NodeConfig{
 
 The [`flywheel` CLI](cmd/flywheel/README.md) turns all of this on by default and adds `flywheel status`
 for an at-a-glance report of queue health, schedules, and recent failures.
+
+</details>
+
+<br/>
+
+<details>
+<summary><strong><code>Retention and scheduler maintenance</code></strong></summary>
+<br/>
+
+The `Scheduler` runs three or four maintenance activities, each on its own goroutine and its own
+cadence: the periodic tick, the lease sweep, and — when you enable them — a retention prune and a
+queue-health heartbeat.
+
+Independence is the point. A slow retention prune must not delay the lease sweep, because the sweep is
+the only path by which work lost to a crashed process comes back. An activity also never overlaps
+itself: a tick that arrives while its predecessor is still running is skipped and logged at warn with
+a **consecutive** skip count. One skip is a slow pass; a climbing count is a cadence your deployment
+needs to widen.
+
+```go
+driver := flywheel.NewPostgresDriver(db)
+
+node, _ := flywheel.NewNode(flywheel.NodeConfig{
+    Runners: []flywheel.RunnerConfig{{DB: db, Driver: driver, Registry: reg, Queues: queues}},
+    Scheduler: &flywheel.SchedulerConfig{
+        DB:     db,
+        Client: flywheel.NewClient(db),
+        Driver: driver, // the runner's driver, not a second one
+    },
+})
+```
+
+The `Driver` is required, and it should be the **same instance** your runners hold. The lease sweep is
+a database operation like any other: if you wrap your driver for metrics or tracing, the wrapper only
+sees the sweep when it is the wrapper you passed here.
+
+### Everything is bounded
+
+Both maintenance operations work in bounded batches, one transaction per batch, looping until the
+backlog is drained. No batch size — zero, negative, or unset — produces an unbounded transaction.
+
+```go
+// Tune the batches when the defaults do not fit your deployment.
+driver := flywheel.NewPostgresDriverWithOptions(db, flywheel.DriverOpts{SweepBatchSize: 2000})
+
+cfg := flywheel.SchedulerConfig{
+    RetentionBatchSize:  500,
+    RetentionMaxBatches: 20, // cap one pass's total work
+}
+```
+
+`RetentionMaxBatches` bounds how much a single scheduled prune does, which makes its duty cycle
+predictable when the backlog is months deep. The sweep has no equivalent ceiling on purpose: an
+unpruned row is only storage, while an unreclaimed lease is stalled work.
+
+A cancelled pass reports the rows it committed alongside the context error — the completed batches are
+not rolled back — so treat a non-nil error as "partial progress", not "nothing happened".
+
+### Retention
+
+Retention is **off by default**. `jobs` and `job_runs` otherwise grow forever: one row per job plus one
+per attempt, so a daemon at 1,000 jobs/day with 1.1 attempts/job accumulates roughly 800k rows a year.
+
+It is off rather than on because the runtime cannot know whether you treat `job_runs` as an audit
+record of record. Turn it on deliberately:
+
+```go
+cfg := flywheel.SchedulerConfig{
+    RetentionMaxAge:   30 * 24 * time.Hour,
+    RetentionInterval: time.Hour,
+}
+```
+
+**Choosing a window.** Longer than the longest question you ask of the audit trail. Thirty to ninety
+days suits most deployments; if you answer "what happened to this job last quarter", you need a
+quarter.
+
+**Before you enable it.** Run one bounded pass by hand and look at what it removes:
+
+```go
+deleted, err := flywheel.DeleteFinishedJobsWithOptions(ctx, db, cutoff,
+    flywheel.RetentionOpts{BatchSize: 100, MaxBatches: 1})
+```
+
+`flywheel prune --older-than 720h` does the same from the CLI.
+
+**If your schema references `job_runs`.** The library declares no foreign key between `jobs` and
+`job_runs`, but your schema may. A row of yours pointing at `job_runs.id` must be `ON DELETE SET NULL`
+— or retention has to stay off, because a prune becomes a foreign-key event in a table the runtime
+does not own. Within each batch the audit rows are deleted before their jobs, which is contractual
+rather than incidental: under an `ON DELETE CASCADE` the reverse order lets the cascade do the work
+silently.
+
+Only terminal jobs are ever removed — succeeded, cancelled, discarded, and only those finalized before
+the cutoff. Pending and running work is never touched, whatever its age.
 
 </details>
 
