@@ -4,6 +4,7 @@ package loadtest
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	flywheel "github.com/mrz1836/go-flywheel"
@@ -31,6 +32,10 @@ type timingDriver struct {
 	sweep *recorder
 	// shard is this driver's histogram shard, fixed for the run.
 	shard int
+	// reclaimed, when non-nil, accumulates what Sweep reports. Only the
+	// scheduler's driver carries one; a runner's is nil because a runner never
+	// sweeps.
+	reclaimed *atomic.Int64
 }
 
 // newTimingDriver binds a driver to one histogram shard.
@@ -38,6 +43,12 @@ func newTimingDriver(inner flywheel.Driver, t *timings, shard int) *timingDriver
 	return &timingDriver{
 		inner: inner, claim: t.claim, final: t.finalize, sweep: t.sweep, shard: shard,
 	}
+}
+
+// countingReclaims returns d with its reclaim counter wired to counter.
+func (d *timingDriver) countingReclaims(counter *atomic.Int64) *timingDriver {
+	d.reclaimed = counter
+	return d
 }
 
 // timings is the harness's three histograms, shared by every timingDriver.
@@ -122,60 +133,27 @@ func (d *timingDriver) InsertChild(
 	return d.inner.InsertChild(ctx, tx, fu, parentID)
 }
 
-// Sweep times the lease sweep.
+// Sweep times the lease sweep and counts what it reclaimed.
+//
+// The reclaim counter lives here rather than in the loop above the driver
+// because the loop is now the runtime's own Scheduler, which the harness does
+// not get to instrument. Counting at the seam is also the more honest place:
+// Report.Reclaimed then means "what the driver reported", the same relationship
+// every other harness number has to the operation it measures.
 func (d *timingDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
 	start := time.Now()
 	n, err := d.inner.Sweep(ctx, now)
 	d.sweep.record(d.shard, time.Since(start))
+	if n > 0 && d.reclaimed != nil {
+		d.reclaimed.Add(int64(n))
+	}
 	return n, err
 }
 
-// sweepInterval is how often the harness runs its own sweeper.
+// sweepInterval is how often the harness's scheduler sweeps.
 //
 // One second is the cadence a scheduler would plausibly use, and it is what
 // makes the steady-state cost of a no-op sweep visible: at 100k rows the sweep
 // that reclaims nothing still scans, and that fixed cost is exactly where the
 // jobs_running_leased index earns its keep.
 const sweepInterval = time.Second
-
-// runSweeper sweeps expired leases until ctx ends.
-//
-// The harness runs its own sweeper because the Runner does not sweep — nothing
-// in the runtime's dispatch loop calls Sweep. Without this goroutine
-// Report.Sweep would have no observations at all, and the acceptance criterion
-// that the report carry non-zero claim, finalize, and sweep percentiles would be
-// unmeetable rather than unmet.
-// It sweeps once immediately and then on the interval. The immediate sweep is
-// not cosmetic: a run that drains in under a second would otherwise never tick,
-// and Report.Sweep would be empty on exactly the short runs a test asserts
-// against — a silence indistinguishable from a broken sweeper. It is also what a
-// scheduler does, which starts by clearing whatever the last process left
-// behind.
-func (h *Harness) runSweeper(ctx context.Context, driver flywheel.Driver) {
-	ticker := time.NewTicker(sweepInterval)
-	defer ticker.Stop()
-
-	h.sweepOnce(ctx, driver)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			h.sweepOnce(ctx, driver)
-		}
-	}
-}
-
-// sweepOnce runs one sweep, recording its duration and any reclaim.
-func (h *Harness) sweepOnce(ctx context.Context, driver flywheel.Driver) {
-	reclaimed, err := driver.Sweep(ctx, time.Now())
-	if err != nil {
-		if ctx.Err() == nil {
-			h.errs.add(err)
-		}
-		return
-	}
-	if reclaimed > 0 {
-		h.prog.reclaimed.Add(int64(reclaimed))
-	}
-}

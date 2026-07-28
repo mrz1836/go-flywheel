@@ -526,9 +526,15 @@ numbers rather than living only here.
   `OnSupersede` events. The residue query survives as an independent cross-check: the two count
   different things — the residue misses a superseded attempt whose job later succeeded on a retry —
   and a report notes a disagreement rather than asserting one.
-- **The sweep numbers come from the harness's own sweeper.** The runner does not sweep; nothing in its
-  dispatch loop calls `Sweep`. The harness runs a sweeper on a one-second interval, which is what a
-  scheduler would do.
+- **The sweep numbers come from a real `Scheduler`.** The runner does not sweep; nothing in its
+  dispatch loop calls `Sweep`. The harness therefore runs the runtime's own `Scheduler` on a
+  one-second sweep interval, with the harness's timing driver injected — which is what an injected
+  `Driver` is for, and what makes these numbers describe the loop a deployment runs rather than a
+  hand-rolled imitation of it.
+
+  The scheduler gets its own connection pool, sized to its concurrent activity count. Sharing the
+  runners' pool would let a sweep queue behind a saturated work pool, and that wait would land inside
+  the reported sweep latency — measuring the harness's pool sizing rather than the runtime.
 
 <br/>
 

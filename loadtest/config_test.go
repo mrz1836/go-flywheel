@@ -96,7 +96,7 @@ func TestConnectionBudgetErrorShowsItsArithmetic(t *testing.T) {
 		t.Fatal("expected a rejection")
 	}
 	msg := err.Error()
-	for _, want := range []string{"16×17", "276", "90", "max_connections=100"} {
+	for _, want := range []string{"16×17", "278", "90", "max_connections=100"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message must contain %q, got: %s", want, msg)
 		}
@@ -108,13 +108,13 @@ func TestConnectionBudgetErrorShowsItsArithmetic(t *testing.T) {
 func TestConnectionBudgetBoundary(t *testing.T) {
 	t.Parallel()
 
-	// 8 runners × (10 workers + 1) + 4 = 92 > 90: rejected.
-	// 8 runners × ( 9 workers + 1) + 4 = 84 ≤ 90: accepted.
+	// 8 runners × (10 workers + 1) + 6 = 94 > 90: rejected.
+	// 8 runners × ( 9 workers + 1) + 6 = 86 ≤ 90: accepted.
 	if _, err := (Config{DSN: testDSN, Jobs: 1, Runners: 8, Workers: 10}).validate(); err == nil {
-		t.Error("8×11+4 = 92 exceeds the budget and must be rejected")
+		t.Error("8×11+6 = 94 exceeds the budget and must be rejected")
 	}
 	if _, err := (Config{DSN: testDSN, Jobs: 1, Runners: 8, Workers: 9}).validate(); err != nil {
-		t.Errorf("8×10+4 = 84 is within the budget: %v", err)
+		t.Errorf("8×10+6 = 86 is within the budget: %v", err)
 	}
 }
 
