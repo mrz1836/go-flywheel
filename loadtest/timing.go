@@ -157,3 +157,12 @@ func (d *timingDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
 // that reclaims nothing still scans, and that fixed cost is exactly where the
 // jobs_running_leased index earns its keep.
 const sweepInterval = time.Second
+
+// replenishInterval is how often a duration-bounded steady run tops its live
+// population back up.
+//
+// It is deliberately coarser than the drain it is feeding: a tighter loop would
+// spend most of its time on a COUNT that returns a deficit of nearly zero, and
+// the population only has to be constant on the timescale the storage sampler
+// observes, not instant to instant.
+const replenishInterval = 500 * time.Millisecond

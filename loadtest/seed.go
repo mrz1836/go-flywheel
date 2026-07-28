@@ -96,6 +96,50 @@ func seedAPI(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onIn
 	return nil
 }
 
+// seedTerminal writes count already-finalized jobs, each with a finished
+// job_runs row, backdated by age.
+//
+// It exists so a retention pass has something to delete. The ordinary bulk path
+// writes state 'available' with no finalized_at and no job_runs at all, so a
+// retention sweep against a freshly seeded run removes zero rows however long
+// it runs — which would look like retention working against an empty backlog
+// rather than like a measurement of nothing.
+//
+// The rows are written server-side from generate_series rather than through the
+// bulk path: this is fixture, not workload, it is never claimed, and its insert
+// rate is not part of any number the run reports.
+func seedTerminal(ctx context.Context, db *gorm.DB, cfg Config, count int, age time.Duration) error {
+	if count <= 0 {
+		return nil
+	}
+	finalized := time.Now().UTC().Add(-age)
+
+	if err := db.WithContext(ctx).Exec(
+		`
+		INSERT INTO jobs (id, created_at, updated_at, metadata, kind, queue, args, priority,
+		                  state, attempt, max_attempts, scheduled_at, finalized_at,
+		                  executor_class, tags)
+		SELECT 'lt-terminal-' || g, ?, ?, '{}'::jsonb, ?, ?, '{}'::jsonb, 100,
+		       'succeeded', 1, 25, ?, ?, ?, '[]'::jsonb
+		FROM generate_series(0, ?) AS g`,
+		finalized, finalized, loadKind, cfg.Queue, finalized, finalized, cfg.ExecutorClass, count-1,
+	).Error; err != nil {
+		return fmt.Errorf("loadtest: seed terminal jobs: %w", err)
+	}
+
+	if err := db.WithContext(ctx).Exec(
+		`
+		INSERT INTO job_runs (id, job_id, attempt, executor_class, executor_id, started_at,
+		                      finished_at, outcome, enqueued_children, created_at)
+		SELECT 'lt-trun-' || g, 'lt-terminal-' || g, 1, ?, 'seed', ?, ?, 'success', 0, ?
+		FROM generate_series(0, ?) AS g`,
+		cfg.ExecutorClass, finalized, finalized, finalized, count-1,
+	).Error; err != nil {
+		return fmt.Errorf("loadtest: seed terminal runs: %w", err)
+	}
+	return nil
+}
+
 // seedBulk inserts the workload in batches.
 //
 // It is setup, not measurement: for a drain run the number that matters is the
@@ -109,7 +153,30 @@ func seedAPI(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onIn
 // no production database sees, which would corrupt every storage number in the
 // report.
 func seedBulk(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onInsert func(int)) error {
-	ids := rand.New(rand.NewPCG(uint64(cfg.Seed), streamID)) //nolint:gosec // reproducibility, not security
+	return seedBulkFrom(ctx, db, cfg, specs, 0, onInsert)
+}
+
+// seedBulkFrom is seedBulk with an explicit generation offset, so a run that
+// seeds more than once does not mint the same ids twice.
+//
+// The offset shifts both the id timestamps and the PCG stream. Shifting the
+// timestamp alone would not be enough — two generations an equal number of
+// microseconds apart would still collide on the random tail — and shifting the
+// stream alone would break the monotone id property that keeps every insert at
+// the right-most leaf of the primary-key btree, which is the whole reason these
+// ids are minted rather than random.
+//
+// generation 0 is exactly what seedBulk always produced, so a run that seeds
+// once is byte-identical to before.
+func seedBulkFrom(
+	ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, generation int, onInsert func(int),
+) error {
+	ids := rand.New(rand.NewPCG( //nolint:gosec // reproducibility, not security
+		uint64(cfg.Seed), streamID+uint64(generation), //nolint:gosec // a non-negative counter
+	))
+	// Each generation starts a full second past the previous one's last id, which
+	// is far more than any generation's microsecond-per-row span at these sizes.
+	base := seedEpoch.Add(time.Duration(generation) * time.Second)
 
 	rows := make([]bulkJobRow, len(specs))
 	for i, spec := range specs {
@@ -117,7 +184,7 @@ func seedBulk(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onI
 		if err != nil {
 			return err
 		}
-		at := seedEpoch.Add(time.Duration(i) * time.Microsecond)
+		at := base.Add(time.Duration(i) * time.Microsecond)
 		rows[i] = bulkJobRow{
 			ID:            newMonotoneID(at, ids),
 			CreatedAt:     at,

@@ -73,6 +73,35 @@ func (c IndexCondition) Valid() bool {
 	}
 }
 
+// StorageCondition selects the storage parameters the target's jobs table
+// carries. It mirrors IndexCondition: the two conditions differ in exactly one
+// variable, so a delta between them is attributable to the storage parameters
+// and to nothing else.
+type StorageCondition string
+
+// Recognized StorageCondition values.
+const (
+	// StorageDefault leaves PostgreSQL's defaults in place: fillfactor 100 and
+	// the cluster-wide autovacuum thresholds. It is what a host gets today.
+	StorageDefault StorageCondition = "default"
+	// StorageTuned applies a lower fillfactor and a per-table autovacuum scale
+	// factor to jobs.
+	//
+	// job_runs is deliberately untouched: it is append-only, so it has no update
+	// churn for either setting to act on.
+	StorageTuned StorageCondition = "tuned"
+)
+
+// Valid reports whether c is a recognized StorageCondition.
+func (c StorageCondition) Valid() bool {
+	switch c {
+	case StorageDefault, StorageTuned:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defaults applied by validate to a zero-valued field.
 const (
 	defaultRunners        = 1
@@ -81,6 +110,9 @@ const (
 	defaultTimeout        = 30 * time.Minute
 	defaultQueue          = "default"
 	defaultExecutorClass  = "loadtest"
+	// defaultTerminalSeedAge backdates the seeded terminal jobs far enough that
+	// any plausible retention window is older than none of them.
+	defaultTerminalSeedAge = 90 * 24 * time.Hour
 )
 
 // maxConnections is the connection budget one run may plan for.
@@ -157,6 +189,54 @@ type Config struct {
 	ExecutorClass string
 	// Faults, when non-nil, injects a failure on the schedule the Fault declares.
 	Faults Fault
+
+	// Duration bounds a steady run in time rather than by exhausting a
+	// population. It applies only to the steady mix; zero preserves today's
+	// behavior byte for byte.
+	//
+	// A duration-bounded steady run is a *closed loop*: one job is enqueued for
+	// every job that retires, so the number of jobs in a non-terminal state stays
+	// at Jobs for the whole run.
+	//
+	// That bounds the *working set*, not the table. A retired job stays in jobs
+	// as a terminal row, so total row count still climbs at the drain rate unless
+	// retention is removing them. A storage measurement that wants growth to mean
+	// churn rather than accumulation therefore needs both halves: this flag to
+	// hold the working set steady, and RetentionMaxAge set short enough to keep
+	// the terminal tail bounded. With only this flag, table growth is the sum of
+	// both effects and neither is separable from the other.
+	//
+	// The consequence to state wherever the numbers are published:
+	// EnqueueThroughput equals DrainThroughput under a closed loop *by
+	// construction*, and neither is a ceiling. Compared against an open-loop
+	// drain baseline it reads as a regression, and it is not one.
+	Duration time.Duration
+
+	// RetentionMaxAge enables the scheduler's retention sweep for the run.
+	// RetentionInterval is its cadence and RetentionBatchSize its per-transaction
+	// bound; both default when zero, and retention stays off unless
+	// RetentionMaxAge is set.
+	RetentionMaxAge    time.Duration
+	RetentionInterval  time.Duration
+	RetentionBatchSize int
+
+	// SweepBatchSize bounds the lease sweep's per-transaction batch. Zero selects
+	// the runtime's own default, which is itself a bound.
+	SweepBatchSize int
+
+	// Storage selects the storage-parameter condition applied to jobs.
+	Storage StorageCondition
+
+	// TerminalSeed writes this many already-finalized jobs, each with a finished
+	// run row, backdated by TerminalSeedAge before the run starts.
+	//
+	// It exists because retention has nothing to delete otherwise. The bulk seed
+	// path writes no finalized_at and no job_runs at all, so a retention pass
+	// against a freshly seeded run removes zero rows however long it runs — which
+	// would look like a working retention sweep with an empty backlog rather than
+	// a measurement of nothing.
+	TerminalSeed    int
+	TerminalSeedAge time.Duration
 }
 
 // connections reports the connection budget this configuration plans for: the
@@ -223,6 +303,55 @@ func (c Config) validate() (Config, error) {
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = defaultTimeout
+	}
+	if c.Storage == "" {
+		c.Storage = StorageDefault
+	}
+	if !c.Storage.Valid() {
+		return Config{}, fmt.Errorf(
+			"loadtest: unknown storage condition %q: %w", c.Storage, ErrInvalidConfig,
+		)
+	}
+	if c.Duration < 0 || c.RetentionMaxAge < 0 || c.RetentionInterval < 0 || c.TerminalSeedAge < 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: Duration, RetentionMaxAge, RetentionInterval and TerminalSeedAge "+
+				"must not be negative: %w", ErrInvalidConfig,
+		)
+	}
+	if c.TerminalSeed < 0 || c.RetentionBatchSize < 0 || c.SweepBatchSize < 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: TerminalSeed, RetentionBatchSize and SweepBatchSize must not be negative: %w",
+			ErrInvalidConfig,
+		)
+	}
+	if c.Duration > 0 && c.Mix != WorkloadSteady {
+		return Config{}, fmt.Errorf(
+			"loadtest: Duration applies only to the steady mix, got %q: a fixed population drains "+
+				"when it is empty, not when a clock says so: %w",
+			c.Mix, ErrInvalidConfig,
+		)
+	}
+	// A duration at or past the timeout is the trap this rule exists to close.
+	// Timeout defaults to 30 minutes and Run wraps the whole run in it, so a
+	// -duration longer than an unset -timeout dies partway with a non-zero exit
+	// and a truncated artifact — after having already spent the time.
+	if c.Duration > 0 && c.Duration >= c.Timeout {
+		return Config{}, fmt.Errorf(
+			"loadtest: Duration %s must be less than Timeout %s: the run is wrapped in Timeout, so a "+
+				"Duration at or past it is killed before it can finish (raise -timeout above -duration, "+
+				"leaving room for seeding and teardown): %w",
+			c.Duration, c.Timeout, ErrInvalidConfig,
+		)
+	}
+	if c.RetentionMaxAge > 0 && c.TerminalSeed == 0 && c.Mix != WorkloadSteady {
+		return Config{}, fmt.Errorf(
+			"loadtest: RetentionMaxAge is set but nothing will be finalized old enough to prune: "+
+				"seed a terminal backlog with TerminalSeed, or use the steady mix: %w",
+			ErrInvalidConfig,
+		)
+	}
+	if c.TerminalSeed > 0 && c.TerminalSeedAge == 0 {
+		c.TerminalSeedAge = defaultTerminalSeedAge
 	}
 	if c.Queue == "" {
 		c.Queue = defaultQueue

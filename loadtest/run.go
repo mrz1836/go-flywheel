@@ -66,6 +66,14 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 	report := Report{Config: cfg, Schema: h.schema}
 	p, specs := h.prepareWorkload()
 
+	// The terminal backlog is fixture, written before the clock starts: it is
+	// never claimed, and its insert rate belongs to no number the run reports.
+	if err := seedTerminal(runCtx, h.work, cfg, cfg.TerminalSeed, cfg.TerminalSeedAge); err != nil {
+		report.Errors = h.errs.errs()
+		report.Notes = h.notes.all()
+		return report, err
+	}
+
 	var driveErr error
 	if cfg.Mix == WorkloadSteady {
 		// Enqueue and drain overlap by definition here, so there is no separate
@@ -170,7 +178,77 @@ func (h *Harness) driveSteady(ctx context.Context, p mixPlan, specs []jobSpec) e
 	case <-ctx.Done():
 		return h.drainTimeout(ctx)
 	}
+
+	if h.cfg.Duration > 0 {
+		return h.holdSteady(ctx, specs)
+	}
 	return h.awaitDrain(ctx)
+}
+
+// holdSteady keeps the live population constant for Config.Duration, then stops.
+//
+// It is a closed loop: the replenisher tops the queue back up to the seeded
+// population, so one job is enqueued for roughly every job that retires. That
+// makes the storage question decidable — under a constant row count, table and
+// index growth is churn rather than accumulation, and the two are impossible to
+// separate when the population is drifting.
+//
+// It deliberately does not wait for a drain at the end. The run is bounded by
+// its clock, and whatever is in flight when the clock expires is left for
+// teardown: draining it would add an unbounded, unmeasured tail to a run whose
+// whole point was to be time-bounded.
+func (h *Harness) holdSteady(ctx context.Context, specs []jobSpec) error {
+	deadline := time.After(h.cfg.Duration)
+	ticker := time.NewTicker(replenishInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return h.drainTimeout(ctx)
+		case <-deadline:
+			return nil
+		case <-ticker.C:
+			if err := h.replenish(ctx, specs); err != nil {
+				if ctx.Err() != nil {
+					return h.drainTimeout(ctx)
+				}
+				h.errs.add(err)
+			}
+		}
+	}
+}
+
+// replenish enqueues enough jobs to return the live population to the run's
+// target, and reports how it failed if it could not.
+//
+// The deficit is read from the database rather than inferred from the progress
+// counters, because the counters are an estimate by construction — a job the
+// sweep reclaims fires neither OnFinish nor OnRetry — and an estimate that
+// drifts would make the population drift with it, which is the one thing this
+// loop exists to prevent.
+func (h *Harness) replenish(ctx context.Context, specs []jobSpec) error {
+	active, err := flywheel.CountActiveJobs(ctx, h.probe)
+	if err != nil {
+		return fmt.Errorf("loadtest: replenish: count active: %w", err)
+	}
+	deficit := int(int64(h.cfg.Jobs) - active)
+	if deficit <= 0 {
+		return nil
+	}
+	// Reuse the generated workload cyclically so the replenished jobs have the
+	// same shape distribution as the seeded ones. A different distribution would
+	// make the second half of the run a different workload from the first.
+	offset := int(h.prog.enqueued.Load())
+	batch := make([]jobSpec, deficit)
+	for i := range batch {
+		batch[i] = specs[(offset+i)%len(specs)]
+	}
+	// Each replenish is its own generation, so the ids it mints cannot collide
+	// with the seed's or with a previous replenish's.
+	generation := int(h.generation.Add(1))
+	return seedBulkFrom(ctx, h.work, h.cfg, batch, generation,
+		func(n int) { h.prog.enqueued.Add(int64(n)) })
 }
 
 // drive runs the workload to completion.
@@ -336,6 +414,33 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 			h.cfg.Indexes, len(names), strings.Join(names, ", "))
 	} else {
 		h.errs.add(err)
+	}
+
+	// The same rule for storage parameters: report what pg_class actually holds,
+	// not the condition that was requested.
+	if opts, err := installedStorage(ctx, h.probe); err == nil {
+		report.StorageParams = opts
+		h.notes.add("Storage condition %q installed reloptions: jobs=%q, job_runs=%q.",
+			h.cfg.Storage, opts["jobs"], opts["job_runs"])
+	} else {
+		h.errs.add(err)
+	}
+
+	if h.cfg.Duration > 0 {
+		h.notes.add(
+			"This run is a closed loop: one job was enqueued for every job that retired, so the " +
+				"non-terminal working set stayed at Jobs and EnqueueThroughput equals DrainThroughput " +
+				"by construction. Neither is a throughput ceiling, and comparing either against an " +
+				"open-loop drain baseline is comparing a governor setting against a redline.",
+		)
+		if h.cfg.RetentionMaxAge <= 0 {
+			h.notes.add(
+				"The closed loop bounds the working set, not the table: retired jobs stay as terminal " +
+					"rows, so total row count climbed at the drain rate for this run. Table growth here " +
+					"is churn plus accumulation and the two are not separable. A storage comparison " +
+					"wants RetentionMaxAge set as well, short enough to keep the terminal tail bounded.",
+			)
+		}
 	}
 
 	// Superseded is a measurement now: the runtime reports every discarded

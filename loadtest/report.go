@@ -174,6 +174,11 @@ type Report struct {
 	// Histogram publishes the bucketing the three Latency values came from.
 	Histogram HistogramSpec
 
+	// StorageParams is pg_class.reloptions per table as actually installed,
+	// keyed by table name. An empty string means the table carries PostgreSQL's
+	// defaults. It records what the run got rather than what it asked for.
+	StorageParams map[string]string
+
 	// Schema is the isolated schema the run provisioned, retained so a failed run
 	// can be inspected before the next one drops it.
 	Schema string
@@ -256,34 +261,35 @@ type configJSON struct {
 
 // reportJSON is Report's wire form.
 type reportJSON struct {
-	Config         configJSON      `json:"config"`
-	StartedAt      time.Time       `json:"started_at"`
-	Duration       string          `json:"duration"`
-	DurationNanos  int64           `json:"duration_nanos"`
-	Enqueue        float64         `json:"enqueue_throughput_per_sec"`
-	Drain          float64         `json:"drain_throughput_per_sec"`
-	SlotUtil       float64         `json:"slot_utilization"`
-	Claim          *latencyJSON    `json:"claim,omitempty"`
-	Finalize       *latencyJSON    `json:"finalize,omitempty"`
-	Sweep          *latencyJSON    `json:"sweep,omitempty"`
-	Storage        []StorageSample `json:"storage,omitempty"`
-	PeakRSS        uint64          `json:"peak_rss_bytes"`
-	PeakXactAge    float64         `json:"peak_xact_age_seconds"`
-	PeakLockWaits  int64           `json:"peak_lock_waits"`
-	LongestLockWt  float64         `json:"longest_lock_wait_seconds"`
-	Reclaimed      int64           `json:"reclaimed"`
-	BlockedClaims  int64           `json:"blocked_claims,omitempty"`
-	Concurrent     int64           `json:"concurrent_executions"`
-	Enqueued       int64           `json:"enqueued"`
-	Drained        int64           `json:"drained"`
-	Retried        int64           `json:"retried"`
-	Discarded      int64           `json:"discarded"`
-	Superseded     int64           `json:"superseded"`
-	Errors         []errEntry      `json:"errors,omitempty"`
-	Notes          []string        `json:"notes,omitempty"`
-	WorkloadDigest string          `json:"workload_digest"`
-	Histogram      HistogramSpec   `json:"histogram"`
-	Schema         string          `json:"schema,omitempty"`
+	Config         configJSON        `json:"config"`
+	StartedAt      time.Time         `json:"started_at"`
+	Duration       string            `json:"duration"`
+	DurationNanos  int64             `json:"duration_nanos"`
+	Enqueue        float64           `json:"enqueue_throughput_per_sec"`
+	Drain          float64           `json:"drain_throughput_per_sec"`
+	SlotUtil       float64           `json:"slot_utilization"`
+	Claim          *latencyJSON      `json:"claim,omitempty"`
+	Finalize       *latencyJSON      `json:"finalize,omitempty"`
+	Sweep          *latencyJSON      `json:"sweep,omitempty"`
+	Storage        []StorageSample   `json:"storage,omitempty"`
+	PeakRSS        uint64            `json:"peak_rss_bytes"`
+	PeakXactAge    float64           `json:"peak_xact_age_seconds"`
+	PeakLockWaits  int64             `json:"peak_lock_waits"`
+	LongestLockWt  float64           `json:"longest_lock_wait_seconds"`
+	Reclaimed      int64             `json:"reclaimed"`
+	BlockedClaims  int64             `json:"blocked_claims,omitempty"`
+	Concurrent     int64             `json:"concurrent_executions"`
+	Enqueued       int64             `json:"enqueued"`
+	Drained        int64             `json:"drained"`
+	Retried        int64             `json:"retried"`
+	Discarded      int64             `json:"discarded"`
+	Superseded     int64             `json:"superseded"`
+	Errors         []errEntry        `json:"errors,omitempty"`
+	Notes          []string          `json:"notes,omitempty"`
+	WorkloadDigest string            `json:"workload_digest"`
+	Histogram      HistogramSpec     `json:"histogram"`
+	Schema         string            `json:"schema,omitempty"`
+	StorageParams  map[string]string `json:"storage_params,omitempty"`
 }
 
 // MarshalJSON renders the report in its wire form.
@@ -317,6 +323,7 @@ func (r Report) MarshalJSON() ([]byte, error) {
 		WorkloadDigest: r.WorkloadDigest,
 		Histogram:      r.Histogram,
 		Schema:         r.Schema,
+		StorageParams:  r.StorageParams,
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -368,6 +375,7 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 		WorkloadDigest:       in.WorkloadDigest,
 		Histogram:            in.Histogram,
 		Schema:               in.Schema,
+		StorageParams:        in.StorageParams,
 	}
 	return nil
 }

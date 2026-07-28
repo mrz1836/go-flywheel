@@ -857,7 +857,7 @@ func ExplainClaim(ctx context.Context, cfg ExplainConfig) (ExplainReport, error)
 	}
 	defer closePool(db)
 
-	if err = installSchema(ctx, db, IndexesFull); err != nil {
+	if err = installSchema(ctx, db, IndexesFull, StorageDefault); err != nil {
 		return report, err
 	}
 	if err = seedClaimable(ctx, db, cfg, queues, classes); err != nil {
