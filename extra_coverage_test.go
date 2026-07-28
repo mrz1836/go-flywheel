@@ -248,7 +248,7 @@ func TestInsertFollowUpsPropagatesError(t *testing.T) {
 func TestSweepSurfacesCrashStubError(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	d := baseDriver{db: db}
+	d := NewSQLiteDriver(db)
 
 	past := time.Now().Add(-time.Hour)
 	seedJob(t, db, jobRow{

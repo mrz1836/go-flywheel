@@ -734,7 +734,7 @@ func TestPendingCountSurfacesDBError(t *testing.T) {
 func TestSweepSurfacesDBError(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	d := baseDriver{db: db}
+	d := NewSQLiteDriver(db)
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	require.NoError(t, sqlDB.Close())

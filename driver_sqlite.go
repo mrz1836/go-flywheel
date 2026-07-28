@@ -18,12 +18,61 @@ type sqliteDriver struct {
 	baseDriver
 }
 
-// NewSQLiteDriver returns a Driver backed by a SQLite connection. The
-// connection should be opened with the _txlock=immediate DSN parameter so the
-// write lock is taken up front: a transaction that starts deferred and upgrades
-// to a write mid-claim can fail with SQLITE_BUSY even against a single writer.
+// NewSQLiteDriver returns a Driver backed by a SQLite connection, with the
+// default batching options. The connection should be opened with the
+// _txlock=immediate DSN parameter so the write lock is taken up front: a
+// transaction that starts deferred and upgrades to a write mid-claim can fail
+// with SQLITE_BUSY even against a single writer.
 func NewSQLiteDriver(db *gorm.DB) Driver {
-	return &sqliteDriver{baseDriver{db: db}}
+	return NewSQLiteDriverWithOptions(db, DriverOpts{})
+}
+
+// NewSQLiteDriverWithOptions returns a Driver backed by a SQLite connection,
+// with opts controlling its batching. A zero opts is exactly NewSQLiteDriver.
+func NewSQLiteDriverWithOptions(db *gorm.DB, opts DriverOpts) Driver {
+	return &sqliteDriver{baseDriver{db: db, opts: opts}}
+}
+
+// Sweep reclaims expired leases in bounded batches.
+//
+// SQLite has no SKIP LOCKED, and needs none: it serializes writers, so there is
+// never a second transaction holding rows this one would want to skip. Batching
+// still earns its place here — it bounds how long the single writer is held, and
+// on a busy database that is the whole contention story.
+func (d *sqliteDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
+	return d.sweep(ctx, now, d.reclaimExpired)
+}
+
+// reclaimExpired takes one batch of expired leases and returns them to
+// available, reporting the ids it reclaimed.
+//
+// It is a SELECT of the oldest expired leases followed by an UPDATE of their
+// ids, both inside the caller's transaction — structurally the same shape as
+// this dialect's Dequeue, for the same reason: without a RETURNING-capable
+// UPDATE the ids have to be read before they are written.
+//
+// It runs through Model(&jobRow{}), so GORM's soft-delete scope applies and a
+// soft-deleted running job is left alone. The PostgreSQL path spells that same
+// condition out by hand, because a raw statement inherits no scope.
+func (d *sqliteDriver) reclaimExpired(
+	ctx context.Context, tx *gorm.DB, now time.Time, limit int,
+) ([]string, error) {
+	var ids []string
+	if err := tx.WithContext(ctx).Model(&jobRow{}).
+		Where("state = ? AND leased_until < ?", string(StateRunning), now).
+		Order("leased_until").
+		Limit(limit).
+		Pluck("id", &ids).Error; err != nil {
+		return nil, fmt.Errorf("jobs: find expired leases: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if err := tx.WithContext(ctx).Model(&jobRow{}).
+		Where("id IN ?", ids).Updates(reclaimUpdate(now)).Error; err != nil {
+		return nil, fmt.Errorf("jobs: reclaim jobs: %w", err)
+	}
+	return ids, nil
 }
 
 // Dequeue claims up to limit ready jobs. SQLite has no SKIP LOCKED, so the

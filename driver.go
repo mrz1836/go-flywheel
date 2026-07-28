@@ -63,9 +63,67 @@ type Driver interface {
 
 	// Sweep reclaims jobs whose lease has expired (state running, leased_until
 	// in the past), returning them to available and marking each stale run stub
-	// crashed. It reports how many jobs were reclaimed.
+	// crashed, in bounded batches. It reports how many jobs were reclaimed in
+	// total across every batch.
+	//
+	// Each batch is its own transaction, so a deep backlog never becomes one
+	// long lock-holding statement — the case that arises exactly when the system
+	// is already in trouble, because a backlog that deep is what an executor
+	// pool leaves when it dies holding its whole lease set.
+	//
+	// It loops until the backlog is drained or ctx is cancelled, and reports the
+	// count reclaimed so far alongside the context error. Completed batches are
+	// committed and are not rolled back, so a cancelled sweep is partial
+	// progress rather than none. The batch in flight when the cancel arrives
+	// rolls back whole — its jobs stay running and the next sweep collects them,
+	// which makes an interrupted sweep work redone rather than work lost.
+	//
+	// One Sweep does not guarantee a drained backlog. On PostgreSQL a batch is
+	// taken with FOR UPDATE SKIP LOCKED, so a short batch may mean a concurrent
+	// sweeper holds the rest rather than that none remain. The next sweep takes
+	// them.
 	Sweep(ctx context.Context, now time.Time) (reclaimed int, err error)
 }
+
+// defaultSweepBatchSize is the number of expired leases reclaimed per
+// transaction when DriverOpts leaves SweepBatchSize zero.
+//
+// It is a bound, not a tuning knob to switch off: there is no value of
+// SweepBatchSize, zero or negative, that produces an unbounded transaction.
+const defaultSweepBatchSize = 1000
+
+// DriverOpts configures a Driver's batching behavior. The zero value selects the
+// documented defaults, and no field is ever unbounded.
+type DriverOpts struct {
+	// SweepBatchSize is the number of expired leases reclaimed per transaction.
+	// Zero or negative selects defaultSweepBatchSize.
+	//
+	// It bounds transaction duration and lock-hold time, and on PostgreSQL it
+	// also bounds the statement's bind-parameter count — the reclaim binds one
+	// parameter per row, and the extended protocol rejects a statement carrying
+	// more than 65,535 of them outright.
+	SweepBatchSize int
+}
+
+// sweepBatchSize resolves the configured batch size, applying the default for a
+// non-positive value.
+func (o DriverOpts) sweepBatchSize() int {
+	if o.SweepBatchSize <= 0 {
+		return defaultSweepBatchSize
+	}
+	return o.SweepBatchSize
+}
+
+// reclaimFunc is one dialect's expired-lease batch: it selects up to limit jobs
+// whose lease expired before now, returns them to available with their fence
+// token cleared, and reports the ids it reclaimed.
+//
+// The dialect passes this *up* into the shared loop rather than the loop
+// reaching *down* into the dialect, because Go embedding promotes methods
+// without dispatching them: a loop on baseDriver calling d.reclaimExpired would
+// bind to baseDriver's own copy, never the outer type's, and the SKIP LOCKED
+// path would silently never run.
+type reclaimFunc func(ctx context.Context, tx *gorm.DB, now time.Time, limit int) ([]string, error)
 
 // classifiedError is how the Runner hands the driver its verdict on a failed
 // attempt without widening the Driver.Finalize signature: the Runner wraps the
@@ -256,9 +314,17 @@ func truncate(s string, n int) string {
 }
 
 // baseDriver holds the Driver methods shared by the Postgres and SQLite
-// implementations — only Dequeue differs by dialect.
+// implementations — Dequeue and the sweep's reclaim step differ by dialect.
+//
+// It deliberately has no Sweep method. A method whose correct implementation is
+// dialect-specific must not have a dialect-neutral default here: embedding
+// hands that default to any dialect that forgets to override it, silently and
+// forever, which is how the Scheduler came to run a non-SKIP-LOCKED sweep
+// against PostgreSQL. Each dialect declares Sweep and drives the shared loop
+// below, so the compiler is the enforcement.
 type baseDriver struct {
-	db *gorm.DB
+	db   *gorm.DB
+	opts DriverOpts
 }
 
 // InsertRunStub commits a job_runs row with outcome started before the worker
@@ -547,29 +613,56 @@ func (d *baseDriver) InsertChild(
 	return nil
 }
 
-// Sweep reclaims expired-lease jobs and marks their stale run stubs crashed.
-func (d *baseDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
+// sweep runs reclaim in bounded batches until the backlog is drained or ctx is
+// cancelled, reporting the total reclaimed across every batch.
+//
+// It is the shared half of every dialect's Sweep: the loop, the bound, and the
+// cancellation contract are dialect-independent, and only the batch's reclaim
+// statement is not.
+//
+// There is deliberately no ceiling on the number of batches, where retention
+// has one. An unreclaimed lease is stalled work — a job no runner will pick up
+// until the sweep releases it — while an unpruned row is only storage. Stopping
+// a sweep early to bound its duty cycle would trade a recovery guarantee for
+// tidiness.
+func (d *baseDriver) sweep(ctx context.Context, now time.Time, reclaim reclaimFunc) (int, error) {
+	batchSize := d.opts.sweepBatchSize()
+	reclaimed := 0
+	for {
+		// Cancellation is checked between batches only. Interrupting a batch
+		// mid-transaction would roll it back and lose work already done, and a
+		// batch is bounded by construction, so the wait is bounded too.
+		if err := ctx.Err(); err != nil {
+			return reclaimed, fmt.Errorf("jobs: sweep cancelled after %d reclaimed: %w", reclaimed, err)
+		}
+		n, err := d.sweepBatch(ctx, now, batchSize, reclaim)
+		reclaimed += n
+		if err != nil {
+			return reclaimed, err
+		}
+		// A short batch means the backlog is drained — not that it is empty. Under
+		// SKIP LOCKED it may instead mean a concurrent sweeper holds the rest,
+		// which the next sweep collects.
+		if n < batchSize {
+			return reclaimed, nil
+		}
+	}
+}
+
+// sweepBatch reclaims one bounded batch and crashes its stale run stubs inside a
+// single transaction, so a batch can never leave a job available with its audit
+// row still reading started.
+func (d *baseDriver) sweepBatch(
+	ctx context.Context, now time.Time, limit int, reclaim reclaimFunc,
+) (int, error) {
 	reclaimed := 0
 	err := d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var ids []string
-		if err := tx.Model(&jobRow{}).
-			Where("state = ? AND leased_until < ?", string(StateRunning), now).
-			Pluck("id", &ids).Error; err != nil {
-			return fmt.Errorf("jobs: find expired leases: %w", err)
+		ids, err := reclaim(ctx, tx, now, limit)
+		if err != nil {
+			return err
 		}
 		if len(ids) == 0 {
 			return nil
-		}
-		if err := tx.Model(&jobRow{}).Where("id IN ?", ids).Updates(map[string]any{
-			"state":        string(StateAvailable),
-			"leased_until": nil,
-			// Clearing the token is what makes the reclaim final: the attempt whose
-			// lease just expired can no longer finalize over the next claim, and it
-			// cannot renew the lease it no longer holds either.
-			"lease_token": nil,
-			"updated_at":  now,
-		}).Error; err != nil {
-			return fmt.Errorf("jobs: reclaim jobs: %w", err)
 		}
 		if err := tx.Model(&jobRunRow{}).
 			Where("job_id IN ? AND outcome = ?", ids, string(OutcomeStarted)).
@@ -586,6 +679,22 @@ func (d *baseDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
 		return 0, fmt.Errorf("jobs: sweep: %w", err)
 	}
 	return reclaimed, nil
+}
+
+// reclaimUpdate is the jobs-row column set for a lease reclaim, shared by both
+// dialects so neither can drift from the other on the columns that matter.
+//
+// Clearing the token is what makes the reclaim final: the attempt whose lease
+// just expired can no longer finalize over the next claim, and it cannot renew
+// the lease it no longer holds either. Dropping it would silently reopen the
+// double-execution window the fence exists to close.
+func reclaimUpdate(now time.Time) map[string]any {
+	return map[string]any{
+		"state":        string(StateAvailable),
+		"leased_until": nil,
+		"lease_token":  nil,
+		"updated_at":   now,
+	}
 }
 
 // insertFollowUps inserts a worker's follow-up jobs on tx and reports how many

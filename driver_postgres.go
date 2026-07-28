@@ -17,9 +17,66 @@ type postgresDriver struct {
 	baseDriver
 }
 
-// NewPostgresDriver returns a Driver backed by a PostgreSQL connection.
+// NewPostgresDriver returns a Driver backed by a PostgreSQL connection, with the
+// default batching options.
 func NewPostgresDriver(db *gorm.DB) Driver {
-	return &postgresDriver{baseDriver{db: db}}
+	return NewPostgresDriverWithOptions(db, DriverOpts{})
+}
+
+// NewPostgresDriverWithOptions returns a Driver backed by a PostgreSQL
+// connection, with opts controlling its batching. A zero opts is exactly
+// NewPostgresDriver.
+func NewPostgresDriverWithOptions(db *gorm.DB, opts DriverOpts) Driver {
+	return &postgresDriver{baseDriver{db: db, opts: opts}}
+}
+
+// Sweep reclaims expired leases in bounded batches, each taken with
+// FOR UPDATE SKIP LOCKED.
+//
+// SKIP LOCKED is what makes two concurrent sweeps safe: each takes a disjoint
+// batch instead of one blocking on the other's row locks for a whole
+// transaction. It does not make concurrent sweeps correct *as a deployment* —
+// the scheduler is a singleton by design — it makes an accidental second one a
+// throughput cost rather than an outage.
+func (d *postgresDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
+	return d.sweep(ctx, now, d.reclaimExpired)
+}
+
+// reclaimExpired takes one batch of expired leases and returns them to
+// available, reporting the ids it reclaimed.
+//
+// It is one statement: the CTE selects and row-locks up to limit expired rows
+// with SKIP LOCKED, and the UPDATE reclaims them, RETURNING the ids the caller
+// needs for the run-stub update. Splitting it into a SELECT and an UPDATE would
+// hold the locks across a round trip for no benefit.
+//
+// The predicate carries deleted_at IS NULL explicitly. A raw statement gets no
+// GORM soft-delete scope, and without it this dialect would reclaim
+// soft-deleted running jobs while SQLite's Model-scoped path does not — a
+// dialect divergence in a reclaim path, introduced by the rewrite that exists to
+// make the dialects explicit.
+func (d *postgresDriver) reclaimExpired(
+	ctx context.Context, tx *gorm.DB, now time.Time, limit int,
+) ([]string, error) {
+	const sql = `
+WITH expired AS (
+    SELECT id FROM jobs
+    WHERE state = 'running' AND leased_until < ? AND deleted_at IS NULL
+    ORDER BY leased_until
+    LIMIT ?
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs
+SET state = 'available', leased_until = NULL, lease_token = NULL, updated_at = ?
+FROM expired
+WHERE jobs.id = expired.id
+RETURNING jobs.id`
+
+	var ids []string
+	if err := tx.WithContext(ctx).Raw(sql, now, limit, now).Scan(&ids).Error; err != nil {
+		return nil, fmt.Errorf("jobs: reclaim jobs: %w", err)
+	}
+	return ids, nil
 }
 
 // Dequeue claims up to limit ready jobs in one round trip: the CTE selects and
