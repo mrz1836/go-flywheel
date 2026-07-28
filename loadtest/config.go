@@ -93,10 +93,16 @@ const (
 // in the message, is the difference between a bad config and a bad number.
 const maxConnections = 90
 
+// schedulerConnections is the scheduler pool's size: one connection per
+// maintenance activity that can be in flight at once — the periodic tick and
+// the lease sweep — so neither queues behind the other.
+const schedulerConnections = 2
+
 // overheadConnections is what the run needs beyond the work pool: the admin pool
-// that owns CREATE/DROP SCHEMA, the probe pool the sampler and the completion
-// check share, and one spare.
-const overheadConnections = 4
+// that owns CREATE/DROP SCHEMA (2), the probe pool the sampler and the
+// completion check share (1), the scheduler's own pool (schedulerConnections),
+// and one spare.
+const overheadConnections = 3 + schedulerConnections + 1
 
 // Config declares one run. The zero value is not runnable: DSN and Jobs are
 // required. Every other field has a default, applied by validate.

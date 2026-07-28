@@ -45,6 +45,9 @@ type Harness struct {
 	// behind the run it is measuring — and, once faults exist, so a fault that
 	// gates the work pool leaves the harness able to see through it.
 	probe *gorm.DB
+	// sched is the scheduler's pool, schema-scoped, sized to its activity count
+	// so a maintenance pass never queues behind the runners it is measuring.
+	sched *gorm.DB
 
 	// inner is the undecorated driver. Each runner wraps it in its own
 	// timingDriver bound to its own histogram shard, so shard selection costs
@@ -278,6 +281,15 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 	if h.probe, err = openPool(scoped, 1); err != nil {
 		return h, fmt.Errorf("loadtest: open probe pool: %w", err)
 	}
+	// The scheduler gets its own pool rather than sharing the runners'. Its two
+	// activities would otherwise queue behind the work pool whenever the runners
+	// saturated it, and the wait would land inside Report.Sweep — which is the
+	// number published as the longest maintenance transaction. A sweep latency
+	// that is mostly connection acquisition measures the harness's pool sizing,
+	// not the runtime.
+	if h.sched, err = openPool(scoped, schedulerConnections); err != nil {
+		return h, fmt.Errorf("loadtest: open scheduler pool: %w", err)
+	}
 
 	if err = installSchema(ctx, h.work, cfg.Indexes); err != nil {
 		return h, err
@@ -343,7 +355,7 @@ func (h *Harness) Close(ctx context.Context) error {
 
 	h.stopRunners()
 
-	for _, db := range []*gorm.DB{h.work, h.probe} {
+	for _, db := range []*gorm.DB{h.work, h.probe, h.sched} {
 		if db == nil {
 			continue
 		}
@@ -434,13 +446,52 @@ func (h *Harness) startRunners(ctx context.Context) error {
 		})
 	}
 
-	// The sweeper is the harness's, not the runtime's: nothing in the dispatch
-	// loop calls Sweep, so this goroutine is the only reason Report.Sweep has
-	// observations. It gets the last shard, past the runners'.
+	// The sweep runs through the runtime's own Scheduler, carrying the harness's
+	// timingDriver. Nothing in the dispatch loop calls Sweep, so this is still
+	// the only reason Report.Sweep has observations — but the loop above the
+	// driver is now the one a deployment runs, not a hand-rolled ticker that
+	// resembled it. That is precisely what an injected Driver is for, and it
+	// means the sweep numbers describe the scheduler's behavior rather than the
+	// harness's imitation of it.
+	//
+	// The scheduler's driver gets the last histogram shard, past the runners'.
 	sweepCtx, cancelSweep := context.WithCancel(ctx)
 	h.cancelSweeper = cancelSweep
-	sweeper := newTimingDriver(h.inner, h.timings, h.cfg.Runners)
-	h.wg.Go(func() { h.runSweeper(sweepCtx, sweeper) })
+
+	sweeper := newTimingDriver(flywheel.NewPostgresDriver(h.sched), h.timings, h.cfg.Runners).
+		countingReclaims(&h.prog.reclaimed)
+	scheduler, err := flywheel.NewSchedulerWithConfig(flywheel.SchedulerConfig{
+		DB:     h.sched,
+		Client: flywheel.NewClient(h.sched),
+		Driver: sweeper,
+		// Only the sweep is wanted. The periodic tick is pushed far out rather
+		// than disabled because there is no way to disable it, and a run that
+		// installs no periodic definitions has nothing for it to find anyway; the
+		// interval keeps it from costing a query per second regardless.
+		TickInterval:  time.Hour,
+		SweepInterval: sweepInterval,
+	})
+	if err != nil {
+		return fmt.Errorf("loadtest: build scheduler: %w", err)
+	}
+
+	// One sweep before the loop starts. A run that drains in under a second
+	// would otherwise never tick, and Report.Sweep would be empty on exactly the
+	// short runs a test asserts against — a silence indistinguishable from a
+	// broken sweeper. A real scheduler's first tick is one interval away, so the
+	// harness takes that first sweep itself rather than pretending the scheduler
+	// took it.
+	if _, err := sweeper.Sweep(sweepCtx, time.Now()); err != nil && sweepCtx.Err() == nil {
+		h.errs.add(err)
+	}
+
+	h.wg.Go(func() {
+		// Run returns its stop reason as an error, and the only way it stops is
+		// cancellation at the end of the run, which is not a failure.
+		if err := scheduler.Run(sweepCtx); err != nil && sweepCtx.Err() == nil {
+			h.errs.add(err)
+		}
+	})
 
 	// The sampler shares the sweeper's cancellation: both are the harness's own
 	// background work, and both must be stopped before collect reads what they
