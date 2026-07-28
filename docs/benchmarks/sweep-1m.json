@@ -1,0 +1,2521 @@
+{
+    "claim": {
+        "count": 387011,
+        "max": "7.450300209s",
+        "mean": "2.200429ms",
+        "min": "135.542µs",
+        "nanos": {
+            "max": 7450300209,
+            "mean": 2200429,
+            "min": 135542,
+            "p50": 1563125,
+            "p95": 4843165,
+            "p99": 6252500
+        },
+        "p50": "1.563125ms",
+        "p95": "4.843165ms",
+        "p99": "6.2525ms"
+    },
+    "concurrent_executions": 0,
+    "config": {
+        "executor_class": "loadtest",
+        "faults": "expire every held lease at 50% drained",
+        "heartbeat": "0s",
+        "indexes": "full",
+        "jobs": 1000000,
+        "lease": "1s",
+        "mix": "drain",
+        "queue": "default",
+        "runners": 4,
+        "sample_interval": "5s",
+        "seed": 1,
+        "target": "postgres://localhost:5432/flywheel_test",
+        "timeout": "1h0m0s",
+        "work_duration": "2ms",
+        "work_jitter": "0s",
+        "workers": 8
+    },
+    "discarded": 0,
+    "drain_throughput_per_sec": 4114.977349567543,
+    "drained": 1000000,
+    "duration": "4m3.014703375s",
+    "duration_nanos": 243014703375,
+    "enqueue_throughput_per_sec": 93596.9685936611,
+    "enqueued": 1000000,
+    "finalize": {
+        "count": 1000044,
+        "max": "7.442704167s",
+        "mean": "1.282573ms",
+        "min": "158.083µs",
+        "nanos": {
+            "max": 7442704167,
+            "mean": 1282573,
+            "min": 158083,
+            "p50": 957215,
+            "p95": 2421583,
+            "p99": 3828859
+        },
+        "p50": "957.215µs",
+        "p95": "2.421583ms",
+        "p99": "3.828859ms"
+    },
+    "histogram": {
+        "Buckets": 83,
+        "MaxExponent": 37,
+        "MaxRelativeError": 0.1552734375,
+        "MinExponent": 10,
+        "SubBucketsPerOctave": 3
+    },
+    "longest_lock_wait_seconds": 0.001134,
+    "notes": [
+        "Seeding used the bulk path, so EnqueueThroughput is the harness's batch-insert rate rather than the runtime's producer API. The enqueue and steady mixes measure the API.",
+        "RSS is the harness client process, not the PostgreSQL server. Mechanism: getrusage(RUSAGE_SELF).ru_maxrss (peak resident set; darwin has no current-RSS source in the standard library, so the sampled series is a monotone high-water envelope).",
+        "pgstattuple is not installed in this database, so FreePercent and DeadTuplePercent are absent rather than zero. CREATE EXTENSION pgstattuple to collect them.",
+        "MassLeaseExpiry expired 22 held leases and immediately reclaimed 2. The gap is attempts whose heartbeat renewed the lease back, or which finalized, between the two statements.",
+        "Fault injected at 61.8% drained: expire every held lease at 50% drained.",
+        "LockWaits is an instantaneous sample of pg_locks: it counts requests ungranted at the moment of the sample, and lock waits under normal contention are far shorter than the sampling interval. A run of zeroes means the sampler did not catch one, not that there was no contention. LongestLockWait is the companion that survives sampling: it measures how long the longest blocked backend has been waiting, which stays non-zero for the duration of a wait rather than only at the instant it is sampled. Both are scoped to this database.",
+        "MaxXactAge is sampled server-side from pg_stat_activity, and its guarantee is one-sided: a sampler at interval I always observes a transaction living longer than I, at an age of at least L-I, and may miss one shorter than I entirely. It is therefore the right instrument for an unbounded maintenance transaction and the wrong one for a bounded batch. For bounded maintenance the exact figure is Sweep.Max, which is client-side, is not bucketed, and covers exactly one transaction per call - at the cost of including pool acquisition, which the server-side age excludes.",
+        "MaxXactAge and the lock-wait pair count client backends only. An autovacuum worker carries an xact_start like any other backend and runs for minutes on a churning table, so including it would report vacuum duration as maintenance-transaction age - a quantity AutovacuumCount already reports, in the one field meant to answer whether a maintenance pass held a snapshot open.",
+        "MaxXactAge and the lock-wait pair are scoped to the database, not to this run's schema. The harness isolates a run by schema within one database, so a concurrent run against the same database - or an interactive query against it - is visible in these three numbers. Use a dedicated database for a run whose contention figures are being published.",
+        "WALBytes is the delta in pg_stat_wal, which is cluster-wide: PostgreSQL offers no per-database breakdown, so any other activity on the same server is included.",
+        "SlotUtilization is attempt time over slots × wall time, and it is a floor: an attempt's duration runs from its run stub to its finalize, so the claim, stub, and finalize round trips around it are capacity the pool was using and this does not count. It read 34.6% over 4 runners × 8 workers.",
+        "Index condition \"full\" installed 12 indexes: idx_job_periodics_slug, idx_jobs_deleted_at, job_periodics_pkey, job_runs_job_attempt, job_runs_pkey, jobs_parent, jobs_pkey, jobs_ready, jobs_running_leased, jobs_state, jobs_unique_active_key, jobs_unique_key.",
+        "Storage condition \"default\" installed reloptions: jobs=\"\", job_runs=\"\".",
+        "Superseded is 44 by observed event and 0 by row residue (a successful run row against a job that did not end succeeded). The two count different things and are expected to differ; a large gap means supersedes are occurring where the Observer does not see them.",
+        "44 attempts were superseded: their work ran and its outcome was discarded because the claim was lost."
+    ],
+    "peak_lock_waits": 1,
+    "peak_rss_bytes": 1711751168,
+    "peak_xact_age_seconds": 0.075617,
+    "reclaimed": 44,
+    "retried": 0,
+    "schema": "lt_dkab9krxtlhk_gi0_1",
+    "slot_utilization": 0.3460154244303861,
+    "started_at": "2026-07-28T11:31:52.308926-04:00",
+    "storage": [
+        {
+            "At": "2026-07-28T11:31:57.318862-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 30199,
+                "jobs": 67339
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 67414,
+                "jobs": 85759
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 5300224,
+                "jobs": 135462912
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 33714,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.000237,
+            "RSS": 1711472640,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 20946944,
+                "jobs": 628637696
+            },
+            "WALBytes": 0
+        },
+        {
+            "At": "2026-07-28T11:32:02.318897-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 58088,
+                "jobs": 131533
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 131610,
+                "jobs": 165689
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 9707520,
+                "jobs": 138051584
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 65811,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001374,
+            "RSS": 1711521792,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 38240256,
+                "jobs": 663101440
+            },
+            "WALBytes": 160473101
+        },
+        {
+            "At": "2026-07-28T11:32:07.318957-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 88840,
+                "jobs": 200576
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 200638,
+                "jobs": 250469
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 14409728,
+                "jobs": 141180928
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 100319,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001238,
+            "RSS": 1711603712,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 56901632,
+                "jobs": 700268544
+            },
+            "WALBytes": 181293416
+        },
+        {
+            "At": "2026-07-28T11:32:12.318979-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 113310,
+                "jobs": 254902
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 255050,
+                "jobs": 316426
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 18210816,
+                "jobs": 143589376
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 127501,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.000299,
+            "RSS": 1711702016,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 71909376,
+                "jobs": 730161152
+            },
+            "WALBytes": 125265884
+        },
+        {
+            "At": "2026-07-28T11:32:17.319003-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 140764,
+                "jobs": 316055
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 316078,
+                "jobs": 390192
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 22274048,
+                "jobs": 146194432
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 158033,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.005213,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 87998464,
+                "jobs": 762249216
+            },
+            "WALBytes": 142034476
+        },
+        {
+            "At": "2026-07-28T11:32:22.319039-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 166078,
+                "jobs": 372825
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 372848,
+                "jobs": 458326
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 26017792,
+                "jobs": 148635648
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 186425,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.075617,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 102744064,
+                "jobs": 791748608
+            },
+            "WALBytes": 140486408
+        },
+        {
+            "At": "2026-07-28T11:32:27.319078-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 186979,
+                "jobs": 420494
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 420476,
+                "jobs": 515276
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 29908992,
+                "jobs": 153845760
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 210268,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001682,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 116269056,
+                "jobs": 815210496
+            },
+            "WALBytes": 112599407
+        },
+        {
+            "At": "2026-07-28T11:32:32.319133-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 202304,
+                "jobs": 456418
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 456450,
+                "jobs": 558008
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 32620544,
+                "jobs": 158318592
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 228252,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.002951,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 125059072,
+                "jobs": 829816832
+            },
+            "WALBytes": 76020157
+        },
+        {
+            "At": "2026-07-28T11:32:37.319158-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 215902,
+                "jobs": 488928
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 488964,
+                "jobs": 596498
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 35618816,
+                "jobs": 163430400
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 244472,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001022,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 134995968,
+                "jobs": 846422016
+            },
+            "WALBytes": 80895108
+        },
+        {
+            "At": "2026-07-28T11:32:42.319215-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 237527,
+                "jobs": 538024
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 537890,
+                "jobs": 654630
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 39665664,
+                "jobs": 170311680
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 268930,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.002339,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 148709376,
+                "jobs": 869081088
+            },
+            "WALBytes": 104780513
+        },
+        {
+            "At": "2026-07-28T11:32:47.319227-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 259043,
+                "jobs": 587115
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 587030,
+                "jobs": 712656
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 43810816,
+                "jobs": 177029120
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 293495,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001998,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 162406400,
+                "jobs": 891478016
+            },
+            "WALBytes": 113604262
+        },
+        {
+            "At": "2026-07-28T11:32:52.319259-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 277522,
+                "jobs": 629319
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 629260,
+                "jobs": 762475
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 47382528,
+                "jobs": 179838976
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 314708,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.002365,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 174596096,
+                "jobs": 908148736
+            },
+            "WALBytes": 92948754
+        },
+        {
+            "At": "2026-07-28T11:32:57.319296-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 301188,
+                "jobs": 682020
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 681934,
+                "jobs": 825974
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 52224000,
+                "jobs": 181936128
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 340992,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.000835,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 190611456,
+                "jobs": 928169984
+            },
+            "WALBytes": 112482567
+        },
+        {
+            "At": "2026-07-28T11:33:02.319402-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 329685,
+                "jobs": 747176
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 747114,
+                "jobs": 905976
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 57622528,
+                "jobs": 184066048
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 373604,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.000891,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 208633856,
+                "jobs": 950714368
+            },
+            "WALBytes": 130492968
+        },
+        {
+            "At": "2026-07-28T11:33:07.319396-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 355777,
+                "jobs": 807269
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 807162,
+                "jobs": 978963
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 62734336,
+                "jobs": 185638912
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 403591,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": -0.000005,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 225861632,
+                "jobs": 969195520
+            },
+            "WALBytes": 132858165
+        },
+        {
+            "At": "2026-07-28T11:33:12.319395-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 380862,
+                "jobs": 863853
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 863852,
+                "jobs": 1047247
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 67411968,
+                "jobs": 186286080
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 431916,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001546,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 241606656,
+                "jobs": 979271680
+            },
+            "WALBytes": 115666523
+        },
+        {
+            "At": "2026-07-28T11:33:17.319462-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 404651,
+                "jobs": 917922
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 917902,
+                "jobs": 1112182
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 72097792,
+                "jobs": 187047936
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 458981,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001826,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 257335296,
+                "jobs": 989396992
+            },
+            "WALBytes": 100304183
+        },
+        {
+            "At": "2026-07-28T11:33:22.319798-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 428877,
+                "jobs": 972039
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 972196,
+                "jobs": 1176783
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 76464128,
+                "jobs": 187924480
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 486123,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001632,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 272146432,
+                "jobs": 999391232
+            },
+            "WALBytes": 71346033
+        },
+        {
+            "At": "2026-07-28T11:33:27.319511-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 452347,
+                "jobs": 1026708
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1026628,
+                "jobs": 1241774
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 81043456,
+                "jobs": 191594496
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 513284,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.000449,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 287121408,
+                "jobs": 1012310016
+            },
+            "WALBytes": 99122759
+        },
+        {
+            "At": "2026-07-28T11:33:32.31971-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 473099,
+                "jobs": 1075683
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1075736,
+                "jobs": 1299877
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 85090304,
+                "jobs": 197001216
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 537899,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.022458,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 300752896,
+                "jobs": 1026195456
+            },
+            "WALBytes": 100395781
+        },
+        {
+            "At": "2026-07-28T11:33:37.319582-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 489773,
+                "jobs": 1115967
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1115940,
+                "jobs": 1347590
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 88612864,
+                "jobs": 201162752
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 558011,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001991,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 312246272,
+                "jobs": 1037418496
+            },
+            "WALBytes": 99015060
+        },
+        {
+            "At": "2026-07-28T11:33:42.322057-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 507696,
+                "jobs": 1159204
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1159188,
+                "jobs": 1398669
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 92749824,
+                "jobs": 206372864
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 579595,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.002,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 325836800,
+                "jobs": 1050992640
+            },
+            "WALBytes": 77578095
+        },
+        {
+            "At": "2026-07-28T11:33:51.775161-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 517601,
+                "jobs": 1183594
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1183862,
+                "jobs": 1427417
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 94715904,
+                "jobs": 208986112
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 591812,
+                "jobs": 1000000
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001654,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 332521472,
+                "jobs": 1056595968
+            },
+            "WALBytes": 42070126
+        },
+        {
+            "At": "2026-07-28T11:33:55.523524-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 528474,
+                "jobs": 24993
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1206750,
+                "jobs": 1454322
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 96067584,
+                "jobs": 209526784
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 603390,
+                "jobs": 993102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.004207,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 337068032,
+                "jobs": 1057136640
+            },
+            "WALBytes": 36558038
+        },
+        {
+            "At": "2026-07-28T11:33:57.319752-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 534447,
+                "jobs": 36997
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1218696,
+                "jobs": 1467928
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 96870400,
+                "jobs": 209666048
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 609351,
+                "jobs": 993102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001141,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 340402176,
+                "jobs": 1057275904
+            },
+            "WALBytes": 23689979
+        },
+        {
+            "At": "2026-07-28T11:34:02.319757-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 543647,
+                "jobs": 668471
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1249087,
+                "jobs": 1509237
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 99139584,
+                "jobs": 210001920
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 624552,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001469,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 347291648,
+                "jobs": 1057611776
+            },
+            "WALBytes": 539054248
+        },
+        {
+            "At": "2026-07-28T11:34:07.319793-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 546711,
+                "jobs": 707708
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1288193,
+                "jobs": 1568768
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 101965824,
+                "jobs": 210493440
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 644143,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001507,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 355287040,
+                "jobs": 1058103296
+            },
+            "WALBytes": 78149240
+        },
+        {
+            "At": "2026-07-28T11:34:12.320965-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 550341,
+                "jobs": 748064
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1328653,
+                "jobs": 1629676
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 104603648,
+                "jobs": 210952192
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 664339,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.00276,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 366886912,
+                "jobs": 1058562048
+            },
+            "WALBytes": 81318723
+        },
+        {
+            "At": "2026-07-28T11:34:23.563052-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 550606,
+                "jobs": 748586
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1329183,
+                "jobs": 1630501
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 104628224,
+                "jobs": 210960384
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 664586,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.002729,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 366911488,
+                "jobs": 1058570240
+            },
+            "WALBytes": 0
+        },
+        {
+            "At": "2026-07-28T11:34:27.319944-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 552652,
+                "jobs": 777137
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1357763,
+                "jobs": 1673354
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 106340352,
+                "jobs": 211296256
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 678873,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.002238,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 368623616,
+                "jobs": 1058906112
+            },
+            "WALBytes": 54394403
+        },
+        {
+            "At": "2026-07-28T11:34:32.32001-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 555259,
+                "jobs": 808063
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1388657,
+                "jobs": 1719816
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 108568576,
+                "jobs": 211722240
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 694350,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001962,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 375373824,
+                "jobs": 1059332096
+            },
+            "WALBytes": 73800312
+        },
+        {
+            "At": "2026-07-28T11:34:37.320468-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 5166,
+                "jobs": 846066
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1426701,
+                "jobs": 1776267
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 110731264,
+                "jobs": 212361216
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 584792,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001857,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 380895232,
+                "jobs": 1059971072
+            },
+            "WALBytes": 73095772
+        },
+        {
+            "At": "2026-07-28T11:34:42.322108-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 57871,
+                "jobs": 880410
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1460995,
+                "jobs": 1825794
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 112640000,
+                "jobs": 212910080
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 717326,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.000573,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 382803968,
+                "jobs": 1060519936
+            },
+            "WALBytes": 338672312
+        },
+        {
+            "At": "2026-07-28T11:34:50.478379-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 58025,
+                "jobs": 880747
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1461363,
+                "jobs": 1826349
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 112697344,
+                "jobs": 212926464
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 717484,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001434,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 382861312,
+                "jobs": 1060536320
+            },
+            "WALBytes": 572
+        },
+        {
+            "At": "2026-07-28T11:34:52.320308-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 60376,
+                "jobs": 894312
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1474985,
+                "jobs": 1846251
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 113582080,
+                "jobs": 213123072
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 724312,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.003172,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 383746048,
+                "jobs": 1060732928
+            },
+            "WALBytes": 30822730
+        },
+        {
+            "At": "2026-07-28T11:34:57.320148-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 65446,
+                "jobs": 929705
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1510257,
+                "jobs": 1898403
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 115687424,
+                "jobs": 213663744
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 741941,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.002644,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 385851392,
+                "jobs": 1061273600
+            },
+            "WALBytes": 77293596
+        },
+        {
+            "At": "2026-07-28T11:35:02.320223-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 70669,
+                "jobs": 964893
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1545555,
+                "jobs": 1950147
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 117800960,
+                "jobs": 214261760
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 759582,
+                "jobs": 997102
+            },
+            "LockWaits": 1,
+            "LongestLockWait": 0.001134,
+            "MaxXactAge": 0.006529,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 387964928,
+                "jobs": 1061871616
+            },
+            "WALBytes": 77777264
+        },
+        {
+            "At": "2026-07-28T11:35:07.320556-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 75395,
+                "jobs": 997586
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1578189,
+                "jobs": 1997971
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 119750656,
+                "jobs": 214745088
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 775893,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.004854,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 389914624,
+                "jobs": 1062363136
+            },
+            "WALBytes": 69879251
+        },
+        {
+            "At": "2026-07-28T11:35:12.322299-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 79839,
+                "jobs": 1029437
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1609955,
+                "jobs": 2044503
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 121921536,
+                "jobs": 215212032
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 791807,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001275,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 392085504,
+                "jobs": 1062830080
+            },
+            "WALBytes": 73086119
+        },
+        {
+            "At": "2026-07-28T11:35:17.320462-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 81942,
+                "jobs": 1043953
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1624567,
+                "jobs": 2065835
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 123191296,
+                "jobs": 215359488
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 799106,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.004636,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 393355264,
+                "jobs": 1062977536
+            },
+            "WALBytes": 26546126
+        },
+        {
+            "At": "2026-07-28T11:35:22.320328-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 87546,
+                "jobs": 1083721
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1664395,
+                "jobs": 2126778
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 126394368,
+                "jobs": 215875584
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 819191,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.00475,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 396558336,
+                "jobs": 1063493632
+            },
+            "WALBytes": 98943541
+        },
+        {
+            "At": "2026-07-28T11:35:27.320377-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 95758,
+                "jobs": 1140318
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1720963,
+                "jobs": 2217783
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 130998272,
+                "jobs": 215932928
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 847296,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001113,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 401162240,
+                "jobs": 1063550976
+            },
+            "WALBytes": 105316378
+        },
+        {
+            "At": "2026-07-28T11:35:32.320412-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 102435,
+                "jobs": 1193637
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1774229,
+                "jobs": 2303642
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 135634944,
+                "jobs": 215932928
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 873901,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001163,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 405798912,
+                "jobs": 1063550976
+            },
+            "WALBytes": 102578188
+        },
+        {
+            "At": "2026-07-28T11:35:37.320503-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 108082,
+                "jobs": 1249326
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1829983,
+                "jobs": 2392080
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 140591104,
+                "jobs": 215932928
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 901796,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.000973,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 410755072,
+                "jobs": 1063550976
+            },
+            "WALBytes": 114197759
+        },
+        {
+            "At": "2026-07-28T11:35:42.322586-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 112717,
+                "jobs": 1303506
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1884187,
+                "jobs": 2477929
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 145260544,
+                "jobs": 215973888
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 928917,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.00325,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 415424512,
+                "jobs": 1063591936
+            },
+            "WALBytes": 124200376
+        },
+        {
+            "At": "2026-07-28T11:35:47.320508-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 114977,
+                "jobs": 1333850
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1914473,
+                "jobs": 2525933
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 148283392,
+                "jobs": 215990272
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 944049,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.002003,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 418447360,
+                "jobs": 1063608320
+            },
+            "WALBytes": 70154145
+        },
+        {
+            "At": "2026-07-28T11:35:52.320549-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 117634,
+                "jobs": 1384508
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1965123,
+                "jobs": 2606283
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 152535040,
+                "jobs": 215998464
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 969242,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001661,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 422699008,
+                "jobs": 1063616512
+            },
+            "WALBytes": 120875230
+        },
+        {
+            "At": "2026-07-28T11:35:55.325375-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 1,
+                "jobs": 1
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 119235,
+                "jobs": 1415767
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 1996343,
+                "jobs": 2655829
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 155238400,
+                "jobs": 215998464
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 984936,
+                "jobs": 997102
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0,
+            "RSS": 1711751168,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 425402368,
+                "jobs": 1063616512
+            },
+            "WALBytes": 0
+        }
+    ],
+    "storage_params": {
+        "job_periodics": "",
+        "job_runs": "",
+        "jobs": ""
+    },
+    "superseded": 44,
+    "sweep": {
+        "count": 237,
+        "max": "7.254196042s",
+        "mean": "126.868164ms",
+        "min": "722.875µs",
+        "nanos": {
+            "max": 7254196042,
+            "mean": 126868164,
+            "min": 722875,
+            "p50": 9686330,
+            "p95": 309962566,
+            "p99": 1960375393
+        },
+        "p50": "9.68633ms",
+        "p95": "309.962566ms",
+        "p99": "1.960375393s"
+    },
+    "workload_digest": "da09f67d6c05a2ec713e866c202274d56c6f96808d807111a413162f1fa2f83a"
+}
