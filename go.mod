@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/glebarez/sqlite v1.11.0
-	github.com/mrz1836/go-foundation v0.3.4
+	github.com/mrz1836/go-foundation v0.3.5
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
