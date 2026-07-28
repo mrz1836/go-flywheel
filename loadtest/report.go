@@ -48,10 +48,23 @@ type StorageSample struct {
 	// WALBytes is the delta in pg_stat_wal since the previous sample. It is
 	// cluster-wide: PostgreSQL offers no per-database breakdown.
 	WALBytes int64
-	// LockWaits counts rows in pg_locks with granted = false at the instant of
-	// the sample. It is a sample of a transient condition and reads zero through
-	// most real contention; see Notes.
+	// LockWaits counts ungranted lock requests against this database at the
+	// instant of the sample. It is a sample of a transient condition and reads
+	// zero through most real contention; see Notes.
 	LockWaits int64
+	// LongestLockWait is how long, in seconds, the longest-blocked backend has
+	// been waiting at the instant of the sample. Where LockWaits counts a
+	// condition, this measures its duration — which is what survives being
+	// sampled on an interval.
+	LongestLockWait float64
+	// MaxXactAge is the age in seconds of the longest transaction open against
+	// this database at the instant of the sample, excluding the sampler's own.
+	//
+	// Its guarantee is one-sided: a sampler at interval I always observes a
+	// transaction living longer than I, and may miss one shorter than I entirely.
+	// That makes it the right instrument for a long transaction and the wrong one
+	// for a short one; see the sampleXactAge doc comment.
+	MaxXactAge float64
 	// RSS is the harness client process's resident set, not the server's.
 	RSS uint64
 }
@@ -107,6 +120,22 @@ type Report struct {
 
 	Storage []StorageSample
 	PeakRSS uint64
+
+	// PeakXactAge is the longest server-side transaction age any sample observed,
+	// in seconds. It is the run-level answer to "did any single transaction hold
+	// a snapshot open", which is what an unbounded maintenance pass looks like
+	// from outside the process running it.
+	//
+	// It under-reports a transaction shorter than the sample interval, by
+	// construction. For bounded maintenance the exact figure is Sweep.Max, which
+	// is client-side and measures one transaction per call — at the cost of
+	// including pool acquisition, which the server-side age excludes.
+	PeakXactAge float64
+	// PeakLockWaits is the highest ungranted lock count any sample observed, and
+	// LongestLockWait the longest single wait. Both are scoped to this run's
+	// database.
+	PeakLockWaits   int64
+	LongestLockWait float64
 
 	Enqueued, Drained, Retried, Discarded, Superseded int64
 
@@ -239,6 +268,9 @@ type reportJSON struct {
 	Sweep          *latencyJSON    `json:"sweep,omitempty"`
 	Storage        []StorageSample `json:"storage,omitempty"`
 	PeakRSS        uint64          `json:"peak_rss_bytes"`
+	PeakXactAge    float64         `json:"peak_xact_age_seconds"`
+	PeakLockWaits  int64           `json:"peak_lock_waits"`
+	LongestLockWt  float64         `json:"longest_lock_wait_seconds"`
 	Reclaimed      int64           `json:"reclaimed"`
 	BlockedClaims  int64           `json:"blocked_claims,omitempty"`
 	Concurrent     int64           `json:"concurrent_executions"`
@@ -269,6 +301,9 @@ func (r Report) MarshalJSON() ([]byte, error) {
 		Sweep:          latencyToJSON(r.Sweep),
 		Storage:        r.Storage,
 		PeakRSS:        r.PeakRSS,
+		PeakXactAge:    r.PeakXactAge,
+		PeakLockWaits:  r.PeakLockWaits,
+		LongestLockWt:  r.LongestLockWait,
 		Reclaimed:      r.Reclaimed,
 		BlockedClaims:  r.BlockedClaims,
 		Concurrent:     r.ConcurrentExecutions,
@@ -317,6 +352,9 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 		Sweep:                latencyFromJSON(in.Sweep),
 		Storage:              in.Storage,
 		PeakRSS:              in.PeakRSS,
+		PeakXactAge:          in.PeakXactAge,
+		PeakLockWaits:        in.PeakLockWaits,
+		LongestLockWait:      in.LongestLockWt,
 		Reclaimed:            in.Reclaimed,
 		BlockedClaims:        in.BlockedClaims,
 		ConcurrentExecutions: in.Concurrent,

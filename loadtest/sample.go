@@ -22,14 +22,23 @@ const pgstattupleEvery = 10
 //nolint:gochecknoglobals // the runtime's own three tables, fixed
 var sampledTables = []string{"jobs", "job_runs"}
 
-// sampleset accumulates storage samples.
+// sampleset accumulates storage samples and the run-level peaks derived from
+// them.
+//
+// The peaks are tracked here rather than recomputed from the series at report
+// time for the same reason peakRSS always was: a caller that trims or downsamples
+// the series would silently change the peak, and a peak is the one statistic that
+// must survive the series it came from.
 type sampleset struct {
-	mu      sync.Mutex
-	samples []StorageSample
-	peakRSS uint64
+	mu              sync.Mutex
+	samples         []StorageSample
+	peakRSS         uint64
+	peakXactAge     float64
+	peakLockWaits   int64
+	longestLockWait float64
 }
 
-// add records one sample and tracks the running RSS peak.
+// add records one sample and tracks the running peaks.
 func (s *sampleset) add(sample StorageSample) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -37,6 +46,22 @@ func (s *sampleset) add(sample StorageSample) {
 	if sample.RSS > s.peakRSS {
 		s.peakRSS = sample.RSS
 	}
+	if sample.MaxXactAge > s.peakXactAge {
+		s.peakXactAge = sample.MaxXactAge
+	}
+	if sample.LockWaits > s.peakLockWaits {
+		s.peakLockWaits = sample.LockWaits
+	}
+	if sample.LongestLockWait > s.longestLockWait {
+		s.longestLockWait = sample.LongestLockWait
+	}
+}
+
+// peaks returns the run-level contention peaks the samples observed.
+func (s *sampleset) peaks() (xactAge float64, lockWaits int64, longestLockWait float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peakXactAge, s.peakLockWaits, s.longestLockWait
 }
 
 // all returns a copy of the collected samples.
@@ -144,9 +169,14 @@ func (h *Harness) sampleOnce(ctx context.Context, prevWAL int64, withBloat bool)
 		sample.WALBytes = wal - prevWAL
 	}
 
-	locks, err := h.sampleLockWaits(ctx)
+	locks, longestWait, err := h.sampleLockWaits(ctx)
 	collect(err)
 	sample.LockWaits = locks
+	sample.LongestLockWait = longestWait
+
+	xactAge, err := h.sampleXactAge(ctx)
+	collect(err)
+	sample.MaxXactAge = xactAge
 
 	if withBloat {
 		collect(h.sampleBloat(ctx, &sample))
@@ -243,14 +273,64 @@ func (h *Harness) sampleWAL(ctx context.Context) (int64, error) {
 	return wal, nil
 }
 
-// sampleLockWaits counts ungranted lock requests at this instant.
-func (h *Harness) sampleLockWaits(ctx context.Context) (int64, error) {
-	var n int64
-	if err := h.probe.WithContext(ctx).
-		Raw(`SELECT count(*) FROM pg_locks WHERE NOT granted`).Scan(&n).Error; err != nil {
-		return 0, fmt.Errorf("loadtest: sample lock waits: %w", err)
+// sampleLockWaits counts ungranted lock requests at this instant and reports
+// the longest one's wait, scoped to this database.
+//
+// The bare `count(*) FROM pg_locks WHERE NOT granted` it replaces read zero in
+// every published report, and the reason is structural rather than lucky: with
+// one sweeper there is no second transaction to contend with, and a count of a
+// transient condition sampled once a second sees almost nothing regardless.
+// Joining pg_stat_activity turns it from a count of a condition into a
+// measurement of a duration — how long the longest blocked backend has been
+// waiting — which is the quantity a lock-contention claim actually needs, and
+// which is non-zero for as long as the contention lasts rather than only at the
+// instant it is sampled.
+//
+// It also scopes to the current database. The count it replaces was
+// cluster-wide, so a sibling database's contention read as this run's.
+func (h *Harness) sampleLockWaits(ctx context.Context) (int64, float64, error) {
+	var row struct {
+		Waiters     int64
+		LongestWait float64
 	}
-	return n, nil
+	if err := h.probe.WithContext(ctx).Raw(`
+		SELECT count(*) AS waiters,
+		       coalesce(max(extract(epoch from (now() - a.state_change))), 0) AS longest_wait
+		FROM pg_locks l
+		JOIN pg_stat_activity a ON a.pid = l.pid
+		WHERE NOT l.granted
+		  AND a.datname = current_database()
+		  AND a.pid <> pg_backend_pid()`).Scan(&row).Error; err != nil {
+		return 0, 0, fmt.Errorf("loadtest: sample lock waits: %w", err)
+	}
+	return row.Waiters, row.LongestWait, nil
+}
+
+// sampleXactAge reports the age in seconds of the longest-running transaction
+// open against this database, excluding the sampler's own backend.
+//
+// It is the instrument the bounded-maintenance claim is measured against, and
+// its guarantee is worth stating precisely because it is one-sided. A sampler at
+// interval I is *guaranteed* to observe any transaction living longer than I, at
+// an age of at least L-I; a transaction shorter than I may be missed entirely.
+//
+// That makes it exactly the right instrument for the unbounded sweep it is meant
+// to characterize — a transaction measured in seconds cannot hide from a
+// one-second sampler — and the wrong one for the bounded sweep that replaced it,
+// whose batches are far shorter than any sample interval. For the bounded side
+// the client-side Sweep latency is exact, and the report says which number is
+// which rather than presenting them as interchangeable.
+func (h *Harness) sampleXactAge(ctx context.Context) (float64, error) {
+	var age float64
+	if err := h.probe.WithContext(ctx).Raw(`
+		SELECT coalesce(max(extract(epoch from (now() - xact_start))), 0)
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND xact_start IS NOT NULL
+		  AND pid <> pg_backend_pid()`).Scan(&age).Error; err != nil {
+		return 0, fmt.Errorf("loadtest: sample transaction age: %w", err)
+	}
+	return age, nil
 }
 
 // sampleBloat reads approximate free and dead-tuple percentages.
@@ -318,7 +398,24 @@ func (h *Harness) noteSamplingCaveats() {
 		"LockWaits is an instantaneous sample of pg_locks: it counts requests ungranted at the moment " +
 			"of the sample, and lock waits under normal contention are far shorter than the sampling " +
 			"interval. A run of zeroes means the sampler did not catch one, not that there was no " +
-			"contention.",
+			"contention. LongestLockWait is the companion that survives sampling: it measures how long " +
+			"the longest blocked backend has been waiting, which stays non-zero for the duration of a " +
+			"wait rather than only at the instant it is sampled. Both are scoped to this database.",
+	)
+	h.notes.add(
+		"MaxXactAge is sampled server-side from pg_stat_activity, and its guarantee is one-sided: a " +
+			"sampler at interval I always observes a transaction living longer than I, at an age of at " +
+			"least L-I, and may miss one shorter than I entirely. It is therefore the right instrument " +
+			"for an unbounded maintenance transaction and the wrong one for a bounded batch. For " +
+			"bounded maintenance the exact figure is Sweep.Max, which is client-side, is not bucketed, " +
+			"and covers exactly one transaction per call - at the cost of including pool acquisition, " +
+			"which the server-side age excludes.",
+	)
+	h.notes.add(
+		"MaxXactAge and the lock-wait pair are scoped to the database, not to this run's schema. The " +
+			"harness isolates a run by schema within one database, so a concurrent run against the same " +
+			"database is visible in these three numbers. Use a dedicated database for a run whose " +
+			"contention figures are being published.",
 	)
 	h.notes.add(
 		"WALBytes is the delta in pg_stat_wal, which is cluster-wide: PostgreSQL offers no per-database " +

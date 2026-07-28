@@ -270,6 +270,7 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 	h.finalSample(ctx)
 	report.Storage = h.samples.all()
 	report.PeakRSS = h.peakRSS()
+	report.PeakXactAge, report.PeakLockWaits, report.LongestLockWait = h.samples.peaks()
 	h.noteSamplingCaveats()
 
 	if report.Duration > 0 {
