@@ -405,6 +405,21 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 	report.Drained = counts[string(flywheel.StateSucceeded)]
 	report.Discarded = counts[string(flywheel.StateDiscarded)] + counts[string(flywheel.StateCancelled)]
 
+	// Drained is a residual: it counts rows still in a terminal state when the run
+	// ended. With retention running, those rows are being deleted continuously, so
+	// it undercounts what the run drained by however much retention removed —
+	// which on a long run is most of it. Saying so is the difference between a
+	// field a reader misreads and a field a reader understands.
+	if h.cfg.RetentionMaxAge > 0 {
+		h.notes.add(
+			"Retention was enabled, so Drained and Discarded are NOT the number of jobs this run "+
+				"drained: they are residual state counts, read after the run, of the terminal rows "+
+				"retention had not yet pruned. The number of jobs actually drained is "+
+				"DrainThroughput x Duration - about %.0f for this run, against a Drained residual of %d.",
+			report.DrainThroughput*report.Duration.Seconds(), report.Drained,
+		)
+	}
+
 	// Record what the target actually carried, not what was asked for. The
 	// index-condition delta is the point of two of these runs, and a report that
 	// only echoed its own Config could not tell a real delta from a schema that
