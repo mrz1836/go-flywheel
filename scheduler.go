@@ -31,6 +31,7 @@ type Scheduler struct {
 	sweepInterval        time.Duration
 	retentionMaxAge      time.Duration
 	retentionInterval    time.Duration
+	retentionOpts        RetentionOpts
 	healthSampleInterval time.Duration
 }
 
@@ -76,6 +77,16 @@ type SchedulerConfig struct {
 	// RetentionInterval is the cadence of the retention sweep. It applies only
 	// when RetentionMaxAge is set; left zero, it defaults to one hour.
 	RetentionInterval time.Duration
+	// RetentionBatchSize is the number of jobs the retention sweep deletes per
+	// transaction. Zero selects the documented default; it is never unbounded.
+	RetentionBatchSize int
+	// RetentionMaxBatches, when positive, caps how many batches one retention
+	// pass runs, bounding the work a single scheduled prune performs. Zero runs
+	// each pass until the backlog is exhausted.
+	//
+	// A pass that ends on this ceiling is logged, so "retention can never keep up
+	// with its window" is visible rather than silent.
+	RetentionMaxBatches int
 	// HealthSampleInterval enables the queue-health heartbeat: when > 0 the
 	// Scheduler samples QueueHealth on this cadence and logs a one-line pulse
 	// (ready, in-flight, oldest-ready lag, discarded). Zero (the default) disables
@@ -149,15 +160,18 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 	}
 
 	s := &Scheduler{
-		db:                   cfg.DB,
-		client:               cfg.Client,
-		driver:               cfg.Driver,
-		logger:               cfg.Logger,
-		backfillCap:          cfg.BackfillCap,
-		tickInterval:         cfg.TickInterval,
-		sweepInterval:        cfg.SweepInterval,
-		retentionMaxAge:      cfg.RetentionMaxAge,
-		retentionInterval:    cfg.RetentionInterval,
+		db:                cfg.DB,
+		client:            cfg.Client,
+		driver:            cfg.Driver,
+		logger:            cfg.Logger,
+		backfillCap:       cfg.BackfillCap,
+		tickInterval:      cfg.TickInterval,
+		sweepInterval:     cfg.SweepInterval,
+		retentionMaxAge:   cfg.RetentionMaxAge,
+		retentionInterval: cfg.RetentionInterval,
+		retentionOpts: RetentionOpts{
+			BatchSize: cfg.RetentionBatchSize, MaxBatches: cfg.RetentionMaxBatches,
+		},
 		healthSampleInterval: cfg.HealthSampleInterval,
 	}
 	if s.logger == nil {
@@ -226,6 +240,13 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				s.logger.ErrorContext(ctx, "jobs: retention sweep failed", "error", err)
 			} else if n > 0 {
 				s.logger.InfoContext(ctx, "jobs: retention sweep pruned finished jobs", "deleted", n)
+				if s.prunedOnItsCeiling(n) {
+					// A pass that ends on its ceiling every tick is a retention window
+					// the deployment can never catch up to. Saying so is the difference
+					// between a knob that is working and one that is silently losing.
+					s.logger.InfoContext(ctx, "jobs: retention sweep stopped on its batch ceiling",
+						"deleted", n, "max_batches", s.retentionOpts.MaxBatches)
+				}
 			}
 		case <-healthC:
 			s.logHealth(ctx)
@@ -299,15 +320,29 @@ func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
 }
 
 // PruneRetention hard-deletes terminal jobs (and their job_runs) finalized
-// longer ago than RetentionMaxAge, reporting how many jobs were removed. It is a
-// no-op returning (0, nil) when retention is disabled, so calling it on a
-// retention-less Scheduler can never delete anything.
+// longer ago than RetentionMaxAge, in bounded batches, reporting how many jobs
+// were removed. It is a no-op returning (0, nil) when retention is disabled, so
+// calling it on a retention-less Scheduler can never delete anything.
+//
+// The returned count is meaningful alongside a non-nil error: committed batches
+// are not rolled back by a later batch's failure.
 func (s *Scheduler) PruneRetention(ctx context.Context) (int64, error) {
 	if s.retentionMaxAge <= 0 {
 		return 0, nil
 	}
 	cutoff := models.ClockFrom(ctx).Now(ctx).Add(-s.retentionMaxAge)
-	return DeleteFinishedJobs(ctx, s.db, cutoff)
+	return DeleteFinishedJobsWithOptions(ctx, s.db, cutoff, s.retentionOpts)
+}
+
+// prunedOnItsCeiling reports whether a pass that deleted n rows stopped because
+// it ran out of batches rather than out of work.
+//
+// It is an inference, not a flag the retention pass returns, and the inference
+// is exact: MaxBatches batches each deleting a full BatchSize is the only way to
+// reach that total without the loop having selected an empty batch.
+func (s *Scheduler) prunedOnItsCeiling(n int64) bool {
+	max := s.retentionOpts.MaxBatches
+	return max > 0 && n == int64(max)*int64(s.retentionOpts.batchSize())
 }
 
 // fire enqueues one job per missed bucket of def (capped at backfillCap) and
