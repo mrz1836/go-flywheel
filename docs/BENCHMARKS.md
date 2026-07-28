@@ -67,7 +67,47 @@ go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix mixed-speed \
 # The poll-error ladder, against a 60-second database outage at 50% drained.
 go run -tags=loadtest ./loadtest/cmd/scenario -jobs 10000 -mix drain \
   -fault pause-database:60s -out docs/benchmarks/poll-backoff-after.json
+
+# Bounded maintenance at depth: a 1M drain under mass lease expiry.
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 1000000 -mix drain \
+  -work 2ms -lease 1s -fault mass-lease-expiry -timeout 60m -sample-interval 5s \
+  -out docs/benchmarks/sweep-1m.json
+
+# Retention against a seeded backlog plus live churn.
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 200000 -mix steady \
+  -duration 20m -timeout 90m -work 2ms \
+  -retention 2m -retention-interval 30s -retention-batch 1000 \
+  -terminal-seed 500000 -sample-interval 10s \
+  -out docs/benchmarks/retention-under-load.json
+
+# Storage parameters, A/B at a 1M working set. Same command twice.
+for arm in untuned tuned; do
+  [ "$arm" = tuned ] && tune=-storage-tuning || tune=
+  go run -tags=loadtest ./loadtest/cmd/scenario -jobs 1000000 -mix steady \
+    -duration 30m -timeout 120m -work 2ms \
+    -retention 2m -retention-interval 30s -sample-interval 10s $tune \
+    -out "docs/benchmarks/bloat-$arm.json"
+done
 ```
+
+Three things about those four commands are load-bearing, and each was found by getting it wrong first.
+
+- **`-timeout` must exceed `-duration`.** `Run` wraps the whole run in `Timeout`, which defaults to 30
+  minutes, so a `-duration 2h` against an unset `-timeout` dies partway with a non-zero exit and a
+  truncated artifact — after spending the thirty minutes. `validate()` now rejects the combination up
+  front rather than leaving it to be discovered.
+- **The retention window is 2 minutes, not an hour.** Retention deletes jobs finalized *longer ago
+  than* the window. Nothing in a 20-minute run is an hour old, so an hour-long window prunes exactly
+  zero and produces an artifact that looks like a working sweep against an empty backlog.
+  `-terminal-seed` supplies a real starting backlog on top of the live churn, because the bulk seed
+  path writes no `finalized_at` and no `job_runs` at all.
+- **Both bloat arms carry retention.** The closed loop bounds the *working set*, not the table:
+  retired jobs stay as terminal rows, so without retention the table grows by accumulation and churn
+  at once and neither is separable. Retention is identical across the two arms, so the delta stays
+  attributable to the storage parameters.
+
+A bloat arm that ends below three autovacuum cycles is unfinished, and no slope should be quoted from
+it. `AutovacuumCount` is sampled per tick.
 
 The two `-after` runs above have committed `-before` halves taken by checking out `047cdf2` into a
 worktree and cherry-picking only the harness's measurement commit onto it — `SlotUtilization` and
@@ -383,7 +423,165 @@ growth. Its index footprint nearly doubles (6.0 MB → 11.8 MB) — a smaller in
 
 This is a finding rather than a tuning result: nothing here was tuned. It says the runtime's
 steady-state storage cost is dominated by update churn on `jobs`, not by row growth, and that the
-default autovacuum settings do not keep pace with a 100k drain at this rate.
+default autovacuum settings do not keep pace with a 100k drain at this rate. *The storage-parameter
+comparison below is what that finding turned into.*
+
+<br/>
+
+## Bounded maintenance
+
+Both maintenance operations — the lease sweep and the retention prune — work in bounded batches, one
+transaction per batch. This section is why.
+
+### The unbounded versions did not degrade at depth. They stopped working.
+
+Measured against the pre-change code, because these numbers are unobtainable afterwards. Both paths
+built a single `IN (?)` list and bound one parameter per row, and PostgreSQL's extended protocol
+rejects a statement carrying more than **65,535** of them.
+
+| Path | Failing statement | Exact ceiling |
+|---|---|---|
+| lease sweep | `UPDATE jobs … WHERE id IN (?)` | **65,531 rows** |
+| retention | `DELETE FROM job_runs WHERE job_id IN (?)` | **65,535 rows** |
+
+The four-row difference is the sweep's `SET` clause — `state`, `leased_until`, `lease_token`,
+`updated_at` are four bind parameters of their own. Verified by bisection: 65,531 reclaims in 1.769 s,
+65,532 fails outright with `extended protocol limited to 65535 parameters`.
+
+Past the ceiling it is a hard error, not a slow path. An executor pool that died holding more than
+~65k leases left a backlog the sweep could **never** clear — every subsequent attempt failed on the
+same statement — and the sweep is the only recovery path for work lost to a crashed process. Retention
+had the same cliff, and a first prune against a long-lived database is exactly where it is met.
+
+Below the ceiling, transaction age was linear in backlog at ≈26 µs/row, holding a row lock on every
+reclaimed job throughout:
+
+| Backlog | Sweep wall time | Peak server-side transaction age |
+|---|---|---|
+| 10,000 | 230 ms | 0.202 s |
+| 25,000 | 604 ms | 0.602 s |
+| 50,000 | 1.263 s | 1.252 s |
+| 65,531 | 1.769 s | 1.752 s |
+| 65,532 | — | **fails** |
+
+### After: 1,000,000 jobs, and the longest transaction is 76 ms
+
+`docs/benchmarks/sweep-1m.json` — a 1M-job drain under the mass-lease-expiry fault.
+
+| | |
+|---|---|
+| Jobs drained | 1,000,000 |
+| Peak **client-backend** transaction age, whole run | **0.076 s** |
+| Sweep p50 / p99 | 9.7 ms / 1.96 s |
+| Leases reclaimed / attempts superseded | 44 / 44 |
+| Concurrent executions | **0** |
+| Peak ungranted locks / longest wait | 1 / 1.1 ms |
+
+The 76 ms is the number the rewrite exists to produce: across a million jobs, no client transaction
+held a snapshot longer than that. Reclaiming 44 leases is not a weak test — it is the ceiling. Only a
+*held* lease can expire, and the in-flight set is bounded by the connection budget, so no live
+scenario reaches a deep backlog. The 200k-backlog case is covered by an integration test that writes
+the rows directly, which is the only way to reach it.
+
+Two numbers in that table measure different things and are easy to conflate. The **server-side** age
+comes from `pg_stat_activity` on a sampling interval; the **client-side** `Sweep.max` of 7.25 s is one
+`Sweep` call end to end, including connection acquisition and Go scheduling on a saturated box. The
+gap between 0.076 s and 7.25 s is that overhead, not a transaction. See the sampling caveat below for
+which to quote when.
+
+### Retention under concurrent load
+
+`docs/benchmarks/retention-under-load.json` — 20 minutes of concurrent enqueue and drain at a 200k
+working set, against a 500k seeded terminal backlog with a 2-minute window.
+
+The first pass removed all 500,000 in bounded batches. Subsequent passes tracked live churn at
+80k–190k per 30-second tick, with zero concurrent executions throughout.
+
+> **`Drained` is a residual, not a count.** It is read from the table after the run: how many rows
+> were still in a terminal state at the end. With retention deleting continuously, that is what had
+> *not yet been pruned* — this run reports `drained: 357,912` while actually draining about
+> **3,376,000** jobs. The event-based figure is `DrainThroughput × Duration`. Newer runs emit a note
+> carrying both; these artifacts predate it.
+
+<br/>
+
+## Storage parameters: measured, then adopted
+
+The 100k finding above said update churn dominates and the autovacuum defaults do not keep pace. This
+is the A/B that turned it into the settings `Migrate` and `InstallStorageParameters` now apply.
+
+Two 33-minute runs at a **1,000,000-job working set**, identical in every respect except the storage
+parameters on `jobs`. Both carry the same retention settings, so the terminal tail stays bounded and
+growth is attributable to churn rather than accumulation; retention being identical across the two
+keeps the delta attributable to the storage parameters alone.
+
+`docs/benchmarks/bloat-untuned.json` · `docs/benchmarks/bloat-tuned.json`
+
+| | Default | Tuned |
+|---|---|---|
+| **Table growth, final third** | **+19.3 MB/min** | **−4.8 MB/min** |
+| Index growth, final third | +19.2 MB/min | +4.6 MB/min |
+| Dead tuples, final | 4,716,750 | **793,208** |
+| Dead tuples, peak | 7,010,561 | 1,920,226 |
+| `jobs` table, final | 2,809 MB | 2,165 MB |
+| Autovacuum cycles | 5 | **29** |
+| Drain throughput | 2,596 jobs/s | **3,947 jobs/s** |
+| **WAL per job** | **7.0 KB** | **10.8 KB** |
+
+The default arm grows monotonically. The tuned arm *shrinks* over its final third — autovacuum
+reclaiming faster than churn adds. Both ran well past three autovacuum cycles, below which a slope
+means nothing: table size under autovacuum is a saw-tooth, and a first-versus-last comparison across
+a partial cycle measures where the run happened to stop.
+
+**The cost is real.** WAL rises 54 % per job. Vacuuming more often writes more WAL, and a fillfactor
+below 100 puts fewer tuples on a page. A deployment paying for replication bandwidth or backup storage
+by the byte should weigh that against the bloat and throughput it buys.
+
+**Three honest qualifications.**
+
+- **The condition bundles both settings**, so this does not attribute the win between them. The
+  5-to-29 cycle count points hard at `autovacuum_vacuum_scale_factor`, which is also the only one of
+  the two with a mechanism that plainly applies here.
+- **`fillfactor` does not enable HOT updates on this table**, and the common claim that it does is
+  false here. A HOT update requires that no index-relevant column change, and `state` sits in the
+  *predicate* of `jobs_ready`, `jobs_unique_active_key`, `jobs_running_leased`, and `jobs_state`. A
+  predicate column is index-relevant, so every state transition is non-HOT whatever the fillfactor
+  is — before these settings, and before `jobs_state` existed. What fillfactor buys is same-page
+  placement for the new tuple version.
+- **The two arms drained different amounts of work** (2,596 against 3,947 jobs/s), so absolute sizes
+  are not directly comparable between them. The slope over the final third is the comparison that is,
+  which is why it is the one reported.
+
+`job_runs` and `job_periodics` get no parameters: neither has update churn, and a lower fillfactor on
+an append-only table reserves free space on every page for updates that never come.
+
+<br/>
+
+## The queue-state telemetry index
+
+`jobs_state` is `(state) WHERE deleted_at IS NULL`. It serves three readers, not the two the
+counts-by-state reads are usually described as: `SampleQueueHealth`, `Overview`, and `CountActiveJobs`
+— the last of which the harness itself polls every 250 ms during a run, which puts it inside the
+window every number in this document is measured in.
+
+Its plan is gated with `SET LOCAL enable_seqscan = off`, and that is deliberate rather than
+convenient. An index-only scan consults the visibility map per heap page, and this table churns hard
+enough that `relallvisible` sits near zero under load — so the planner **correctly** prices a
+sequential scan lower, and a gate asserting the unforced choice would fail whenever autovacuum was
+behind, for a reason that is not a defect. What is gated instead is what a schema change can silently
+break: the index's shape against the query's, read back from `pg_indexes.indexdef` rather than probed
+by name. Probing by name is exactly what let a stale `jobs_ready` definition pass a green suite here
+before.
+
+Forced, the counts read reaches `Index Only Scan using jobs_state`. On SQLite the plan degrades
+without it from `SCAN jobs USING INDEX jobs_state` to `SCAN jobs` plus `USE TEMP B-TREE FOR GROUP BY`
+— verified by dropping the index, because an assertion never seen to fail is not yet a gate.
+
+An honest ceiling on what to expect: at 1M rows `jobs` is roughly 890 MB against a ~30 MB partial
+index, so the IO ceiling is about 30×. Parallelism and a cold visibility map erode it to roughly
+**3–10×** on a quiet queue and closer to **1×** during a heavy drain. `Overview` with a `Kind` filter
+cannot use it — that needs `(kind, state)` — and is a documented limitation rather than a defect: it
+is an inspection query a human runs, not a scrape path something polls.
 
 <br/>
 
