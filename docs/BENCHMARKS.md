@@ -515,9 +515,23 @@ numbers rather than living only here.
   harness reads `/proc/self/statm` instead.
 - **`pgstattuple` was not installed**, so free-space and dead-tuple percentages are absent from these
   reports rather than reported as zero. `CREATE EXTENSION pgstattuple` collects them.
-- **Lock waits read zero throughout.** `pg_locks` is sampled instantaneously and real lock waits are
-  far shorter than the sampling interval, so a run of zeroes means the sampler did not catch one — not
-  that there was no contention.
+- **Lock waits are a count *and* a duration.** `LockWaits` samples `pg_locks` instantaneously, and
+  real lock waits are far shorter than the sampling interval, so a run of zeroes there means the
+  sampler did not catch one rather than that there was no contention. `LongestLockWait` is the
+  companion that survives being sampled: it measures how long the longest blocked backend has been
+  waiting, which stays non-zero for the duration of a wait instead of only at the instant it is
+  observed. Reports predating this pair carry only the count.
+- **`MaxXactAge` has a one-sided guarantee, and it decides which number to quote.** A sampler at
+  interval *I* is *guaranteed* to observe any transaction living longer than *I*, at an age of at
+  least *L − I*; anything shorter may be missed entirely. That makes the server-side age the right
+  instrument for an unbounded maintenance transaction and the wrong one for a bounded batch — the
+  bounded sweep's batches finish in single-digit milliseconds and are invisible to it by design. For
+  bounded maintenance the figure to quote is the client-side `Sweep.Max`, which is exact rather than
+  bucketed and covers exactly one transaction per call, at the cost of including pool acquisition.
+- **The contention numbers are database-scoped, not schema-scoped.** The harness isolates a run by
+  schema *within* one database, so a concurrent run against the same database appears in
+  `MaxXactAge`, `LockWaits`, and `LongestLockWait`. Publish contention figures only from a run that
+  had the database to itself.
 - **WAL is cluster-wide.** `pg_stat_wal` has no per-database breakdown, so any other activity on the
   server is included. These runs had a quiet server.
 - **Superseded is a measurement, and was not always.** Before v0.7.0 the runtime computed the supersede
