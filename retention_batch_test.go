@@ -150,7 +150,7 @@ func TestDeleteFinishedJobsLeavesNonTerminalJobsAlone(t *testing.T) {
 	assert.EqualValues(t, 3, countRows(t, db, &jobRow{}), "the running jobs survive")
 }
 
-// TestRetentionBatchSizeIsNeverUnbounded is the FR-03-04 guarantee stated
+// TestRetentionBatchSizeIsNeverUnbounded states the bound guarantee
 // directly against the resolver.
 func TestRetentionBatchSizeIsNeverUnbounded(t *testing.T) {
 	t.Parallel()
@@ -164,7 +164,7 @@ func TestRetentionBatchSizeIsNeverUnbounded(t *testing.T) {
 	assert.Positive(t, defaultRetentionBatchSize, "the default is itself a bound")
 }
 
-// TestDeleteFinishedJobsCancelledReportsPartialProgress covers FR-03-06 for
+// TestDeleteFinishedJobsCancelledReportsPartialProgress covers cancellation for
 // retention: a cancelled pass reports what it committed, and committed batches
 // are not rolled back.
 func TestDeleteFinishedJobsCancelledReportsPartialProgress(t *testing.T) {

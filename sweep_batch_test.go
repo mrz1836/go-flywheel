@@ -165,7 +165,7 @@ func TestSweepLeavesSoftDeletedJobsAlone(t *testing.T) {
 	assert.Equal(t, 2, reclaimed, "a soft-deleted running job is not reclaimed")
 }
 
-// TestSweepBatchSizeIsNeverUnbounded is the FR-03-04 guarantee stated directly
+// TestSweepBatchSizeIsNeverUnbounded states the bound guarantee directly
 // against the resolver, so no value a caller can supply — zero, negative, or
 // absurd — selects an unbounded transaction.
 func TestSweepBatchSizeIsNeverUnbounded(t *testing.T) {
@@ -180,7 +180,7 @@ func TestSweepBatchSizeIsNeverUnbounded(t *testing.T) {
 	assert.Positive(t, defaultSweepBatchSize, "the default is itself a bound")
 }
 
-// TestSweepCancelledReportsPartialProgress covers FR-03-06. A cancelled sweep
+// TestSweepCancelledReportsPartialProgress covers cancellation. A cancelled sweep
 // must report what it committed rather than discarding it, and must wrap
 // context.Canceled so a caller can tell a shutdown from a database failure.
 //
