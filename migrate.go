@@ -68,7 +68,10 @@ func Models() []any {
 // of its own.
 //
 // The indexes it applies are IndexSet(db.Name()), in that order, through the
-// same apply path [InstallIndexes] uses.
+// same apply path [InstallIndexes] uses, and the storage parameters are
+// StorageParameterSet(db.Name()) through the path [InstallStorageParameters]
+// uses. On PostgreSQL those tune the jobs table for its update rate; on SQLite
+// there are none to apply.
 //
 // Migrate is idempotent: AutoMigrate is a no-op against an up-to-date schema and
 // every index uses IF NOT EXISTS, so repeated calls are safe.
@@ -94,14 +97,16 @@ type MigrateOpts struct {
 }
 
 // MigrateWithOptions installs the schema per opts: the pre-1.0 column
-// reconciliation (unless opts skips it), AutoMigrate over Models, then
-// IndexSet's statements in order.
+// reconciliation (unless opts skips it), AutoMigrate over Models,
+// StorageParameterSet's statements, then IndexSet's statements in order.
 //
 // A host that owns its schema history but still wants the installer — one
 // process, one call, no hand-copied DDL — sets SkipColumnReconcile so the
-// runtime issues no ALTER TABLE of its own inside a versioned schema. A host
-// whose migration tool already created the tables wants InstallIndexes instead:
-// it applies the index half and nothing else.
+// runtime issues no ALTER TABLE of its own inside a versioned schema.
+//
+// A host whose migration tool already created the tables wants InstallIndexes
+// and InstallStorageParameters instead: together they apply everything Migrate
+// does except the tables themselves.
 func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 	if db == nil {
 		return fmt.Errorf("flywheel: Migrate: db is nil")
@@ -115,6 +120,14 @@ func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 
 	if err := db.AutoMigrate(Models()...); err != nil {
 		return fmt.Errorf("flywheel: Migrate: automigrate: %w", err)
+	}
+
+	// Storage parameters go on between the tables and the indexes. The order is
+	// load-bearing rather than tidy: fillfactor governs only pages written after
+	// it is set, so applying it after rows exist leaves every existing page at
+	// the old target. On SQLite this is a no-op.
+	if err := applyStorageParameters(context.Background(), db); err != nil {
+		return fmt.Errorf("flywheel: Migrate: %w", err)
 	}
 
 	if err := applyIndexes(context.Background(), db); err != nil {
