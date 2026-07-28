@@ -144,42 +144,28 @@ func installSchema(ctx context.Context, db *gorm.DB, cond IndexCondition, storag
 	return nil
 }
 
-// tunedStorageParameters are the per-table settings the tuned condition applies
-// to jobs.
-//
-// fillfactor leaves free space on each page for an updated tuple version to land
-// beside its predecessor. What it does *not* do here is enable HOT updates, and
-// the tuning guide must not claim otherwise: a HOT update requires that no
-// indexed column change, and `state` appears in the predicate of jobs_ready,
-// jobs_unique_active_key, jobs_running_leased, and jobs_state. A predicate
-// column is index-relevant, so every state transition is already non-HOT --
-// before any of these settings, and before jobs_state was added.
-//
-// The autovacuum scale factor is the setting with a mechanism that plainly
-// applies. At 1M rows the default 0.2 means 200,050 dead tuples accumulate
-// before a vacuum triggers; 0.02 makes it 20,050. A table that churns every row
-// at least twice reaches either threshold quickly, so the difference is the
-// *period* of the saw-tooth, which is most of what the tuning does.
-//
-//nolint:gochecknoglobals // fixed DDL for the tuned condition
-var tunedStorageParameters = []string{
-	`ALTER TABLE jobs SET (fillfactor = 80)`,
-	`ALTER TABLE jobs SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_cost_limit = 1000)`,
-}
-
 // applyStorage applies the storage condition's parameters to the run's tables.
 //
-// The default condition applies nothing at all rather than explicitly setting
-// PostgreSQL's defaults: an ALTER TABLE that writes reloptions produces a
-// non-empty pg_class.reloptions, and the report reads that back as evidence of
-// what was actually installed. A "default" arm that left a fingerprint would be
-// indistinguishable from a tuned one in the artifact.
+// The tuned arm sources its DDL from the runtime's own StorageParameterSet
+// rather than hand-copying it, for the same reason the index conditions source
+// theirs from IndexSet: a local copy would drift from what a host installs, and
+// then the published comparison would describe a configuration nobody runs.
+//
+// The default arm applies nothing at all rather than explicitly resetting to
+// PostgreSQL's defaults. installSchema builds its tables with AutoMigrate, not
+// Migrate, so they arrive with no reloptions and there is nothing to strip —
+// and an ALTER that wrote reloptions would leave a fingerprint in pg_class,
+// which is exactly what the report reads back to tell the two arms apart.
 func applyStorage(ctx context.Context, db *gorm.DB, storage StorageCondition) error {
 	if storage != StorageTuned {
 		return nil
 	}
-	for _, ddl := range tunedStorageParameters {
-		if err := db.WithContext(ctx).Exec(ddl).Error; err != nil {
+	ddl, err := flywheel.StorageParameters(db.Name())
+	if err != nil {
+		return fmt.Errorf("loadtest: storage parameters: %w", err)
+	}
+	for _, stmt := range ddl {
+		if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
 			return fmt.Errorf("loadtest: apply storage parameters: %w", err)
 		}
 	}
