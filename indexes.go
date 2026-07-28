@@ -183,6 +183,25 @@ func runtimeIndexes() []Index {
 			DDL: `CREATE INDEX IF NOT EXISTS jobs_running_leased ON jobs (leased_until) WHERE state = 'running'`,
 		},
 		{
+			// Performance: counts by state, the telemetry read.
+			//
+			// Three readers, not two: SampleQueueHealth's GROUP BY state, which the
+			// scheduler heartbeat and a /metrics scrape both sample on a timer;
+			// Overview's identical grouping; and CountActiveJobs, whose
+			// state IN (…) predicate is the same access path.
+			//
+			// The key is (state) alone rather than (state, queue): none of the three
+			// filters by queue, and a second column no reader constrains only widens
+			// the index. The deleted_at IS NULL predicate matches GORM's soft-delete
+			// scope, which is what makes the index usable for these reads at all.
+			//
+			// Overview's optional kind filter is not served — that would need
+			// (kind, state) — and it is not meant to be. It is an inspection query a
+			// human runs, not a scrape path something polls.
+			Name: "jobs_state", Kind: IndexPerformance, Table: "jobs",
+			DDL: `CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state) WHERE deleted_at IS NULL`,
+		},
+		{
 			// Performance: soft-delete restore/audit lookups. A partial index a
 			// struct tag cannot express, so it lives here rather than on
 			// jobRow.DeletedAt.

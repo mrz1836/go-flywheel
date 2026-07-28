@@ -29,6 +29,7 @@ var (
 		"jobs_ready",
 		"jobs_parent",
 		"jobs_running_leased",
+		"jobs_state",
 		"idx_jobs_deleted_at",
 		"job_runs_job_attempt",
 		"idx_job_periodics_slug",
