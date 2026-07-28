@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mrz1836/go-foundation/models"
@@ -193,65 +195,176 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 	return s, nil
 }
 
-// Run ticks periodic definitions and runs the stuck-lease sweep until ctx is
-// cancelled. The sweep runs on a 30-second cadence — frequent enough that a
-// crashed executor's jobs come back promptly, cheap enough to be a single
-// indexed scan. When retention is
-// enabled (RetentionMaxAge > 0) it also runs a retention sweep on its own
-// cadence; otherwise no retention ticker is armed.
-func (s *Scheduler) Run(ctx context.Context) error {
-	periodicTicker := time.NewTicker(s.tickInterval)
-	defer periodicTicker.Stop()
-	sweepTicker := time.NewTicker(s.sweepInterval)
-	defer sweepTicker.Stop()
+// activity is one maintenance loop: a name, a cadence, the work, and a guard
+// that skips a tick whose predecessor is still running.
+//
+// Each activity owns a goroutine. Before that, Run was a single select over
+// four tickers with every case inline, so a slow retention prune blocked the
+// lease sweep for its whole duration — and the sweep is the only recovery path
+// for work lost to a crashed process. The failure compounds in exactly the
+// wrong direction: retention is slow because the database is under load, the
+// sweep it blocks is what recovers leases, and the leases it fails to recover
+// are what keeps jobs from being re-dispatched.
+//
+// It is always used through a pointer. An atomic.Bool in a value slice is a
+// copylocks vet failure, and a copied guard guards nothing.
+type activity struct {
+	// name labels the activity in logs.
+	name string
+	// interval is the cadence at which run fires.
+	interval time.Duration
+	// run performs one pass. It returns nothing: no caller above this can act on
+	// a maintenance failure, and collapsing four specific log messages into one
+	// generic error would lose the strings hosts key their alerts on. Each
+	// closure logs its own failure in its own words.
+	run func(context.Context)
+	// running is the self-overlap guard: a tick arriving while a pass is still in
+	// flight is skipped rather than queued.
+	running atomic.Bool
+	// skips counts *consecutive* skipped ticks, reset by every completed pass.
+	// One skip is a slow pass; a climbing count is a cadence the deployment has
+	// to widen, and only a consecutive count distinguishes the two.
+	skips atomic.Int64
+}
 
-	// A disabled retention sweep gets a stopped ticker with a nil channel, which
-	// blocks forever in the select — the same as not having the case at all.
-	var retentionC <-chan time.Time
-	if s.retentionMaxAge > 0 {
-		retentionTicker := time.NewTicker(s.retentionInterval)
-		defer retentionTicker.Stop()
-		retentionC = retentionTicker.C
-	}
-
-	// The queue-health heartbeat is opt-in the same way: a nil channel when
-	// HealthSampleInterval is zero blocks forever, so no pulse is ever logged.
-	var healthC <-chan time.Time
-	if s.healthSampleInterval > 0 {
-		healthTicker := time.NewTicker(s.healthSampleInterval)
-		defer healthTicker.Stop()
-		healthC = healthTicker.C
-	}
-
+// loop runs the activity until ctx is cancelled.
+func (a *activity) loop(ctx context.Context, logger *slog.Logger) {
+	ticker := time.NewTicker(a.interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("jobs: scheduler stopped: %w", ctx.Err())
-		case <-periodicTicker.C:
-			if _, err := s.Tick(ctx); err != nil {
-				s.logger.ErrorContext(ctx, "jobs: periodic tick failed", "error", err)
-			}
-		case <-sweepTicker.C:
-			if _, err := s.Sweep(ctx); err != nil {
-				s.logger.ErrorContext(ctx, "jobs: lease sweep failed", "error", err)
-			}
-		case <-retentionC:
-			if n, err := s.PruneRetention(ctx); err != nil {
-				s.logger.ErrorContext(ctx, "jobs: retention sweep failed", "error", err)
-			} else if n > 0 {
-				s.logger.InfoContext(ctx, "jobs: retention sweep pruned finished jobs", "deleted", n)
-				if s.prunedOnItsCeiling(n) {
-					// A pass that ends on its ceiling every tick is a retention window
-					// the deployment can never catch up to. Saying so is the difference
-					// between a knob that is working and one that is silently losing.
-					s.logger.InfoContext(ctx, "jobs: retention sweep stopped on its batch ceiling",
-						"deleted", n, "max_batches", s.retentionOpts.MaxBatches)
-				}
-			}
-		case <-healthC:
-			s.logHealth(ctx)
+			return
+		case <-ticker.C:
+			a.tick(ctx, logger)
 		}
 	}
+}
+
+// tick runs one pass unless the previous one is still going, in which case it
+// records and logs the skip.
+func (a *activity) tick(ctx context.Context, logger *slog.Logger) {
+	if !a.running.CompareAndSwap(false, true) {
+		logger.WarnContext(ctx, "jobs: maintenance tick skipped, previous pass still running",
+			"activity", a.name,
+			"consecutive_skips", a.skips.Add(1),
+			"interval", a.interval.String())
+		return
+	}
+	defer a.running.Store(false)
+	a.run(ctx)
+	a.skips.Store(0)
+}
+
+// Run ticks periodic definitions and runs the stuck-lease sweep until ctx is
+// cancelled. The sweep runs on a 30-second cadence — frequent enough that a
+// crashed executor's jobs come back promptly, cheap enough to be a single
+// indexed scan. When retention is enabled (RetentionMaxAge > 0) it also runs a
+// retention sweep on its own cadence, and when HealthSampleInterval is set it
+// logs a queue-health pulse on that cadence.
+//
+// Each activity runs on its own goroutine, so none can delay another, and none
+// can overlap itself: a tick arriving while its predecessor is still running is
+// skipped and logged at warn rather than queued behind it.
+//
+// Run returns only when ctx is cancelled, and waits for any in-flight pass
+// before returning. That wait is bounded by one batch rather than one backlog —
+// which is true only because the sweep and the retention prune are batched, and
+// is what makes a Node's DrainTimeout a meaningful bound on shutdown.
+func (s *Scheduler) Run(ctx context.Context) error {
+	s.runActivities(ctx, s.activities())
+	return fmt.Errorf("jobs: scheduler stopped: %w", ctx.Err())
+}
+
+// runActivities runs each activity on its own goroutine until ctx is cancelled,
+// then waits for every in-flight pass to finish.
+//
+// It is separate from Run so the lifecycle — one goroutine each, cancel, wait —
+// is expressed once and can be exercised against a hand-built activity set,
+// without a Scheduler configuration that can produce the timing under test.
+func (s *Scheduler) runActivities(ctx context.Context, activities []*activity) {
+	var wg sync.WaitGroup
+	for _, a := range activities {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a.loop(ctx, s.logger)
+		}()
+	}
+	<-ctx.Done()
+	wg.Wait()
+}
+
+// activities builds the maintenance set for this Scheduler's configuration.
+//
+// Retention and the health heartbeat stay opt-in structurally rather than by a
+// disabled ticker: no interval, no goroutine. A capability that is off should
+// cost nothing, not tick into a branch that returns early.
+func (s *Scheduler) activities() []*activity {
+	acts := []*activity{
+		{name: "periodic", interval: s.tickInterval, run: s.tickOnce},
+		{name: "sweep", interval: s.sweepInterval, run: s.sweepOnce},
+	}
+	if s.retentionMaxAge > 0 {
+		acts = append(acts, &activity{
+			name: "retention", interval: s.retentionInterval, run: s.pruneOnce,
+		})
+	}
+	if s.healthSampleInterval > 0 {
+		acts = append(acts, &activity{
+			name: "health", interval: s.healthSampleInterval, run: s.logHealth,
+		})
+	}
+	return acts
+}
+
+// tickOnce fires every due periodic definition once.
+func (s *Scheduler) tickOnce(ctx context.Context) {
+	if _, err := s.Tick(ctx); err != nil {
+		s.logMaintenanceError(ctx, "jobs: periodic tick failed", err)
+	}
+}
+
+// sweepOnce reclaims expired leases once.
+func (s *Scheduler) sweepOnce(ctx context.Context) {
+	if _, err := s.Sweep(ctx); err != nil {
+		s.logMaintenanceError(ctx, "jobs: lease sweep failed", err)
+	}
+}
+
+// pruneOnce runs one retention pass.
+func (s *Scheduler) pruneOnce(ctx context.Context) {
+	n, err := s.PruneRetention(ctx)
+	if err != nil {
+		s.logMaintenanceError(ctx, "jobs: retention sweep failed", err)
+		return
+	}
+	if n == 0 {
+		return
+	}
+	s.logger.InfoContext(ctx, "jobs: retention sweep pruned finished jobs", "deleted", n)
+	if s.prunedOnItsCeiling(n) {
+		// A pass that ends on its ceiling every tick is a retention window the
+		// deployment can never catch up to. Saying so is the difference between a
+		// knob that is working and one that is silently losing.
+		s.logger.InfoContext(ctx, "jobs: retention sweep stopped on its batch ceiling",
+			"deleted", n, "max_batches", s.retentionOpts.MaxBatches)
+	}
+}
+
+// logMaintenanceError logs a maintenance failure, suppressing the ones that
+// are just the shutdown arriving.
+//
+// A cancelled sweep or prune is what a clean drain looks like from inside the
+// activity: the batched implementations report partial progress plus the
+// context error, which is correct for a caller and noise in a log. Without this
+// every ordinary shutdown would gain an error line the unbounded implementation
+// never produced — a new alert for a non-event.
+func (s *Scheduler) logMaintenanceError(ctx context.Context, msg string, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	s.logger.ErrorContext(ctx, msg, "error", err)
 }
 
 // SampleHealth reads a QueueHealth gauge snapshot through the Scheduler's

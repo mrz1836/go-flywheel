@@ -15,18 +15,35 @@ import (
 // captureHandler is a concurrency-safe slog.Handler that records every message
 // it handles, so a test can assert the scheduler heartbeat fired without parsing
 // formatted log text. It is safe to read from the test goroutine while the
-// scheduler's Run goroutine writes.
+// scheduler's Run goroutines write.
 type captureHandler struct {
 	mu       sync.Mutex
 	messages []string
+	records  []captured
+}
+
+// captured is one handled record's message plus a snapshot of its attributes,
+// which is what lets a test assert on a logged *count* rather than only on the
+// fact that a message appeared. Attributes are snapshotted at handle time
+// because slog.Record's attribute storage is not safe to read later.
+type captured struct {
+	message string
+	attrs   map[string]slog.Value
 }
 
 func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	attrs := make(map[string]slog.Value, r.NumAttrs())
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value
+		return true
+	})
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.messages = append(h.messages, r.Message)
+	h.records = append(h.records, captured{message: r.Message, attrs: attrs})
 	return nil
 }
 
@@ -43,6 +60,19 @@ func (h *captureHandler) has(msg string) bool {
 		}
 	}
 	return false
+}
+
+// recordsFor returns every captured record carrying msg, in handle order.
+func (h *captureHandler) recordsFor(msg string) []captured {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []captured
+	for _, r := range h.records {
+		if r.message == msg {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func TestSchedulerSampleHealthReturnsSnapshot(t *testing.T) {
