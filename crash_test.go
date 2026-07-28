@@ -34,7 +34,7 @@ func TestSweepReclaimsExpiredLeaseAndCrashesStub(t *testing.T) {
 		runID, jobID, "local", now.Add(-time.Hour), string(OutcomeStarted), now.Add(-time.Hour),
 	).Error)
 
-	sweeper := baseDriver{db: db}
+	sweeper := NewSQLiteDriver(db)
 	n, err := sweeper.Sweep(context.Background(), now)
 	require.NoError(t, err)
 	assert.Equal(t, 1, n, "exactly one job had an expired lease")
