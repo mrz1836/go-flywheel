@@ -80,7 +80,7 @@ func TestSchedulerPruneRetentionDeletesOldTerminalJobs(t *testing.T) {
 	seedFinished(t, db, "old-done", StateSucceeded, now.Add(-30*24*time.Hour))
 	seedFinished(t, db, "new-done", StateSucceeded, now.Add(-time.Hour))
 
-	sched := NewSchedulerWithConfig(SchedulerConfig{
+	sched := newSchedulerCfg(t, SchedulerConfig{
 		DB: db, Client: NewClient(db), RetentionMaxAge: 14 * 24 * time.Hour,
 	})
 	deleted, err := sched.PruneRetention(ctx)
@@ -98,7 +98,7 @@ func TestSchedulerPruneRetentionDisabledIsNoOp(t *testing.T) {
 
 	seedFinished(t, db, "old-done", StateSucceeded, now.Add(-30*24*time.Hour))
 
-	sched := NewScheduler(db, NewClient(db)) // no RetentionMaxAge => disabled
+	sched := newScheduler(t, db) // no RetentionMaxAge => disabled
 	deleted, err := sched.PruneRetention(ctx)
 	require.NoError(t, err)
 	assert.Zero(t, deleted, "retention disabled deletes nothing")
@@ -112,7 +112,7 @@ func TestSchedulerRunFiresRetentionOnCadence(t *testing.T) {
 
 	seedFinished(t, db, "old-done", StateSucceeded, now.Add(-30*24*time.Hour))
 
-	sched := NewSchedulerWithConfig(SchedulerConfig{
+	sched := newSchedulerCfg(t, SchedulerConfig{
 		DB: db, Client: NewClient(db),
 		TickInterval:      time.Hour, // keep the periodic and lease sweeps quiet
 		SweepInterval:     time.Hour,

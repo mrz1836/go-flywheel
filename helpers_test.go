@@ -159,3 +159,39 @@ func runToIdle(t testing.TB, ctx context.Context, r *Runner) {
 func clockCtx(ctx context.Context, clk models.Clock) context.Context {
 	return models.WithClock(ctx, clk)
 }
+
+// newScheduler builds a Scheduler over db with the default cadences, failing the
+// test on a construction error.
+//
+// It exists so a test whose subject is a tick, a sweep, or a prune does not
+// carry three lines of construction error handling that its assertion never
+// reads. The construction contract itself — that a Driver is required, and that
+// the dialect selects one — is asserted directly in scheduler_driver_test.go,
+// which is where a reader should look for it.
+func newScheduler(t testing.TB, db *gorm.DB) *Scheduler {
+	t.Helper()
+	s, err := NewScheduler(db, NewClient(db))
+	if err != nil {
+		t.Fatalf("newScheduler: %v", err)
+	}
+	return s
+}
+
+// newSchedulerCfg builds a Scheduler from cfg, defaulting the SQLite driver when
+// the caller left one out, and fails the test on a construction error.
+//
+// The Driver default is a convenience for tests configuring some *other* field —
+// a retention window, a backfill cap — and it is deliberately not available to
+// production code: NewSchedulerWithConfig rejects a nil Driver, and
+// TestNewSchedulerWithConfigRequiresADriver is what holds that line.
+func newSchedulerCfg(t testing.TB, cfg SchedulerConfig) *Scheduler {
+	t.Helper()
+	if cfg.Driver == nil && cfg.DB != nil {
+		cfg.Driver = NewSQLiteDriver(cfg.DB)
+	}
+	s, err := NewSchedulerWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("newSchedulerCfg: %v", err)
+	}
+	return s
+}

@@ -248,7 +248,7 @@ func TestRealWorldPeriodicPolling(t *testing.T) {
 	t.Run("interval-fires-and-is-idempotent", func(t *testing.T) {
 		t.Parallel()
 		db := newDB(t)
-		sched := NewScheduler(db, NewClient(db))
+		sched := newScheduler(t, db)
 		base := time.Now().UTC().Truncate(time.Second)
 
 		// A fresh schedule seeds next_run_at = base + Every, so it does not fire
@@ -277,7 +277,7 @@ func TestRealWorldPeriodicPolling(t *testing.T) {
 	t.Run("cron-fires", func(t *testing.T) {
 		t.Parallel()
 		db := newDB(t)
-		sched := NewScheduler(db, NewClient(db))
+		sched := newScheduler(t, db)
 		base := time.Now().UTC().Truncate(time.Minute)
 
 		require.NoError(t, UpsertPeriodic(clockCtx(context.Background(), models.NewFixedClock(base)),
@@ -293,7 +293,7 @@ func TestRealWorldPeriodicPolling(t *testing.T) {
 	t.Run("backfill-cap-bounds-catchup", func(t *testing.T) {
 		t.Parallel()
 		db := newDB(t)
-		sched := NewSchedulerWithConfig(SchedulerConfig{DB: db, Client: NewClient(db), BackfillCap: 10})
+		sched := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db), BackfillCap: 10})
 		base := time.Now().UTC().Truncate(time.Second)
 
 		require.NoError(t, UpsertPeriodic(clockCtx(context.Background(), models.NewFixedClock(base)),
@@ -613,7 +613,7 @@ func TestRealWorldCrashRecoveryLeaseExpiry(t *testing.T) {
 
 	// The lease expires; sweep reclaims it and crashes the stale stub.
 	sweepCtx := clockCtx(ctx, models.NewFixedClock(base.Add(time.Hour)))
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 	reclaimed, err := sched.Sweep(sweepCtx)
 	require.NoError(t, err)
 	assert.Equal(t, 1, reclaimed, "the expired lease is reclaimed")

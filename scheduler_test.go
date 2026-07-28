@@ -48,7 +48,7 @@ func jobCount(t *testing.T, db *gorm.DB, kind string) int64 {
 func TestSchedulerTickFiresIntervalAndAdvancesNextRunAt(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	// Anchor a fixed clock so the test is unaffected by wall-clock drift /
 	// stored-text-vs-time-Time round-trip subtleties.
@@ -72,7 +72,7 @@ func TestSchedulerTickFiresIntervalAndAdvancesNextRunAt(t *testing.T) {
 func TestSchedulerTickFiresCron(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
@@ -89,7 +89,7 @@ func TestSchedulerTickFiresCron(t *testing.T) {
 func TestSchedulerTickIdempotentOnRepeatTick(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
@@ -113,7 +113,7 @@ func TestSchedulerTickIdempotentOnRepeatTick(t *testing.T) {
 func TestSchedulerTickSkipsInactiveDefinitions(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
@@ -130,7 +130,7 @@ func TestSchedulerTickSkipsInactiveDefinitions(t *testing.T) {
 func TestSchedulerTickBackfillsAtMostBackfillCapJobs(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
@@ -149,7 +149,7 @@ func TestSchedulerTickBackfillsAtMostBackfillCapJobs(t *testing.T) {
 func TestSchedulerSweepReclaimsExpiredLeases(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	now := time.Now().UTC()
 	pastLease := now.Add(-time.Minute)

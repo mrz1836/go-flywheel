@@ -560,7 +560,7 @@ func TestCancelJobSurfacesClassificationReadError(t *testing.T) {
 func TestSchedulerTickSurfacesLoadError(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 	closeDB(t, db)
 
 	_, err := sched.Tick(context.Background())
@@ -576,7 +576,7 @@ func TestSchedulerFireSurfacesAdvanceError(t *testing.T) {
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	require.NoError(t, db.Migrator().DropTable(&jobPeriodicRow{}), "drop job_periodics so only the advance fails")
 
@@ -597,7 +597,7 @@ func TestSchedulerFireSurfacesCronBucketError(t *testing.T) {
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	bad := "not a cron"
 	def := jobPeriodicRow{
@@ -617,7 +617,7 @@ func TestSchedulerFireSurfacesEnqueueError(t *testing.T) {
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
@@ -642,7 +642,7 @@ func TestEnqueueBucketDefaultsEmptyPayload(t *testing.T) {
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	def := jobPeriodicRow{Slug: "e", Kind: "cov.k", Queue: "periodic", ArgsTemplate: nil}
 	ok, err := sched.enqueueBucket(ctx, def, now)
@@ -657,7 +657,7 @@ func TestEnqueueBucketCollisionIsNoOp(t *testing.T) {
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	def := jobPeriodicRow{
 		Slug: "dup", Kind: "cov.k", Queue: "periodic",
@@ -681,7 +681,7 @@ func TestEnqueueBucketSurfacesInsertError(t *testing.T) {
 	db := newDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 	closeDB(t, db)
 
 	def := jobPeriodicRow{Slug: "s", Kind: "cov.k", Queue: "periodic", ArgsTemplate: datatypes.JSON("{}")}

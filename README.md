@@ -571,12 +571,15 @@ func newRegistry() *flywheel.Registry {
 **The long-running process** runs a `Node` on its class, and owns the scheduler:
 
 ```go
+// One driver, shared by the runner and the scheduler.
+driver := flywheel.NewPostgresDriver(db)
+
 node, _ := flywheel.NewNode(flywheel.NodeConfig{
     Runners: []flywheel.RunnerConfig{{
-        DB: db, Driver: flywheel.NewPostgresDriver(db), Registry: newRegistry(),
+        DB: db, Driver: driver, Registry: newRegistry(),
         Queues: []string{"default", "periodic"}, ExecutorClass: "worker", Concurrency: 4,
     }},
-    Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db)},
+    Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db), Driver: driver},
 })
 _ = node.Run(ctx)
 ```

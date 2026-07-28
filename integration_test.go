@@ -210,7 +210,8 @@ func TestRunnerPGLeaseExpiryReclaimsJob(t *testing.T) {
 	).Error)
 
 	// Sweep + drain.
-	sched := flywheel.NewScheduler(db, flywheel.NewClient(db))
+	sched, err := flywheel.NewScheduler(db, flywheel.NewClient(db))
+	require.NoError(t, err)
 	reclaimed, err := sched.Sweep(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, 1, reclaimed)

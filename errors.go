@@ -105,11 +105,26 @@ var (
 // errWorkerPanicked wraps a recovered worker panic.
 var errWorkerPanicked = errors.New("jobs: worker panicked")
 
-// Node configuration errors returned by NewNode.
+// SchedulerConfig validation errors returned by NewScheduler and
+// NewSchedulerWithConfig.
+//
+// They are unexported for the same reason errRunnerNeedsDriver is: a
+// construction failure is a wiring bug the caller fixes in source, not a
+// runtime condition it branches on. An exported sentinel invites a caller to
+// handle what it should have prevented.
 var (
-	errNodeNeedsRunner     = errors.New("jobs: node config requires at least one runner")
-	errNodeSchedulerConfig = errors.New("jobs: node scheduler config requires DB and Client")
+	errSchedulerNeedsDB     = errors.New("jobs: scheduler config requires DB")
+	errSchedulerNeedsClient = errors.New("jobs: scheduler config requires Client")
+	errSchedulerNeedsDriver = errors.New("jobs: scheduler config requires Driver")
 )
+
+// errNodeNeedsRunner is returned by NewNode for a config with no runners.
+//
+// There is no companion "node scheduler config" error: NewNode wraps whatever
+// NewSchedulerWithConfig returns rather than re-deriving its own verdict, so a
+// caller sees the specific field that was missing instead of a generic message
+// that names three.
+var errNodeNeedsRunner = errors.New("jobs: node config requires at least one runner")
 
 // errPeriodicNoSchedule is returned when a periodic definition has neither a
 // cron expression nor an interval.

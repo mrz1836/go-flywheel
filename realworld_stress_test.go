@@ -260,7 +260,7 @@ func TestRealWorldStressChaosLeaseExpiry(t *testing.T) {
 
 	// The leases expire; one sweep reclaims the whole crashed chunk.
 	sweepCtx := clockCtx(context.Background(), models.NewFixedClock(base.Add(time.Hour)))
-	sched := NewScheduler(db, client)
+	sched := newScheduler(t, db)
 	reclaimed, err := sched.Sweep(sweepCtx)
 	require.NoError(t, err)
 	assert.Equal(t, crashed, reclaimed, "every expired lease is reclaimed in one sweep")

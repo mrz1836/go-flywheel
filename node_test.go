@@ -107,9 +107,27 @@ func TestNewNodeRejectsSchedulerWithoutDBAndClient(t *testing.T) {
 	reg := NewRegistry()
 	_, err := NewNode(NodeConfig{
 		Runners:   []RunnerConfig{sqliteRunner(db, reg)},
-		Scheduler: &SchedulerConfig{}, // nil DB and Client
+		Scheduler: &SchedulerConfig{}, // nil DB, Client, and Driver
 	})
-	require.ErrorIs(t, err, errNodeSchedulerConfig)
+	// The scheduler's own constructor is the authority, so the error names the
+	// first missing field rather than a generic "node scheduler config" verdict.
+	require.ErrorIs(t, err, errSchedulerNeedsDB)
+}
+
+// TestNewNodePropagatesASchedulerConstructionError proves the propagation for a
+// config NewNode itself never inspected: DB and Client are present, and only the
+// Driver is missing. Before the scheduler owned its validation this reached
+// NewSchedulerWithConfig unchecked and a Node was built around a scheduler that
+// could not sweep.
+func TestNewNodePropagatesASchedulerConstructionError(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	reg := NewRegistry()
+	_, err := NewNode(NodeConfig{
+		Runners:   []RunnerConfig{sqliteRunner(db, reg)},
+		Scheduler: &SchedulerConfig{DB: db, Client: NewClient(db)}, // nil Driver
+	})
+	require.ErrorIs(t, err, errSchedulerNeedsDriver)
 }
 
 func TestNodeRunDrainsRunnerOnContextCancel(t *testing.T) {
@@ -188,7 +206,7 @@ func TestNodeRunsSchedulerEnqueuesPeriodic(t *testing.T) {
 	node, err := NewNode(NodeConfig{
 		Runners: []RunnerConfig{sqliteRunner(db, reg)},
 		Scheduler: &SchedulerConfig{
-			DB: db, Client: NewClient(db),
+			DB: db, Client: NewClient(db), Driver: NewSQLiteDriver(db),
 			TickInterval: 5 * time.Millisecond, SweepInterval: 50 * time.Millisecond,
 		},
 	})
