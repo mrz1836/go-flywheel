@@ -82,21 +82,21 @@ func Migrate(db *gorm.DB) error {
 }
 
 // MigrateOpts configures MigrateWithOptions. The zero value is the library-owned
-// install: the runtime brings up its own tables, indexes, and pre-1.0 column
+// install: the runtime brings up its own tables, indexes, and legacy column
 // reconciliation against a database it is the only writer of.
 type MigrateOpts struct {
-	// SkipColumnReconcile disables the pre-1.0 routing-column rename pass. Set it
+	// SkipColumnReconcile disables the legacy routing-column rename pass. Set it
 	// when the database's schema history is owned by an external migration tool:
 	// the rename is imperative DDL, and running it inside a versioned schema means
 	// two migration authorities on one database.
 	//
 	// The reconciliation belongs to the library-owned mode only. It is removed in
-	// v1.0.0, at which point this field becomes a no-op — a host that sets it
+	// v0.16.0, at which point this field becomes a no-op — a host that sets it
 	// today needs no further change then.
 	SkipColumnReconcile bool
 }
 
-// MigrateWithOptions installs the schema per opts: the pre-1.0 column
+// MigrateWithOptions installs the schema per opts: the legacy column
 // reconciliation (unless opts skips it), AutoMigrate over Models,
 // StorageParameterSet's statements, then IndexSet's statements in order.
 //
@@ -136,7 +136,7 @@ func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 	return nil
 }
 
-// reconcileColumnRenames renames the pre-1.0 routing columns to their
+// reconcileColumnRenames renames the legacy routing columns to their
 // executor_class names on an existing database, before AutoMigrate runs. The
 // routing model moved from the closed lambda/ecs/either vocabulary to a
 // free-form ExecutorClass, so jobs.run_on became jobs.executor_class and
@@ -153,7 +153,7 @@ func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 // This pass belongs to the library-owned install mode. It is imperative DDL, so
 // a host whose schema history is owned by a migration tool skips it with
 // MigrateOpts.SkipColumnReconcile rather than running a second migration
-// authority against its database. It is removed in v1.0.0.
+// authority against its database. It is removed in v0.16.0.
 func reconcileColumnRenames(db *gorm.DB) error {
 	renames := []struct{ table, oldCol, newCol string }{
 		{"jobs", "run_on", "executor_class"},
