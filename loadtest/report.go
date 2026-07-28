@@ -137,6 +137,16 @@ type Report struct {
 	PeakLockWaits   int64
 	LongestLockWait float64
 
+	// Enqueued, Retried and Superseded are event counts accumulated during the
+	// run. Drained and Discarded are *residual state counts*, read from the table
+	// after the run: how many rows were sitting in a terminal state at the end.
+	//
+	// The distinction is invisible on a drain run, where nothing removes rows, and
+	// decisive on a run with retention enabled, where terminal rows are being
+	// deleted continuously — there, Drained counts what retention had not yet
+	// pruned, which can be an order of magnitude below the number of jobs the run
+	// actually drained. The event-based figure is DrainThroughput × Duration, and
+	// a run with retention on says so in its Notes.
 	Enqueued, Drained, Retried, Discarded, Superseded int64
 
 	// Reclaimed counts jobs the harness's sweeper returned to available after
