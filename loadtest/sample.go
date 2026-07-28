@@ -300,6 +300,7 @@ func (h *Harness) sampleLockWaits(ctx context.Context) (int64, float64, error) {
 		JOIN pg_stat_activity a ON a.pid = l.pid
 		WHERE NOT l.granted
 		  AND a.datname = current_database()
+		  AND a.backend_type = 'client backend'
 		  AND a.pid <> pg_backend_pid()`).Scan(&row).Error; err != nil {
 		return 0, 0, fmt.Errorf("loadtest: sample lock waits: %w", err)
 	}
@@ -320,6 +321,15 @@ func (h *Harness) sampleLockWaits(ctx context.Context) (int64, float64, error) {
 // whose batches are far shorter than any sample interval. For the bounded side
 // the client-side Sweep latency is exact, and the report says which number is
 // which rather than presenting them as interchangeable.
+// It counts client backends only, and that exclusion is load-bearing rather
+// than tidy. An autovacuum worker appears in pg_stat_activity with an
+// xact_start like any other backend, and on a churning table it runs for
+// minutes: measured on a 1M-row drain leaving ~1.2M dead tuples, an autovacuum
+// worker produced a 110-second "longest transaction" while the sweep's own
+// batches were finishing in single-digit milliseconds. Including it does not
+// make the number conservative, it makes it answer a different question — one
+// AutovacuumCount already answers — and it would be published as evidence about
+// maintenance transactions it has nothing to do with.
 func (h *Harness) sampleXactAge(ctx context.Context) (float64, error) {
 	var age float64
 	if err := h.probe.WithContext(ctx).Raw(`
@@ -327,6 +337,7 @@ func (h *Harness) sampleXactAge(ctx context.Context) (float64, error) {
 		FROM pg_stat_activity
 		WHERE datname = current_database()
 		  AND xact_start IS NOT NULL
+		  AND backend_type = 'client backend'
 		  AND pid <> pg_backend_pid()`).Scan(&age).Error; err != nil {
 		return 0, fmt.Errorf("loadtest: sample transaction age: %w", err)
 	}
@@ -412,10 +423,17 @@ func (h *Harness) noteSamplingCaveats() {
 			"which the server-side age excludes.",
 	)
 	h.notes.add(
+		"MaxXactAge and the lock-wait pair count client backends only. An autovacuum worker carries an " +
+			"xact_start like any other backend and runs for minutes on a churning table, so including " +
+			"it would report vacuum duration as maintenance-transaction age - a quantity " +
+			"AutovacuumCount already reports, in the one field meant to answer whether a maintenance " +
+			"pass held a snapshot open.",
+	)
+	h.notes.add(
 		"MaxXactAge and the lock-wait pair are scoped to the database, not to this run's schema. The " +
 			"harness isolates a run by schema within one database, so a concurrent run against the same " +
-			"database is visible in these three numbers. Use a dedicated database for a run whose " +
-			"contention figures are being published.",
+			"database - or an interactive query against it - is visible in these three numbers. Use a " +
+			"dedicated database for a run whose contention figures are being published.",
 	)
 	h.notes.add(
 		"WALBytes is the delta in pg_stat_wal, which is cluster-wide: PostgreSQL offers no per-database " +
