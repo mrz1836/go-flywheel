@@ -91,7 +91,7 @@ type MigrateOpts struct {
 	// two migration authorities on one database.
 	//
 	// The reconciliation belongs to the library-owned mode only. It is removed in
-	// v0.16.0, at which point this field becomes a no-op — a host that sets it
+	// v0.17.0, at which point this field becomes a no-op — a host that sets it
 	// today needs no further change then.
 	SkipColumnReconcile bool
 }
@@ -153,7 +153,7 @@ func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 // This pass belongs to the library-owned install mode. It is imperative DDL, so
 // a host whose schema history is owned by a migration tool skips it with
 // MigrateOpts.SkipColumnReconcile rather than running a second migration
-// authority against its database. It is removed in v0.16.0.
+// authority against its database. It is removed in v0.17.0.
 func reconcileColumnRenames(db *gorm.DB) error {
 	renames := []struct{ table, oldCol, newCol string }{
 		{"jobs", "run_on", "executor_class"},
