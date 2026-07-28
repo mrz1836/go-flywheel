@@ -14,7 +14,7 @@ import (
 // skippedTickMessage is the warn line an overlapping tick emits.
 const skippedTickMessage = "jobs: maintenance tick skipped, previous pass still running"
 
-// TestActivitySkipsATickWhosePredecessorIsStillRunning covers FR-03-09 at the
+// TestActivitySkipsATickWhosePredecessorIsStillRunning covers the guard at the
 // unit the guard lives on. A pass that outlasts its interval must skip the next
 // tick rather than run concurrently with itself — two overlapping retention
 // passes would delete from the same window twice.
@@ -125,7 +125,7 @@ func TestActivityLoopStopsOnContextCancel(t *testing.T) {
 	}
 }
 
-// TestSchedulerRunKeepsMaintenanceActivitiesIndependent is FR-03-08 at the level
+// TestSchedulerRunKeepsMaintenanceActivitiesIndependent proves independence at the level
 // that matters: a retention pass slower than its own interval must not delay the
 // lease sweep.
 //
