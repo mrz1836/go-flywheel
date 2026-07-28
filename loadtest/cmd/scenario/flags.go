@@ -46,6 +46,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		mix     string
 		indexes string
 		fault   string
+		tuned   bool
 	)
 
 	fs.StringVar(&opts.cfg.DSN, "dsn", os.Getenv(dsnEnv),
@@ -72,6 +73,24 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&opts.out, "out", "", "write the JSON report here (default: stdout)")
 	fs.BoolVar(&opts.quiet, "quiet", false, "suppress the human-readable summary")
 
+	fs.DurationVar(&opts.cfg.Duration, "duration", 0,
+		"steady mix only: hold a constant population for this long instead of draining it "+
+			"(must be below -timeout)")
+	fs.DurationVar(&opts.cfg.RetentionMaxAge, "retention", 0,
+		"enable the scheduler's retention sweep with this window (zero disables it)")
+	fs.DurationVar(&opts.cfg.RetentionInterval, "retention-interval", 0,
+		"cadence of the retention sweep (default: the runtime's own)")
+	fs.IntVar(&opts.cfg.RetentionBatchSize, "retention-batch", 0,
+		"jobs deleted per retention transaction (default: the runtime's own; never unbounded)")
+	fs.IntVar(&opts.cfg.SweepBatchSize, "sweep-batch", 0,
+		"expired leases reclaimed per sweep transaction (default: the runtime's own; never unbounded)")
+	fs.BoolVar(&tuned, "storage-tuning", false,
+		"apply the tuned fillfactor and autovacuum settings to jobs")
+	fs.IntVar(&opts.cfg.TerminalSeed, "terminal-seed", 0,
+		"seed this many already-finalized jobs so retention has a backlog to prune")
+	fs.DurationVar(&opts.cfg.TerminalSeedAge, "terminal-seed-age", 0,
+		"how far back to date the seeded terminal jobs (default: 90 days)")
+
 	if err := fs.Parse(args); err != nil {
 		return options{}, fmt.Errorf("scenario: %w", err)
 	}
@@ -81,6 +100,13 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 
 	opts.cfg.Mix = loadtest.Workload(mix)
 	opts.cfg.Indexes = loadtest.IndexCondition(indexes)
+	// A bool flag rather than a string enum: there are exactly two conditions and
+	// the tuned one is the opt-in, so `-storage-tuning` reads as what it does.
+	// The Config keeps the enum, because that is what the report records.
+	opts.cfg.Storage = loadtest.StorageDefault
+	if tuned {
+		opts.cfg.Storage = loadtest.StorageTuned
+	}
 
 	// The enum checks live here rather than being left to the harness so a typo
 	// costs a message instead of a provisioned schema, and so the message names

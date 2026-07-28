@@ -73,6 +73,9 @@ type Harness struct {
 	// killed counts runners a fault has stopped, so a scenario can assert the
 	// fault actually fired rather than assuming it did.
 	killed atomic.Int64
+	// generation counts bulk-seed generations, so a closed-loop run's repeated
+	// top-ups mint disjoint id spaces rather than colliding on the primary key.
+	generation atomic.Int64
 
 	runners       []*runnerHandle
 	cancelSweeper context.CancelFunc
@@ -291,7 +294,7 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 		return h, fmt.Errorf("loadtest: open scheduler pool: %w", err)
 	}
 
-	if err = installSchema(ctx, h.work, cfg.Indexes); err != nil {
+	if err = installSchema(ctx, h.work, cfg.Indexes, cfg.Storage); err != nil {
 		return h, err
 	}
 
@@ -458,7 +461,10 @@ func (h *Harness) startRunners(ctx context.Context) error {
 	sweepCtx, cancelSweep := context.WithCancel(ctx)
 	h.cancelSweeper = cancelSweep
 
-	sweeper := newTimingDriver(flywheel.NewPostgresDriver(h.sched), h.timings, h.cfg.Runners).
+	inner := flywheel.NewPostgresDriverWithOptions(h.sched, flywheel.DriverOpts{
+		SweepBatchSize: h.cfg.SweepBatchSize,
+	})
+	sweeper := newTimingDriver(inner, h.timings, h.cfg.Runners).
 		countingReclaims(&h.prog.reclaimed)
 	scheduler, err := flywheel.NewSchedulerWithConfig(flywheel.SchedulerConfig{
 		DB:     h.sched,
@@ -470,6 +476,11 @@ func (h *Harness) startRunners(ctx context.Context) error {
 		// interval keeps it from costing a query per second regardless.
 		TickInterval:  time.Hour,
 		SweepInterval: sweepInterval,
+		// Retention is off unless the run asked for it, exactly as it is for a
+		// host: RetentionMaxAge is the switch.
+		RetentionMaxAge:    h.cfg.RetentionMaxAge,
+		RetentionInterval:  h.cfg.RetentionInterval,
+		RetentionBatchSize: h.cfg.RetentionBatchSize,
 	})
 	if err != nil {
 		return fmt.Errorf("loadtest: build scheduler: %w", err)

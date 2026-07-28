@@ -472,7 +472,7 @@ func TestPinnedLeaseTokenIsStableAcrossCaptures(t *testing.T) {
 		t.Fatalf("openPool: %v", err)
 	}
 	defer closePool(db)
-	if err = installSchema(ctx, db, IndexesFull); err != nil {
+	if err = installSchema(ctx, db, IndexesFull, StorageDefault); err != nil {
 		t.Fatalf("installSchema: %v", err)
 	}
 
@@ -675,7 +675,7 @@ func TestExplainClaimCapturesTheDriversOwnSQL(t *testing.T) {
 		t.Fatalf("openPool: %v", err)
 	}
 	defer closePool(db)
-	if err = installSchema(ctx, db, IndexesFull); err != nil {
+	if err = installSchema(ctx, db, IndexesFull, StorageDefault); err != nil {
 		t.Fatalf("installSchema: %v", err)
 	}
 
@@ -818,7 +818,7 @@ func TestExplainClaimLeavesTheTableIntact(t *testing.T) {
 		t.Fatalf("openPool: %v", err)
 	}
 	defer closePool(db)
-	if err = installSchema(ctx, db, IndexesFull); err != nil {
+	if err = installSchema(ctx, db, IndexesFull, StorageDefault); err != nil {
 		t.Fatalf("installSchema: %v", err)
 	}
 
@@ -882,7 +882,7 @@ func TestInstallClaimIndexReplacesRatherThanSkips(t *testing.T) {
 		t.Fatalf("openPool: %v", err)
 	}
 	defer closePool(db)
-	if err = installSchema(ctx, db, IndexesFull); err != nil {
+	if err = installSchema(ctx, db, IndexesFull, StorageDefault); err != nil {
 		t.Fatalf("installSchema: %v", err)
 	}
 
