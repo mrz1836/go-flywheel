@@ -447,15 +447,20 @@ func (s *Scheduler) PruneRetention(ctx context.Context) (int64, error) {
 	return DeleteFinishedJobsWithOptions(ctx, s.db, cutoff, s.retentionOpts)
 }
 
-// prunedOnItsCeiling reports whether a pass that deleted n rows stopped because
-// it ran out of batches rather than out of work.
+// prunedOnItsCeiling reports whether a pass that deleted n rows used every
+// batch it was allowed.
 //
-// It is an inference, not a flag the retention pass returns, and the inference
-// is exact: MaxBatches batches each deleting a full BatchSize is the only way to
-// reach that total without the loop having selected an empty batch.
+// It is an inference rather than a flag the retention pass returns, and it is
+// exact about the mechanism — reaching MaxBatches × BatchSize requires every
+// batch to have been full, which is the only way the loop exits on its counter
+// rather than on an empty batch. It is deliberately not read as "retention is
+// falling behind": a backlog that happens to be exactly that size ends on the
+// ceiling and on exhaustion at once. The log line says the pass stopped on its
+// ceiling, which is what was observed; a run of them across consecutive passes
+// is what means the window cannot be kept.
 func (s *Scheduler) prunedOnItsCeiling(n int64) bool {
-	max := s.retentionOpts.MaxBatches
-	return max > 0 && n == int64(max)*int64(s.retentionOpts.batchSize())
+	maxBatches := s.retentionOpts.MaxBatches
+	return maxBatches > 0 && n == int64(maxBatches)*int64(s.retentionOpts.batchSize())
 }
 
 // fire enqueues one job per missed bucket of def (capped at backfillCap) and
