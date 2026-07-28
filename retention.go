@@ -133,6 +133,13 @@ func DeleteFinishedJobsWithOptions(
 // An empty last id means the batch selected no rows, which is how the caller
 // detects exhaustion. It is distinct from a zero count: a batch can select rows
 // whose jobs delete affects fewer rows than the runs delete did.
+//
+// The cursor predicate is added only once there is a cursor, rather than seeded
+// with an empty string that every id sorts after. An empty string is a valid
+// value for a text id and an *invalid literal* for a uuid one, and a host is
+// free to declare jobs.id as uuid — the runtime's own installer happens to
+// create it as text, so a sentinel comparison would work everywhere the library
+// tests itself and fail on a schema it never builds.
 func deleteFinishedBatch(
 	ctx context.Context, db *gorm.DB, olderThan time.Time, cursor string, limit int,
 ) (int64, string, error) {
@@ -141,13 +148,17 @@ func deleteFinishedBatch(
 		last    string
 	)
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var ids []string
-		if err := tx.Unscoped().Model(&jobRow{}).
+		query := tx.Unscoped().Model(&jobRow{}).
 			Where(
-				"state IN ? AND finalized_at IS NOT NULL AND finalized_at < ? AND id > ?",
-				terminalStateStrings(), olderThan, cursor,
-			).
-			Order("id").Limit(limit).
+				"state IN ? AND finalized_at IS NOT NULL AND finalized_at < ?",
+				terminalStateStrings(), olderThan,
+			)
+		if cursor != "" {
+			query = query.Where("id > ?", cursor)
+		}
+
+		var ids []string
+		if err := query.Order("id").Limit(limit).
 			Pluck("id", &ids).Error; err != nil {
 			return fmt.Errorf("flywheel: find finished jobs: %w", err)
 		}
