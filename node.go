@@ -60,6 +60,12 @@ type NodeConfig struct {
 	// expiry to fall back on. Set it to the longest drain the deployment will
 	// tolerate — on timeout the still-running jobs keep their leases and are
 	// recovered by the lease sweep, and the warning names how many there were.
+	//
+	// Sizing it needs to account for the workers only. The scheduler also waits
+	// for its in-flight maintenance pass, but that wait is bounded by one batch
+	// rather than one backlog: the lease sweep and the retention prune both work
+	// in bounded transactions, so neither can hold shutdown open for the length
+	// of whatever it happened to be draining.
 	DrainTimeout time.Duration
 }
 

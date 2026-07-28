@@ -192,7 +192,12 @@ func TestSweepBatchSizeIsNeverUnbounded(t *testing.T) {
 // from cancellation.
 func TestSweepCancelledReportsPartialProgress(t *testing.T) {
 	t.Parallel()
-	db := newDB(t)
+	// A file-backed database, not the in-memory fixture: this test runs a query
+	// under a cancelled context, which database/sql may treat as a bad
+	// connection and discard. A shared-cache in-memory database lives only as
+	// long as its last connection, so discarding one can take the schema with
+	// it — and the resulting "no such table" would look like a sweep bug.
+	db := newWALFileDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	seedExpiredLeases(t, db, 50, now)
 
