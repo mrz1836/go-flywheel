@@ -220,17 +220,20 @@ func enqueueWork(ctx context.Context, db *gorm.DB, logger *slog.Logger) error {
 // second one in the burst process would double every tick and race every sweep.
 // One process, one scheduler; every other process leaves SchedulerConfig nil.
 func runWorkerProcess(ctx context.Context, db *gorm.DB, logger *slog.Logger) error {
+	// One driver, shared by this process's runner and its scheduler.
+	driver := flywheel.NewSQLiteDriver(db)
+
 	node, err := flywheel.NewNode(flywheel.NodeConfig{
 		Runners: []flywheel.RunnerConfig{{
 			DB:            db,
-			Driver:        flywheel.NewSQLiteDriver(db),
+			Driver:        driver,
 			Registry:      newRegistry(),
 			Queues:        []string{"default", "periodic"},
 			ExecutorClass: classWorker,
 			Concurrency:   1, // SQLite serializes writers; Postgres runs this higher
 			Logger:        logger,
 		}},
-		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db)},
+		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db), Driver: driver},
 		Logger:    logger,
 	})
 	if err != nil {

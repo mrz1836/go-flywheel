@@ -53,7 +53,7 @@ func TestSchedulerSampleHealthReturnsSnapshot(t *testing.T) {
 	seedJob(t, db, jobRow{ID: "sh1", Kind: "k", State: string(StateAvailable), ScheduledAt: now.Add(-time.Minute)})
 	seedJob(t, db, jobRow{ID: "sh2", Kind: "k", State: string(StateRunning), ScheduledAt: now.Add(-time.Minute)})
 
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 	qh, err := sched.SampleHealth(ctx)
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, qh.Ready, "SampleHealth surfaces the same snapshot SampleQueueHealth reads")
@@ -71,7 +71,7 @@ func TestSchedulerRunEmitsHealthHeartbeatOnCadence(t *testing.T) {
 	seedJob(t, db, jobRow{ID: "hb1", Kind: "k", State: string(StateAvailable), ScheduledAt: now.Add(-time.Minute)})
 
 	handler := &captureHandler{}
-	sched := NewSchedulerWithConfig(SchedulerConfig{
+	sched := newSchedulerCfg(t, SchedulerConfig{
 		DB: db, Client: NewClient(db),
 		Logger:               slog.New(handler),
 		TickInterval:         time.Hour, // keep the periodic and lease sweeps quiet
@@ -96,7 +96,7 @@ func TestSchedulerLogHealthLogsSampleError(t *testing.T) {
 	require.NoError(t, sqlDB.Close())
 
 	handler := &captureHandler{}
-	sched := NewSchedulerWithConfig(SchedulerConfig{
+	sched := newSchedulerCfg(t, SchedulerConfig{
 		DB: db, Client: NewClient(db), Logger: slog.New(handler),
 	})
 	// A failing sample is logged and swallowed — it must not panic or stop the loop.
@@ -111,7 +111,7 @@ func TestSchedulerRunNoHeartbeatWhenIntervalZero(t *testing.T) {
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
 
 	handler := &captureHandler{}
-	sched := NewSchedulerWithConfig(SchedulerConfig{
+	sched := newSchedulerCfg(t, SchedulerConfig{
 		DB: db, Client: NewClient(db),
 		Logger:        slog.New(handler),
 		TickInterval:  time.Hour,

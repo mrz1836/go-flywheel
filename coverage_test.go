@@ -392,7 +392,7 @@ func TestRunnerRunStopsOnContextCancel(t *testing.T) {
 func TestSchedulerRunStopsOnContextCancel(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 	sched.tickInterval = 5 * time.Millisecond
 	sched.sweepInterval = 5 * time.Millisecond
 
@@ -414,7 +414,7 @@ func TestSchedulerRunStopsOnContextCancel(t *testing.T) {
 func TestSchedulerFirePeriodicWithoutScheduleErrors(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))

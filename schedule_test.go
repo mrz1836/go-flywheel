@@ -115,7 +115,7 @@ func TestUpsertPeriodicThenSchedulerFiresWhenDue(t *testing.T) {
 	// At base+90s the definition is due; a tick fires it through the same insert
 	// core the Scheduler uses.
 	fireCtx := models.WithClock(context.Background(), models.NewFixedClock(base.Add(90*time.Second)))
-	n, err := NewScheduler(db, NewClient(db)).Tick(fireCtx)
+	n, err := newScheduler(t, db).Tick(fireCtx)
 	require.NoError(t, err)
 	assert.Positive(t, n, "the upserted periodic fires once due")
 	assert.Positive(t, jobCount(t, db, "test.success"))

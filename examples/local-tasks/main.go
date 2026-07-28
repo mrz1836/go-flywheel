@@ -111,13 +111,17 @@ func main() {
 		logger.Warn("skipping mage job: magex not on PATH (install: go install github.com/mrz1836/mage-x/cmd/magex@latest)")
 	}
 
+	// One driver, shared by the runner and the scheduler, so the observer wired
+	// below sees the lease sweep as well as the claims and finalizes.
+	driver := flywheel.NewSQLiteDriver(db)
+
 	node, err := flywheel.NewNode(flywheel.NodeConfig{
 		Runners: []flywheel.RunnerConfig{{
-			DB: db, Driver: flywheel.NewSQLiteDriver(db), Registry: reg,
+			DB: db, Driver: driver, Registry: reg,
 			Queues: []string{"default", "periodic"}, Concurrency: 1, ClaimAnyClass: true,
 			Logger: logger, Observer: runLogObserver{log: logger},
 		}},
-		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: client},
+		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: client, Driver: driver},
 		Logger:    logger,
 	})
 	if err != nil {

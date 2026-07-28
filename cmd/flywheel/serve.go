@@ -75,8 +75,12 @@ func runServe(ctx context.Context, cfg *Config, db *gorm.DB, driver flywheel.Dri
 			Observer:         obs,
 		}},
 		Scheduler: &flywheel.SchedulerConfig{
-			DB:                   db,
-			Client:               flywheel.NewClient(db),
+			DB:     db,
+			Client: flywheel.NewClient(db),
+			// The runner's driver, not a second one built here: the scheduler's
+			// lease sweep is a database operation like any other, and it belongs
+			// behind whatever seam the rest of the process observes.
+			Driver:               driver,
 			RetentionMaxAge:      cfg.Runtime.Retention.Std(),
 			HealthSampleInterval: cfg.Runtime.HealthSampleInterval.Std(),
 		},

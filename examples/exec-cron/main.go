@@ -57,12 +57,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// One driver, shared by the runner and the scheduler, so the lease sweep runs
+	// through the same seam every other database operation does.
+	driver := flywheel.NewSQLiteDriver(db)
+
 	node, err := flywheel.NewNode(flywheel.NodeConfig{
 		Runners: []flywheel.RunnerConfig{{
-			DB: db, Driver: flywheel.NewSQLiteDriver(db), Registry: reg,
+			DB: db, Driver: driver, Registry: reg,
 			Queues: []string{"default", "periodic"}, Concurrency: 1, ClaimAnyClass: true, Logger: logger,
 		}},
-		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db)},
+		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db), Driver: driver},
 		Logger:    logger,
 	})
 	if err != nil {

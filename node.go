@@ -95,12 +95,16 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		runners = append(runners, r)
 	}
 
+	// The scheduler config is validated by its own constructor rather than here.
+	// Two authorities on one config drift: a field added to SchedulerConfig gets
+	// checked in one place and not the other, and the two entry points then
+	// accept different configurations.
 	var scheduler *Scheduler
 	if cfg.Scheduler != nil {
-		if cfg.Scheduler.DB == nil || cfg.Scheduler.Client == nil {
-			return nil, errNodeSchedulerConfig
+		var err error
+		if scheduler, err = NewSchedulerWithConfig(*cfg.Scheduler); err != nil {
+			return nil, fmt.Errorf("flywheel: node scheduler: %w", err)
 		}
-		scheduler = NewSchedulerWithConfig(*cfg.Scheduler)
 	}
 
 	if cfg.Health.Addr != "" && cfg.Health.Readiness == nil {

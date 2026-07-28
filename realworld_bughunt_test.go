@@ -123,7 +123,7 @@ func TestBugHuntB1TruncateUnitRuneBoundary(t *testing.T) {
 func TestBugHuntB2TickIsolatesBadDefinition(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	sched := NewScheduler(db, NewClient(db))
+	sched := newScheduler(t, db)
 
 	now := time.Now().UTC().Truncate(time.Second)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(now))

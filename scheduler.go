@@ -24,6 +24,7 @@ const (
 type Scheduler struct {
 	db                   *gorm.DB
 	client               *Client
+	driver               Driver
 	logger               *slog.Logger
 	backfillCap          int
 	tickInterval         time.Duration
@@ -33,8 +34,8 @@ type Scheduler struct {
 	healthSampleInterval time.Duration
 }
 
-// SchedulerConfig configures a Scheduler. Only DB and Client are required; the
-// cadence and backfill knobs default when left zero. It is the config form a
+// SchedulerConfig configures a Scheduler. DB, Client, and Driver are required;
+// the cadence and backfill knobs default when left zero. It is the config form a
 // Node composes; NewScheduler is the two-argument shorthand for the common case.
 type SchedulerConfig struct {
 	// DB is the database the Scheduler reads periodic definitions from and runs
@@ -42,6 +43,20 @@ type SchedulerConfig struct {
 	DB *gorm.DB
 	// Client is the producer the Scheduler enqueues periodic jobs through.
 	Client *Client
+	// Driver is the seam the lease sweep runs through. Required: a Scheduler
+	// constructs no Driver of its own.
+	//
+	// A host that instruments, traces, or fault-injects its Driver must see the
+	// sweep like every other database operation, and it only does if the same
+	// instance its runners hold is handed here. Passing a freshly constructed
+	// Driver satisfies the type and defeats the purpose — the wrapper wraps the
+	// instance the host is holding, not the type.
+	//
+	// It is also the dialect seam. The sweep's reclaim differs by dialect
+	// (PostgreSQL takes its batch with FOR UPDATE SKIP LOCKED; SQLite has no such
+	// clause and needs none), so a Scheduler that picked its own implementation
+	// would be choosing a dialect it was never told.
+	Driver Driver
 	// Logger logs tick and sweep failures. Optional; defaults to slog.Default().
 	Logger *slog.Logger
 	// BackfillCap bounds how many missed buckets a single due definition
@@ -70,17 +85,73 @@ type SchedulerConfig struct {
 }
 
 // NewScheduler returns a Scheduler over db and the producer client with the
-// default cadence and backfill cap.
-func NewScheduler(db *gorm.DB, client *Client) *Scheduler {
-	return NewSchedulerWithConfig(SchedulerConfig{DB: db, Client: client})
+// default cadence and backfill cap, selecting the Driver from db's dialect.
+//
+// It is the shorthand for a host that does not wrap its Driver. A host that
+// does — for metrics, tracing, or fault injection — should use
+// NewSchedulerWithConfig and pass the same wrapped instance its runners hold,
+// because a Driver this constructor builds is one nothing else can see.
+//
+// An unsupported dialect returns ErrUnsupportedDialect.
+func NewScheduler(db *gorm.DB, client *Client) (*Scheduler, error) {
+	driver, err := driverFor(db)
+	if err != nil {
+		return nil, err
+	}
+	return NewSchedulerWithConfig(SchedulerConfig{DB: db, Client: client, Driver: driver})
+}
+
+// driverFor selects the Driver implementation for db's dialect.
+func driverFor(db *gorm.DB) (Driver, error) {
+	if db == nil {
+		return nil, errSchedulerNeedsDB
+	}
+	return driverForDialect(db.Name(), db)
+}
+
+// driverForDialect is the one place the runtime maps a dialect name onto a
+// Driver. It takes the name rather than reading it off db so the mapping is
+// testable without standing up a database for every dialect it rejects.
+//
+// It reuses ErrUnsupportedDialect rather than minting a sentinel of its own, so
+// a scheduler over an unsupported dialect fails the same way Migrate, IndexSet,
+// and InstallIndexes already do for it — the dialect gate has one answer, given
+// in one vocabulary.
+func driverForDialect(dialect string, db *gorm.DB) (Driver, error) {
+	switch dialect {
+	case "postgres":
+		return NewPostgresDriver(db), nil
+	case "sqlite":
+		return NewSQLiteDriver(db), nil
+	default:
+		return nil, fmt.Errorf(
+			"flywheel: %w: %q: the scheduler supports postgres or sqlite",
+			ErrUnsupportedDialect, dialect,
+		)
+	}
 }
 
 // NewSchedulerWithConfig returns a Scheduler from cfg, applying the cadence and
 // backfill defaults for any field left zero.
-func NewSchedulerWithConfig(cfg SchedulerConfig) *Scheduler {
+//
+// It is the single authority on SchedulerConfig validity: DB, Client, and
+// Driver are all required here rather than being re-checked by each caller, so
+// a Node and a directly-constructed Scheduler reject the same configurations
+// with the same errors.
+func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
+	switch {
+	case cfg.DB == nil:
+		return nil, errSchedulerNeedsDB
+	case cfg.Client == nil:
+		return nil, errSchedulerNeedsClient
+	case cfg.Driver == nil:
+		return nil, errSchedulerNeedsDriver
+	}
+
 	s := &Scheduler{
 		db:                   cfg.DB,
 		client:               cfg.Client,
+		driver:               cfg.Driver,
 		logger:               cfg.Logger,
 		backfillCap:          cfg.BackfillCap,
 		tickInterval:         cfg.TickInterval,
@@ -105,7 +176,7 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) *Scheduler {
 	if s.retentionMaxAge > 0 && s.retentionInterval <= 0 {
 		s.retentionInterval = defaultRetentionInterval
 	}
-	return s
+	return s, nil
 }
 
 // Run ticks periodic definitions and runs the stuck-lease sweep until ctx is
@@ -220,10 +291,11 @@ func (s *Scheduler) Tick(ctx context.Context) (int, error) {
 // in the past, which is what a job looks like when its executor died mid-attempt
 // — returning them to available and marking each stale run stub crashed. It is
 // the runtime's only recovery path for work lost to a crashed process.
+//
+// It runs through the configured Driver, so a host that wrapped its Driver
+// observes the sweep exactly as it observes a claim or a finalize.
 func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
-	now := models.ClockFrom(ctx).Now(ctx)
-	sweeper := baseDriver{db: s.db}
-	return sweeper.Sweep(ctx, now)
+	return s.driver.Sweep(ctx, models.ClockFrom(ctx).Now(ctx))
 }
 
 // PruneRetention hard-deletes terminal jobs (and their job_runs) finalized
