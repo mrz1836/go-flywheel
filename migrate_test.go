@@ -180,7 +180,7 @@ func TestIndexSetMatchesTheMigrateOracle(t *testing.T) {
 	}
 }
 
-// TestMigrateRenamesLegacyRoutingColumns proves Migrate upgrades a pre-1.0
+// TestMigrateRenamesLegacyRoutingColumns proves Migrate upgrades a legacy
 // database — one that still carries the closed-vocabulary jobs.run_on and
 // job_runs.executor_kind columns — by renaming them to executor_class in place
 // and preserving the stored values, before AutoMigrate runs.
@@ -228,8 +228,8 @@ func TestMigrateRenamesLegacyRoutingColumns(t *testing.T) {
 	}
 }
 
-// seedLegacyRoutingSchema stands up a pre-1.0 schema on db: every column the
-// runtime expects, with the same NOT NULL constraints the pre-1.0 schema had,
+// seedLegacyRoutingSchema stands up a legacy schema on db: every column the
+// runtime expects, with the same NOT NULL constraints the legacy schema had,
 // but with the old closed-vocabulary routing column names (jobs.run_on,
 // job_runs.executor_kind). The seed rows populate every NOT NULL column, exactly
 // as a real pre-upgrade database would, so a rename's effect on stored values is
