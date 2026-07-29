@@ -96,6 +96,45 @@ func seedAPI(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onIn
 	return nil
 }
 
+// seedInsertMany inserts the workload through the real bulk producer API,
+// flywheel.InsertMany, in chunks of chunkSize.
+//
+// It is the seed path whose measurement is the batch-enqueue rate — the
+// counterpart to seedAPI's single-row rate — so it goes through the exported API
+// a host calls, not the harness's own reduced bulk struct (seedBulk). That is the
+// point of the batched enqueue benchmark: it times the runtime's own producer
+// path, chunk boundaries, ON CONFLICT clause and SELECT-back included, at each
+// candidate chunk size.
+func seedInsertMany(
+	ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, chunkSize int, onInsert func(int),
+) error {
+	client := flywheel.NewClient(db)
+
+	items := make([]flywheel.BatchItem, len(specs))
+	for i, spec := range specs {
+		payload, err := marshalArgs(specToArgs(spec))
+		if err != nil {
+			return err
+		}
+		items[i] = flywheel.BatchItem{
+			Kind: loadKind,
+			Args: payload,
+			Opts: flywheel.InsertOpts{
+				Queue:         cfg.Queue,
+				Priority:      spec.Priority,
+				ExecutorClass: flywheel.ExecutorClass(cfg.ExecutorClass),
+			},
+		}
+	}
+
+	res, err := flywheel.InsertMany(ctx, client, items, flywheel.BatchOpts{ChunkSize: chunkSize})
+	if err != nil {
+		return fmt.Errorf("loadtest: batch seed: %w", err)
+	}
+	onInsert(res.Inserted)
+	return nil
+}
+
 // seedTerminal writes count already-finalized jobs, each with a finished
 // job_runs row, backdated by age.
 //
