@@ -155,6 +155,47 @@ report's `histogram` object. Count, min, max, and mean are exact.
 
 <br/>
 
+## Bulk enqueue: `InsertMany` vs single-row
+
+`InsertMany` writes N jobs in bounded, dialect-aware chunks — one multi-row `INSERT` per chunk under
+`ON CONFLICT DO NOTHING` — where `Enqueue` writes one row per call. At 100,000 jobs with nothing
+draining, the producer path is the whole measurement.
+
+| | Before (single-row `Enqueue`) | After (`InsertMany`, chunk 1,000) | |
+|---|---|---|---|
+| **Enqueue throughput** | 9,897 jobs/s | **52,230 jobs/s** | **5.3×** |
+| Statements | 100,000 | 100 | the chunk factor |
+
+The before is the single-row baseline above ([`baseline-100k-enqueue.json`](benchmarks/baseline-100k-enqueue.json)),
+reconfirmed at 8.5–9.8k jobs/s in the same session as the after. The after is `BenchmarkEnqueueBatched100k`
+at `-count=5`, median of five ([`enqueue-batched-100k.txt`](benchmarks/enqueue-batched-100k.txt)).
+
+### The chunk-size sweep
+
+The default chunk size — 1,000 on PostgreSQL — is where the round-trip savings have flattened while the
+statement stays far inside the 65,535 bind-parameter ceiling (1,000 × 22 columns = 22,000 parameters).
+
+| Chunk size | Throughput | vs single-row | Statements |
+|---|---|---|---|
+| 250 | 30,798 jobs/s | 3.1× | 400 |
+| 500 | 46,928 jobs/s | 4.7× | 200 |
+| **1,000** (default) | **52,230 jobs/s** | **5.3×** | 100 |
+| 2,000 | 52,960 jobs/s | 5.4× | 50 |
+
+Doubling the chunk from 1,000 to 2,000 buys 1.4 % — by then the round trips are no longer the
+bottleneck — so the default sits at 1,000 where the curve knees, roughly a third of the ceiling so a
+future column addition cannot push a default-configured caller over it.
+
+**The landed-row read-back is skipped when no row carries a unique key.** A row can only be dropped by
+the conflict clause if it has a `unique_key` or `unique_active_key`; its id is a freshly minted value
+that never pre-exists, so the primary key never collides. A chunk without unique keys therefore lands
+whole and needs no `SELECT`-back to attribute — which is the difference between the numbers above and an
+earlier form that paid an id-`IN` read-back per chunk, where the read-back dominated the insert by an
+order of magnitude because a bulk load leaves the table's planner statistics stale. A uniquely-keyed bulk
+load still pays that read-back per chunk.
+
+<br/>
+
 ## The index comparison
 
 The headline is not what the shape of the question suggests.
