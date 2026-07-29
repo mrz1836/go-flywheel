@@ -3,6 +3,7 @@ package flywheel
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"gorm.io/gorm"
 )
@@ -104,6 +105,144 @@ func InstallStorageParameters(ctx context.Context, db *gorm.DB) error {
 		return fmt.Errorf("flywheel: InstallStorageParameters: %w", err)
 	}
 	return nil
+}
+
+// StorageParameterDrift is one per-table storage parameter whose installed value
+// differs from the one the runtime sets.
+type StorageParameterDrift struct {
+	// Table is the table the parameter is set on.
+	Table string
+	// Parameter is the reloption name, e.g. fillfactor.
+	Parameter string
+	// Installed is the value the catalog reports, or the empty string when the
+	// parameter is unset on the table.
+	Installed string
+	// Expected is the value the runtime sets.
+	Expected string
+}
+
+// InspectStorageParameters reports every runtime storage parameter whose
+// installed value on db differs from the one the runtime sets. It reads pg_class
+// and writes nothing.
+//
+// Unlike an index, a storage parameter does not silently drift through a
+// re-install. InstallStorageParameters emits ALTER TABLE ... SET (...), which
+// converges the reloptions to the declared value unconditionally, so a re-install
+// — or the next Migrate — heals any difference on its own. There is no fail-loud
+// default here for that reason: forcing one would regress the current convergent
+// behavior for a defect that does not exist.
+//
+// What a host cannot get for free is the parity check itself. A host whose
+// migration tool owns the schema hand-writes that same ALTER in a migration, and
+// this is how it asserts in CI that its migration still sets exactly what the
+// runtime does — the counterpart to InspectIndexes, on the parameter that has no
+// name-only install to hide a drift behind.
+//
+// On SQLite it returns no drift: there are no storage parameters to compare. An
+// unsupported dialect returns ErrUnsupportedDialect.
+func InspectStorageParameters(ctx context.Context, db *gorm.DB) ([]StorageParameterDrift, error) {
+	if db == nil {
+		return nil, fmt.Errorf("flywheel: InspectStorageParameters: db is nil")
+	}
+	set, err := StorageParameterSet(db.Name())
+	if err != nil {
+		return nil, fmt.Errorf("flywheel: InspectStorageParameters: %w", err)
+	}
+	if len(set) == 0 {
+		// SQLite: nothing to compare, and that is not drift.
+		return nil, nil
+	}
+
+	installed := map[string]map[string]string{}
+	var drift []StorageParameterDrift
+	for _, exp := range storageParameterExpectations(set) {
+		opts, ok := installed[exp.table]
+		if !ok {
+			opts, err = readReloptions(ctx, db, exp.table)
+			if err != nil {
+				return nil, fmt.Errorf("flywheel: InspectStorageParameters: %w", err)
+			}
+			installed[exp.table] = opts
+		}
+		got := opts[exp.param]
+		if normalizeStorageValue(got) != normalizeStorageValue(exp.expected) {
+			drift = append(drift, StorageParameterDrift{
+				Table:     exp.table,
+				Parameter: exp.param,
+				Installed: got,
+				Expected:  exp.expected,
+			})
+		}
+	}
+	return drift, nil
+}
+
+// storageParamExpectation is one flattened (table, parameter, value) the runtime
+// sets, so each setting can be compared against the catalog independently of how
+// they were grouped into ALTER statements.
+type storageParamExpectation struct {
+	table    string
+	param    string
+	expected string
+}
+
+// storageParameterExpectations flattens the runtime's storage DDL into one
+// expectation per setting. Each DDL is ALTER TABLE <t> SET (a = 1, b = 2), so it
+// reads the parameters out of the parenthesized list rather than restating them,
+// for the same reason the tests do: a second copy would drift from the DDL.
+func storageParameterExpectations(set []StorageParameter) []storageParamExpectation {
+	var out []storageParamExpectation
+	for _, p := range set {
+		open := strings.Index(p.DDL, "(")
+		end := strings.LastIndex(p.DDL, ")")
+		if open < 0 || end <= open {
+			continue
+		}
+		for _, setting := range strings.Split(p.DDL[open+1:end], ",") {
+			name, value, ok := strings.Cut(setting, "=")
+			if !ok {
+				continue
+			}
+			out = append(out, storageParamExpectation{
+				table:    p.Table,
+				param:    strings.ToLower(strings.TrimSpace(name)),
+				expected: strings.TrimSpace(value),
+			})
+		}
+	}
+	return out
+}
+
+// readReloptions reads a table's storage parameters from pg_class into a
+// name→value map, lower-casing the names. An unset table yields an empty map, so
+// every declared parameter reads as absent rather than as an error.
+func readReloptions(ctx context.Context, db *gorm.DB, table string) (map[string]string, error) {
+	var joined string
+	if err := db.WithContext(ctx).Raw(`
+		SELECT coalesce(array_to_string(c.reloptions, ','), '')
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = current_schema() AND c.relname = ?`, table).Scan(&joined).Error; err != nil {
+		return nil, fmt.Errorf("read storage parameters on %s: %w", table, err)
+	}
+	out := map[string]string{}
+	if joined == "" {
+		return out, nil
+	}
+	for _, kv := range strings.Split(joined, ",") {
+		name, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		out[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
+	}
+	return out, nil
+}
+
+// normalizeStorageValue reduces a reloption value to a comparable shape, so
+// `0.02` compares equal whether the runtime wrote it with a space after the `=`
+// or the catalog rendered it without one.
+func normalizeStorageValue(v string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(v), " ", ""))
 }
 
 // applyStorageParameters is the one apply path, shared by
