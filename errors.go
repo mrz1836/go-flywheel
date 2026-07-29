@@ -3,6 +3,7 @@ package flywheel
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ErrValidation is the sentinel every lifecycle validation failure wraps, so a
@@ -52,6 +53,48 @@ var ErrUnknownKind = errors.New("jobs: unknown job kind")
 // dialect name, so every one of those entry points fails identically under
 // errors.Is.
 var ErrUnsupportedDialect = errors.New("flywheel: unsupported dialect")
+
+// ErrIndexDrift is the sentinel an IndexDriftError unwraps to, so a caller can
+// branch on errors.Is(err, ErrIndexDrift) without depending on the error's
+// concrete type. It is returned by InstallIndexes and Migrate when an installed
+// index's definition has drifted from the runtime's and reconciliation was not
+// requested.
+var ErrIndexDrift = errors.New("flywheel: installed index definition has drifted")
+
+// IndexDriftError is returned by the installer when one or more installed indexes
+// have drifted from the runtime's definitions and reconciliation was not enabled.
+// It carries every drift so a host can act on all of them at once rather than
+// rediscovering them one failed deploy at a time. It unwraps to ErrIndexDrift.
+//
+// The default is to return this rather than to reconcile, because correcting the
+// drift takes a table-wide ACCESS EXCLUSIVE lock a host should choose to pay: this
+// failure is recoverable, while a lock taken on a deploy the host did not ask for
+// is a stall under load. Set IndexOpts.Reconcile or MigrateOpts.Reconcile to
+// reconcile instead.
+type IndexDriftError struct {
+	// Drift is every index whose installed definition differs from the runtime's,
+	// each naming the installed and the expected definition.
+	Drift []IndexDrift
+}
+
+// Error names each drifted index, what is installed, and what was expected, so a
+// host can act without reading library source.
+func (e *IndexDriftError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(
+		&b,
+		"flywheel: %d installed index definition(s) have drifted from the runtime's; "+
+			"enable reconciliation (IndexOpts.Reconcile) or correct by hand:",
+		len(e.Drift),
+	)
+	for _, d := range e.Drift {
+		fmt.Fprintf(&b, "\n  %s:\n    installed: %s\n    expected:  %s", d.Name, d.Installed, d.Expected)
+	}
+	return b.String()
+}
+
+// Unwrap exposes ErrIndexDrift for errors.Is.
+func (e *IndexDriftError) Unwrap() error { return ErrIndexDrift }
 
 // ErrSQLiteConcurrency is returned by NewRunner when a SQLite driver is wired
 // with a concurrency greater than 1 — SQLite serializes writers and a second

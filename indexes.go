@@ -92,39 +92,136 @@ func Indexes(dialect string) ([]string, error) {
 	return ddl, nil
 }
 
-// InstallIndexes applies every index for db's dialect, in order. It is the
-// host-owned install step: a host whose migration tool created the three tables
-// from Models calls this once per install or deploy to reach index parity with
-// Migrate, which applies the same set through this same function.
+// IndexOpts configures InstallIndexesWithOptions. The zero value reports drift as
+// an error and installs nothing over a drifted index — the safe default, because
+// correcting drift takes a table-wide lock a host should choose to pay
+// deliberately rather than have the library take on a deploy it did not ask for.
+type IndexOpts struct {
+	// Reconcile drops and recreates an index whose installed definition has drifted
+	// from the runtime's, rather than reporting it. It is off by default because the
+	// rebuild takes an ACCESS EXCLUSIVE lock on the table for its duration: on a
+	// large jobs table that blocks every reader and writer until the rebuild
+	// finishes, which is a cost a host pays deliberately, not one the library takes
+	// on a deploy the host did not ask for.
+	//
+	// The drop and recreate run inside one transaction, so the lock is held for the
+	// whole rebuild and a correctness-bearing unique index is never briefly absent —
+	// no duplicate slips through the window. CREATE INDEX CONCURRENTLY, which would
+	// avoid the lock, cannot run inside a transaction and is out of scope; a host
+	// that needs it acts on the InspectIndexes report by hand.
+	//
+	// With Reconcile off, drift is returned as an IndexDriftError naming each index,
+	// its installed definition, and the expected one, and no index is dropped. An
+	// absent index is created either way — that is a first install, not drift.
+	Reconcile bool
+}
+
+// InstallIndexes applies every index for db's dialect, reporting drift as an
+// error rather than reconciling it. It is InstallIndexesWithOptions(ctx, db,
+// IndexOpts{}) — the safe default that never takes a lock the caller did not ask
+// for.
 //
-// Every statement uses IF NOT EXISTS, so InstallIndexes is idempotent and safe
-// to run on every deploy. It creates no tables and alters no columns: on a
-// database that lacks the three tables it fails on the first statement.
+// It is the host-owned install step: a host whose migration tool created the
+// three tables from Models calls this once per install or deploy to reach index
+// parity with Migrate, which applies the same set through the same path.
+//
+// It is idempotent and safe to run on every deploy: an absent index is created,
+// a matching index is left untouched, and a re-run over an up-to-date schema does
+// nothing. It creates no tables and alters no columns: on a database that lacks
+// the three tables it fails on the first statement. On a database carrying an
+// index whose definition has drifted it returns an IndexDriftError rather than
+// silently leaving the stale index in place — see InstallIndexesWithOptions to
+// reconcile instead.
 func InstallIndexes(ctx context.Context, db *gorm.DB) error {
+	return InstallIndexesWithOptions(ctx, db, IndexOpts{})
+}
+
+// InstallIndexesWithOptions applies every index for db's dialect, in order,
+// reconciling by definition rather than by name.
+//
+// An absent index is created. An index whose installed definition matches the
+// runtime's is left alone. An index whose definition has drifted is, by default,
+// reported as an IndexDriftError and left in place; set IndexOpts.Reconcile to
+// drop and recreate it instead — see IndexOpts.Reconcile for the lock that takes.
+//
+// It creates no tables and alters no columns: on a database that lacks the three
+// tables it fails on the first statement.
+func InstallIndexesWithOptions(ctx context.Context, db *gorm.DB, opts IndexOpts) error {
 	if db == nil {
 		return fmt.Errorf("flywheel: InstallIndexes: db is nil")
 	}
-	if err := applyIndexes(ctx, db); err != nil {
+	if err := applyIndexes(ctx, db, opts); err != nil {
 		return fmt.Errorf("flywheel: InstallIndexes: %w", err)
 	}
 	return nil
 }
 
-// applyIndexes is the one apply path: InstallIndexes is its exported form and
-// Migrate reaches the index step through it too, so both install the same
-// statements in the same order. It leaves the caller's name off the error so
-// each entry point can prefix its own.
-func applyIndexes(ctx context.Context, db *gorm.DB) error {
+// applyIndexes is the one apply path: InstallIndexes reaches it through
+// InstallIndexesWithOptions and Migrate reaches the index step through it too, so
+// both act on the same set under the same rules. It leaves the caller's name off
+// the error so each entry point can prefix its own.
+//
+// It acts only on what needs action — inspectIndexes returns absent and drifted
+// indexes, and a matching index appears in neither. An absent index is created
+// (the normal first install). A drifted index is dropped and recreated when the
+// caller opted in, or collected and returned as an IndexDriftError when it did
+// not: the library never takes the rebuild's ACCESS EXCLUSIVE lock uninvited.
+func applyIndexes(ctx context.Context, db *gorm.DB, opts IndexOpts) error {
 	set, err := IndexSet(db.Name())
 	if err != nil {
 		return err
 	}
-	for _, idx := range set {
-		if err := db.WithContext(ctx).Exec(idx.DDL).Error; err != nil {
-			return fmt.Errorf("create index %s: %w", idx.Name, err)
+	drift, err := inspectIndexes(ctx, db, set)
+	if err != nil {
+		return err
+	}
+	var drifted []IndexDrift
+	for _, d := range drift {
+		switch {
+		case d.Installed == "":
+			// Absent: a first install, not drift. Create it. inspectIndexes preserves
+			// IndexSet order, so absent indexes are created in that order.
+			if err := db.WithContext(ctx).Exec(d.Expected).Error; err != nil {
+				return fmt.Errorf("create index %s: %w", d.Name, err)
+			}
+		case opts.Reconcile:
+			if err := reconcileIndex(ctx, db, d); err != nil {
+				return err
+			}
+		default:
+			drifted = append(drifted, d)
 		}
 	}
+	if len(drifted) > 0 {
+		return &IndexDriftError{Drift: drifted}
+	}
 	return nil
+}
+
+// reconcileIndex drops and recreates one drifted index inside a single
+// transaction. The transaction is the point: DROP INDEX + CREATE INDEX each take
+// an ACCESS EXCLUSIVE lock on the table, and holding both under one transaction
+// keeps the lock for the whole rebuild — so a correctness-bearing unique index is
+// never briefly absent and no duplicate slips through the window between drop and
+// create.
+func reconcileIndex(ctx context.Context, db *gorm.DB, d IndexDrift) error {
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`DROP INDEX ` + quoteIndexIdent(d.Name)).Error; err != nil {
+			return fmt.Errorf("reconcile index %s: drop: %w", d.Name, err)
+		}
+		if err := tx.Exec(d.Expected).Error; err != nil {
+			return fmt.Errorf("reconcile index %s: create: %w", d.Name, err)
+		}
+		return nil
+	})
+}
+
+// quoteIndexIdent double-quotes an index name for a DROP INDEX statement. The
+// runtime's names are fixed safe identifiers, so this is hygiene rather than a
+// guard against injection — but the name reaches SQL as text, so it is quoted the
+// way any identifier should be.
+func quoteIndexIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 // IndexDrift is one runtime index whose installed definition does not match what
