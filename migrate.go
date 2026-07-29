@@ -73,8 +73,12 @@ func Models() []any {
 // uses. On PostgreSQL those tune the jobs table for its update rate; on SQLite
 // there are none to apply.
 //
-// Migrate is idempotent: AutoMigrate is a no-op against an up-to-date schema and
-// every index uses IF NOT EXISTS, so repeated calls are safe.
+// Migrate is idempotent against an up-to-date schema: AutoMigrate is a no-op and
+// every index already matches, so repeated calls do nothing. Against a database
+// whose index definition has drifted from the runtime's it fails loudly by
+// default — with an IndexDriftError naming the drift — rather than leaving the
+// stale index in place; set MigrateOpts.Reconcile to rebuild it instead. See
+// MigrateOpts.Reconcile for the lock that takes.
 //
 // Migrate is MigrateWithOptions(db, MigrateOpts{}).
 func Migrate(db *gorm.DB) error {
@@ -94,6 +98,18 @@ type MigrateOpts struct {
 	// v0.17.0, at which point this field becomes a no-op — a host that sets it
 	// today needs no further change then.
 	SkipColumnReconcile bool
+
+	// Reconcile drops and recreates any index whose installed definition has
+	// drifted from the runtime's, rather than failing with an IndexDriftError. It
+	// is off by default, uniform with InstallIndexes: the rebuild takes a table-wide
+	// ACCESS EXCLUSIVE lock, and a Migrate on every start that could take one
+	// uninvited is a stall under load. A drifted database therefore fails Migrate
+	// loudly by default — recoverable — until a host either sets this or corrects
+	// the index by hand. See IndexOpts.Reconcile for the lock this takes.
+	//
+	// An absent index is still created and a matching one still left alone; this
+	// governs only what happens to a drifted one.
+	Reconcile bool
 }
 
 // MigrateWithOptions installs the schema per opts: the legacy column
@@ -107,6 +123,11 @@ type MigrateOpts struct {
 // A host whose migration tool already created the tables wants InstallIndexes
 // and InstallStorageParameters instead: together they apply everything Migrate
 // does except the tables themselves.
+//
+// The index step reconciles by definition, not by name: it creates an absent
+// index, leaves a matching one alone, and — with opts.Reconcile unset — fails
+// with an IndexDriftError on one whose definition has drifted rather than
+// silently keeping the stale index. Set opts.Reconcile to rebuild it in place.
 func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 	if db == nil {
 		return fmt.Errorf("flywheel: Migrate: db is nil")
@@ -130,7 +151,7 @@ func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 		return fmt.Errorf("flywheel: Migrate: %w", err)
 	}
 
-	if err := applyIndexes(context.Background(), db); err != nil {
+	if err := applyIndexes(context.Background(), db, IndexOpts{Reconcile: opts.Reconcile}); err != nil {
 		return fmt.Errorf("flywheel: Migrate: %w", err)
 	}
 	return nil
