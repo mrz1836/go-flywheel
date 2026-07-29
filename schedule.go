@@ -408,3 +408,207 @@ func classifyCancelMiss(ctx context.Context, db *gorm.DB, id string) error {
 	}
 	return ErrJobTerminal
 }
+
+// defaultScopeBatchSize bounds a parent-scoped operation's per-transaction batch
+// when ScopeOpts leaves BatchSize zero. Like defaultSweepBatchSize it is a bound,
+// not a knob to switch off: no value of BatchSize, zero or negative, produces an
+// unbounded transaction.
+const defaultScopeBatchSize = 1000
+
+// ScopeResult reports what a parent-scoped operation did. The skipped counts are
+// broken out by reason so a caller distinguishes "nothing to do" from "refused".
+type ScopeResult struct {
+	// Changed is the number of children whose state the operation advanced.
+	Changed int64
+	// SkippedTerminal is the number of children left alone because they had already
+	// reached a terminal state — a succeeded child is never clobbered by a batch
+	// cancel. It is counted before the operation runs, so a cancel's own
+	// freshly-cancelled rows are never miscounted as pre-existing terminal ones.
+	SkippedTerminal int64
+	// SkippedRunning is the number of children left in flight. None of the three
+	// operations interrupts a running attempt: it finalizes normally, and the pause
+	// or cancel applies to its next claim.
+	SkippedRunning int64
+	// Batches is the number of transactions that changed rows.
+	Batches int
+}
+
+// ScopeOpts bounds a parent-scoped operation.
+type ScopeOpts struct {
+	// BatchSize is the number of children updated per transaction. Zero or negative
+	// selects defaultScopeBatchSize; it is never unbounded.
+	BatchSize int
+}
+
+// batchSize resolves the configured batch size, applying the default for a
+// non-positive value.
+func (o ScopeOpts) batchSize() int {
+	if o.BatchSize <= 0 {
+		return defaultScopeBatchSize
+	}
+	return o.BatchSize
+}
+
+// scopeTransition is one parent-scoped operation's state machine: the states it
+// moves children out of, and the columns it writes. The three operations differ
+// only in these two things and share scopeByParent's batched, guarded loop.
+type scopeTransition struct {
+	op      string
+	source  []string
+	updates func(now time.Time) map[string]any
+}
+
+// PauseByParent holds every claimable child of a parent — available, retryable,
+// or scheduled — in the paused state, so no further child is claimed. It is
+// state-guarded: a terminal child is never touched (counted in SkippedTerminal),
+// and a running child is left to finalize (counted in SkippedRunning). A running
+// attempt is not interrupted; the pause takes effect on its next claim.
+//
+// The work is bounded — one transaction per batch, BatchSize children each —
+// exactly like the lease sweep. A held child leaves the claimable scope, so the
+// loop terminates on a short batch with no cursor. Cancellation is checked between
+// batches and committed batches are kept, so a cancelled pause is partial progress,
+// returned alongside the wrapped context error.
+func PauseByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
+	return scopeByParent(ctx, db, parentJobID, opts, scopeTransition{
+		op:     "pause",
+		source: []string{string(StateAvailable), string(StateRetryable), string(StateScheduled)},
+		updates: func(now time.Time) map[string]any {
+			return map[string]any{"state": string(StatePaused), "updated_at": now}
+		},
+	})
+}
+
+// ResumeByParent returns every paused child of a parent to available. It resumes
+// only jobs paused by PauseByParent — its source state is paused alone — so a child
+// deferred to a future time by its own backoff is not disturbed. A resumed child
+// keeps its scheduled_at, so one paused while deferred stays deferred rather than
+// becoming claimable early.
+//
+// It is bounded and cancellable on the same terms as PauseByParent.
+func ResumeByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
+	return scopeByParent(ctx, db, parentJobID, opts, scopeTransition{
+		op:     "resume",
+		source: []string{string(StatePaused)},
+		updates: func(now time.Time) map[string]any {
+			return map[string]any{"state": string(StateAvailable), "updated_at": now}
+		},
+	})
+}
+
+// CancelByParent moves every non-running, non-terminal child of a parent — paused,
+// available, retryable, or scheduled — to the terminal cancelled state, stamping
+// finalized_at and releasing any lease. A running child is left to finalize
+// (SkippedRunning) and a terminal child is left exactly as it is (SkippedTerminal),
+// so a succeeded child's state and finalized_at are never overwritten.
+//
+// It is bounded and cancellable on the same terms as PauseByParent.
+func CancelByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
+	return scopeByParent(ctx, db, parentJobID, opts, scopeTransition{
+		op: "cancel",
+		source: []string{
+			string(StatePaused), string(StateAvailable), string(StateRetryable), string(StateScheduled),
+		},
+		updates: func(now time.Time) map[string]any {
+			return map[string]any{
+				"state": string(StateCancelled), "finalized_at": now,
+				"leased_until": nil, "lease_token": nil, "updated_at": now,
+			}
+		},
+	})
+}
+
+// scopeByParent runs one parent-scoped transition: it counts what the operation
+// leaves alone, then moves the source-state children to the target in bounded,
+// per-transaction batches. It is the shared engine behind Pause/Resume/CancelByParent.
+func scopeByParent(
+	ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts, t scopeTransition,
+) (ScopeResult, error) {
+	if db == nil {
+		return ScopeResult{}, fmt.Errorf("flywheel: %s by parent: db is nil", t.op)
+	}
+	batchSize := opts.batchSize()
+	now := models.ClockFrom(ctx).Now(ctx)
+	var result ScopeResult
+
+	// A dead context on entry does no work at all — not even the counting reads —
+	// and reports the progress made in the loop's own vocabulary, matching the sweep.
+	if err := ctx.Err(); err != nil {
+		return ScopeResult{}, fmt.Errorf("flywheel: %s by parent cancelled after 0 changed: %w", t.op, err)
+	}
+
+	// Count what the operation deliberately leaves alone, before it runs. Counting
+	// terminal children first is what keeps a cancel's own freshly-cancelled rows out
+	// of SkippedTerminal: after the loop those rows are terminal too, and a post-hoc
+	// count could not tell them from ones that were terminal all along.
+	if err := db.WithContext(ctx).Model(&jobRow{}).
+		Where("parent_job_id = ? AND state = ?", parentJobID, string(StateRunning)).
+		Count(&result.SkippedRunning).Error; err != nil {
+		return ScopeResult{}, fmt.Errorf("flywheel: %s by parent: count running: %w", t.op, err)
+	}
+	if err := db.WithContext(ctx).Model(&jobRow{}).
+		Where("parent_job_id = ? AND state IN ?", parentJobID, terminalStateStrings()).
+		Count(&result.SkippedTerminal).Error; err != nil {
+		return ScopeResult{}, fmt.Errorf("flywheel: %s by parent: count terminal: %w", t.op, err)
+	}
+
+	// Move the source-state children to the target in bounded batches, one
+	// transaction each — the sweep's shape. A moved child leaves the source scope, so
+	// termination is a short SELECT, no cursor. Cancellation is checked between
+	// batches; the batch in flight when a cancel arrives rolls back whole and the
+	// committed ones are kept, so a cancelled operation is partial progress.
+	for {
+		if err := ctx.Err(); err != nil {
+			return result, fmt.Errorf(
+				"flywheel: %s by parent cancelled after %d changed: %w", t.op, result.Changed, err,
+			)
+		}
+		selected, changed, err := scopeBatch(ctx, db, parentJobID, t, batchSize, now)
+		if err != nil {
+			return result, fmt.Errorf("flywheel: %s by parent: %w", t.op, err)
+		}
+		result.Changed += changed
+		if selected > 0 {
+			result.Batches++
+		}
+		if selected < batchSize {
+			return result, nil
+		}
+	}
+}
+
+// scopeBatch moves one bounded batch of a parent's source-state children to the
+// target inside a single transaction. It returns how many rows it selected (which
+// drives the loop's termination) and how many it actually changed.
+//
+// The UPDATE re-guards on the source states — WHERE id IN ? AND state IN ? — rather
+// than trusting the ids the SELECT found: without SKIP LOCKED a concurrent operation
+// could move one of them between the SELECT and the UPDATE, and an unguarded UPDATE
+// would resurrect it out of the state that concurrent operation left it in. The
+// re-guard makes the batch move only children still eligible, so Changed counts real
+// transitions and no terminal row is ever revived.
+func scopeBatch(
+	ctx context.Context, db *gorm.DB, parentJobID string, t scopeTransition, batchSize int, now time.Time,
+) (selected int, changed int64, err error) {
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var ids []string
+		if e := tx.Model(&jobRow{}).
+			Where("parent_job_id = ? AND state IN ?", parentJobID, t.source).
+			Limit(batchSize).Pluck("id", &ids).Error; e != nil {
+			return e
+		}
+		selected = len(ids)
+		if selected == 0 {
+			return nil
+		}
+		res := tx.Model(&jobRow{}).
+			Where("id IN ? AND state IN ?", ids, t.source).
+			Updates(t.updates(now))
+		if res.Error != nil {
+			return res.Error
+		}
+		changed = res.RowsAffected
+		return nil
+	})
+	return selected, changed, err
+}
