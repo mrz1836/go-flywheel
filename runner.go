@@ -39,9 +39,13 @@ const (
 	minHeartbeatInterval = time.Second
 )
 
-// nonTerminalStates are the job states that keep RunUntilIdle polling.
+// nonTerminalStates are the job states that keep RunUntilIdle polling. paused is
+// among them deliberately: a paused batch is unfinished work, not a drained
+// queue, so RunUntilIdle waits for it to be resumed or cancelled rather than
+// reporting the queue idle around it.
 var nonTerminalStates = []string{ //nolint:gochecknoglobals // intentional shared constant slice
 	string(StateAvailable), string(StateRunning), string(StateRetryable), string(StateScheduled),
+	string(StatePaused),
 }
 
 // RunnerConfig configures a Runner.

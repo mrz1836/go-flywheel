@@ -5,5 +5,5 @@ jobs_parent	CREATE INDEX jobs_parent ON <schema>.jobs USING btree (parent_job_id
 jobs_ready	CREATE INDEX jobs_ready ON <schema>.jobs USING btree (queue, priority, scheduled_at) WHERE ((state = ANY (ARRAY['available'::text, 'retryable'::text, 'scheduled'::text])) AND (deleted_at IS NULL))
 jobs_running_leased	CREATE INDEX jobs_running_leased ON <schema>.jobs USING btree (leased_until) WHERE (state = 'running'::text)
 jobs_state	CREATE INDEX jobs_state ON <schema>.jobs USING btree (state) WHERE (deleted_at IS NULL)
-jobs_unique_active_key	CREATE UNIQUE INDEX jobs_unique_active_key ON <schema>.jobs USING btree (unique_active_key) WHERE ((unique_active_key IS NOT NULL) AND (state = ANY (ARRAY['available'::text, 'running'::text, 'retryable'::text, 'scheduled'::text])))
+jobs_unique_active_key	CREATE UNIQUE INDEX jobs_unique_active_key ON <schema>.jobs USING btree (unique_active_key) WHERE ((unique_active_key IS NOT NULL) AND (state = ANY (ARRAY['available'::text, 'running'::text, 'retryable'::text, 'scheduled'::text, 'paused'::text])))
 jobs_unique_key	CREATE UNIQUE INDEX jobs_unique_key ON <schema>.jobs USING btree (unique_key) WHERE (unique_key IS NOT NULL)

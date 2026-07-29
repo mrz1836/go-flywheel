@@ -62,9 +62,10 @@ type JobArgsView struct {
 // NonTerminalStates returns the job states from which a job may still progress.
 // The terminal states (succeeded, cancelled, discarded) are excluded. A host
 // uses it to scope "still in flight" queries without re-deriving the runtime's
-// state vocabulary.
+// state vocabulary. paused is included — a held job is still in flight, waiting
+// on a resume rather than on a runner.
 func NonTerminalStates() []JobState {
-	return []JobState{StateAvailable, StateRunning, StateRetryable, StateScheduled}
+	return []JobState{StateAvailable, StateRunning, StateRetryable, StateScheduled, StatePaused}
 }
 
 // nonTerminalStateStrings returns NonTerminalStates as the []string a GORM

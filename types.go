@@ -68,6 +68,12 @@ const (
 	StateRunning   JobState = "running"
 	StateRetryable JobState = "retryable"
 	StateScheduled JobState = "scheduled"
+	// StatePaused is non-terminal but not claimable: an operator has held the job
+	// so no runner picks it up, and it stays held until a resume returns it to
+	// available. It is the one state that is neither claimable nor terminal — a
+	// paused batch is unfinished work, so it keeps RunUntilIdle polling, but no
+	// claim will ever advance it. See PauseByParent/ResumeByParent.
+	StatePaused    JobState = "paused"
 	StateSucceeded JobState = "succeeded"
 	StateCancelled JobState = "cancelled"
 	StateDiscarded JobState = "discarded"
@@ -76,7 +82,7 @@ const (
 // Valid reports whether s is a recognized JobState.
 func (s JobState) Valid() bool {
 	switch s {
-	case StateAvailable, StateRunning, StateRetryable, StateScheduled,
+	case StateAvailable, StateRunning, StateRetryable, StateScheduled, StatePaused,
 		StateSucceeded, StateCancelled, StateDiscarded:
 		return true
 	default:

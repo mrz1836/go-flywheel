@@ -412,8 +412,10 @@ func runtimeIndexes() []Index {
 			// Correctness: at most one active job per key. Unlike jobs_unique_key
 			// the constraint is scoped to live states, so the key frees up once
 			// the job reaches a terminal state and the same key can enqueue again.
+			// paused is one of the live states: a held job still owns its key, so a
+			// second active enqueue of that key is still refused while it is paused.
 			Name: "jobs_unique_active_key", Kind: IndexCorrectness, Table: "jobs",
-			DDL: `CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_active_key ON jobs (unique_active_key) WHERE unique_active_key IS NOT NULL AND state IN ('available', 'running', 'retryable', 'scheduled')`,
+			DDL: `CREATE UNIQUE INDEX IF NOT EXISTS jobs_unique_active_key ON jobs (unique_active_key) WHERE unique_active_key IS NOT NULL AND state IN ('available', 'running', 'retryable', 'scheduled', 'paused')`,
 		},
 		{
 			// Performance: the claim hot path.
