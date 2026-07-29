@@ -14,7 +14,7 @@ import (
 // dialect's parameter ceiling into a rows-per-statement ceiling. It is an upper
 // bound (a NULL optional column may not be bound at all), so a chunk sized from
 // it can never exceed the driver's real parameter cap.
-const jobRowColumns = 22
+const jobRowColumns = 24
 
 // Bulk-enqueue chunk sizing. The defaults sit at roughly a third of each
 // dialect's rows-per-statement ceiling, so adding a jobRow column cannot silently

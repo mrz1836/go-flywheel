@@ -45,6 +45,21 @@ var ErrAlreadyEnqueued = errors.New("jobs: already enqueued")
 // children from one attempt.
 var ErrFollowUpLimit = errors.New("flywheel: follow-up count exceeds the configured limit")
 
+// ErrBarrierTooWide is returned by Finalize when a worker declares a Result.Barrier
+// over more children than DriverOpts.BarrierMaxChildren allows. It is separate from
+// ErrFollowUpLimit and checked in addition to it: a barrier costs an index-only
+// completion count per child finalize — O(children) per child, O(n²) over the
+// generation — which an operator may want to cap more tightly than the general
+// fan-out ceiling. Like ErrFollowUpLimit it is fatal rather than truncating,
+// directing the host to a tree of bounded generations.
+var ErrBarrierTooWide = errors.New("flywheel: barrier-bearing generation exceeds the configured limit")
+
+// ErrBarrierNoChildren is returned by Finalize when a worker declares a
+// Result.Barrier but returns no FollowUp with Parent set. A barrier is scoped to a
+// job's children, so one with no children could never fire — a silently
+// never-running continuation is exactly the do-nothing footgun the runtime refuses.
+var ErrBarrierNoChildren = errors.New("flywheel: barrier declared with no child follow-ups")
+
 // ErrRunAlreadyRecorded is returned by SeedRun when a seeded run collides with
 // an existing (job_id, attempt) pair. It is the job_runs counterpart of
 // ErrAlreadyEnqueued: the database rejected the row, so the attempt is already

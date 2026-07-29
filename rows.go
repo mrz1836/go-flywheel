@@ -43,8 +43,18 @@ type jobRow struct {
 	ParentJobID     *string        `gorm:"column:parent_job_id"`
 	ExecutorClass   string         `gorm:"column:executor_class;not null;default:''"`
 	FinalizedAt     *time.Time     `gorm:"column:finalized_at"`
-	Tags            datatypes.JSON `gorm:"column:tags;type:jsonb;not null;default:'[]'"`
-	DeletedAt       gorm.DeletedAt `gorm:"column:deleted_at"`
+	// BarrierKind and BarrierSpec carry a fan-in barrier a job declared over its
+	// own children. They are set on the spawning job's row when its Finalize
+	// processes Result.Barrier, and read by each child's Finalize to decide whether
+	// that child completed the generation. BarrierKind IS NULL is the fast gate that
+	// skips the completion count for the overwhelmingly common non-barrier finalize;
+	// BarrierSpec is the fully-resolved continuation (args, queue, executor_class,
+	// priority), so the child that fires the barrier needs no further defaulting.
+	// Both are cleared back to NULL once the barrier fires.
+	BarrierKind *string        `gorm:"column:barrier_kind"`
+	BarrierSpec datatypes.JSON `gorm:"column:barrier_spec;type:jsonb"`
+	Tags        datatypes.JSON `gorm:"column:tags;type:jsonb;not null;default:'[]'"`
+	DeletedAt   gorm.DeletedAt `gorm:"column:deleted_at"`
 }
 
 // TableName binds jobRow to the jobs table.

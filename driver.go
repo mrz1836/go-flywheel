@@ -12,6 +12,7 @@ import (
 	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // maxErrorMessage is the byte cap on a stored JobRun.error_message.
@@ -104,6 +105,11 @@ const (
 	// larger fan-out is a design error: spawn a fan-out coordinator job instead of
 	// returning N children from one attempt.
 	defaultFollowUpLimit = 10000
+	// defaultBarrierMaxChildren caps a barrier-bearing generation. It shares
+	// defaultFollowUpLimit's value but is a separate bound: a barrier adds an
+	// O(children) completion count per child finalize on top of the cheap chunked
+	// insert FollowUpLimit bounds, so an operator may want to cap it independently.
+	defaultBarrierMaxChildren = 10000
 )
 
 // DriverOpts configures a Driver's batching behavior. The zero value selects the
@@ -130,6 +136,14 @@ type DriverOpts struct {
 	// truncating — the fan-out is removed as a way to make the runtime hold an
 	// unbounded lock.
 	FollowUpLimit int
+
+	// BarrierMaxChildren caps the children of a generation that carries a
+	// Result.Barrier. Zero or negative selects defaultBarrierMaxChildren. A wider
+	// barrier fails the finalize with ErrBarrierTooWide. It is a separate, and often
+	// tighter, bound than FollowUpLimit: the barrier's per-child completion count
+	// makes a barrier-bearing generation cost O(children²), where a plain fan-out is
+	// O(children).
+	BarrierMaxChildren int
 }
 
 // sweepBatchSize resolves the configured batch size, applying the default for a
@@ -157,6 +171,15 @@ func (o DriverOpts) followUpLimit() int {
 		return defaultFollowUpLimit
 	}
 	return o.FollowUpLimit
+}
+
+// barrierMaxChildren resolves the per-generation barrier ceiling, applying the
+// default for a non-positive value.
+func (o DriverOpts) barrierMaxChildren() int {
+	if o.BarrierMaxChildren <= 0 {
+		return defaultBarrierMaxChildren
+	}
+	return o.BarrierMaxChildren
 }
 
 // reclaimFunc is one dialect's expired-lease batch: it selects up to limit jobs
@@ -531,9 +554,25 @@ func (d *baseDriver) Finalize(
 		// running again under a *different* attempt, the original attempt's
 		// finalize still matches, and whichever attempt finishes first wins
 		// regardless of which one holds the lease.
+		// A barrier is declared on the spawning job's own row, folded into the state
+		// advance so it is written atomically under the fence and never on a superseded
+		// finalize. It is validated first, so a too-wide or childless barrier fails the
+		// whole finalize rather than half-declaring itself.
+		upd := jobFinalizeUpdate(plan, finishedAt)
+		if plan.followUps && result.Barrier != nil {
+			if err := validateBarrier(result, d.opts.barrierMaxChildren()); err != nil {
+				return err
+			}
+			kind, specJSON, err := resolveBarrierColumns(tx, raw, result.Barrier)
+			if err != nil {
+				return err
+			}
+			upd["barrier_kind"] = kind
+			upd["barrier_spec"] = specJSON
+		}
 		res := tx.Model(&jobRow{}).
 			Where("id = ? AND state = ? AND lease_token = ?", raw.ID, string(StateRunning), raw.LeaseToken).
-			Updates(jobFinalizeUpdate(plan, finishedAt))
+			Updates(upd)
 		if res.Error != nil {
 			return fmt.Errorf("jobs: advance job state: %w", res.Error)
 		}
@@ -568,6 +607,17 @@ func (d *baseDriver) Finalize(
 			}
 		}
 		out.EnqueuedChildren = enqueued
+
+		// The barrier completion check: when this finalize moves a child to a terminal
+		// state, its parent's barrier — if it declared one — may now be complete. It
+		// runs for any terminal transition (success, failure, or cancel), so a
+		// half-failed generation still gets its finalizer, but never for a retry or
+		// snooze (the child is still pending) or a superseded finalize.
+		if !out.Superseded && raw.ParentJobID != nil && isTerminalStateString(string(plan.jobState)) {
+			if err := d.fireBarrierIfComplete(txCtx, tx, *raw.ParentJobID); err != nil {
+				return err
+			}
+		}
 
 		runUpd, err := runFinalizeUpdate(plan, result, workErr, finishedAt, durationMs, enqueued)
 		if err != nil {
@@ -806,4 +856,166 @@ func (d *baseDriver) insertFollowUps(
 		enqueued += len(landed)
 	}
 	return enqueued, nil
+}
+
+// barrierSpec is the fully-resolved continuation stored in jobs.barrier_spec: the
+// defaulted routing plus the marshaled args, so the child that fires the barrier
+// builds the continuation without re-reading the parent's columns.
+type barrierSpec struct {
+	Args          json.RawMessage `json:"args,omitempty"`
+	Queue         string          `json:"queue"`
+	ExecutorClass string          `json:"executor_class"`
+	Priority      int             `json:"priority"`
+}
+
+// validateBarrier rejects a barrier that could never fire or would cost too much:
+// it must name a continuation kind, cover at least one child, and stay within the
+// configured ceiling. It runs before any row is written, so a bad barrier fails the
+// whole finalize rather than half-declaring itself.
+func validateBarrier(result Result, maxChildren int) error {
+	if result.Barrier.Kind == "" {
+		return newValidationError("barrier kind", "is required")
+	}
+	children := 0
+	for i := range result.FollowUps {
+		if result.FollowUps[i].Parent {
+			children++
+		}
+	}
+	if children == 0 {
+		return ErrBarrierNoChildren
+	}
+	if children > maxChildren {
+		return ErrBarrierTooWide
+	}
+	return nil
+}
+
+// resolveBarrierColumns builds the barrier_kind and barrier_spec column values for
+// the spawning job's row, resolving the continuation's routing against the parent's
+// own columns so the later fire needs no defaulting. queue is on the RawJob;
+// executor_class and priority are read from the parent row, which is the rare
+// declaration path rather than a per-finalize cost.
+func resolveBarrierColumns(tx *gorm.DB, raw RawJob, b *Barrier) (string, datatypes.JSON, error) {
+	var parent jobRow
+	if err := tx.Model(&jobRow{}).Select("executor_class, priority").
+		Where("id = ?", raw.ID).First(&parent).Error; err != nil {
+		return "", nil, fmt.Errorf("jobs: read barrier parent routing: %w", err)
+	}
+	args, err := json.Marshal(b.Args)
+	if err != nil {
+		return "", nil, fmt.Errorf("jobs: marshal barrier args: %w", err)
+	}
+	spec := barrierSpec{
+		Args:          args,
+		Queue:         orString(b.Queue, raw.Queue),
+		ExecutorClass: orString(string(b.ExecutorClass), parent.ExecutorClass),
+		Priority:      orInt(b.Priority, parent.Priority),
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		return "", nil, fmt.Errorf("jobs: marshal barrier spec: %w", err)
+	}
+	return b.Kind, datatypes.JSON(specJSON), nil
+}
+
+// fireBarrierIfComplete enqueues a parent's barrier continuation when the child
+// whose finalize is running is the last of the generation to reach a terminal
+// state. It runs inside that child's finalize transaction, so the enqueue is atomic
+// with the child's own state advance and inherits its supersede-idempotency.
+//
+// The overwhelmingly common case — a parent that declared no barrier — returns at
+// the fast gate, having taken no lock and issued no completion count. When a barrier
+// is declared it serializes concurrent completion checks on the parent row: without
+// that, two children finalizing at once could each see the other as still pending
+// under READ COMMITTED and neither fire. On SQLite the single-writer model already
+// serializes finalizes, so the row lock is taken on PostgreSQL alone.
+func (d *baseDriver) fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, parentID string) error {
+	// Fast gate: a plain read of the parent's barrier_kind by primary key. A parent
+	// with no barrier — every parent that did not declare one — returns here, having
+	// touched nothing else.
+	var gate jobRow
+	switch err := tx.WithContext(ctx).Model(&jobRow{}).
+		Select("barrier_kind").Where("id = ?", parentID).First(&gate).Error; {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return nil // the parent row is gone (pruned); nothing to fire
+	case err != nil:
+		return fmt.Errorf("jobs: read barrier gate: %w", err)
+	}
+	if gate.BarrierKind == nil {
+		return nil
+	}
+
+	// A barrier is declared. Lock the parent row so concurrent completion checks
+	// serialize on it, then re-read under the lock: a concurrent finalize may have
+	// fired and cleared the barrier between the gate read and the lock.
+	var parent jobRow
+	locked := tx.WithContext(ctx).Model(&jobRow{}).
+		Select("barrier_kind, barrier_spec").Where("id = ?", parentID)
+	if tx.Name() == "postgres" {
+		locked = locked.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	switch err := locked.First(&parent).Error; {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return nil
+	case err != nil:
+		return fmt.Errorf("jobs: lock barrier parent: %w", err)
+	}
+	if parent.BarrierKind == nil {
+		return nil // a concurrent finalize already fired and cleared it
+	}
+
+	// Count the parent's still-pending children, index-only via jobs_parent_state
+	// (Model adds deleted_at IS NULL, which the partial index requires). This child's
+	// own terminal state is already applied in this transaction, so a zero count means
+	// it is the last of the generation.
+	var remaining int64
+	if err := tx.WithContext(ctx).Model(&jobRow{}).
+		Where("parent_job_id = ? AND state NOT IN ?", parentID, terminalStateStrings()).
+		Count(&remaining).Error; err != nil {
+		return fmt.Errorf("jobs: count barrier siblings: %w", err)
+	}
+	if remaining > 0 {
+		return nil
+	}
+
+	// Last child: enqueue the continuation, keyed so a torn retry can never enqueue it
+	// twice, and clear the barrier so the continuation's own finalize skips the check.
+	fu, err := followUpFromBarrierSpec(*parent.BarrierKind, parent.BarrierSpec, parentID)
+	if err != nil {
+		return err
+	}
+	row, err := buildChildRow(ctx, fu, parentID)
+	if err != nil {
+		return err
+	}
+	if _, err := conflictInsertChunk(ctx, tx, []jobRow{row}); err != nil {
+		return fmt.Errorf("jobs: enqueue barrier continuation: %w", err)
+	}
+	if err := tx.WithContext(ctx).Model(&jobRow{}).Where("id = ?", parentID).
+		Updates(map[string]any{"barrier_kind": nil, "barrier_spec": nil}).Error; err != nil {
+		return fmt.Errorf("jobs: clear fired barrier: %w", err)
+	}
+	return nil
+}
+
+// followUpFromBarrierSpec reconstructs the continuation FollowUp from a parent's
+// stored barrier columns. Parent is set so the continuation joins the same
+// generation (and shows up in the parent's own Progress rollup), and the unique key
+// is the parent id, so the barrier enqueues at most one continuation ever — even
+// under a torn retry, where ON CONFLICT DO NOTHING absorbs the second insert.
+func followUpFromBarrierSpec(kind string, specJSON datatypes.JSON, parentID string) (FollowUp, error) {
+	var spec barrierSpec
+	if err := json.Unmarshal(specJSON, &spec); err != nil {
+		return FollowUp{}, fmt.Errorf("jobs: unmarshal barrier spec: %w", err)
+	}
+	return FollowUp{
+		Kind:          kind,
+		Args:          spec.Args,
+		Queue:         spec.Queue,
+		ExecutorClass: ExecutorClass(spec.ExecutorClass),
+		Priority:      spec.Priority,
+		Parent:        true,
+		UniqueKey:     "barrier:" + parentID,
+	}, nil
 }
