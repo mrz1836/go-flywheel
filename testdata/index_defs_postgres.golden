@@ -1,7 +1,7 @@
 idx_job_periodics_slug	CREATE UNIQUE INDEX idx_job_periodics_slug ON <schema>.job_periodics USING btree (slug)
 idx_jobs_deleted_at	CREATE INDEX idx_jobs_deleted_at ON <schema>.jobs USING btree (deleted_at) WHERE (deleted_at IS NOT NULL)
 job_runs_job_attempt	CREATE UNIQUE INDEX job_runs_job_attempt ON <schema>.job_runs USING btree (job_id, attempt)
-jobs_parent	CREATE INDEX jobs_parent ON <schema>.jobs USING btree (parent_job_id) WHERE (parent_job_id IS NOT NULL)
+jobs_parent_state	CREATE INDEX jobs_parent_state ON <schema>.jobs USING btree (parent_job_id, state) WHERE ((parent_job_id IS NOT NULL) AND (deleted_at IS NULL))
 jobs_ready	CREATE INDEX jobs_ready ON <schema>.jobs USING btree (queue, priority, scheduled_at) WHERE ((state = ANY (ARRAY['available'::text, 'retryable'::text, 'scheduled'::text])) AND (deleted_at IS NULL))
 jobs_running_leased	CREATE INDEX jobs_running_leased ON <schema>.jobs USING btree (leased_until) WHERE (state = 'running'::text)
 jobs_state	CREATE INDEX jobs_state ON <schema>.jobs USING btree (state) WHERE (deleted_at IS NULL)

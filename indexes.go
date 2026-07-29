@@ -161,11 +161,13 @@ func InstallIndexesWithOptions(ctx context.Context, db *gorm.DB, opts IndexOpts)
 // both act on the same set under the same rules. It leaves the caller's name off
 // the error so each entry point can prefix its own.
 //
-// It acts only on what needs action — inspectIndexes returns absent and drifted
-// indexes, and a matching index appears in neither. An absent index is created
+// It acts only on what needs action — inspectIndexes returns absent, drifted, and
+// retired indexes, and a matching index appears in none. An absent index is created
 // (the normal first install). A drifted index is dropped and recreated when the
 // caller opted in, or collected and returned as an IndexDriftError when it did
-// not: the library never takes the rebuild's ACCESS EXCLUSIVE lock uninvited.
+// not: the library never takes the rebuild's ACCESS EXCLUSIVE lock uninvited. A
+// retired index — one the runtime once installed and no longer declares — is
+// dropped unconditionally, since that takes no lock worth deferring.
 func applyIndexes(ctx context.Context, db *gorm.DB, opts IndexOpts) error {
 	set, err := IndexSet(db.Name())
 	if err != nil {
@@ -178,6 +180,15 @@ func applyIndexes(ctx context.Context, db *gorm.DB, opts IndexOpts) error {
 	var drifted []IndexDrift
 	for _, d := range drift {
 		switch {
+		case d.Retired:
+			// A superseded index the runtime no longer declares, still installed.
+			// Drop it unconditionally — DROP INDEX IF EXISTS is cheap, idempotent,
+			// and loses no data, so unlike a drift rebuild it needs no opt-in. It runs
+			// after the desired-set entries above, so any covering replacement is
+			// created before its predecessor is dropped.
+			if err := db.WithContext(ctx).Exec(`DROP INDEX IF EXISTS ` + quoteIndexIdent(d.Name)).Error; err != nil {
+				return fmt.Errorf("drop retired index %s: %w", d.Name, err)
+			}
 		case d.Installed == "":
 			// Absent: a first install, not drift. Create it. inspectIndexes preserves
 			// IndexSet order, so absent indexes are created in that order.
@@ -225,15 +236,24 @@ func quoteIndexIdent(name string) string {
 }
 
 // IndexDrift is one runtime index whose installed definition does not match what
-// the runtime declares.
+// the runtime declares, or a retired index the runtime no longer declares that is
+// still installed.
 type IndexDrift struct {
 	// Name is the index name, as both the runtime and the catalog call it.
 	Name string
 	// Installed is the definition the catalog reports, or the empty string when
 	// the index is absent.
 	Installed string
-	// Expected is the runtime's DDL — the definition the index should carry.
+	// Expected is the runtime's DDL — the definition the index should carry. It is
+	// empty for a retired index, which the runtime no longer declares and only
+	// wants dropped.
 	Expected string
+	// Retired is true when this is not a drifted runtime index but a superseded one
+	// the runtime once installed and no longer declares (retiredIndexNames). The
+	// installer drops it; InspectIndexes surfaces it so a host that hand-applies DDL
+	// sees the straggler, but it is never counted as drift and never fails an
+	// install.
+	Retired bool
 }
 
 // InspectIndexes reports every runtime index that is absent from db or whose
@@ -251,7 +271,10 @@ type IndexDrift struct {
 // actually installed.
 //
 // An index whose definition matches produces no entry, so an empty slice means
-// parity: every runtime index is present with the runtime's definition. An
+// parity: every runtime index is present with the runtime's definition, and no
+// retired index survives. A retired index the runtime no longer declares but that
+// is still installed is reported with Retired set and an empty Expected — surfaced
+// so a host that hand-applies DDL sees the straggler, never counted as drift. An
 // unsupported dialect returns ErrUnsupportedDialect.
 func InspectIndexes(ctx context.Context, db *gorm.DB) ([]IndexDrift, error) {
 	if db == nil {
@@ -270,7 +293,8 @@ func InspectIndexes(ctx context.Context, db *gorm.DB) ([]IndexDrift, error) {
 
 // inspectIndexes compares the runtime's declared set against what db's catalog
 // holds, returning one IndexDrift per index that is absent or whose installed
-// definition has drifted. A matching index produces no entry, so the caller acts
+// definition has drifted, followed by one Retired entry per retiredIndexNames
+// index still present. A matching index produces no entry, so the caller acts
 // only on what needs action.
 //
 // It reads the catalog once into a name→definition map and is the shared core of
@@ -289,6 +313,16 @@ func inspectIndexes(ctx context.Context, db *gorm.DB, set []Index) ([]IndexDrift
 			drift = append(drift, IndexDrift{Name: idx.Name, Installed: "", Expected: idx.DDL})
 		case normalizeIndexDef(def) != normalizeIndexDef(idx.DDL):
 			drift = append(drift, IndexDrift{Name: idx.Name, Installed: def, Expected: idx.DDL})
+		}
+	}
+	// Retired stragglers: an index the runtime once installed and no longer
+	// declares, still present in the catalog. It carries Retired so the installer
+	// drops it and InspectIndexes reports it without ever counting it as drift. The
+	// entries come last, after every desired-set entry, so applyIndexes creates any
+	// absent covering index before dropping the one it supersedes.
+	for _, name := range retiredIndexNames() {
+		if def, ok := installed[name]; ok {
+			drift = append(drift, IndexDrift{Name: name, Installed: def, Retired: true})
 		}
 	}
 	return drift, nil
@@ -392,6 +426,27 @@ func normalizeIndexDef(def string) string {
 	return s
 }
 
+// retiredIndexNames lists indexes the runtime once installed and no longer wants.
+// applyIndexes drops each — DROP INDEX IF EXISTS — whenever it is found installed,
+// on every Migrate and InstallIndexes (not gated on the reconcile opt-in, unlike a
+// drift rebuild: dropping a superseded index takes no lock worth deferring and
+// loses no data, so there is nothing for a host to opt into). InspectIndexes
+// surfaces any that survive as an informational straggler.
+//
+// It is an explicit, hardcoded list, and must never become "drop anything not in
+// the desired set". That distinction is the whole safety property: a name absent
+// from IndexSet but absent from here too is left strictly alone, so an index a host
+// added for its own purposes on the same table is never touched.
+//
+// It carries the same sunset as reconcileColumnRenames: jobs_parent — superseded
+// by the covering jobs_parent_state — is dropped here until v0.17.0, at which point
+// this list empties and the drop becomes a no-op. Any database that has run one
+// Migrate or InstallIndexes since the retirement no longer has jobs_parent to drop,
+// so the removal changes nothing for a host that stayed current.
+func retiredIndexNames() []string {
+	return []string{"jobs_parent"}
+}
+
 // runtimeIndexes is the dialect-independent index set. PostgreSQL and SQLite
 // both support partial indexes (CREATE INDEX ... WHERE) and IF NOT EXISTS, so
 // the DDL is portable between them; IndexSet owns the dialect gate and rejects
@@ -442,9 +497,18 @@ func runtimeIndexes() []Index {
 			DDL: `CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (queue, priority, scheduled_at) WHERE state IN ('available', 'retryable', 'scheduled') AND deleted_at IS NULL`,
 		},
 		{
-			// Performance: follow-up / DAG lookup.
-			Name: "jobs_parent", Kind: IndexPerformance, Table: "jobs",
-			DDL: `CREATE INDEX IF NOT EXISTS jobs_parent ON jobs (parent_job_id) WHERE parent_job_id IS NOT NULL`,
+			// Performance: follow-up / DAG lookup, the batch rollup, and the fan-in
+			// barrier's completion count.
+			//
+			// The key is (parent_job_id, state), a superset of the retired
+			// (parent_job_id) index: a leading-column prefix serves every plain
+			// parent lookup the old index did, and the trailing state column serves
+			// the rollup's GROUP BY parent_job_id, state and the barrier's
+			// COUNT(*) WHERE parent_job_id = ? AND state NOT IN (...) index-only,
+			// without a heap visit per child. deleted_at IS NULL matches the
+			// soft-delete scope, which is what makes it usable for those reads.
+			Name: "jobs_parent_state", Kind: IndexPerformance, Table: "jobs",
+			DDL: `CREATE INDEX IF NOT EXISTS jobs_parent_state ON jobs (parent_job_id, state) WHERE parent_job_id IS NOT NULL AND deleted_at IS NULL`,
 		},
 		{
 			// Performance: stuck-lease / orphan-recovery sweep.
