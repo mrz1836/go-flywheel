@@ -256,13 +256,58 @@ func periodicViewFromRow(r jobPeriodicRow) PeriodicView {
 	return v
 }
 
+// RetryOpts configures a RetryJobWithOptions call.
+type RetryOpts struct {
+	// Force retries a job that has already reached a terminal state — including a
+	// succeeded one. Without it a terminal job is refused with ErrJobTerminal, so an
+	// operator "retry now" can never silently re-run finished work. Re-running a
+	// completed job is a legitimate action; it just has to be deliberate.
+	Force bool
+	// ResetAttempts would restore the job's retry budget. It is reserved for the
+	// replay work and not yet implemented: setting it today is rejected with
+	// ErrResetAttemptsUnsupported rather than silently ignored, so the field cannot
+	// become a knob that does nothing. It is declared now so the options type is not
+	// broken a second time when the replay work lands.
+	ResetAttempts bool
+}
+
 // RetryJob forces a job back to available so a runner re-claims it on the next
 // poll, clearing any lease and finalization. It is the operator action behind a
-// "retry now" — it works on a terminal (discarded/cancelled/succeeded) job as well
-// as a stuck one. It returns ErrJobNotFound when no live job has the id.
+// "retry now".
+//
+// It is state-guarded to the same standard as CancelJob: a job that has already
+// reached a terminal state (succeeded, cancelled, discarded) is left exactly as it
+// is and ErrJobTerminal is returned, so a retry can never silently re-run finished
+// work and clear the outcome that recorded it. Use RetryJobWithOptions with Force
+// to re-run a terminal job deliberately. It returns ErrJobNotFound when no live job
+// has the id.
+//
+// This is a change from the earlier unguarded behavior, which returned any job —
+// including a succeeded one — to available. The guard is the point.
 func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
+	return RetryJobWithOptions(ctx, db, id, RetryOpts{})
+}
+
+// RetryJobWithOptions is RetryJob with explicit options. Force retries a job that
+// has already reached a terminal state; without it a terminal job returns
+// ErrJobTerminal. ResetAttempts is reserved and, if set, returns
+// ErrResetAttemptsUnsupported. It returns ErrJobNotFound when no live job has the
+// id. See RetryOpts.
+func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts RetryOpts) error {
+	if opts.ResetAttempts {
+		return ErrResetAttemptsUnsupported
+	}
 	now := models.ClockFrom(ctx).Now(ctx)
-	res := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id).Updates(map[string]any{
+	q := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id)
+	if !opts.Force {
+		// Scope the write to the states a job can still be retried from, naming the
+		// allowed states rather than excluding the terminal ones — the same guard
+		// CancelJob uses, and for the same reason: a row in a state this runtime does
+		// not recognize is refused rather than clobbered, so the guard can never be
+		// defeated by a state added to the vocabulary but missed here.
+		q = q.Where("state IN ?", nonTerminalStateStrings())
+	}
+	res := q.Updates(map[string]any{
 		"state":        string(StateAvailable),
 		"leased_until": nil,
 		// An attempt may still be running against this job. Clearing its token is
@@ -277,9 +322,32 @@ func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
 		return fmt.Errorf("flywheel: retry job %q: %w", id, res.Error)
 	}
 	if res.RowsAffected == 0 {
-		return ErrJobNotFound
+		return classifyRetryMiss(ctx, db, id)
 	}
 	return nil
+}
+
+// classifyRetryMiss explains why RetryJobWithOptions's UPDATE matched no row,
+// exactly as classifyCancelMiss does for CancelJob: the job does not exist
+// (ErrJobNotFound), or it exists but is terminal and Force was not set
+// (ErrJobTerminal). Under Force the UPDATE carries no state guard, so a miss can
+// only be a missing (or soft-deleted) job — the count is zero and this returns
+// ErrJobNotFound, which is the right answer.
+//
+// The count is scoped exactly like the UPDATE — Model(&jobRow{}) applies gorm's
+// deleted_at IS NULL — so a soft-deleted job reads as missing rather than terminal.
+// It runs outside a transaction for the same reason classifyCancelMiss does: the
+// miss path writes nothing, and serializing an operator-scale diagnostic read would
+// cost a write lock on SQLite for no correctness gain.
+func classifyRetryMiss(ctx context.Context, db *gorm.DB, id string) error {
+	var count int64
+	if err := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id).Count(&count).Error; err != nil {
+		return fmt.Errorf("flywheel: retry job %q: %w", id, err)
+	}
+	if count == 0 {
+		return ErrJobNotFound
+	}
+	return ErrJobTerminal
 }
 
 // CancelJob moves a still-in-flight job to the terminal cancelled state. An
