@@ -283,8 +283,8 @@ if err := flywheel.Migrate(db); err != nil { // db is a *gorm.DB
 ```
 
 `Migrate` runs `AutoMigrate` over the row structs, sets the `jobs` table's storage parameters, and
-applies the partial/unique indexes GORM cannot express from struct tags. It is idempotent
-(`AutoMigrate` no-op + `CREATE INDEX IF NOT EXISTS`), so repeated calls are safe.
+applies the partial/unique indexes GORM cannot express from struct tags. It is idempotent against an
+up-to-date schema — a re-run creates nothing and changes nothing — so it is safe to run on every deploy.
 
 **Host-owned** — your loader creates the tables, you apply the indexes:
 
@@ -329,6 +329,20 @@ for _, idx := range must(flywheel.IndexSet("postgres")) {
 A host that owns its schema history but still wants the installer can have both:
 `MigrateWithOptions(db, MigrateOpts{SkipColumnReconcile: true})` skips the routing-column reconciliation
 pass, so the runtime issues no `ALTER TABLE` of its own inside a versioned schema.
+
+**The install compares indexes by definition, not by name.** `CREATE INDEX IF NOT EXISTS` matches on the
+name alone, so a database already carrying an index of that name keeps its old definition through an
+install that reports success — a re-keyed index or a dropped `WHERE` predicate lands nowhere and the
+claim it was meant to serve quietly runs the slow plan. So the install reads each definition back from
+the catalog: an absent index is created, a matching one is left alone, and one whose definition has
+**drifted** is reported rather than silently kept — `InstallIndexes` and `Migrate` return an error
+naming the index, what is installed, and what is expected. Call `InspectIndexes(ctx, db)` to make that a
+CI parity check: it reports every index that is absent or drifted and writes nothing, so a host that owns
+its schema can assert it matches the runtime without copying a normalizer. To correct drift in place, set
+`IndexOpts{Reconcile: true}` (or `MigrateOpts{Reconcile: true}`) — it drops and recreates the drifted
+index, which takes an `ACCESS EXCLUSIVE` lock on the table for the rebuild, so it is opt-in and the
+default leaves that lock to you. `InspectStorageParameters(ctx, db)` gives the same parity check for the
+`jobs` storage parameters, which the unconditional `ALTER TABLE … SET` install converges on its own.
 
 > Only PostgreSQL and SQLite are supported, because both express the partial indexes the runtime relies
 > on. Every entry point returns `flywheel.ErrUnsupportedDialect` for anything else rather than silently
