@@ -37,6 +37,14 @@ func newValidationError(field, msg string) error {
 // already submitted.
 var ErrAlreadyEnqueued = errors.New("jobs: already enqueued")
 
+// ErrFollowUpLimit is returned by Finalize when a worker returns more follow-ups
+// than the configured limit. It is deliberately fatal rather than truncating:
+// silently dropping children would lose work with no signal, so the finalize
+// transaction rolls back and nothing is enqueued. A fan-out larger than the limit
+// is a design error — spawn a fan-out coordinator job instead of returning N
+// children from one attempt.
+var ErrFollowUpLimit = errors.New("flywheel: follow-up count exceeds the configured limit")
+
 // ErrRunAlreadyRecorded is returned by SeedRun when a seeded run collides with
 // an existing (job_id, attempt) pair. It is the job_runs counterpart of
 // ErrAlreadyEnqueued: the database rejected the row, so the attempt is already

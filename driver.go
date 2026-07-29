@@ -92,6 +92,20 @@ type Driver interface {
 // SweepBatchSize, zero or negative, that produces an unbounded transaction.
 const defaultSweepBatchSize = 1000
 
+// Follow-up fan-out bounds applied when DriverOpts leaves them zero. A worker's
+// Result.FollowUps is inserted inside the finalize transaction, so an unbounded
+// fan-out is an unbounded, lock-holding transaction: the insert is chunked, and
+// the total is capped.
+const (
+	// defaultFollowUpChunk is the number of child rows per INSERT during finalize.
+	// Like defaultSweepBatchSize it is a bound, not a knob to switch off.
+	defaultFollowUpChunk = 500
+	// defaultFollowUpLimit is the maximum children one attempt may enqueue. A
+	// larger fan-out is a design error: spawn a fan-out coordinator job instead of
+	// returning N children from one attempt.
+	defaultFollowUpLimit = 10000
+)
+
 // DriverOpts configures a Driver's batching behavior. The zero value selects the
 // documented defaults, and no field is ever unbounded.
 type DriverOpts struct {
@@ -103,6 +117,19 @@ type DriverOpts struct {
 	// parameter per row, and the extended protocol rejects a statement carrying
 	// more than 65,535 of them outright.
 	SweepBatchSize int
+
+	// FollowUpChunkSize is the number of child rows per INSERT when a finalize
+	// enqueues a worker's Result.FollowUps. Zero or negative selects
+	// defaultFollowUpChunk. It bounds how long the finalize transaction holds its
+	// row lock while fanning out.
+	FollowUpChunkSize int
+
+	// FollowUpLimit is the maximum number of children one attempt may enqueue.
+	// Zero or negative selects defaultFollowUpLimit. A worker returning more than
+	// this fails the finalize with ErrFollowUpLimit rather than silently
+	// truncating — the fan-out is removed as a way to make the runtime hold an
+	// unbounded lock.
+	FollowUpLimit int
 }
 
 // sweepBatchSize resolves the configured batch size, applying the default for a
@@ -112,6 +139,24 @@ func (o DriverOpts) sweepBatchSize() int {
 		return defaultSweepBatchSize
 	}
 	return o.SweepBatchSize
+}
+
+// followUpChunkSize resolves the follow-up insert chunk size, applying the
+// default for a non-positive value.
+func (o DriverOpts) followUpChunkSize() int {
+	if o.FollowUpChunkSize <= 0 {
+		return defaultFollowUpChunk
+	}
+	return o.FollowUpChunkSize
+}
+
+// followUpLimit resolves the per-attempt follow-up ceiling, applying the default
+// for a non-positive value.
+func (o DriverOpts) followUpLimit() int {
+	if o.FollowUpLimit <= 0 {
+		return defaultFollowUpLimit
+	}
+	return o.FollowUpLimit
 }
 
 // reclaimFunc is one dialect's expired-lease batch: it selects up to limit jobs
@@ -567,14 +612,17 @@ func (d *baseDriver) RenewLease(
 	return res.RowsAffected == 1, nil
 }
 
-// InsertChild writes one follow-up job on tx. A unique_key collision is
-// surfaced as ErrAlreadyEnqueued so Finalize can skip it without aborting.
-func (d *baseDriver) InsertChild(
-	ctx context.Context, tx *gorm.DB, fu FollowUp, parentID string,
-) error {
+// buildChildRow constructs the jobs row for one follow-up from fu and the
+// spawning job's id.
+//
+// It preserves the child's asymmetry with a top-level Insert: a child may carry a
+// UniqueKey and, when fu.Parent, a parent_job_id, but never a UniqueActiveKey. It
+// is shared by InsertChild (one child) and insertFollowUps (the chunked fan-out),
+// so the two cannot drift on a child's row shape.
+func buildChildRow(ctx context.Context, fu FollowUp, parentID string) (jobRow, error) {
 	payload, err := json.Marshal(fu.Args)
 	if err != nil {
-		return fmt.Errorf("jobs: marshal child args: %w", err)
+		return jobRow{}, fmt.Errorf("jobs: marshal child args: %w", err)
 	}
 	now := models.ClockFrom(ctx).Now(ctx)
 	row := jobRow{
@@ -602,6 +650,22 @@ func (d *baseDriver) InsertChild(
 	if fu.Parent {
 		pid := parentID
 		row.ParentJobID = &pid
+	}
+	return row, nil
+}
+
+// InsertChild writes one follow-up job on tx. A unique_key collision is
+// surfaced as ErrAlreadyEnqueued so Finalize can skip it without aborting.
+//
+// It remains on the Driver interface as a single-row public seam, but production
+// no longer routes through it: the finalize fan-out (insertFollowUps) uses the
+// shared chunk primitive. Its single-row behavior here is unchanged.
+func (d *baseDriver) InsertChild(
+	ctx context.Context, tx *gorm.DB, fu FollowUp, parentID string,
+) error {
+	row, err := buildChildRow(ctx, fu, parentID)
+	if err != nil {
+		return err
 	}
 	if createErr := tx.WithContext(ctx).Create(&row).Error; createErr != nil {
 		wrapped := models.WrapDBError(createErr)
@@ -701,19 +765,45 @@ func reclaimUpdate(now time.Time) map[string]any {
 // were enqueued. A unique_key collision is skipped rather than fatal: the child
 // is already enqueued, so the parent's finalization has nothing to correct and
 // must not be rolled back over it.
+//
+// The fan-out is bounded on both axes. A count over the configured limit fails
+// with ErrFollowUpLimit before anything is written, so the finalize transaction
+// rolls back and enqueues nothing — a loud failure in place of a silently
+// truncated set. Within the limit the children are inserted in chunks — one
+// bounded multi-row INSERT each, on the finalize tx directly (no sub-transaction,
+// so the fan-out stays atomic with the state advance) — instead of one statement
+// per child holding the row lock across the whole set. The count is the number of
+// rows that actually landed, read back per chunk by the shared primitive: a
+// colliding child is skipped by ON CONFLICT DO NOTHING and does not count, exactly
+// as it did not under the old per-child ErrAlreadyEnqueued swallow.
 func (d *baseDriver) insertFollowUps(
 	ctx context.Context, tx *gorm.DB, followUps []FollowUp, parentID string,
 ) (int, error) {
-	enqueued := 0
-	for _, fu := range followUps {
-		err := d.InsertChild(ctx, tx, fu, parentID)
-		if errors.Is(err, ErrAlreadyEnqueued) {
-			continue
+	if len(followUps) == 0 {
+		return 0, nil
+	}
+	if len(followUps) > d.opts.followUpLimit() {
+		return 0, ErrFollowUpLimit
+	}
+
+	rows := make([]jobRow, len(followUps))
+	for i, fu := range followUps {
+		row, err := buildChildRow(ctx, fu, parentID)
+		if err != nil {
+			return 0, err
 		}
+		rows[i] = row
+	}
+
+	chunkSize := d.opts.followUpChunkSize()
+	enqueued := 0
+	for start := 0; start < len(rows); start += chunkSize {
+		end := min(start+chunkSize, len(rows))
+		landed, err := conflictInsertChunk(ctx, tx, rows[start:end])
 		if err != nil {
 			return enqueued, err
 		}
-		enqueued++
+		enqueued += len(landed)
 	}
 	return enqueued, nil
 }
