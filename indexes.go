@@ -3,6 +3,8 @@ package flywheel
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"gorm.io/gorm"
 )
@@ -123,6 +125,174 @@ func applyIndexes(ctx context.Context, db *gorm.DB) error {
 		}
 	}
 	return nil
+}
+
+// IndexDrift is one runtime index whose installed definition does not match what
+// the runtime declares.
+type IndexDrift struct {
+	// Name is the index name, as both the runtime and the catalog call it.
+	Name string
+	// Installed is the definition the catalog reports, or the empty string when
+	// the index is absent.
+	Installed string
+	// Expected is the runtime's DDL — the definition the index should carry.
+	Expected string
+}
+
+// InspectIndexes reports every runtime index that is absent from db or whose
+// installed definition has drifted from the one the runtime declares. It reads
+// the catalog and writes nothing: it is the parity check a host runs to assert
+// its schema matches the runtime, without recreating anything and without
+// writing its own definition normalizer.
+//
+// The comparison is by definition, not by name. Both dialects install indexes
+// with CREATE INDEX IF NOT EXISTS, which matches on the name alone, so a database
+// already carrying an index of that name keeps its old definition through a
+// re-install that reports success. A check that probes by name passes against
+// that stale index; this does not — it reads the definition back from
+// pg_indexes.indexdef or sqlite_master.sql, the only authority on what is
+// actually installed.
+//
+// An index whose definition matches produces no entry, so an empty slice means
+// parity: every runtime index is present with the runtime's definition. An
+// unsupported dialect returns ErrUnsupportedDialect.
+func InspectIndexes(ctx context.Context, db *gorm.DB) ([]IndexDrift, error) {
+	if db == nil {
+		return nil, fmt.Errorf("flywheel: InspectIndexes: db is nil")
+	}
+	set, err := IndexSet(db.Name())
+	if err != nil {
+		return nil, fmt.Errorf("flywheel: InspectIndexes: %w", err)
+	}
+	drift, err := inspectIndexes(ctx, db, set)
+	if err != nil {
+		return nil, fmt.Errorf("flywheel: InspectIndexes: %w", err)
+	}
+	return drift, nil
+}
+
+// inspectIndexes compares the runtime's declared set against what db's catalog
+// holds, returning one IndexDrift per index that is absent or whose installed
+// definition has drifted. A matching index produces no entry, so the caller acts
+// only on what needs action.
+//
+// It reads the catalog once into a name→definition map and is the shared core of
+// InspectIndexes, which reports the drift, and applyIndexes, which acts on it. It
+// leaves the caller's name off the error so each entry point can prefix its own.
+func inspectIndexes(ctx context.Context, db *gorm.DB, set []Index) ([]IndexDrift, error) {
+	installed, err := readInstalledIndexDefs(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	var drift []IndexDrift
+	for _, idx := range set {
+		def, ok := installed[idx.Name]
+		switch {
+		case !ok:
+			drift = append(drift, IndexDrift{Name: idx.Name, Installed: "", Expected: idx.DDL})
+		case normalizeIndexDef(def) != normalizeIndexDef(idx.DDL):
+			drift = append(drift, IndexDrift{Name: idx.Name, Installed: def, Expected: idx.DDL})
+		}
+	}
+	return drift, nil
+}
+
+// readInstalledIndexDefs reads db's catalog into a name→definition map for the
+// runtime's three tables. The definition is the statement the database actually
+// holds — pg_indexes.indexdef on PostgreSQL, sqlite_master.sql on SQLite — which
+// is the only authority the name-level install cannot fake.
+func readInstalledIndexDefs(ctx context.Context, db *gorm.DB) (map[string]string, error) {
+	out := map[string]string{}
+	switch db.Name() {
+	case "postgres":
+		var rows []struct {
+			Indexname string
+			Indexdef  string
+		}
+		if err := db.WithContext(ctx).Raw(`
+			SELECT indexname, indexdef FROM pg_indexes
+			WHERE schemaname = current_schema()
+			  AND tablename IN ('jobs', 'job_runs', 'job_periodics')`).Scan(&rows).Error; err != nil {
+			return nil, fmt.Errorf("read installed index definitions: %w", err)
+		}
+		for _, r := range rows {
+			out[r.Indexname] = r.Indexdef
+		}
+	case "sqlite":
+		// sqlite_master.sql is NULL for the indexes SQLite creates implicitly for a
+		// UNIQUE/PRIMARY KEY constraint; the runtime's are all explicit CREATE
+		// statements, so the IS NOT NULL guard keeps the implicit ones out of the map
+		// rather than mapping a runtime name to an empty definition.
+		var rows []struct {
+			Name string
+			Sql  string
+		}
+		if err := db.WithContext(ctx).Raw(`
+			SELECT name, sql FROM sqlite_master
+			WHERE type = 'index' AND sql IS NOT NULL`).Scan(&rows).Error; err != nil {
+			return nil, fmt.Errorf("read installed index definitions: %w", err)
+		}
+		for _, r := range rows {
+			out[r.Name] = r.Sql
+		}
+	default:
+		return nil, fmt.Errorf(
+			"flywheel: %w: %q: index inspection requires postgres or sqlite",
+			ErrUnsupportedDialect, db.Name(),
+		)
+	}
+	return out, nil
+}
+
+// index-definition normalization regexes, compiled once.
+//
+//nolint:gochecknoglobals // package-level compiled regexes for normalizeIndexDef
+var (
+	// anyArrayIndexRe matches PostgreSQL's rendering of an IN list, which the
+	// catalog returns as `= ANY (ARRAY[...])`.
+	anyArrayIndexRe = regexp.MustCompile(`=\s*any\s*\(\s*array\[([^\]]*)\]\s*\)`)
+	// schemaOnTableIndexRe matches the `on <schema>.` qualifier PostgreSQL adds to
+	// the table name; an isolated schema's name differs every run.
+	schemaOnTableIndexRe = regexp.MustCompile(`\bon [a-z0-9_]+\.`)
+	// allWhitespaceIndexRe collapses whitespace so formatting differences do not
+	// read as drift.
+	allWhitespaceIndexRe = regexp.MustCompile(`\s+`)
+)
+
+// normalizeIndexDef reduces an index definition to a comparable shape, so a
+// definition read back from the catalog compares equal to the DDL that created
+// it. Two hosts wrote this same reduction independently before it moved here; it
+// is the reason InspectIndexes can compare meaning rather than formatting.
+//
+// pg_indexes.indexdef and the runtime's CREATE INDEX text are two renderings of
+// the same statement, and most of what differs between them is the catalog's own
+// formatting. Three rewrites are semantic rather than cosmetic, because the
+// catalog genuinely spells the same thing differently:
+//
+//   - `IN ('a', 'b')` comes back as `= ANY (ARRAY['a', 'b'])`
+//   - a literal compared against a text column gains a `::text` cast
+//   - the table is qualified with the schema the index lives in
+//
+// Everything else — case, quoting, IF NOT EXISTS, USING btree, whitespace, and
+// parenthesization — is noise the reduction strips. What survives is the name,
+// table, key columns in order, and predicate, which is exactly what a drift would
+// change. The one thing it cannot see is operator precedence expressed only
+// through parentheses, since it strips them; no runtime index depends on that,
+// and the must-not-match tests fix the boundary so the reduction is not tightened
+// until it matches everything.
+func normalizeIndexDef(def string) string {
+	s := strings.ToLower(def)
+	s = strings.ReplaceAll(s, `"`, "")
+	s = strings.ReplaceAll(s, "if not exists ", "")
+	s = strings.ReplaceAll(s, "::text", "")
+	s = anyArrayIndexRe.ReplaceAllString(s, "in ($1)")
+	s = strings.ReplaceAll(s, "public.", "")
+	s = schemaOnTableIndexRe.ReplaceAllString(s, "on ")
+	s = strings.ReplaceAll(s, "using btree ", "")
+	s = allWhitespaceIndexRe.ReplaceAllString(s, "")
+	s = strings.ReplaceAll(s, "(", "")
+	s = strings.ReplaceAll(s, ")", "")
+	return s
 }
 
 // runtimeIndexes is the dialect-independent index set. PostgreSQL and SQLite
