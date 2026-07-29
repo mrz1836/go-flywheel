@@ -48,3 +48,27 @@ func TestProgressRollupsPostgres(t *testing.T) {
 	assert.Equal(t, 5, byKind["leaf"].Total)
 	assert.Equal(t, 1, byKind["coordinator"].Total)
 }
+
+// TestChildOutputsPostgres proves the fold reads back the same on PostgreSQL,
+// where the job_id IN keyed read and the attempt ordering render differently. It
+// drives a real generation through the driver so the outputs come from actual
+// finalize writes.
+func TestChildOutputsPostgres(t *testing.T) {
+	t.Parallel()
+	db := NewPostgresIsolatedDB(t)
+	d := NewPostgresDriver(db)
+	ctx := context.Background()
+
+	parent := declareBarrierParent(t, d, db, ctx, "child", "finalize", 4)
+	for i := range 4 {
+		finalizeJob(t, d, ctx, claimOne(t, d, ctx), Result{Output: map[string]int{"n": i}}, nil)
+	}
+
+	outs, err := ChildOutputs(ctx, db, parent, ListRunsParams{})
+	require.NoError(t, err)
+	require.Len(t, outs, 4, "one entry per terminal child")
+	for _, o := range outs {
+		assert.Equal(t, StateSucceeded, o.State)
+		assert.NotEmpty(t, o.Output)
+	}
+}

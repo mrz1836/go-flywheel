@@ -2,6 +2,7 @@ package flywheel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -254,4 +255,80 @@ func isTerminalStateString(s string) bool {
 	default:
 		return false
 	}
+}
+
+// ChildOutput is one terminal child of a parent, paired with the recorded output
+// of its last attempt. It is the fold a barrier continuation reads: the barrier
+// fires when the generation is complete, and this is how the continuation sees what
+// the generation produced.
+type ChildOutput struct {
+	JobID string `json:"job_id"`
+	// State is the child's final state — succeeded, cancelled, or discarded.
+	State JobState `json:"state"`
+	// Attempt is the attempt number of the recorded run this output came from. It is
+	// zero for a child that never ran (a child cancelled before it was claimed has a
+	// terminal state but no attempt and no output).
+	Attempt int `json:"attempt"`
+	// Output is the child's last attempt's recorded Result.Output, empty when the
+	// child produced none or never ran.
+	Output json.RawMessage `json:"output,omitempty"`
+}
+
+// ChildOutputs returns the recorded output of each terminal child of a parent,
+// newest attempt per child, reading through db. It pages the terminal children by
+// created_at (newest first) exactly as ListRuns pages a job's runs: p.Before is a
+// created_at cursor (zero means newest) and a positive p.Limit caps the page; a
+// zero p.Limit reads every terminal child, which is the fold a barrier continuation
+// wants over a bounded generation.
+//
+// The outputs come from a second read keyed by the page's child ids rather than a
+// SQL join, mirroring RecentFailures: the runs are loaded ordered by attempt, and
+// the last row seen per child — the highest attempt — is the one that reached the
+// terminal state. A terminal child with no recorded run (cancelled before it was
+// claimed) still gets an entry, with a zero Attempt and an empty Output.
+func ChildOutputs(ctx context.Context, db *gorm.DB, parentJobID string, p ListRunsParams) ([]ChildOutput, error) {
+	query := db.WithContext(ctx).Model(&jobRow{}).
+		Where("parent_job_id = ? AND state IN ?", parentJobID, terminalStateStrings())
+	if !p.Before.IsZero() {
+		query = query.Where("created_at < ?", p.Before)
+	}
+	if p.Limit > 0 {
+		query = query.Limit(p.Limit)
+	}
+	var children []jobRow
+	if err := query.Order("created_at desc, id desc").Find(&children).Error; err != nil {
+		return nil, fmt.Errorf("flywheel: child outputs: %w", err)
+	}
+	if len(children) == 0 {
+		return []ChildOutput{}, nil
+	}
+
+	ids := make([]string, len(children))
+	for i := range children {
+		ids[i] = children[i].ID
+	}
+	var runs []jobRunRow
+	if err := db.WithContext(ctx).Model(&jobRunRow{}).
+		Where("job_id IN ?", ids).
+		Order("attempt asc").Find(&runs).Error; err != nil {
+		return nil, fmt.Errorf("flywheel: child outputs runs: %w", err)
+	}
+	// attempt asc means the last write per child is the highest (final) attempt.
+	latest := make(map[string]jobRunRow, len(runs))
+	for i := range runs {
+		latest[runs[i].JobID] = runs[i]
+	}
+
+	out := make([]ChildOutput, len(children))
+	for i := range children {
+		co := ChildOutput{JobID: children[i].ID, State: JobState(children[i].State)}
+		if run, ok := latest[children[i].ID]; ok {
+			co.Attempt = run.Attempt
+			if len(run.Output) > 0 {
+				co.Output = json.RawMessage(run.Output)
+			}
+		}
+		out[i] = co
+	}
+	return out, nil
 }
