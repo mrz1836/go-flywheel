@@ -130,7 +130,7 @@ func TestWriteArtifactIsNotWorldReadable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "plans.txt")
 
 	report := loadtest.ExplainReport{Target: "postgres://localhost:5432/flywheel_test", Jobs: 1}
-	if err := writeArtifact(report, path, os.Stdout); err != nil {
+	if err := writeArtifact(report.Text(), path, os.Stdout); err != nil {
 		t.Fatalf("writeArtifact: %v", err)
 	}
 
