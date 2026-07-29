@@ -135,6 +135,7 @@ The runtime is built from focused, composable pieces:
 - **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work ([client.go](client.go))
 - **Follow-up jobs (DAG)** — workers return child jobs that are enqueued atomically ([types.go](types.go))
 - **Outbox pattern** — enqueue on the caller's own `*gorm.DB` transaction for exactly-once side effects ([client.go](client.go))
+- **Bulk enqueue** — `InsertMany` writes N jobs in bounded, dialect-aware chunks, honoring the outbox transaction and per-row idempotency ([batch.go](batch.go))
 - **Generic workers** — ready-made `ExecWorker`, `ShellWorker`, `PythonWorker`, `MageWorker` (magex/mage), and `HTTPWorker` so local scripts and build tasks need no custom Go ([workers/](workers))
 
 <br/>
@@ -347,6 +348,61 @@ default leaves that lock to you. `InspectStorageParameters(ctx, db)` gives the s
 > Only PostgreSQL and SQLite are supported, because both express the partial indexes the runtime relies
 > on. Every entry point returns `flywheel.ErrUnsupportedDialect` for anything else rather than silently
 > dropping idempotency. The module takes **no** hard dependency on Atlas or any external migration tool.
+
+</details>
+
+<details>
+<summary><strong><code>Bulk enqueue and the follow-up ceiling</code></strong></summary>
+<br>
+
+Enqueuing one job is one `Insert`/`Enqueue` call and one row. Enqueuing many that way is one round trip
+per job — a 100k fan-out is 100k statements. `InsertMany` writes them in bounded, dialect-aware chunks
+instead: one multi-row `INSERT` per chunk, so the round trips drop by the chunk factor.
+
+```go
+items := make([]flywheel.BatchItem, len(subjects))
+for i, subject := range subjects {
+    args, err := json.Marshal(reportArgs{Subject: subject})
+    if err != nil {
+        return err
+    }
+    items[i] = flywheel.BatchItem{
+        Kind: "report",
+        Args: args,
+        Opts: flywheel.InsertOpts{Queue: "reports", UniqueKey: subject}, // per-row options
+    }
+}
+
+res, err := flywheel.InsertMany(ctx, client, items, flywheel.BatchOpts{})
+// res.Inserted + res.Skipped == len(items).
+// res.IDs stays aligned to the input — empty at any row a unique-key collision skipped.
+```
+
+Everything `Enqueue` guarantees for one row holds per row here: the same defaults, the same
+`unique_key`/`unique_active_key` idempotency, the same `ErrAlreadyEnqueued` meaning — a collision is a
+per-row skip, never a failed batch. `res.Skipped` counts the collisions; set `BatchOpts.SkipDuplicates`
+to drop them silently instead. `InsertManyTyped[A]` is the generic form: it reads each job's kind from
+the args value, exactly as `Insert` does.
+
+**The outbox guarantee carries over.** Set `BatchOpts.Tx` and every chunk writes on your transaction —
+the batch opens none of its own, so the rows land with your domain writes or not at all. Leave it unset
+and each chunk commits independently, so a mid-batch failure leaves the earlier chunks committed and the
+returned error names the failing chunk.
+
+`ChunkSize` defaults to a value chosen so a chunk stays well inside the driver's bind-parameter ceiling;
+a request above the dialect maximum is clamped down, not rejected.
+
+| Dialect | Bind-parameter ceiling | Rows per statement | Default `ChunkSize` |
+|---|---|---|---|
+| PostgreSQL | 65,535 | 2,978 | **1,000** |
+| SQLite | 32,766 | 1,489 | **500** |
+
+**The follow-up fan-out is bounded the same way.** A worker's `Result.FollowUps` is enqueued inside the
+finalize transaction, so an unbounded fan-out is an unbounded, lock-holding transaction. The children
+are inserted in chunks, and the total is capped: a fan-out past the limit fails the finalize with
+`ErrFollowUpLimit` rather than silently truncating. The bounds are `DriverOpts.FollowUpChunkSize`
+(default 500) and `DriverOpts.FollowUpLimit` (default 10,000) — a fan-out that large is a signal to
+spawn a coordinator job rather than return N children from one attempt.
 
 </details>
 

@@ -4,6 +4,7 @@ package loadtest
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -178,6 +179,73 @@ func runEnqueueBenchmark(b *testing.B, cfg Config) {
 		b.StartTimer()
 
 		elapsed, seedErr := h.insert(context.Background(), p, specs)
+
+		b.StopTimer()
+		if seedErr != nil {
+			_ = h.Close(context.Background())
+			b.Fatalf("seed: %v", seedErr)
+		}
+		totalJobs += float64(len(specs))
+		totalTime += elapsed.Seconds()
+		if err := h.Close(context.Background()); err != nil {
+			b.Fatalf("close: %v", err)
+		}
+		b.StartTimer()
+	}
+	b.StopTimer()
+
+	if totalTime > 0 {
+		b.ReportMetric(totalJobs/totalTime, "jobs/s")
+	}
+}
+
+// BenchmarkEnqueueBatched100k measures the bulk producer API: 100,000 rows
+// through flywheel.InsertMany, swept across chunk sizes to justify the default.
+//
+// It coexists with BenchmarkEnqueue100k (single-row through Enqueue) rather than
+// replacing it — the two are the before/after of the same 100k enqueue — and its
+// name keeps it inside a -bench=BenchmarkEnqueue filter. The sub-benchmarks vary
+// only the chunk size, so the delta between them is attributable to nothing else.
+func BenchmarkEnqueueBatched100k(b *testing.B) {
+	dsn := benchDSN(b)
+	for _, chunk := range []int{250, 500, 1000, 2000} {
+		b.Run(fmt.Sprintf("chunk=%d", chunk), func(b *testing.B) {
+			cfg := baselineConfig(dsn)
+			cfg.Mix = WorkloadEnqueueOnly
+			runBatchedEnqueueBenchmark(b, cfg, chunk)
+		})
+	}
+}
+
+// runBatchedEnqueueBenchmark times seedInsertMany — the bulk enqueue path through
+// the exported InsertMany — at the given chunk size, reporting jobs/s.
+//
+// Like runEnqueueBenchmark it times the seed rather than a drive, since for this
+// mix the insert is the measurement; the harness provisioning is bracketed out of
+// the timer on every iteration.
+func runBatchedEnqueueBenchmark(b *testing.B, cfg Config, chunkSize int) {
+	b.Helper()
+
+	var totalJobs, totalTime float64
+
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		h, err := newHarness(context.Background(), cfg)
+		if h == nil {
+			b.Fatalf("newHarness: %v", err)
+		}
+		if err != nil {
+			_ = h.Close(context.Background())
+			b.Fatalf("newHarness: %v", err)
+		}
+		_, specs := h.prepareWorkload()
+		b.StartTimer()
+
+		start := time.Now()
+		seedErr := seedInsertMany(context.Background(), h.work, h.cfg, specs, chunkSize,
+			func(n int) { h.prog.enqueued.Add(int64(n)) })
+		elapsed := time.Since(start)
 
 		b.StopTimer()
 		if seedErr != nil {
