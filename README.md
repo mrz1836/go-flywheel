@@ -306,7 +306,7 @@ if err := flywheel.InstallStorageParameters(ctx, db); err != nil {
 
 Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
 it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
-GORM struct tag cannot express. Four of the eight are correctness-bearing — without `jobs_unique_key`
+GORM struct tag cannot express. Four of the nine are correctness-bearing — without `jobs_unique_key`
 and `jobs_unique_active_key` the database accepts duplicate enqueues and **`ErrAlreadyEnqueued` is never
 returned.** Use `flywheel.IndexSet(dialect)` when you want them classified:
 
