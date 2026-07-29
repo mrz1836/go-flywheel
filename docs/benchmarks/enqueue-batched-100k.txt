@@ -1,0 +1,29 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrz1836/go-flywheel/loadtest
+cpu: Apple M4
+BenchmarkEnqueue100k-10           	       1	10261698959 ns/op	      9745 jobs/s
+BenchmarkEnqueue100k-10           	       1	14070663625 ns/op	      7107 jobs/s
+BenchmarkEnqueue100k-10           	       1	14278508375 ns/op	      7004 jobs/s
+BenchmarkEnqueue100k-10           	       1	11700649167 ns/op	      8547 jobs/s
+BenchmarkEnqueue100k-10           	       1	10165314458 ns/op	      9837 jobs/s
+BenchmarkEnqueueBatched100k/chunk=250-10         	       1	3364155084 ns/op	     29725 jobs/s
+BenchmarkEnqueueBatched100k/chunk=250-10         	       1	2979140542 ns/op	     33567 jobs/s
+BenchmarkEnqueueBatched100k/chunk=250-10         	       1	3053415668 ns/op	     32750 jobs/s
+BenchmarkEnqueueBatched100k/chunk=250-10         	       1	3386803542 ns/op	     29526 jobs/s
+BenchmarkEnqueueBatched100k/chunk=250-10         	       1	3246959834 ns/op	     30798 jobs/s
+BenchmarkEnqueueBatched100k/chunk=500-10         	       1	1969059208 ns/op	     50786 jobs/s
+BenchmarkEnqueueBatched100k/chunk=500-10         	       1	2185593791 ns/op	     45754 jobs/s
+BenchmarkEnqueueBatched100k/chunk=500-10         	       1	2130904500 ns/op	     46928 jobs/s
+BenchmarkEnqueueBatched100k/chunk=500-10         	       1	2267837208 ns/op	     44095 jobs/s
+BenchmarkEnqueueBatched100k/chunk=500-10         	       1	1972196501 ns/op	     50705 jobs/s
+BenchmarkEnqueueBatched100k/chunk=1000-10        	       1	1894003250 ns/op	     52798 jobs/s
+BenchmarkEnqueueBatched100k/chunk=1000-10        	       1	1829851209 ns/op	     54649 jobs/s
+BenchmarkEnqueueBatched100k/chunk=1000-10        	       1	1916956251 ns/op	     52166 jobs/s
+BenchmarkEnqueueBatched100k/chunk=1000-10        	       1	1914614041 ns/op	     52230 jobs/s
+BenchmarkEnqueueBatched100k/chunk=1000-10        	       1	1933951500 ns/op	     51708 jobs/s
+BenchmarkEnqueueBatched100k/chunk=2000-10        	       1	1888209875 ns/op	     52960 jobs/s
+BenchmarkEnqueueBatched100k/chunk=2000-10        	       1	1729635499 ns/op	     57816 jobs/s
+BenchmarkEnqueueBatched100k/chunk=2000-10        	       1	1852114667 ns/op	     53992 jobs/s
+BenchmarkEnqueueBatched100k/chunk=2000-10        	       1	2178800333 ns/op	     45897 jobs/s
+BenchmarkEnqueueBatched100k/chunk=2000-10        	       1	2331374124 ns/op	     42893 jobs/s
