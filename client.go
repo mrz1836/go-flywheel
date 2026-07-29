@@ -78,6 +78,28 @@ func (c *Client) insert(ctx context.Context, kind string, payload []byte, opts I
 	if opts.Tx != nil {
 		db = opts.Tx
 	}
+	row := buildRow(ctx, kind, payload, opts)
+
+	if createErr := db.WithContext(ctx).Create(&row).Error; createErr != nil {
+		wrapped := models.WrapDBError(createErr)
+		if errors.Is(wrapped, models.ErrDuplicateKey) {
+			return "", ErrAlreadyEnqueued
+		}
+		return "", fmt.Errorf("jobs: insert: %w", wrapped)
+	}
+	return row.ID, nil
+}
+
+// buildRow constructs the jobs row for one enqueue from kind, payload, and opts:
+// it reads the context clock and request id, applies the producer defaults, and
+// sets the four optional columns (schedule, unique key, unique-active key,
+// timeout).
+//
+// It is a free function and never reads opts.Tx — picking the handle is the
+// caller's job — so the single insert and the bulk InsertMany path share one row
+// builder and land byte-identical rows. BeforeCreate re-defaults any field left
+// zero here, so the two paths cannot drift on a producer default either.
+func buildRow(ctx context.Context, kind string, payload []byte, opts InsertOpts) jobRow {
 	now := models.ClockFrom(ctx).Now(ctx)
 
 	requestID := opts.RequestID
@@ -116,15 +138,7 @@ func (c *Client) insert(ctx context.Context, kind string, payload []byte, opts I
 		ms := int(opts.Timeout.Milliseconds())
 		row.TimeoutMs = &ms
 	}
-
-	if createErr := db.WithContext(ctx).Create(&row).Error; createErr != nil {
-		wrapped := models.WrapDBError(createErr)
-		if errors.Is(wrapped, models.ErrDuplicateKey) {
-			return "", ErrAlreadyEnqueued
-		}
-		return "", fmt.Errorf("jobs: insert: %w", wrapped)
-	}
-	return row.ID, nil
+	return row
 }
 
 // orString returns value when non-empty, otherwise fallback.
