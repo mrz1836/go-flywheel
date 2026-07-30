@@ -116,3 +116,11 @@ func TestReplayUnscopedByKindAndWindowPostgres(t *testing.T) {
 	assert.EqualValues(t, 10, scoutDiscarded, "out-of-window scout failures are left discarded")
 	assert.EqualValues(t, 25, weatherDiscarded, "the weather kind is untouched")
 }
+
+// TestStaggerDistributesUniformlyPostgres is A5 against real PostgreSQL — the same
+// deterministic decile assertion as the SQLite path, proving the CASE-based
+// scheduled_at placement reads identically on both dialects.
+func TestStaggerDistributesUniformlyPostgres(t *testing.T) {
+	t.Parallel()
+	assertStaggerDeciles(t, NewPostgresIsolatedDB(t))
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/mrz1836/go-foundation/models"
@@ -36,6 +37,19 @@ type ReplayOpts struct {
 	// it, so an incident window can be replayed without touching older failures. It
 	// is the other bound an unscoped Replay accepts.
 	FailedSince time.Time
+
+	// Stagger, when > 0, spreads the replayed cohort's scheduled_at uniformly across
+	// that window instead of making every job immediately available — how a
+	// 30,000-job replay avoids arriving at a just-recovered dependency all at once.
+	// Job i of n (a global index across batches, over the pre-counted cohort) lands
+	// at base + Stagger*i/n, where base is now + Delay. The placement is
+	// deterministic — no randomness — so an operator can predict when the last job
+	// lands, and it is reproducible.
+	//
+	// Stagger shapes arrival; it is not a rate ceiling. It does not cap how fast the
+	// cohort is claimed once each job is due, only when each becomes due. Admission
+	// control — an actual claim-rate ceiling — is a separate, later capability.
+	Stagger time.Duration
 
 	// BatchSize bounds the transaction per batch. Zero or negative selects the
 	// default; it is never unbounded.
@@ -150,6 +164,9 @@ func replay(
 	stateStrs := stateStrings(states)
 	batchSize := opts.batchSize()
 	now := models.ClockFrom(ctx).Now(ctx)
+	// base is the cohort's un-staggered arrival: Delay 0 makes it immediately
+	// claimable, a positive Delay defers it, and a Stagger spreads arrivals from base.
+	base := now.Add(opts.Delay)
 	var result ScopeResult
 
 	// A dead context on entry does no work at all — not even the counting reads — and
@@ -175,23 +192,45 @@ func replay(
 		return ScopeResult{}, fmt.Errorf("flywheel: %s: count terminal: %w", label, err)
 	}
 
+	// The stagger denominator: the size of the changeable set, counted once so job i
+	// of n lands at base + Stagger*i/n across the whole cohort rather than restarting
+	// per batch. Only counted when staggering — the common uniform replay skips it.
+	total := 0
+	if opts.Stagger > 0 {
+		q := scope(db.WithContext(ctx).Model(&jobRow{})).Where("state IN ?", stateStrs)
+		if !opts.FailedSince.IsZero() {
+			q = q.Where("finalized_at >= ?", opts.FailedSince)
+		}
+		var n int64
+		if err := q.Count(&n).Error; err != nil {
+			return ScopeResult{}, fmt.Errorf("flywheel: %s: count changeable: %w", label, err)
+		}
+		total = int(n)
+	}
+
 	// Move the targeted children to available in bounded batches, one transaction
 	// each, advancing a keyset cursor over id. The cursor — rather than the scoped
 	// controls' "moved rows leave the source scope, so a short page means done" — is
 	// what guarantees termination even if States overlaps the target state, and it
 	// gives the deterministic global running index a staggered replay needs.
 	// Cancellation is checked between batches; the committed batches are kept, so a
-	// cancelled replay is partial progress.
+	// cancelled replay is partial progress. placed is the global running index — how
+	// many jobs have been assigned a stagger slot so far, advanced by every selected
+	// row so a re-guard skip leaves only a negligible gap in the distribution.
 	var cursor string
+	placed := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return result, fmt.Errorf("flywheel: %s cancelled after %d changed: %w", label, result.Changed, err)
 		}
-		selected, changed, last, err := replayBatch(ctx, db, scope, stateStrs, opts, cursor, batchSize, now)
+		selected, changed, last, err := replayBatch(
+			ctx, db, scope, stateStrs, opts, cursor, batchSize, now, base, total, placed,
+		)
 		if err != nil {
 			return result, fmt.Errorf("flywheel: %s: %w", label, err)
 		}
 		result.Changed += changed
+		placed += selected
 		if selected > 0 {
 			result.Batches++
 		}
@@ -215,7 +254,7 @@ func replay(
 // Changed counts real transitions.
 func replayBatch(
 	ctx context.Context, db *gorm.DB, scope func(*gorm.DB) *gorm.DB, stateStrs []string,
-	opts ReplayOpts, cursor string, batchSize int, now time.Time,
+	opts ReplayOpts, cursor string, batchSize int, now, base time.Time, total, placed int,
 ) (selected int, changed int64, last string, err error) {
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		q := scope(tx.Model(&jobRow{})).Where("state IN ?", stateStrs)
@@ -240,9 +279,7 @@ func replayBatch(
 			"leased_until": nil,
 			"lease_token":  nil,
 			"finalized_at": nil,
-			// Delay 0 makes the cohort immediately claimable (scheduled_at == now); a
-			// positive Delay defers it, gated by the claim's scheduled_at <= now.
-			"scheduled_at": now.Add(opts.Delay),
+			"scheduled_at": scheduledAtValue(ids, base, opts.Stagger, total, placed),
 			"updated_at":   now,
 		}
 		applyRetryBudget(upd, opts.RetryOpts)
@@ -255,4 +292,34 @@ func replayBatch(
 		return nil
 	})
 	return selected, changed, last, err
+}
+
+// scheduledAtValue is the scheduled_at assignment for one batch. Without a stagger
+// window every replayed job lands at base — one uniform value, the fast path and the
+// common case. With a window, job at global index placed+k lands at
+// base + Stagger*(placed+k)/total, expressed as a portable CASE id WHEN … THEN …
+// ELSE scheduled_at END so a single UPDATE places the whole batch at once. The CASE
+// binds two parameters per row, bounded by the batch size, and reads identically on
+// PostgreSQL and SQLite. The placement is deterministic: an operator can predict
+// when the last job lands, and a test can assert exact per-decile counts.
+//
+// The ELSE scheduled_at branch is never reached — every id in the batch matches a
+// WHEN — but it gives the CASE a concrete timestamp type. Without it PostgreSQL
+// types the untyped time parameters as text and rejects the assignment to the
+// timestamptz column; the existing-value ELSE resolves that portably rather than
+// with a dialect-specific cast.
+func scheduledAtValue(ids []string, base time.Time, window time.Duration, total, placed int) any {
+	if window <= 0 || total <= 0 {
+		return base
+	}
+	var b strings.Builder
+	b.WriteString("CASE id")
+	args := make([]any, 0, len(ids)*2)
+	for k, id := range ids {
+		b.WriteString(" WHEN ? THEN ?")
+		offset := time.Duration(int64(window) * int64(placed+k) / int64(total))
+		args = append(args, id, base.Add(offset))
+	}
+	b.WriteString(" ELSE scheduled_at END")
+	return gorm.Expr(b.String(), args...)
 }

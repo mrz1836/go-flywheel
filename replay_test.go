@@ -257,3 +257,75 @@ func TestReplayNilDBIsAnError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "db is nil")
 }
+
+// assertStaggerDeciles seeds a cohort of discarded children, replays it across a
+// 10-minute window in several batches, and asserts each decile of that window holds
+// exactly a tenth of the cohort. Because the placement is deterministic — job i of n
+// lands at base + Stagger*i/n over a global index spanning batches — the assertion
+// is on exact per-decile counts, not a distribution shape. It is shared by the
+// SQLite and Postgres stagger tests so the parity claim is one body run twice.
+func assertStaggerDeciles(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	const (
+		n      = 1000
+		window = 10 * time.Minute
+	)
+	base := time.Now().UTC().Truncate(time.Second)
+	ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
+
+	seedTerminalChildrenBulk(t, db, "P", n, StateDiscarded, 3, base.Add(-time.Hour))
+
+	res, err := ReplayByParent(ctx, db, "P", ReplayOpts{
+		RetryOpts: RetryOpts{ResetAttempts: true}, Stagger: window, BatchSize: 250,
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, n, res.Changed)
+	require.Equal(t, 4, res.Batches, "a 1000-job cohort in batches of 250 spans four transactions")
+
+	// Read every replayed child's scheduled_at and bucket it into one of ten deciles
+	// of the window, measured from base (now, since Delay is zero). A global index
+	// that restarted per batch would pile four cohorts into the first 2.5 minutes;
+	// the flat decile counts are what prove it does not.
+	var scheduled []time.Time
+	require.NoError(t, db.Model(&jobRow{}).
+		Where("parent_job_id = ?", "P").Pluck("scheduled_at", &scheduled).Error)
+	require.Len(t, scheduled, n)
+
+	deciles := make([]int, 10)
+	bucket := window / 10
+	for _, s := range scheduled {
+		offset := s.Sub(base)
+		require.GreaterOrEqual(t, offset, time.Duration(0), "no job lands before base")
+		require.Less(t, offset, window, "no job lands at or after the full window")
+		deciles[int(offset/bucket)]++
+	}
+	for d, count := range deciles {
+		assert.Equalf(t, n/10, count, "decile %d holds exactly a tenth of the cohort", d)
+	}
+}
+
+// TestStaggerDistributesUniformly is A5 on SQLite.
+func TestStaggerDistributesUniformly(t *testing.T) {
+	t.Parallel()
+	assertStaggerDeciles(t, newDB(t))
+}
+
+// TestStaggerZeroLeavesTheCohortImmediatelyClaimable is the fast path: with no
+// Stagger every replayed job lands at base (now + Delay), immediately claimable.
+func TestStaggerZeroLeavesTheCohortImmediatelyClaimable(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
+
+	seedTerminalChildrenBulk(t, db, "P", 50, StateDiscarded, 3, base.Add(-time.Hour))
+	_, err := ReplayByParent(ctx, db, "P", ReplayOpts{})
+	require.NoError(t, err)
+
+	var scheduled []time.Time
+	require.NoError(t, db.Model(&jobRow{}).
+		Where("parent_job_id = ?", "P").Pluck("scheduled_at", &scheduled).Error)
+	for _, s := range scheduled {
+		assert.True(t, s.Equal(base), "every job is immediately claimable at base")
+	}
+}
