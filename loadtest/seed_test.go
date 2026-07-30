@@ -55,7 +55,7 @@ func TestSeedBulkMatchesEnqueueRowShape(t *testing.T) {
 		t.Fatalf("seedAPI: %v", err)
 	}
 	bulkSpecs := []jobSpec{{N: 2, WorkNanos: 1000, Priority: 100, Payload: "abc"}}
-	if err := seedBulk(ctx, h.work, h.cfg, bulkSpecs, func(int) {}); err != nil {
+	if err := seedBulk(ctx, h.work, h.cfg, bulkSpecs, "", func(int) {}); err != nil {
 		t.Fatalf("seedBulk: %v", err)
 	}
 
@@ -160,7 +160,7 @@ func TestSeedPathsBothLandEveryRow(t *testing.T) {
 		t.Fatalf("generate produced %d specs, want %d", len(specs), rows)
 	}
 	inserted := 0
-	if err := seedBulk(ctx, h.work, h.cfg, specs, func(n int) { inserted += n }); err != nil {
+	if err := seedBulk(ctx, h.work, h.cfg, specs, "", func(n int) { inserted += n }); err != nil {
 		t.Fatalf("seedBulk: %v", err)
 	}
 	if inserted != rows {

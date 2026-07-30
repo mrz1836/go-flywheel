@@ -244,7 +244,7 @@ func TestSeedBulkGenerationsDoNotCollide(t *testing.T) {
 
 	specs := generate(cfg)
 	for generation := range 3 {
-		if err := seedBulkFrom(ctx, h.work, cfg, specs, generation, func(int) {}); err != nil {
+		if err := seedBulkFrom(ctx, h.work, cfg, specs, generation, "", func(int) {}); err != nil {
 			t.Fatalf("generation %d: %v", generation, err)
 		}
 	}

@@ -88,6 +88,12 @@ for arm in untuned tuned; do
     -retention 2m -retention-interval 30s -sample-interval 10s $tune \
     -out "docs/benchmarks/bloat-$arm.json"
 done
+
+# Replay a 30k-failure cohort and assert it re-converges. 35,000 children under one
+# parent, 85.7% failing transiently, replayed with a restored budget over a 10m window.
+go run -tags=loadtest ./loadtest/cmd/scenario -mix fan-out -children 35000 \
+  -fail-fraction 0.857 -replay -replay-stagger 10m \
+  -out docs/benchmarks/replay-30k.json
 ```
 
 Three things about those four commands are load-bearing, and each was found by getting it wrong first.
@@ -904,6 +910,48 @@ available at any price.
 ```bash
 go test -tags=loadtest -run='^$' -bench=BenchmarkDrainWithHeartbeat -benchtime=1x -count=5 ./loadtest/
 ```
+
+<br/>
+
+## Replaying a failed cohort: re-convergence, and the one-more-try defect it replaces
+
+"Replay the failures" is the common operator action after an incident, and the runtime used to support
+it badly. A plain retry cleared a job's finalization and returned it to `available` but left `attempt`
+and `max_attempts` untouched, so a job discarded at `attempt == max_attempts` was re-claimed exactly
+once, failed on that single attempt, and was discarded again. An operator replaying 30,000 jobs watched
+30,000 immediate re-failures with no signal why. The fix restores the retry budget as headroom
+(`max_attempts = attempt + budget`) rather than rewinding the counter, so a replayed job gets a real
+second life and its `job_runs` audit sequence stays continuous.
+
+This run measures the whole path at scale. It seeds 35,000 children under one parent, fails 85.7% of
+them transiently, drains to a mix of discarded and succeeded, replays the discarded cohort under its
+parent with a restored budget of three spread across a ten-minute window, and awaits a second drain.
+
+| Measurement | Value |
+|---|---|
+| Children seeded (one parent) | 35,000 |
+| First drain — discarded / succeeded | 30,031 / 4,969 |
+| Replayed (`ReplayByParent`, budget 3) | 30,031 |
+| Succeeded children left untouched | 4,969 (before == after) |
+| Re-converged discarded after replay | 30,031 |
+| Jobs run past their restored budget | 0 |
+| Concurrent executions | 0 |
+| Retry transitions across both drains | 120,124 |
+| Claim p50 / finalize p50 | 1.21 ms / 0.96 ms |
+
+Every child re-converges to a terminal state. The 4,969 that succeeded on the first drain are never
+re-run — the replay targets discarded jobs only — and the 30,031 that failed are replayed, run their
+three restored attempts, and re-discard. `max_runs_over_budget` is zero: no job runs more times than
+its restored budget allows, which is the invariant the restored budget exists to hold.
+
+The stagger is why the run's wall clock is ten minutes and its drain rate reads 106 jobs/s: the replayed
+cohort's `scheduled_at` is spread across the window *by construction*, so that rate is a governor
+setting, not a ceiling — stagger shapes arrival, it does not cap the claim rate. The `retried` count is
+the fix in one number: 120,124 retry transitions, four per failed child (attempts 1→2 and 2→3 on the
+first drain, then 4→5 and 5→6 on the replay). A one-more-try retry could never have produced them — it
+would have granted a single attempt and discarded.
+
+`docs/benchmarks/replay-30k.json` is the committed artifact.
 
 <br/>
 

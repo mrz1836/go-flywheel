@@ -59,6 +59,7 @@ type bulkJobRow struct {
 	MaxAttempts   int            `gorm:"column:max_attempts"`
 	ScheduledAt   time.Time      `gorm:"column:scheduled_at"`
 	ExecutorClass string         `gorm:"column:executor_class"`
+	ParentJobID   *string        `gorm:"column:parent_job_id"`
 	Tags          datatypes.JSON `gorm:"column:tags"`
 }
 
@@ -191,8 +192,18 @@ func seedTerminal(ctx context.Context, db *gorm.DB, cfg Config, count int, age t
 // would scatter inserts across the whole index and produce page-split behavior
 // no production database sees, which would corrupt every storage number in the
 // report.
-func seedBulk(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onInsert func(int)) error {
-	return seedBulkFrom(ctx, db, cfg, specs, 0, onInsert)
+func seedBulk(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, parentID string, onInsert func(int)) error {
+	return seedBulkFrom(ctx, db, cfg, specs, 0, parentID, onInsert)
+}
+
+// maxAttemptsFor resolves the seeded jobs' retry budget: the configured override
+// when set, otherwise the runtime's own default of 25 — the value the bulk path
+// wrote before MaxAttempts was configurable.
+func maxAttemptsFor(cfg Config) int {
+	if cfg.MaxAttempts > 0 {
+		return cfg.MaxAttempts
+	}
+	return 25
 }
 
 // seedBulkFrom is seedBulk with an explicit generation offset, so a run that
@@ -208,7 +219,7 @@ func seedBulk(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onI
 // generation 0 is exactly what seedBulk always produced, so a run that seeds
 // once is byte-identical to before.
 func seedBulkFrom(
-	ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, generation int, onInsert func(int),
+	ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, generation int, parentID string, onInsert func(int),
 ) error {
 	ids := rand.New(rand.NewPCG( //nolint:gosec // reproducibility, not security
 		uint64(cfg.Seed), streamID+uint64(generation), //nolint:gosec // a non-negative counter
@@ -216,6 +227,15 @@ func seedBulkFrom(
 	// Each generation starts a full second past the previous one's last id, which
 	// is far more than any generation's microsecond-per-row span at these sizes.
 	base := seedEpoch.Add(time.Duration(generation) * time.Second)
+	maxAttempts := maxAttemptsFor(cfg)
+
+	// A non-empty parentID seeds every row as a leaf child of that parent (the
+	// replay cohort's shape), so it is threaded onto each row rather than left nil.
+	var parent *string
+	if parentID != "" {
+		p := parentID
+		parent = &p
+	}
 
 	rows := make([]bulkJobRow, len(specs))
 	for i, spec := range specs {
@@ -235,9 +255,10 @@ func seedBulkFrom(
 			Priority:      spec.Priority,
 			State:         string(flywheel.StateAvailable),
 			Attempt:       0,
-			MaxAttempts:   25,
+			MaxAttempts:   maxAttempts,
 			ScheduledAt:   at,
 			ExecutorClass: cfg.ExecutorClass,
+			ParentJobID:   parent,
 			Tags:          datatypes.JSON(`[]`),
 		}
 	}
@@ -267,6 +288,7 @@ func specToArgs(spec jobSpec, mix Workload) loadArgs {
 		Payload:   spec.Payload,
 		Children:  spec.Children,
 		Barrier:   mix == WorkloadBarrier && spec.Children > 0,
+		Fail:      spec.Fail,
 	}
 }
 
