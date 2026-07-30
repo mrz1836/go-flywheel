@@ -130,6 +130,81 @@ func TestNewRunnerDefaultsAndFloorsMaxPollBackoff(t *testing.T) {
 	}
 }
 
+// --- the configurable retry backoff cap -------------------------------------
+
+// TestBackoffCapShapesTheRetryLadder pins the retry ladder against several caps:
+// each rung doubles from the base until it reaches the ceiling, then holds flat,
+// and every rung stays inside the ±25% jitter band. A higher cap stretches the
+// same attempt budget over a longer window — the whole point of the knob.
+func TestBackoffCapShapesTheRetryLadder(t *testing.T) {
+	t.Parallel()
+	const base = time.Second
+	tests := map[string]struct {
+		cap  time.Duration
+		want []time.Duration // the un-jittered delay expected at attempts 1..len
+	}{
+		"the one-minute default": {
+			cap:  time.Minute,
+			want: []time.Duration{base, 2 * base, 4 * base, 8 * base, 16 * base, 32 * base, time.Minute, time.Minute},
+		},
+		"a thirty-minute cap climbs further before holding": {
+			cap: 30 * time.Minute,
+			want: []time.Duration{
+				base, 2 * base, 4 * base, 8 * base, 16 * base, 32 * base, 64 * base, 128 * base,
+				256 * base, 512 * base, 1024 * base, 30 * time.Minute, 30 * time.Minute,
+			},
+		},
+		"a cap below the base holds after the unclamped first rung": {
+			// expBackoff never clamps the first attempt, so rung one is the base;
+			// every rung after it saturates at the sub-base cap.
+			cap:  500 * time.Millisecond,
+			want: []time.Duration{base, 500 * time.Millisecond, 500 * time.Millisecond},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			r := &Runner{cfg: RunnerConfig{RetryBackoffBase: base, MaxRetryBackoff: tc.cap}}
+			for i, want := range tc.want {
+				attempt := i + 1
+				got := r.backoff(attempt)
+				low := time.Duration(float64(want) * (1 - backoffJitterSpread/2))
+				high := time.Duration(float64(want) * (1 + backoffJitterSpread/2))
+				assert.GreaterOrEqualf(t, got, low, "attempt %d: %s below the jitter floor for %s", attempt, got, want)
+				assert.LessOrEqualf(t, got, high, "attempt %d: %s above the jitter ceiling for %s", attempt, got, want)
+			}
+		})
+	}
+}
+
+// TestNewRunnerDefaultsMaxRetryBackoff proves the zero value takes the
+// one-minute default (no behavior change) while an explicit cap is preserved,
+// and that RetryBackoffBase's one-second default is untouched by the new field.
+func TestNewRunnerDefaultsMaxRetryBackoff(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		cap  time.Duration
+		want time.Duration
+	}{
+		"zero takes the one-minute default": {0, defaultMaxRetryBackoff},
+		"an explicit cap is kept":           {30 * time.Minute, 30 * time.Minute},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
+			r, err := NewRunner(RunnerConfig{
+				DB: db, Driver: NewSQLiteDriver(db), Registry: NewRegistry(),
+				Queues: []string{"default"}, MaxRetryBackoff: tc.cap,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, r.cfg.MaxRetryBackoff, "the cap resolves as documented")
+			assert.Equal(t, defaultRetryBackoffBase, r.cfg.RetryBackoffBase,
+				"the base default is one second regardless of the cap")
+		})
+	}
+}
+
 // --- bounded logging during an outage ---------------------------------------
 
 // TestPollErrorLoggingFollowsTheBackoffCadence is A5's logging half, asserted as

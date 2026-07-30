@@ -10,6 +10,7 @@ import (
 	"time"
 
 	flywheel "github.com/mrz1836/go-flywheel"
+	"github.com/mrz1836/go-foundation/models"
 )
 
 // completionCheckInterval is how often the drain loop asks the database whether
@@ -141,6 +142,12 @@ func (h *Harness) prepareWorkload() (mixPlan, []jobSpec) {
 // provisioning in newHarness, and teardown after collect.
 func (h *Harness) insert(ctx context.Context, p mixPlan, specs []jobSpec) (time.Duration, error) {
 	start := time.Now()
+	if h.cfg.Mix == WorkloadFairness {
+		// The fairness mix assigns priority and parent per row, so it seeds through
+		// its own path rather than seedBulk's single-parent one.
+		err := seedFairness(ctx, h.work, h.cfg, specs, func(n int) { h.prog.enqueued.Add(int64(n)) })
+		return time.Since(start), err
+	}
 	if p.Bulk {
 		err := seedBulk(ctx, h.work, h.cfg, specs, p.ParentID, func(n int) { h.prog.enqueued.Add(int64(n)) })
 		return time.Since(start), err
@@ -260,6 +267,9 @@ func (h *Harness) drive(ctx context.Context) error {
 	if h.cfg.Mix == WorkloadEnqueueOnly {
 		return nil
 	}
+	if h.clockDriven() {
+		return h.driveOutage(ctx)
+	}
 
 	if err := h.startRunners(ctx); err != nil {
 		return err
@@ -276,6 +286,35 @@ func (h *Harness) drive(ctx context.Context) error {
 		return h.replayAndReconverge(ctx)
 	}
 	return nil
+}
+
+// driveOutage runs the downstream-outage measurement on the advanceable clock.
+//
+// It differs from drive in three ways, all forced by time compression: the
+// runners' context carries the simulated clock, the fault is injected once at the
+// start rather than on a drain fraction (the whole cohort must meet the outage),
+// and a background advancer steps the clock between drain rounds so the runners'
+// own backoff ladder — however long its cap — is ridden out in seconds of wall
+// time. The wall clock still bounds and times the run.
+func (h *Harness) driveOutage(ctx context.Context) error {
+	runCtx := models.WithClock(ctx, h.clock)
+
+	if err := h.startRunners(runCtx); err != nil {
+		return err
+	}
+	defer h.stopRunners()
+
+	// Open the outage before the advancer can move the clock past its window.
+	if _, err := h.cfg.Faults.Inject(runCtx, h); err != nil {
+		return fmt.Errorf("loadtest: inject %s: %w", h.cfg.Faults.Describe(), err)
+	}
+	h.notes.add("Fault injected at run start: %s.", h.cfg.Faults.Describe())
+
+	advCtx, cancelAdvancer := context.WithCancel(runCtx)
+	defer cancelAdvancer()
+	h.wg.Go(func() { h.runClockAdvancer(advCtx) })
+
+	return h.awaitDrain(runCtx)
 }
 
 // replayAndReconverge runs the replay phase after the initial drain: it replays
@@ -588,6 +627,18 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 		}
 	}
 
+	// The outage-length backoff account, on a clock-driven run. Attempt volume per
+	// cohort is the A2 number; SimSpanCovered is the outage the ladder rode out.
+	if h.clockDriven() {
+		h.recordBackoff(report)
+	}
+
+	// The fairness account, on a fairness-mix run: whether the parents interleaved
+	// or one starved the other.
+	if h.fairness != nil {
+		h.recordFairness(report)
+	}
+
 	// Superseded is a measurement now: the runtime reports every discarded
 	// attempt through the Observer, so the harness counts events rather than
 	// inferring from row residue after the fact.
@@ -667,6 +718,76 @@ func (h *Harness) noteAdmission(report *Report) {
 			h.cfg.WorkerSnooze, report.RunRows, ratio, report.Drained,
 		)
 	}
+}
+
+// recordBackoff fills in the outage-length backoff account and notes the finding.
+//
+// The attempt volume is RunRows — one job_runs row per attempt — measured per
+// cohort. The exponential ladder makes it nearly cap-independent: a job that
+// fails through the outage spends the same handful of attempts whether the cap is
+// a minute or half an hour. What the cap buys is SimSpanCovered — the same budget
+// spread across a proportionally longer outage.
+func (h *Harness) recordBackoff(report *Report) {
+	retryCap := h.cfg.MaxRetryBackoff
+	if retryCap <= 0 {
+		retryCap = defaultOutageBackoffCap
+	}
+	var window time.Duration
+	if o, ok := h.cfg.Faults.(DownstreamOutage); ok {
+		window = o.For
+	}
+	attemptsPerJob := 0.0
+	if h.cfg.Jobs > 0 {
+		attemptsPerJob = float64(report.RunRows) / float64(h.cfg.Jobs)
+	}
+	report.Backoff = &BackoffReport{
+		MaxRetryBackoff:   retryCap.String(),
+		OutageWindow:      window.String(),
+		SimSpanCovered:    h.clock.span().String(),
+		Cohort:            h.cfg.Jobs,
+		MaxAttempts:       maxAttemptsFor(h.cfg),
+		Attempts:          report.RunRows,
+		AttemptsPerJob:    attemptsPerJob,
+		TransientFailures: h.outage.failures.Load(),
+		Drained:           report.Drained,
+		Discarded:         report.Discarded,
+	}
+	h.notes.add(
+		"Outage-length backoff: %d jobs spent %d attempts (%.2f/job) riding out a simulated %s outage on a "+
+			"%s cap, %d discarded and %d drained. The exponential ladder makes attempt volume nearly "+
+			"cap-independent; the cap sets how long the same budget rides out (sim span %s).",
+		h.cfg.Jobs, report.RunRows, attemptsPerJob, window, retryCap,
+		report.Discarded, report.Drained, h.clock.span(),
+	)
+}
+
+// defaultOutageBackoffCap is the runtime's own retry ceiling, used when a
+// clock-driven run left MaxRetryBackoff zero so the report records the cap the
+// runners actually used rather than the zero the caller passed.
+const defaultOutageBackoffCap = time.Minute
+
+// recordFairness fills in the interleaving account and notes the finding.
+//
+// MaxConsecutiveSameParent is the non-starvation number and MinActiveWindowShare
+// the interleaving one; under FIFO the first is near the batch size and the second
+// near zero, under banding the first is a small handful and the second near
+// 1/Parents.
+func (h *Harness) recordFairness(report *Report) {
+	rep := computeFairness(h.cfg, h.fairness.snapshot())
+	report.Fairness = rep
+
+	strategy := "strict FIFO"
+	if h.cfg.Fairness == FairnessRoundRobinParent {
+		strategy = "priority banding"
+	}
+	h.notes.add(
+		"Fairness (%s): %d parents x %d children. The longest single-parent run was %d claims and the "+
+			"smallest window share any still-working parent got was %.1f%% (window %d). Under strict FIFO the "+
+			"run approaches the batch size and the share approaches zero; banding holds the run to a handful "+
+			"and the share near %.1f%%.",
+		strategy, rep.Parents, rep.ChildrenPerParent, rep.MaxConsecutiveSameParent,
+		100*rep.MinActiveWindowShare, rep.WindowSize, 100.0/float64(rep.Parents),
+	)
 }
 
 // stateCounts reports how many jobs are in each state.

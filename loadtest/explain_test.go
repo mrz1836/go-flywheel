@@ -311,6 +311,56 @@ func TestExplainVariantsSharePartialPredicate(t *testing.T) {
 	}
 }
 
+// TestFairnessVariantsShareThePredicateAndDifferOnlyInOrdering pins the property
+// the whole fairness comparison rests on: F0, F1, and F2 apply the identical
+// routed predicate, so a cost delta between them is attributable to the ordering
+// and to nothing else. It also guards the two things a reader looks for — F0 is
+// O(LIMIT) and the ranked variants carry the window function — and the banded
+// variant's priority pre-filter.
+func TestFairnessVariantsShareThePredicateAndDifferOnlyInOrdering(t *testing.T) {
+	t.Parallel()
+
+	queues := []string{"q0", "q1", "q2"}
+	variants := fairnessVariants(queues, "loadtest", 8)
+	if len(variants) != 3 {
+		t.Fatalf("want 3 variants (shipped, ranked, banded), got %d", len(variants))
+	}
+
+	pred := fairnessPredicate(queues, "loadtest")
+	for _, v := range variants {
+		if !strings.Contains(v.SQL, pred) {
+			t.Errorf("%s must carry the shared routed predicate verbatim:\n%s", v.Name, v.SQL)
+		}
+		// Every variant compares scheduled_at against the pinned instant, which is
+		// what keeps the committed artifact reproducible across runs.
+		if !strings.Contains(v.SQL, fairnessNow) {
+			t.Errorf("%s must pin scheduled_at to %s for a reproducible artifact", v.Name, fairnessNow)
+		}
+	}
+
+	f0, f1, f2 := variants[0], variants[1], variants[2]
+	if strings.Contains(f0.SQL, "row_number()") {
+		t.Errorf("F0 is the shipped O(LIMIT) claim and must not rank: %s", f0.SQL)
+	}
+	if !strings.Contains(f0.SQL, "FOR UPDATE SKIP LOCKED") {
+		t.Errorf("F0 must mirror the driver's FOR UPDATE SKIP LOCKED: %s", f0.SQL)
+	}
+	for _, v := range []FairnessVariant{f1, f2} {
+		if !strings.Contains(v.SQL, "row_number() OVER (PARTITION BY COALESCE(parent_job_id, id)") {
+			t.Errorf("%s must rank by parent via the window function: %s", v.Name, v.SQL)
+		}
+		if !strings.Contains(v.SQL, "ORDER BY priority, rn, scheduled_at") {
+			t.Errorf("%s must claim in (priority, rank, scheduled_at) order: %s", v.Name, v.SQL)
+		}
+	}
+	if strings.Contains(f1.SQL, "priority <= (SELECT min(priority)") {
+		t.Errorf("F1 is the unbanded ranked variant and must not pre-filter: %s", f1.SQL)
+	}
+	if !strings.Contains(f2.SQL, "priority <= (SELECT min(priority) FROM jobs WHERE") {
+		t.Errorf("F2 must add the priority-band pre-filter: %s", f2.SQL)
+	}
+}
+
 // TestExplainVariantsCoverScheduledAt guards a coupling outside this package:
 // health_test.go drops jobs_ready so it can drop the scheduled_at column, and
 // SQLite refuses to drop a column an index still references. A candidate that

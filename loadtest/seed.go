@@ -277,6 +277,78 @@ func seedBulkFrom(
 	return nil
 }
 
+// fairnessPriorityBase is the priority a fairness child is banded from. It matches
+// the runtime's own producer default (client.go), so a banded run's numbers read
+// as "the default, plus a per-rank offset" rather than as an unrelated value.
+const fairnessPriorityBase = 100
+
+// seedFairness inserts the fairness mix: Parents synthetic parents, each with
+// Children ready leaf children, all available at once.
+//
+// Child N belongs to parent N/Children (parent-major, so schedule order is
+// parent-major and strict FIFO drains the first parent before the second). Under
+// FairnessRoundRobinParent the child's priority is banded by its rank within its
+// parent — child j of every parent shares priority base+j — so the shipped
+// (priority, scheduled_at) claim interleaves the parents with no claim-path
+// change. Under FairnessFIFO every child shares one priority, which is the
+// head-of-line-blocking baseline.
+//
+// This is the one seed that assigns priority and parent per row, so it builds the
+// rows itself rather than threading two more parameters through seedBulkFrom. The
+// generated specs still supply the work duration and the realistic row width, so
+// the fairness rows are as wide as every other mix's.
+func seedFairness(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onInsert func(int)) error {
+	children := childCount(cfg)
+	banding := cfg.Fairness == FairnessRoundRobinParent
+
+	rows := make([]bulkJobRow, len(specs))
+	for i, spec := range specs {
+		parent := i / children
+		rank := i % children
+		priority := fairnessPriorityBase
+		if banding {
+			priority += rank
+		}
+		args := specToArgs(spec, cfg.Mix)
+		args.Group = parent
+		payload, err := marshalArgs(args)
+		if err != nil {
+			return err
+		}
+		at := seedEpoch.Add(time.Duration(i) * time.Microsecond)
+		parentID := fmt.Sprintf("lt-fair-parent-%d", parent)
+		rows[i] = bulkJobRow{
+			ID:            fmt.Sprintf("lt-fair-%d", i),
+			CreatedAt:     at,
+			UpdatedAt:     at,
+			Metadata:      datatypes.JSON(`{}`),
+			Kind:          loadKind,
+			Queue:         cfg.Queue,
+			Args:          datatypes.JSON(payload),
+			Priority:      priority,
+			State:         string(flywheel.StateAvailable),
+			Attempt:       0,
+			MaxAttempts:   maxAttemptsFor(cfg),
+			ScheduledAt:   at,
+			ExecutorClass: cfg.ExecutorClass,
+			ParentJobID:   &parentID,
+			Tags:          datatypes.JSON(`[]`),
+		}
+	}
+
+	for start := 0; start < len(rows); start += bulkBatch {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("loadtest: fairness seed interrupted after %d jobs: %w", start, err)
+		}
+		end := min(start+bulkBatch, len(rows))
+		if err := db.WithContext(ctx).CreateInBatches(rows[start:end], bulkBatch).Error; err != nil {
+			return fmt.Errorf("loadtest: fairness seed rows %d-%d: %w", start, end, err)
+		}
+		onInsert(end - start)
+	}
+	return nil
+}
+
 // specToArgs renders a generated spec into the worker's args for the given mix.
 // A barrier-mix parent — a spec that fans out children — carries the barrier flag
 // so its worker declares the continuation; every other spec, including the mix's

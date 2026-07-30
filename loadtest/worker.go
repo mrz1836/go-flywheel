@@ -14,7 +14,40 @@ import (
 	"time"
 
 	flywheel "github.com/mrz1836/go-flywheel"
+	"github.com/mrz1836/go-foundation/models"
 )
+
+// outageState is the shared switch the downstream-outage fault flips and the
+// worker reads. It carries the simulated instant the outage lifts, so the worker
+// fails every attempt until the advanceable clock passes it — which is what makes
+// the runner's own backoff ladder, not the worker's NextRetry, govern the retries.
+type outageState struct {
+	// endNanos is the sim-time UnixNano the outage lifts at; zero means no outage
+	// has begun.
+	endNanos atomic.Int64
+	// failures counts the attempts the outage forced to fail, for the report.
+	failures atomic.Int64
+}
+
+// begin opens the outage, lifting at the simulated instant end.
+func (o *outageState) begin(end time.Time) { o.endNanos.Store(end.UnixNano()) }
+
+// failing reports whether an attempt at simulated instant now falls inside the
+// outage window.
+func (o *outageState) failing(now time.Time) bool {
+	end := o.endNanos.Load()
+	return end != 0 && now.UnixNano() < end
+}
+
+// end reports the simulated instant the outage lifts, or the zero time if no
+// outage has begun. The clock advancer reads it to keep from jumping the boundary.
+func (o *outageState) end() time.Time {
+	ns := o.endNanos.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
 
 // errTransientLoad is the error a fail-marked job returns. Left unclassified, the
 // runtime treats it as transient — retried until the budget is exhausted, then
@@ -56,6 +89,10 @@ type loadArgs struct {
 	// the job exhausts its budget to discarded. It is how a replay run manufactures
 	// the failures it then recovers.
 	Fail bool `json:"fail,omitempty"`
+	// Group is the parent ordinal a fairness-mix child belongs to, so the worker can
+	// record which parent each claim served without a second query. It is set only on
+	// the fairness mix; every other mix leaves it zero and unread.
+	Group int `json:"g,omitempty"`
 }
 
 // Kind names the job kind.
@@ -122,6 +159,15 @@ type loadWorker struct {
 	// budget. It is the mechanism the pre-claim gate is measured against — a snooze
 	// spends a full claim cycle and a job_runs row without advancing the job.
 	snooze *flywheel.TokenBucket
+	// outage, when set, is the downstream-outage switch: while the simulated clock
+	// is inside its window the worker fails every attempt transiently, so the
+	// runner's own exponential backoff — capped by MaxRetryBackoff — governs the
+	// retries. Nil on every run but the outage measurement.
+	outage *outageState
+	// fairness, when set, records the parent ordinal of each claim in execution
+	// order, so the report can measure interleaving and non-starvation. Nil on every
+	// run but the fairness mix.
+	fairness *fairnessRecorder
 }
 
 // Kind names the job kind this worker serves.
@@ -160,6 +206,25 @@ func (w loadWorker) Work(ctx context.Context, job *flywheel.Job[loadArgs]) (flyw
 			}
 			return flywheel.Result{Snooze: &delay}, nil
 		}
+	}
+
+	// The downstream outage: while the simulated clock is inside the window every
+	// attempt fails transiently. Returning zero from NextRetry (the outage worker
+	// carries no retryBackoff) defers to the runner's own exponential backoff, so
+	// the ladder that reschedules the job is the one MaxRetryBackoff caps — the
+	// whole point of the measurement.
+	if w.outage != nil {
+		if now := models.ClockFrom(ctx).Now(ctx); w.outage.failing(now) {
+			w.outage.failures.Add(1)
+			return flywheel.Result{}, errTransientLoad
+		}
+	}
+
+	// Record which parent this claim served, in execution order — which tracks claim
+	// order closely enough at WorkNanos 0 to show whether the parents interleave or
+	// one starves the other.
+	if w.fairness != nil {
+		w.fairness.record(job.Args.Group)
 	}
 
 	if d := time.Duration(job.Args.WorkNanos); d > 0 {

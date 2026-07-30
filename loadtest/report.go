@@ -203,6 +203,81 @@ type Report struct {
 	// Replay carries the replay phase's re-convergence account on a -replay run,
 	// and is nil otherwise.
 	Replay *ReplayReport
+
+	// Backoff carries the outage-length backoff account on a downstream-outage run,
+	// and is nil otherwise.
+	Backoff *BackoffReport
+
+	// Fairness carries the interleaving and non-starvation account on a fairness-mix
+	// run, and is nil otherwise.
+	Fairness *FairnessReport
+}
+
+// FairnessReport is the account of a fairness-mix run: whether the parents'
+// claims interleaved or one starved the other. It is present only on the fairness
+// mix.
+//
+// The two findings are MaxConsecutiveSameParent — the longest run of claims from
+// one parent, near the batch size under strict FIFO and a small handful under
+// banding — and MinActiveWindowShare, the smallest slice any still-working parent
+// got in any window, ~1/Parents under banding and ~0 under FIFO.
+type FairnessReport struct {
+	// Strategy is the priority-assignment strategy the run used, "" for FIFO.
+	Strategy string `json:"strategy"`
+	// Parents and ChildrenPerParent describe the seeded shape.
+	Parents           int `json:"parents"`
+	ChildrenPerParent int `json:"children_per_parent"`
+	// ClaimsPerParent is how many claims each parent received. Under either strategy
+	// the totals are equal — every child runs once — so this is the control that
+	// proves the difference is order, not volume.
+	ClaimsPerParent []int64 `json:"claims_per_parent"`
+	// MaxConsecutiveSameParent is the longest run of consecutive claims from one
+	// parent. It is the non-starvation number: near ChildrenPerParent under FIFO,
+	// a small handful under banding.
+	MaxConsecutiveSameParent int `json:"max_consecutive_same_parent"`
+	// WindowSize is how many consecutive claims one interleaving window spans, and
+	// Windows how many there were.
+	WindowSize int `json:"window_size"`
+	Windows    int `json:"windows"`
+	// MinActiveWindowShare is the smallest share any parent with work left got in any
+	// window — the interleaving number. Banding holds it near 1/Parents; FIFO drops
+	// it to ~0 for the parent waiting its turn.
+	MinActiveWindowShare float64 `json:"min_active_window_share"`
+}
+
+// BackoffReport is the account of a downstream-outage run: how a cohort's attempt
+// budget was spent against an outage the runner rode out on its own backoff
+// ladder. It is present only on a run with the downstream-outage fault.
+//
+// The headline is Attempts per cohort — the A2 number. The exponential ladder
+// means the count barely moves with the cap (a job that fails through the outage
+// spends the same handful of attempts either way); what the cap changes is how
+// far apart those attempts fall, which is SimSpanCovered. A one-minute cap and a
+// thirty-minute cap discard the same cohort for the same attempt volume, but the
+// thirty-minute cap does it over an outage thirty times longer.
+type BackoffReport struct {
+	// MaxRetryBackoff is the cap the runners used, resolved (never the zero the
+	// caller may have passed).
+	MaxRetryBackoff string `json:"max_retry_backoff"`
+	// OutageWindow is the simulated outage the workers failed through.
+	OutageWindow string `json:"outage_window"`
+	// SimSpanCovered is how far simulated time advanced — the wall-clock-free span
+	// the ladder rode out before the cohort's budget was spent.
+	SimSpanCovered string `json:"sim_span_covered"`
+	// Cohort is the seeded job count the attempt volume is measured per.
+	Cohort int `json:"cohort"`
+	// MaxAttempts is the per-job retry budget the cohort was seeded with.
+	MaxAttempts int `json:"max_attempts"`
+	// Attempts is the total job_runs the cohort produced — the A2 number.
+	Attempts int64 `json:"attempts"`
+	// AttemptsPerJob is Attempts over Cohort.
+	AttemptsPerJob float64 `json:"attempts_per_job"`
+	// TransientFailures is how many attempts the outage forced to fail.
+	TransientFailures int64 `json:"transient_failures"`
+	// Drained is how many jobs eventually succeeded (the outage lifted before their
+	// budget was spent); Discarded is how many exhausted their budget inside it.
+	Drained   int64 `json:"drained"`
+	Discarded int64 `json:"discarded"`
 }
 
 // ReplayReport is the account of a replay phase: what it recovered and whether the
@@ -315,6 +390,14 @@ type configJSON struct {
 	Burst         int    `json:"burst,omitempty"`
 	MaxConcurrent int    `json:"max_concurrent,omitempty"`
 	WorkerSnooze  int    `json:"worker_snooze,omitempty"`
+	// MaxRetryBackoff and MaxAttempts record the runners' retry ladder: the cap and
+	// the per-job budget. Both omit-empty, so an ordinary run's config is unchanged.
+	MaxRetryBackoff string `json:"max_retry_backoff,omitempty"`
+	MaxAttempts     int    `json:"max_attempts,omitempty"`
+	// Parents and Fairness record the fairness mix's shape and priority strategy.
+	// Both omit-empty, so no other mix's config section carries them.
+	Parents  int    `json:"parents,omitempty"`
+	Fairness string `json:"fairness,omitempty"`
 }
 
 // reportJSON is Report's wire form.
@@ -350,6 +433,8 @@ type reportJSON struct {
 	Schema         string            `json:"schema,omitempty"`
 	StorageParams  map[string]string `json:"storage_params,omitempty"`
 	Replay         *ReplayReport     `json:"replay,omitempty"`
+	Backoff        *BackoffReport    `json:"backoff,omitempty"`
+	Fairness       *FairnessReport   `json:"fairness,omitempty"`
 }
 
 // MarshalJSON renders the report in its wire form.
@@ -386,6 +471,8 @@ func (r Report) MarshalJSON() ([]byte, error) {
 		Schema:         r.Schema,
 		StorageParams:  r.StorageParams,
 		Replay:         r.Replay,
+		Backoff:        r.Backoff,
+		Fairness:       r.Fairness,
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -440,6 +527,8 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 		Schema:               in.Schema,
 		StorageParams:        in.StorageParams,
 		Replay:               in.Replay,
+		Backoff:              in.Backoff,
+		Fairness:             in.Fairness,
 	}
 	return nil
 }
@@ -468,6 +557,15 @@ func configToJSON(c Config) configJSON {
 		Burst:          c.Burst,
 		MaxConcurrent:  c.MaxConcurrent,
 		WorkerSnooze:   c.WorkerSnooze,
+		MaxRetryBackoff: func() string {
+			if c.MaxRetryBackoff > 0 {
+				return c.MaxRetryBackoff.String()
+			}
+			return ""
+		}(),
+		MaxAttempts: c.MaxAttempts,
+		Parents:     c.Parents,
+		Fairness:    string(c.Fairness),
 	}
 }
 
@@ -493,25 +591,29 @@ func describeFault(f Fault) string {
 // target that does not exist.
 func configFromJSON(c configJSON) Config {
 	return Config{
-		Jobs:           c.Jobs,
-		Seed:           c.Seed,
-		Runners:        c.Runners,
-		Workers:        c.Workers,
-		Mix:            Workload(c.Mix),
-		Indexes:        IndexCondition(c.Indexes),
-		WorkDuration:   mustParseDuration(c.WorkDuration),
-		WorkJitter:     mustParseDuration(c.WorkJitter),
-		Lease:          mustParseDuration(c.Lease),
-		Heartbeat:      mustParseDuration(c.Heartbeat),
-		SampleInterval: mustParseDuration(c.SampleInterval),
-		Timeout:        mustParseDuration(c.Timeout),
-		Queue:          c.Queue,
-		ExecutorClass:  c.ExecutorClass,
-		Limiter:        LimiterKind(c.Limiter),
-		Rate:           c.Rate,
-		Burst:          c.Burst,
-		MaxConcurrent:  c.MaxConcurrent,
-		WorkerSnooze:   c.WorkerSnooze,
+		Jobs:            c.Jobs,
+		Seed:            c.Seed,
+		Runners:         c.Runners,
+		Workers:         c.Workers,
+		Mix:             Workload(c.Mix),
+		Indexes:         IndexCondition(c.Indexes),
+		WorkDuration:    mustParseDuration(c.WorkDuration),
+		WorkJitter:      mustParseDuration(c.WorkJitter),
+		Lease:           mustParseDuration(c.Lease),
+		Heartbeat:       mustParseDuration(c.Heartbeat),
+		SampleInterval:  mustParseDuration(c.SampleInterval),
+		Timeout:         mustParseDuration(c.Timeout),
+		Queue:           c.Queue,
+		ExecutorClass:   c.ExecutorClass,
+		Limiter:         LimiterKind(c.Limiter),
+		Rate:            c.Rate,
+		Burst:           c.Burst,
+		MaxConcurrent:   c.MaxConcurrent,
+		WorkerSnooze:    c.WorkerSnooze,
+		MaxRetryBackoff: mustParseDuration(c.MaxRetryBackoff),
+		MaxAttempts:     c.MaxAttempts,
+		Parents:         c.Parents,
+		Fairness:        FairnessStrategy(c.Fairness),
 	}
 }
 

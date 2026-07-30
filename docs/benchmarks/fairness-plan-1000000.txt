@@ -1,0 +1,191 @@
+go-flywheel — parent-fairness claim cost characterization
+======================================================================================================================
+
+target:        postgres://localhost:5432/flywheel_test
+server:        PostgreSQL 17.10 (Homebrew) on aarch64-apple-darwin25.4.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+schema:        lt_dkc2ys1h2y34_1o7q_1
+jobs seeded:   1,000,000, all claimable
+ready set:     166,667 rows match the routed claim predicate
+queues:        q0, q1, q2 (seeded across all)
+claim queue:   q0 (single queue — where jobs_ready is reached)
+classes:       loadtest, (empty wildcard), loadtest-b, loadtest-c
+claim limit:   8
+seed:          1
+jobs relation: 564.3 MB (table plus indexes, at measurement time)
+
+variants
+  F0   shipped claim — jobs_ready walked in (priority, scheduled_at) order, O(LIMIT)
+  F1   round-robin: row_number() OVER (PARTITION BY COALESCE(parent_job_id, id)) then LIMIT
+  F2   F1 + priority-band pre-filter (WHERE priority <= (SELECT min(priority) ...))
+
+summary
+----------------------------------------------------------------------------------------------------------------------
+cell      scan node                               scan rows sort removed   buf hit  buf read exec ms
+----------------------------------------------------------------------------------------------------------------------
+F0        Index Scan using jobs_ready on jobs     8         no   7         9        11       0.059
+F1        Parallel Seq Scan on jobs               55,556    YES  277,778   12,687   42,977   216.014
+          sort method: external merge  Disk: 5944kB
+F2        Index Scan using jobs_ready on jobs jo… 1         YES  11,087    170      41,482   102.360
+          sort method: quicksort  Memory: 1673kB
+----------------------------------------------------------------------------------------------------------------------
+
+notes
+  - F0 mirrors postgresDriver.Dequeue's inner select verbatim (driver_postgres.go), its scheduled_at bound pinned to a
+    fixed instant so the artifact is reproducible. The state list, deleted_at guard, queue IN, and OR-on-class clause
+    are byte-identical across all three variants, so the only difference measured is the ordering.
+  - The claim names a single queue — the shape the shipped claim reaches jobs_ready in, matching the runtime's own
+    claim-plan gate — while rows are seeded across every queue. Its predicate matches 166,667 rows, the ready set.
+    F0 walks jobs_ready and stops at LIMIT=8; F1 ranks the whole ready set through a WindowAgg before the LIMIT
+    applies, which is the O(ready) cost the ship-or-band decision turns on.
+  - Every row is seeded parentless, so COALESCE(parent_job_id, id) makes each job its own partition of one — the
+    common case the plan's 1000/1001 paragraph describes. The WindowAgg still processes every ready row, so its cost
+    is O(ready) whatever the partition sizes are.
+  - F1 carries no FOR UPDATE SKIP LOCKED: PostgreSQL forbids a locking clause on a query with a window function, so a
+    shipped fairness claim would rank into a candidate set and re-lock it in a second step. This run measures the
+    ranking cost, which is what dominates and what the decision turns on.
+  - EXPLAIN (ANALYZE) executes the statement, so every capture ran inside a transaction that was rolled back. The
+    seeded table is identical for every variant.
+
+statements
+======================================================================================================================
+
+--- F0 ---
+SELECT id FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2099-01-01 00:00:00+00'
+      AND queue IN ('q0')
+      AND (executor_class = 'loadtest' OR executor_class = '')
+    ORDER BY priority, scheduled_at
+    LIMIT 8
+    FOR UPDATE SKIP LOCKED
+
+--- F1 ---
+WITH ranked AS (
+    SELECT id, priority, scheduled_at,
+           row_number() OVER (PARTITION BY COALESCE(parent_job_id, id)
+                              ORDER BY priority, scheduled_at) AS rn
+    FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2099-01-01 00:00:00+00'
+      AND queue IN ('q0')
+      AND (executor_class = 'loadtest' OR executor_class = '')
+)
+SELECT id FROM ranked
+ORDER BY priority, rn, scheduled_at
+LIMIT 8
+
+--- F2 ---
+WITH ranked AS (
+    SELECT id, priority, scheduled_at,
+           row_number() OVER (PARTITION BY COALESCE(parent_job_id, id)
+                              ORDER BY priority, scheduled_at) AS rn
+    FROM jobs
+    WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2099-01-01 00:00:00+00'
+      AND queue IN ('q0')
+      AND (executor_class = 'loadtest' OR executor_class = '')
+      AND priority <= (SELECT min(priority) FROM jobs WHERE state IN ('available', 'retryable', 'scheduled')
+      AND deleted_at IS NULL
+      AND scheduled_at <= '2099-01-01 00:00:00+00'
+      AND queue IN ('q0')
+      AND (executor_class = 'loadtest' OR executor_class = ''))
+)
+SELECT id FROM ranked
+ORDER BY priority, rn, scheduled_at
+LIMIT 8
+
+plans
+======================================================================================================================
+
+--- F0 ---
+Limit  (cost=0.42..13.11 rows=8 width=59) (actual time=0.022..0.053 rows=8 loops=1)
+  Buffers: shared hit=9 read=11 dirtied=6 written=11
+  ->  LockRows  (cost=0.42..232903.74 rows=146881 width=59) (actual time=0.022..0.053 rows=8 loops=1)
+        Buffers: shared hit=9 read=11 dirtied=6 written=11
+        ->  Index Scan using jobs_ready on jobs  (cost=0.42..231434.93 rows=146881 width=59) (actual time=0.018..0.042 rows=8 loops=1)
+              Index Cond: ((queue = 'q0'::text) AND (scheduled_at <= '2098-12-31 19:00:00-05'::timestamp with time zone))
+              Filter: ((deleted_at IS NULL) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+              Rows Removed by Filter: 7
+              Buffers: shared hit=1 read=11 written=11
+Planning:
+  Buffers: shared hit=25
+Planning Time: 0.077 ms
+Execution Time: 0.059 ms
+
+--- F1 ---
+Limit  (cost=98697.98..98698.00 rows=8 width=61) (actual time=212.274..214.938 rows=8 loops=1)
+  Buffers: shared hit=12687 read=42977 written=97, temp read=2043 written=2046
+  ->  Sort  (cost=98697.98..99065.18 rows=146881 width=61) (actual time=212.274..214.937 rows=8 loops=1)
+        Sort Key: ranked.priority, ranked.rn, ranked.scheduled_at
+        Sort Method: top-N heapsort  Memory: 26kB
+        Buffers: shared hit=12687 read=42977 written=97, temp read=2043 written=2046
+        ->  Subquery Scan on ranked  (cost=74247.22..95760.36 rows=146881 width=61) (actual time=71.927..206.911 rows=166667 loops=1)
+              Buffers: shared hit=12687 read=42977 written=97, temp read=2043 written=2046
+              ->  WindowAgg  (cost=74247.22..94291.55 rows=146881 width=93) (actual time=71.927..201.142 rows=166667 loops=1)
+                    Buffers: shared hit=12687 read=42977 written=97, temp read=2043 written=2046
+                    ->  Gather Merge  (cost=74247.22..91353.93 rows=146881 width=85) (actual time=71.923..177.494 rows=166667 loops=1)
+                          Workers Planned: 2
+                          Workers Launched: 2
+                          Buffers: shared hit=12687 read=42977 written=97, temp read=2043 written=2046
+                          ->  Sort  (cost=73247.19..73400.19 rows=61200 width=85) (actual time=69.874..82.282 rows=55556 loops=3)
+                                Sort Key: (COALESCE(jobs.parent_job_id, jobs.id)), jobs.priority, jobs.scheduled_at
+                                Sort Method: external merge  Disk: 5944kB
+                                Buffers: shared hit=12687 read=42977 written=97, temp read=2043 written=2046
+                                Worker 0:  Sort Method: external merge  Disk: 5232kB
+                                Worker 1:  Sort Method: external merge  Disk: 5168kB
+                                ->  Parallel Seq Scan on jobs  (cost=0.00..65451.91 rows=61200 width=85) (actual time=0.036..43.913 rows=55556 loops=3)
+                                      Filter: ((deleted_at IS NULL) AND (scheduled_at <= '2098-12-31 19:00:00-05'::timestamp with time zone) AND (queue = 'q0'::text) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND ((executor_class = 'loadtest'::text) OR (executor_class = ''::text)))
+                                      Rows Removed by Filter: 277778
+                                      Buffers: shared hit=12581 read=42975 written=95
+Planning:
+  Buffers: shared hit=8
+Planning Time: 0.062 ms
+Execution Time: 216.014 ms
+
+--- F2 ---
+Limit  (cost=72688.66..72688.68 rows=8 width=61) (actual time=102.138..102.324 rows=8 loops=1)
+  Buffers: shared hit=170 read=41482 written=15934
+  ->  Sort  (cost=72688.66..72811.06 rows=48960 width=61) (actual time=102.138..102.323 rows=8 loops=1)
+        Sort Key: ranked.priority, ranked.rn, ranked.scheduled_at
+        Sort Method: top-N heapsort  Memory: 26kB
+        Buffers: shared hit=170 read=41482 written=15934
+        ->  Subquery Scan on ranked  (cost=64538.46..71709.46 rows=48960 width=61) (actual time=72.481..99.875 rows=33320 loops=1)
+              Buffers: shared hit=170 read=41482 written=15934
+              ->  WindowAgg  (cost=64538.46..71219.86 rows=48960 width=93) (actual time=72.481..98.750 rows=33320 loops=1)
+                    Buffers: shared hit=170 read=41482 written=15934
+                    InitPlan 2
+                      ->  Result  (cost=1.99..2.00 rows=1 width=8) (actual time=0.010..0.011 rows=1 loops=1)
+                            Buffers: shared hit=4
+                            InitPlan 1
+                              ->  Limit  (cost=0.42..1.99 rows=1 width=8) (actual time=0.010..0.010 rows=1 loops=1)
+                                    Buffers: shared hit=4
+                                    ->  Index Scan using jobs_ready on jobs jobs_1  (cost=0.42..230173.79 rows=146881 width=8) (actual time=0.010..0.010 rows=1 loops=1)
+                                          Index Cond: ((queue = 'q0'::text) AND (scheduled_at <= '2098-12-31 19:00:00-05'::timestamp with time zone))
+                                          Filter: ((executor_class = 'loadtest'::text) OR (executor_class = ''::text))
+                                          Buffers: shared hit=4
+                    ->  Gather Merge  (cost=64536.45..70238.65 rows=48960 width=85) (actual time=72.478..94.011 rows=33320 loops=1)
+                          Workers Planned: 2
+                          Workers Launched: 2
+                          Buffers: shared hit=170 read=41482 written=15934
+                          ->  Sort  (cost=63536.43..63587.43 rows=20400 width=85) (actual time=71.225..71.432 rows=11107 loops=3)
+                                Sort Key: (COALESCE(jobs.parent_job_id, jobs.id)), jobs.priority, jobs.scheduled_at
+                                Sort Method: quicksort  Memory: 1673kB
+                                Buffers: shared hit=166 read=41482 written=15934
+                                Worker 0:  Sort Method: quicksort  Memory: 1565kB
+                                Worker 1:  Sort Method: quicksort  Memory: 1560kB
+                                ->  Parallel Bitmap Heap Scan on jobs  (cost=5294.06..62076.17 rows=20400 width=85) (actual time=6.796..67.156 rows=11107 loops=3)
+                                      Recheck Cond: ((queue = 'q0'::text) AND (priority <= (InitPlan 2).col1) AND (scheduled_at <= '2098-12-31 19:00:00-05'::timestamp with time zone) AND (state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL))
+                                      Filter: ((executor_class = 'loadtest'::text) OR (executor_class = ''::text))
+                                      Rows Removed by Filter: 11087
+                                      Heap Blocks: exact=14486
+                                      Buffers: shared hit=118 read=41482 written=15934
+                                      ->  Bitmap Index Scan on jobs_ready  (cost=0.00..5281.82 rows=112101 width=0) (actual time=4.849..4.849 rows=66581 loops=1)
+                                            Index Cond: ((queue = 'q0'::text) AND (priority <= (InitPlan 2).col1) AND (scheduled_at <= '2098-12-31 19:00:00-05'::timestamp with time zone))
+                                            Buffers: shared hit=109 read=482 written=288
+Planning:
+  Buffers: shared hit=20 read=1
+Planning Time: 0.864 ms
+Execution Time: 102.360 ms

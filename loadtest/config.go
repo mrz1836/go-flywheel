@@ -42,12 +42,48 @@ const (
 	// claimed batch before claiming again, so one slow member holds its entire
 	// batch — and at Workers: 8 with 10% slow jobs, most batches contain one.
 	WorkloadMixedSpeed Workload = "mixed-speed"
+	// WorkloadFairness seeds Parents synthetic parents, each with Children ready leaf
+	// children, all available at once — the shape that exposes head-of-line blocking.
+	// Under strict FIFO the first parent's whole batch drains before the second gets a
+	// claim; the Fairness strategy bands the children's priorities at enqueue so the
+	// claim interleaves the parents instead. It is what measures A4 (window share) and
+	// A5 (non-starvation).
+	WorkloadFairness Workload = "fairness"
 )
 
 // Valid reports whether w is a recognized Workload.
 func (w Workload) Valid() bool {
 	switch w {
-	case WorkloadEnqueueOnly, WorkloadDrainOnly, WorkloadSteady, WorkloadFanOut, WorkloadBarrier, WorkloadMixedSpeed:
+	case WorkloadEnqueueOnly, WorkloadDrainOnly, WorkloadSteady, WorkloadFanOut,
+		WorkloadBarrier, WorkloadMixedSpeed, WorkloadFairness:
+		return true
+	default:
+		return false
+	}
+}
+
+// FairnessStrategy selects how the fairness mix assigns its children's priorities.
+type FairnessStrategy string
+
+// Recognized FairnessStrategy values.
+const (
+	// FairnessFIFO is the default: every child carries the same priority, so the
+	// claim's (priority, scheduled_at) order is strict FIFO and the first parent's
+	// whole batch drains before the second is seen. It is the baseline the banding
+	// is measured against.
+	FairnessFIFO FairnessStrategy = ""
+	// FairnessRoundRobinParent bands the children's priorities at enqueue: a parent's
+	// n-th child shares a priority band with every other parent's n-th child, so the
+	// shipped claim interleaves the parents at O(batch) with no claim-path change.
+	// This is the mechanism the README documents; the ranked-CTE alternative it
+	// replaces was measured O(ready) and disqualifying (see BENCHMARKS).
+	FairnessRoundRobinParent FairnessStrategy = "round-robin-parent"
+)
+
+// Valid reports whether s is a recognized FairnessStrategy.
+func (s FairnessStrategy) Valid() bool {
+	switch s {
+	case FairnessFIFO, FairnessRoundRobinParent:
 		return true
 	default:
 		return false
@@ -166,6 +202,11 @@ const (
 	// defaultReplayBudget is how many attempts a replay restores when ReplayBudget
 	// is left zero.
 	defaultReplayBudget = 3
+	// defaultFairnessParents and defaultFairnessChildren size the fairness mix when
+	// the flags are left zero: two parents is the smallest set that can starve, and
+	// a deep child batch is what makes the head-of-line blocking visible.
+	defaultFairnessParents  = 2
+	defaultFairnessChildren = 10_000
 )
 
 // maxConnections is the connection budget one run may plan for.
@@ -329,6 +370,22 @@ type Config struct {
 	// exhausts quickly.
 	MaxAttempts int
 
+	// MaxRetryBackoff caps the runners' exponential retry delay, threaded to
+	// RunnerConfig.MaxRetryBackoff verbatim. Zero leaves the runtime's own default
+	// (one minute) in place. It is the knob the downstream-outage measurement
+	// varies: a longer cap spreads the same attempt budget across a longer outage.
+	MaxRetryBackoff time.Duration
+
+	// Parents is how many synthetic parents the fairness mix seeds, each with
+	// Children ready leaf children. It applies only to the fairness mix and must be
+	// at least two — one parent cannot starve itself.
+	Parents int
+	// Fairness selects the fairness mix's priority-assignment strategy: FairnessFIFO
+	// (the strict-FIFO baseline) or FairnessRoundRobinParent (priority banding). It
+	// is an enqueue-time property, not a runner setting — the claim path is
+	// untouched — so a run's claim query is byte-identical whichever is chosen.
+	Fairness FairnessStrategy
+
 	// Replay runs a replay phase after the initial drain: the discarded children are
 	// replayed under their parent with a restored budget, then the run awaits a
 	// second drain and asserts the cohort re-converges — every job terminal, no
@@ -471,6 +528,35 @@ func (c Config) validate() (Config, error) {
 	if c.MaxAttempts < 0 || c.ReplayBudget < 0 || c.ReplayStagger < 0 {
 		return Config{}, fmt.Errorf(
 			"loadtest: MaxAttempts, ReplayBudget and ReplayStagger must not be negative: %w", ErrInvalidConfig,
+		)
+	}
+	if c.MaxRetryBackoff < 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: MaxRetryBackoff must not be negative, got %s: %w", c.MaxRetryBackoff, ErrInvalidConfig,
+		)
+	}
+	if !c.Fairness.Valid() {
+		return Config{}, fmt.Errorf("loadtest: unknown fairness strategy %q: %w", c.Fairness, ErrInvalidConfig)
+	}
+	if c.Parents < 0 {
+		return Config{}, fmt.Errorf("loadtest: Parents must not be negative, got %d: %w", c.Parents, ErrInvalidConfig)
+	}
+	if c.Mix == WorkloadFairness {
+		if c.Parents == 0 {
+			c.Parents = defaultFairnessParents
+		}
+		if c.Parents < 2 {
+			return Config{}, fmt.Errorf(
+				"loadtest: the fairness mix needs Parents >= 2, got %d: one parent cannot starve itself: %w",
+				c.Parents, ErrInvalidConfig,
+			)
+		}
+		if c.Children == 0 {
+			c.Children = defaultFairnessChildren
+		}
+	} else if c.Fairness != FairnessFIFO {
+		return Config{}, fmt.Errorf(
+			"loadtest: -fairness applies only to the fairness mix, got %q: %w", c.Mix, ErrInvalidConfig,
 		)
 	}
 	if c.Replay {

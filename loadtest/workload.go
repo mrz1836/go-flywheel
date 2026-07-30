@@ -201,6 +201,12 @@ func plan(cfg Config) mixPlan {
 		p.BaseWork = base
 		p.SlowWork = slowFactor * base
 		p.SlowShare = slowFraction
+	case WorkloadFairness:
+		// Parents synthetic parents, each with Children ready leaf children, direct-
+		// seeded and all available. The seed count is the product, not Config.Jobs —
+		// the fairness mix's size is its own Parents×Children, so the drain target
+		// counts exactly the children that compete for claims.
+		p.Rows = cfg.Parents * childCount(cfg)
 	case WorkloadDrainOnly:
 	}
 	return p

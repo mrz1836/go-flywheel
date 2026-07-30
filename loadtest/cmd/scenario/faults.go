@@ -39,6 +39,11 @@ const (
 	// gives no duration. Long enough that a drain visibly stalls, short enough
 	// that a scenario still finishes.
 	defaultPauseWindow = 30 * time.Second
+	// defaultOutageWindow is how long downstream-outage lasts when the command line
+	// gives no duration. It is measured in simulated time and the run compresses it,
+	// so it is sized well past any realistic backoff ladder rather than for wall
+	// time: the point is to outlast the attempt budget, not to be quick.
+	defaultOutageWindow = 4 * time.Hour
 	// faultNone is the spelling for "no fault", so a scenario script can pass the
 	// flag unconditionally.
 	faultNone = "none"
@@ -81,6 +86,13 @@ var faultBuilders = map[string]faultBuilder{
 			return nil, fmt.Errorf("scenario: -fault mass-lease-expiry takes no duration: the expiry is instantaneous")
 		}
 		return loadtest.MassLeaseExpiry{Fraction: spec.fraction}, nil
+	},
+	"downstream-outage": func(spec faultSpec) (loadtest.Fault, error) {
+		window := spec.window
+		if window == 0 {
+			window = defaultOutageWindow
+		}
+		return loadtest.DownstreamOutage{For: window}, nil
 	},
 }
 

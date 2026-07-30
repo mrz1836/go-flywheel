@@ -21,7 +21,7 @@ const (
 	defaultLeaseDuration    = 30 * time.Second
 	defaultPollInterval     = 100 * time.Millisecond
 	defaultRetryBackoffBase = time.Second
-	maxRetryBackoff         = time.Minute
+	defaultMaxRetryBackoff  = time.Minute
 	backoffJitterSpread     = 0.5 // ±25% — the jitter multiplier spans [0.75, 1.25).
 	// defaultMaxPollBackoff caps the delay between polls during a sustained
 	// failure. A failing database must not be polled at the empty-queue rate:
@@ -125,6 +125,19 @@ type RunnerConfig struct {
 	// RetryBackoffBase is the base delay for the exponential retry backoff.
 	// Optional; defaults to one second.
 	RetryBackoffBase time.Duration
+	// MaxRetryBackoff caps the exponential retry delay. Optional; defaults to one
+	// minute.
+	//
+	// Size it against MaxAttempts: the backoff doubles from RetryBackoffBase each
+	// attempt until it reaches this ceiling, then holds flat. A dependency whose
+	// outages last hours is served poorly by the one-minute default — every
+	// attempt past the first few fires a minute apart, so a 25-attempt budget is
+	// spent in well under half an hour and the job fails permanently while the
+	// dependency is still down. Raising the cap to, say, thirty minutes stretches
+	// the same attempt budget across hours, matching the retry cadence to the
+	// outage length. The cap only widens the spacing of the later rungs; it never
+	// changes the first-attempt delay, which stays RetryBackoffBase.
+	MaxRetryBackoff time.Duration
 	// DefaultTimeout, when > 0, is the execution ceiling applied to every attempt
 	// that specifies no timeout of its own (per-job InsertOpts.Timeout or per-kind
 	// Timeouter). Optional; zero means no default timeout.
@@ -245,6 +258,9 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 	}
 	if cfg.RetryBackoffBase <= 0 {
 		cfg.RetryBackoffBase = defaultRetryBackoffBase
+	}
+	if cfg.MaxRetryBackoff <= 0 {
+		cfg.MaxRetryBackoff = defaultMaxRetryBackoff
 	}
 	if cfg.Observer == nil {
 		cfg.Observer = noopObserver{}
@@ -1308,7 +1324,7 @@ func (r *Runner) classify(entry registryEntry, workErr error, raw RawJob) error 
 
 // backoff is the exponential retry delay with ±25% jitter.
 func (r *Runner) backoff(attempt int) time.Duration {
-	return jittered(expBackoff(r.cfg.RetryBackoffBase, maxRetryBackoff, attempt))
+	return jittered(expBackoff(r.cfg.RetryBackoffBase, r.cfg.MaxRetryBackoff, attempt))
 }
 
 // jittered spreads d by ±25%. It is the one jitter this package applies — the
