@@ -154,9 +154,9 @@ func TestTokenBucketMaxConcurrentCapsHoldersAndReleaseIsIdempotent(t *testing.T)
 	assert.Equal(t, 3, g4.N, "releasing g1 freed exactly three, no more")
 }
 
-// --- A2 (FR-08-02): the budget is keyed on the resource ----------------------
+// --- the budget is keyed on the resource ------------------------------------
 
-// TestTokenBucketKeysOnResource is the deterministic core of FR-08-02: exhausting
+// TestTokenBucketKeysOnResource is the deterministic core of resource keying: exhausting
 // one resource's budget leaves another's untouched, because the key is the
 // resource string and nothing else.
 func TestTokenBucketKeysOnResource(t *testing.T) {
@@ -177,7 +177,7 @@ func TestTokenBucketKeysOnResource(t *testing.T) {
 	assert.Equal(t, 2, g.N, "resource b has its own independent budget")
 }
 
-// --- A3 (FR-08-03, FR-08-06): holders never exceed MaxConcurrent -------------
+// --- holders never exceed MaxConcurrent -------------------------------------
 
 // TestGatedRunnerHoldersNeverExceedMaxConcurrent runs an eight-slot pool under a
 // real token bucket with a loose rate and MaxConcurrent 5, and asserts — by
@@ -206,7 +206,7 @@ func TestGatedRunnerHoldersNeverExceedMaxConcurrent(t *testing.T) {
 		"jobs did run concurrently, so the bound is not vacuous")
 }
 
-// --- A2 topology: one class, two runners, two resources ----------------------
+// --- topology: one class, two runners, two resources ------------------------
 
 // TestGatedRunnersShareOneLimiterWithIndependentResources runs the documented
 // topology — two runners on one executor class, each keyed on its own resource,
@@ -214,7 +214,7 @@ func TestGatedRunnerHoldersNeverExceedMaxConcurrent(t *testing.T) {
 // other. It uses independent pool drivers so the assertion is about the gate, not
 // about SQLite's single-writer contention. Per-resource independence itself is
 // pinned deterministically in TestTokenBucketKeysOnResource, and the realistic
-// multi-process shared budget is the Postgres A4 test.
+// multi-process shared budget is the Postgres integration test.
 func TestGatedRunnersShareOneLimiterWithIndependentResources(t *testing.T) {
 	t.Parallel()
 	// One shared limiter, keyed per resource, with a loose rate so both drain.
@@ -241,7 +241,7 @@ func TestGatedRunnersShareOneLimiterWithIndependentResources(t *testing.T) {
 	stopB()
 
 	// Each runner minted its own resource key: the shared limiter tracked them as
-	// two independent buckets, which is FR-08-02 at the runner level.
+	// two independent buckets: resource keying at the runner level.
 	tb.mu.Lock()
 	_, hasA := tb.buckets["provider:a"]
 	_, hasB := tb.buckets["provider:b"]

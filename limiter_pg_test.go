@@ -31,7 +31,7 @@ func newSharedDBLimiters(t *testing.T, n int, cfg DBLimiterConfig) []*DBLimiter 
 	return limiters
 }
 
-// TestDBLimiterSharedCeilingAcrossInstancesPostgres is A4's shared-budget half:
+// TestDBLimiterSharedCeilingAcrossInstancesPostgres is the shared-budget check:
 // three independent limiter instances contend for one MaxConcurrent ceiling, and
 // the total admitted never exceeds it even under concurrent Acquire — the bucket
 // row lock serializes the reclaim-count-grant across every instance.
@@ -60,7 +60,7 @@ func TestDBLimiterSharedCeilingAcrossInstancesPostgres(t *testing.T) {
 		"three instances admit exactly the shared ceiling, no more")
 }
 
-// TestDBLimiterInlineReclaimAcrossInstancesPostgres is A4's crash-reclaim half: a
+// TestDBLimiterInlineReclaimAcrossInstancesPostgres is the crash-reclaim check: a
 // holder of four permits dies without releasing, and once its TTL lapses another
 // instance's Acquire reclaims exactly those four inline — with no sweeper running —
 // while a second, still-valid holder's reservation is left intact. The clock is

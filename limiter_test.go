@@ -225,7 +225,7 @@ func TestNewRunnerRequiresResourceWithLimiter(t *testing.T) {
 	require.NoError(t, err, "a Limiter with a Resource constructs")
 }
 
-// --- FR-08-01: the grant reduces the claim -----------------------------------
+// --- the grant reduces the claim ---------------------------------------------
 
 // TestGatedRunnerClaimsOnlyWhatIsGranted proves the gate reduces a claim below the
 // pool size: an eight-slot pool under a grant of two never claims more than two,
@@ -257,7 +257,7 @@ func TestGatedRunnerClaimsOnlyWhatIsGranted(t *testing.T) {
 	assert.Zero(t, lim.inFlight(), "every permit is released once the backlog drains")
 }
 
-// --- A5 (FR-08-07): a denied runner parks, and never claims -------------------
+// --- a denied runner parks, and never claims ---------------------------------
 
 // TestGatedRunnerDeniedNeverClaims proves a fully-denied limiter produces a
 // bounded wait derived from its own RetryAfter and no claim at all — the
@@ -280,7 +280,7 @@ func TestGatedRunnerDeniedNeverClaims(t *testing.T) {
 	assert.Less(t, got, 100, "denial parks on RetryAfter rather than busy-polling")
 }
 
-// --- A6 (FR-08-08): a limiter error never stops the runner --------------------
+// --- a limiter error never stops the runner ----------------------------------
 
 // TestGatedRunnerLimiterErrorDoesNotStopTheRunner covers both failure policies:
 // fail-open claims anyway and warns, fail-closed defers and never claims, and
@@ -344,7 +344,7 @@ func TestGatedRunnerLimiterErrorDoesNotStopTheRunner(t *testing.T) {
 	})
 }
 
-// --- A7 (FR-08-09): the permit is released on every dispatch exit -------------
+// --- the permit is released on every dispatch exit ---------------------------
 
 // TestGatedRunnerReleasesPermitOnEveryFinalizePath drives each way a dispatch can
 // end — a stub failure and an unknown kind (both early returns before the
@@ -418,7 +418,7 @@ func TestGatedRunnerReleasesPermitOnEveryFinalizePath(t *testing.T) {
 	}
 }
 
-// --- A8 (FR-08-10): the coordinator-starvation heuristic ---------------------
+// --- the coordinator-starvation heuristic ------------------------------------
 
 // starvedMsg is the exact warning the starvation heuristic logs.
 const starvedMsg = "jobs: gated runner may be starved; the limiter has denied " +

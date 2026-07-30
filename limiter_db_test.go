@@ -60,12 +60,12 @@ func TestDBLimiterShortCircuitsWhenUnbounded(t *testing.T) {
 	assert.Zero(t, buckets, "no bucket row is created when both caps are off")
 }
 
-// --- A9 (FR-08-11): the same budget under the SQLite write-lock --------------
+// --- the same budget under the SQLite write-lock ---------------------------
 
 // TestDBLimiterRateBudgetOnSQLite runs the rate path on a single-connection
-// in-memory SQLite database — the DSN shape whose BEGIN IMMEDIATE write-lock
-// serializes writers in place of FOR UPDATE — and asserts the budget is enforced
-// exactly as it would be on Postgres.
+// in-memory SQLite database — where the one-connection pool serializes writers in
+// place of the FOR UPDATE the limiter omits on SQLite — and asserts the budget is
+// enforced exactly as it would be on Postgres.
 func TestDBLimiterRateBudgetOnSQLite(t *testing.T) {
 	t.Parallel()
 	db := newSingleConnMemoryDB(t)
@@ -118,7 +118,7 @@ func TestDBLimiterConcurrencyBudgetOnSQLite(t *testing.T) {
 	assert.Equal(t, 2, g4.N, "releasing g1 freed exactly two")
 }
 
-// --- FR-08-05: inline expiry reclaim self-heals without a sweeper ------------
+// --- inline expiry reclaim self-heals without a sweeper --------------------
 
 // TestDBLimiterInlineReclaimSelfHeals is the crashed-holder case: a permit whose
 // TTL has lapsed is reclaimed by the next Acquire itself — no sweeper — so a
