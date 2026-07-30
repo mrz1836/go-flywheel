@@ -142,7 +142,7 @@ func (h *Harness) prepareWorkload() (mixPlan, []jobSpec) {
 func (h *Harness) insert(ctx context.Context, p mixPlan, specs []jobSpec) (time.Duration, error) {
 	start := time.Now()
 	if p.Bulk {
-		err := seedBulk(ctx, h.work, h.cfg, specs, func(n int) { h.prog.enqueued.Add(int64(n)) })
+		err := seedBulk(ctx, h.work, h.cfg, specs, p.ParentID, func(n int) { h.prog.enqueued.Add(int64(n)) })
 		return time.Since(start), err
 	}
 	err := seedAPI(ctx, h.work, h.cfg, specs, func() { h.prog.enqueued.Add(1) })
@@ -245,9 +245,10 @@ func (h *Harness) replenish(ctx context.Context, specs []jobSpec) error {
 		batch[i] = specs[(offset+i)%len(specs)]
 	}
 	// Each replenish is its own generation, so the ids it mints cannot collide
-	// with the seed's or with a previous replenish's.
+	// with the seed's or with a previous replenish's. The steady mix has no
+	// direct-seeded parent, so the replenished rows carry none.
 	generation := int(h.generation.Add(1))
-	return seedBulkFrom(ctx, h.work, h.cfg, batch, generation,
+	return seedBulkFrom(ctx, h.work, h.cfg, batch, generation, "",
 		func(n int) { h.prog.enqueued.Add(int64(n)) })
 }
 
@@ -266,7 +267,117 @@ func (h *Harness) drive(ctx context.Context) error {
 	defer h.stopRunners()
 	h.startFaults(ctx)
 
-	return h.awaitDrain(ctx)
+	if err := h.awaitDrain(ctx); err != nil {
+		return err
+	}
+	if h.cfg.Replay {
+		// The runners are still polling — drive defers stopRunners — so the replayed
+		// cohort is picked up as the replay returns it to available.
+		return h.replayAndReconverge(ctx)
+	}
+	return nil
+}
+
+// replayAndReconverge runs the replay phase after the initial drain: it replays
+// each parent's discarded children with a restored budget, awaits a second drain,
+// and records whether the cohort re-converged — every job terminal, no succeeded
+// child re-run, and no job run more times than its restored budget allows.
+//
+// It runs while the runners are still polling, so the replayed jobs are claimed as
+// the stagger releases them, and it reads the authoritative counts from the
+// database rather than the live estimate the drain fraction uses.
+func (h *Harness) replayAndReconverge(ctx context.Context) error {
+	before, err := h.stateCounts(ctx)
+	if err != nil {
+		return err
+	}
+	succeededBefore := before[string(flywheel.StateSucceeded)]
+
+	parents, err := h.replayParents(ctx)
+	if err != nil {
+		return err
+	}
+
+	rep := &ReplayReport{Parents: len(parents), SucceededBeforeReplay: succeededBefore}
+	for _, parent := range parents {
+		res, replayErr := flywheel.ReplayByParent(ctx, h.work, parent, flywheel.ReplayOpts{
+			RetryOpts: flywheel.RetryOpts{ResetAttempts: true, Budget: h.cfg.ReplayBudget},
+			Stagger:   h.cfg.ReplayStagger,
+		})
+		if replayErr != nil {
+			return fmt.Errorf("loadtest: replay parent %q: %w", parent, replayErr)
+		}
+		rep.Replayed += res.Changed
+		rep.SkippedTerminal += res.SkippedTerminal
+	}
+	h.replay = rep
+
+	// Await the second drain: the replayed cohort must re-converge to fully terminal.
+	if err := h.awaitDrain(ctx); err != nil {
+		return err
+	}
+
+	after, err := h.stateCounts(ctx)
+	if err != nil {
+		return err
+	}
+	rep.SucceededAfterReplay = after[string(flywheel.StateSucceeded)]
+	rep.DiscardedAfterReplay = after[string(flywheel.StateDiscarded)] + after[string(flywheel.StateCancelled)]
+
+	overBudget, err := h.maxRunsOverBudget(ctx)
+	if err != nil {
+		return err
+	}
+	rep.MaxRunsOverBudget = overBudget
+	h.recordReconvergence(rep)
+	return nil
+}
+
+// recordReconvergence turns a broken re-convergence invariant into a collected
+// error, so a replay that re-ran succeeded work or overran a restored budget fails
+// the run rather than being buried in a field a reader has to notice.
+func (h *Harness) recordReconvergence(rep *ReplayReport) {
+	if rep.SucceededAfterReplay != rep.SucceededBeforeReplay {
+		h.errs.add(fmt.Errorf(
+			"loadtest: replay re-ran succeeded work: %d succeeded before, %d after: %w",
+			rep.SucceededBeforeReplay, rep.SucceededAfterReplay, ErrReplayReconvergence,
+		))
+	}
+	if rep.MaxRunsOverBudget > 0 {
+		h.errs.add(fmt.Errorf(
+			"loadtest: a replayed job ran %d times past its restored budget: %w",
+			rep.MaxRunsOverBudget, ErrReplayReconvergence,
+		))
+	}
+}
+
+// replayParents returns the distinct parent ids of the seeded cohort, so the
+// replay is scoped per parent exactly as an operator's ReplayByParent would be.
+func (h *Harness) replayParents(ctx context.Context) ([]string, error) {
+	var parents []string
+	if err := h.probe.WithContext(ctx).
+		Raw(`SELECT DISTINCT parent_job_id FROM jobs WHERE parent_job_id IS NOT NULL`).
+		Scan(&parents).Error; err != nil {
+		return nil, fmt.Errorf("loadtest: find replay parents: %w", err)
+	}
+	return parents, nil
+}
+
+// maxRunsOverBudget reports the largest amount by which any job's recorded run
+// count exceeds its max_attempts. It must be non-positive: the runtime never runs a
+// job more than max_attempts times, and a replay only raises that ceiling as
+// headroom, so a positive value would mean a replay had granted a job more runs
+// than its restored budget allows.
+func (h *Harness) maxRunsOverBudget(ctx context.Context) (int64, error) {
+	var over int64
+	if err := h.probe.WithContext(ctx).Raw(
+		`SELECT COALESCE(MAX(rc.cnt - j.max_attempts), 0)
+		 FROM jobs j
+		 JOIN (SELECT job_id, count(*) AS cnt FROM job_runs GROUP BY job_id) rc ON rc.job_id = j.id`,
+	).Scan(&over).Error; err != nil {
+		return 0, fmt.Errorf("loadtest: max runs over budget: %w", err)
+	}
+	return over, nil
 }
 
 // startFaults launches the fault scheduler, if this run has one.
@@ -404,6 +515,19 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 	}
 	report.Drained = counts[string(flywheel.StateSucceeded)]
 	report.Discarded = counts[string(flywheel.StateDiscarded)] + counts[string(flywheel.StateCancelled)]
+
+	// The replay phase's outcome, recorded by drive while the runners were up. On a
+	// run with -replay it carries the re-convergence account; it is nil otherwise.
+	report.Replay = h.replay
+	if rep := h.replay; rep != nil {
+		h.notes.add(
+			"Replay recovered %d discarded children across %d parent(s) with a restored budget of %d, "+
+				"left %d succeeded children untouched, and the cohort re-converged to %d discarded with no "+
+				"job exceeding its restored budget (max overrun %d).",
+			rep.Replayed, rep.Parents, h.cfg.ReplayBudget, rep.SkippedTerminal,
+			rep.DiscardedAfterReplay, rep.MaxRunsOverBudget,
+		)
+	}
 
 	// Drained is a residual: it counts rows still in a terminal state when the run
 	// ended. With retention running, those rows are being deleted continuously, so

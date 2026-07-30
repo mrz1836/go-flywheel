@@ -192,6 +192,39 @@ type Report struct {
 	// Schema is the isolated schema the run provisioned, retained so a failed run
 	// can be inspected before the next one drops it.
 	Schema string
+
+	// Replay carries the replay phase's re-convergence account on a -replay run,
+	// and is nil otherwise.
+	Replay *ReplayReport
+}
+
+// ReplayReport is the account of a replay phase: what it recovered and whether the
+// cohort re-converged. It is present only on a run with -replay.
+//
+// The re-convergence guarantee is three numbers. SucceededBeforeReplay and
+// SucceededAfterReplay must be equal — a replay of the discarded cohort never
+// re-runs succeeded work. MaxRunsOverBudget must be non-positive — no job ran more
+// times than its restored budget allowed. And the run reaching this report at all
+// means the second drain completed, so every replayed job re-converged to terminal.
+type ReplayReport struct {
+	// Parents is how many parents the replay scoped to (ReplayByParent per parent).
+	Parents int `json:"parents"`
+	// Replayed is the total children returned to available across those parents —
+	// the sum of ScopeResult.Changed.
+	Replayed int64 `json:"replayed"`
+	// SkippedTerminal is the sum of ScopeResult.SkippedTerminal: the terminal
+	// children the replay left alone, which are the succeeded ones.
+	SkippedTerminal int64 `json:"skipped_terminal"`
+	// SucceededBeforeReplay and SucceededAfterReplay bracket the replay. They must
+	// be equal: a replay of the discarded cohort must not re-run succeeded work.
+	SucceededBeforeReplay int64 `json:"succeeded_before_replay"`
+	SucceededAfterReplay  int64 `json:"succeeded_after_replay"`
+	// DiscardedAfterReplay is the terminal discarded count once the replayed cohort
+	// re-converged — the second-drain terminal count.
+	DiscardedAfterReplay int64 `json:"discarded_after_replay"`
+	// MaxRunsOverBudget is the largest amount by which any job's recorded run count
+	// exceeded its restored max_attempts. It must be non-positive.
+	MaxRunsOverBudget int64 `json:"max_runs_over_budget"`
 }
 
 // --- JSON wire form ---------------------------------------------------------
@@ -300,6 +333,7 @@ type reportJSON struct {
 	Histogram      HistogramSpec     `json:"histogram"`
 	Schema         string            `json:"schema,omitempty"`
 	StorageParams  map[string]string `json:"storage_params,omitempty"`
+	Replay         *ReplayReport     `json:"replay,omitempty"`
 }
 
 // MarshalJSON renders the report in its wire form.
@@ -334,6 +368,7 @@ func (r Report) MarshalJSON() ([]byte, error) {
 		Histogram:      r.Histogram,
 		Schema:         r.Schema,
 		StorageParams:  r.StorageParams,
+		Replay:         r.Replay,
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -386,6 +421,7 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 		Histogram:            in.Histogram,
 		Schema:               in.Schema,
 		StorageParams:        in.StorageParams,
+		Replay:               in.Replay,
 	}
 	return nil
 }

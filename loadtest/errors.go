@@ -32,6 +32,11 @@ var (
 	// is deliberately Postgres-only: the claim path it exists to measure is
 	// FOR UPDATE SKIP LOCKED, which has no SQLite equivalent.
 	ErrUnsupportedDialect = errors.New("unsupported dialect")
+	// ErrReplayReconvergence reports that a replayed cohort did not re-converge as
+	// required: succeeded work was re-run, or a job ran more times than its restored
+	// budget allowed. It is a distinct sentinel because it is the replay guarantee
+	// stated as a number, the counterpart to ErrExactlyOnceViolated.
+	ErrReplayReconvergence = errors.New("replay re-convergence violated")
 )
 
 // maxDistinctErrors bounds how many distinct error messages an errset retains.

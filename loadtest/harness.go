@@ -61,6 +61,11 @@ type Harness struct {
 	// prepareWorkload, before any runner exists.
 	digest string
 
+	// replay records the replay phase's outcome on a -replay run, set by drive
+	// while the runners are still up and read by collect. It is nil on a run that
+	// did not replay.
+	replay *ReplayReport
+
 	prog    *progress
 	errs    *errset
 	notes   *noteset
@@ -301,10 +306,25 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 	h.inner = flywheel.NewPostgresDriverWithOptions(h.work, workDriverOpts(cfg))
 	h.timings = newTimings(cfg.Runners)
 	h.registry = flywheel.NewRegistry()
-	flywheel.Register(h.registry, loadWorker{track: h.exec})
+	// The worker carries the seed and fail fraction so a runtime-fanned child's
+	// outcome matches the generator's, and a fast retry backoff on a fail run so the
+	// cohort exhausts to discarded in bounded wall time rather than climbing the
+	// default ladder to its one-minute cap.
+	var retryBackoff time.Duration
+	if cfg.FailFraction > 0 {
+		retryBackoff = replayRetryBackoff
+	}
+	flywheel.Register(h.registry, loadWorker{
+		track: h.exec, seed: cfg.Seed, failFraction: cfg.FailFraction, retryBackoff: retryBackoff,
+	})
 
 	return h, nil
 }
+
+// replayRetryBackoff is the fixed retry delay a fail-fraction run gives its worker,
+// so a fail cohort's attempts exhaust quickly and deterministically instead of
+// following the runner's exponential ladder up to its one-minute cap.
+const replayRetryBackoff = 250 * time.Millisecond
 
 // openPool opens one gorm connection pool with a fixed size.
 func openPool(dsn string, maxOpen int) (*gorm.DB, error) {

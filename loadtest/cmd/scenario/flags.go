@@ -93,6 +93,17 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.DurationVar(&opts.cfg.TerminalSeedAge, "terminal-seed-age", 0,
 		"how far back to date the seeded terminal jobs (default: 90 days)")
 
+	fs.Float64Var(&opts.cfg.FailFraction, "fail-fraction", 0,
+		"fan-out mix: share of children that fail transiently, in [0,1); seeds the cohort under one parent")
+	fs.IntVar(&opts.cfg.MaxAttempts, "max-attempts", 0,
+		"seeded jobs' retry budget (0 selects the runtime default; a replay run defaults it small)")
+	fs.BoolVar(&opts.cfg.Replay, "replay", false,
+		"replay the discarded children after the initial drain and assert the cohort re-converges")
+	fs.DurationVar(&opts.cfg.ReplayStagger, "replay-stagger", 0,
+		"spread the replayed cohort's scheduled_at across this window (zero replays them at once)")
+	fs.IntVar(&opts.cfg.ReplayBudget, "replay-budget", 0,
+		"attempts the replay restores per job (0 selects a small default)")
+
 	if err := fs.Parse(args); err != nil {
 		return options{}, fmt.Errorf("scenario: %w", err)
 	}
@@ -114,7 +125,9 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	// costs a message instead of a provisioned schema, and so the message names
 	// the flag the operator typed.
 	if !opts.cfg.Mix.Valid() {
-		return options{}, fmt.Errorf("scenario: -mix %q is not one of enqueue, drain, steady, fan-out, mixed-speed", mix)
+		return options{}, fmt.Errorf(
+			"scenario: -mix %q is not one of enqueue, drain, steady, fan-out, barrier, mixed-speed", mix,
+		)
 	}
 	if !opts.cfg.Indexes.Valid() {
 		return options{}, fmt.Errorf("scenario: -indexes %q is not one of full, correctness-only", indexes)

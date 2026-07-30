@@ -120,6 +120,13 @@ const (
 	// defaultTerminalSeedAge backdates the seeded terminal jobs far enough that
 	// any plausible retention window is older than none of them.
 	defaultTerminalSeedAge = 90 * 24 * time.Hour
+	// defaultReplayMaxAttempts is the small seeded budget a replay run applies when
+	// MaxAttempts is left zero, so a fail-child exhausts to discarded in three
+	// attempts rather than the runtime default of twenty-five.
+	defaultReplayMaxAttempts = 3
+	// defaultReplayBudget is how many attempts a replay restores when ReplayBudget
+	// is left zero.
+	defaultReplayBudget = 3
 )
 
 // maxConnections is the connection budget one run may plan for.
@@ -249,6 +256,34 @@ type Config struct {
 	// a measurement of nothing.
 	TerminalSeed    int
 	TerminalSeedAge time.Duration
+
+	// FailFraction is the share of the fan-out cohort's children that fail
+	// transiently, so a replay has failures to recover. It applies to the fan-out
+	// mix and must be in [0,1); zero preserves the all-succeed workload. A run with
+	// a positive fraction seeds its children directly under one parent with
+	// MaxAttempts each, rather than fanning out at runtime — the runtime gives a
+	// follow-up no way to carry a small budget, and a small budget is what lets a
+	// fail-child exhaust to discarded in a few attempts.
+	FailFraction float64
+	// MaxAttempts overrides the seeded jobs' retry budget. Zero selects the
+	// runtime's own default (25); a replay run defaults it small so the fail cohort
+	// exhausts quickly.
+	MaxAttempts int
+
+	// Replay runs a replay phase after the initial drain: the discarded children are
+	// replayed under their parent with a restored budget, then the run awaits a
+	// second drain and asserts the cohort re-converges — every job terminal, no
+	// succeeded child re-run, and no job run more times than its restored budget
+	// allows. It requires the fan-out mix and a positive FailFraction.
+	Replay bool
+	// ReplayStagger spreads the replayed cohort's scheduled_at across this window,
+	// instead of making every replayed job immediately claimable. Zero replays them
+	// all at once.
+	ReplayStagger time.Duration
+	// ReplayBudget is the number of attempts the replay restores (the ResetAttempts
+	// Budget). Zero selects a small default. It is the ceiling the re-convergence
+	// check holds the replayed cohort to: no job runs more than its restored budget.
+	ReplayBudget int
 }
 
 // connections reports the connection budget this configuration plans for: the
@@ -367,6 +402,39 @@ func (c Config) validate() (Config, error) {
 	}
 	if c.TerminalSeed > 0 && c.TerminalSeedAge == 0 {
 		c.TerminalSeedAge = defaultTerminalSeedAge
+	}
+	if c.FailFraction < 0 || c.FailFraction >= 1 {
+		return Config{}, fmt.Errorf(
+			"loadtest: FailFraction %.3f is not in [0,1): 1 would fail every child and leave nothing "+
+				"to succeed: %w", c.FailFraction, ErrInvalidConfig,
+		)
+	}
+	if c.MaxAttempts < 0 || c.ReplayBudget < 0 || c.ReplayStagger < 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: MaxAttempts, ReplayBudget and ReplayStagger must not be negative: %w", ErrInvalidConfig,
+		)
+	}
+	if c.Replay {
+		// A replay recovers failed children under a parent, so it needs both a
+		// lineage to scope to (the fan-out mix) and failures to recover (a positive
+		// fail fraction). Without either there is nothing to replay.
+		if c.Mix != WorkloadFanOut {
+			return Config{}, fmt.Errorf(
+				"loadtest: Replay requires the fan-out mix (it replays a parent's children), got %q: %w",
+				c.Mix, ErrInvalidConfig,
+			)
+		}
+		if c.FailFraction <= 0 {
+			return Config{}, fmt.Errorf(
+				"loadtest: Replay needs failures to recover: set a positive FailFraction: %w", ErrInvalidConfig,
+			)
+		}
+		if c.MaxAttempts == 0 {
+			c.MaxAttempts = defaultReplayMaxAttempts
+		}
+		if c.ReplayBudget == 0 {
+			c.ReplayBudget = defaultReplayBudget
+		}
 	}
 	if c.Queue == "" {
 		c.Queue = defaultQueue

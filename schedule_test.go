@@ -207,15 +207,105 @@ func TestRetryJobForceRerunsTerminalJob(t *testing.T) {
 		"Force re-runs a succeeded job")
 }
 
-func TestRetryJobRejectsResetAttempts(t *testing.T) {
+// TestRetryJobResetAttemptsRestoresBudgetAsHeadroom is A1: a job discarded at
+// attempt == max_attempts is retried with ResetAttempts, which restores a real
+// budget by raising max_attempts rather than rewinding attempt. Budget 0 (and a
+// negative Budget) restores the original budget — max_attempts becomes
+// attempt + old max_attempts — and a positive Budget grants exactly that many
+// attempts of headroom. attempt is never written, so it stays monotonic and the
+// next job_runs row cannot collide with the recorded failures (see the pg test for
+// that invariant under the real claim path).
+func TestRetryJobResetAttemptsRestoresBudgetAsHeadroom(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		budget          int
+		wantMaxAttempts int
+	}{
+		"budget zero restores the original 25 as headroom": {budget: 0, wantMaxAttempts: 50},
+		"budget three grants exactly three":                {budget: 3, wantMaxAttempts: 28},
+		"negative budget behaves like zero":                {budget: -5, wantMaxAttempts: 50},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
+			base := time.Now().UTC().Truncate(time.Second)
+			finalized := base.Add(-time.Hour)
+			ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
+
+			seedJob(t, db, jobRow{
+				ID: "j", Kind: "k", State: string(StateDiscarded),
+				Attempt: 25, MaxAttempts: 25, FinalizedAt: &finalized,
+			})
+
+			require.NoError(t, RetryJobWithOptions(ctx, db, "j", RetryOpts{
+				Force: true, ResetAttempts: true, Budget: tt.budget,
+			}))
+
+			row := jobRowByID(t, db, "j")
+			assert.Equal(t, string(StateAvailable), row.State)
+			assert.Equal(t, 25, row.Attempt, "attempt is never rewound — it is the job_runs audit key")
+			assert.Equal(t, tt.wantMaxAttempts, row.MaxAttempts,
+				"the budget is restored as headroom above the current attempt")
+			assert.Nil(t, row.FinalizedAt, "the discard's finalization is cleared")
+			assert.True(t, row.ScheduledAt.Equal(base), "with no Delay the job is immediately claimable")
+		})
+	}
+}
+
+// TestRetryJobResetAttemptsWithoutForceOnANonTerminalJob proves ResetAttempts is not
+// coupled to Force: a still-retryable job (below its budget) can have its headroom
+// topped up without forcing a terminal-state retry.
+func TestRetryJobResetAttemptsWithoutForceOnANonTerminalJob(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	seedJob(t, db, jobRow{ID: "j", Kind: "k", State: string(StateAvailable)})
+	ctx := context.Background()
 
-	err := RetryJobWithOptions(context.Background(), db, "j", RetryOpts{ResetAttempts: true})
-	require.ErrorIs(t, err, ErrResetAttemptsUnsupported,
-		"a reserved field that does nothing is refused loudly, not silently ignored")
-	assert.Equal(t, string(StateAvailable), jobState(t, db, "j"), "the rejected call changed nothing")
+	seedJob(t, db, jobRow{ID: "j", Kind: "k", State: string(StateRetryable), Attempt: 3, MaxAttempts: 5})
+	require.NoError(t, RetryJobWithOptions(ctx, db, "j", RetryOpts{ResetAttempts: true, Budget: 10}))
+
+	row := jobRowByID(t, db, "j")
+	assert.Equal(t, string(StateAvailable), row.State)
+	assert.Equal(t, 3, row.Attempt, "attempt is untouched")
+	assert.Equal(t, 13, row.MaxAttempts, "max_attempts becomes attempt + Budget")
+}
+
+// TestRetryJobDelaySchedulesIntoTheFuture proves Delay defers the re-run: the job
+// returns to available but with a future scheduled_at, which the claim gates on.
+func TestRetryJobDelaySchedulesIntoTheFuture(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	base := time.Now().UTC().Truncate(time.Second)
+	ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
+
+	seedJob(t, db, jobRow{ID: "j", Kind: "k", State: string(StateRetryable)})
+	require.NoError(t, RetryJobWithOptions(ctx, db, "j", RetryOpts{Delay: 10 * time.Minute}))
+
+	row := jobRowByID(t, db, "j")
+	assert.Equal(t, string(StateAvailable), row.State, "the state advances to available")
+	assert.True(t, row.ScheduledAt.Equal(base.Add(10*time.Minute)),
+		"Delay defers the re-run without a state change, gated by the claim's scheduled_at <= now")
+}
+
+// TestRetryJobWithoutResetAttemptsLeavesTheBudgetAlone pins the default: a plain
+// retry grants no new headroom, so a job discarded at its ceiling is re-claimable
+// but re-discards on that one attempt. This is the one-more-try shape ResetAttempts
+// exists to fix, asserted so a regression that silently reset the budget is caught.
+func TestRetryJobWithoutResetAttemptsLeavesTheBudgetAlone(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+
+	seedJob(t, db, jobRow{
+		ID: "j", Kind: "k", State: string(StateDiscarded), Attempt: 25, MaxAttempts: 25,
+	})
+	require.NoError(t, RetryJobWithOptions(ctx, db, "j", RetryOpts{Force: true}))
+
+	row := jobRowByID(t, db, "j")
+	assert.Equal(t, 25, row.Attempt, "attempt is untouched")
+	assert.Equal(t, 25, row.MaxAttempts, "max_attempts is untouched — no free retry without ResetAttempts")
 }
 
 func TestRetryJobMissingReturnsErrJobNotFound(t *testing.T) {

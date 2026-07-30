@@ -276,12 +276,21 @@ type InsertOpts struct {
 	// UniqueKey enforces idempotency forever: an insert collides with any job
 	// that ever carried the same key, terminal or not. Use it for "enqueue this
 	// exact unit of work at most once, ever".
+	//
+	// A consequence to plan for: a job enqueued with UniqueKey can never be
+	// re-enqueued — the key collides with the original row forever, terminal or not.
+	// To run that unit of work again, keep its row and retry it (RetryJobWithOptions,
+	// or ReplayByParent/Replay for a cohort) rather than re-enqueuing. If a later run
+	// is expected instead, UniqueActiveKey is the key that frees on a terminal state.
 	UniqueKey string
 	// UniqueActiveKey enforces idempotency only while a job is active (available,
-	// running, retryable, or scheduled): an insert collides only with a still-live
-	// job carrying the same key, and the key frees up once that job reaches a
-	// terminal state. Use it for "at most one in-flight job for this subject",
-	// where a later run is expected once the current one finishes.
+	// running, retryable, scheduled, or paused): an insert collides only with a
+	// still-live job carrying the same key, and the key frees up once that job
+	// reaches a terminal state. Use it for "at most one in-flight job for this
+	// subject", where a later run is expected once the current one finishes.
+	//
+	// For "at most once ever" — colliding even with a terminal job, and never
+	// re-enqueuable afterward — use UniqueKey instead.
 	UniqueActiveKey string
 	ScheduleAt      *time.Time
 	Parent          *string
