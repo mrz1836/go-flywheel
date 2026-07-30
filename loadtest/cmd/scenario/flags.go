@@ -47,6 +47,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		indexes string
 		fault   string
 		tuned   bool
+		limiter string
 	)
 
 	fs.StringVar(&opts.cfg.DSN, "dsn", os.Getenv(dsnEnv),
@@ -104,6 +105,15 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.IntVar(&opts.cfg.ReplayBudget, "replay-budget", 0,
 		"attempts the replay restores per job (0 selects a small default)")
 
+	fs.StringVar(&limiter, "limiter", string(loadtest.LimiterNone),
+		"pre-claim admission gate: none, token-bucket, db")
+	fs.IntVar(&opts.cfg.Rate, "rate", 0, "limiter rate in operations/second (0 disables the rate cap)")
+	fs.IntVar(&opts.cfg.Burst, "burst", 0, "limiter burst capacity (0 defaults to the rate)")
+	fs.IntVar(&opts.cfg.MaxConcurrent, "max-concurrent", 0,
+		"limiter concurrency ceiling (0 disables the concurrency cap)")
+	fs.IntVar(&opts.cfg.WorkerSnooze, "worker-snooze", 0,
+		"claim-then-snooze baseline: hold worker completions to this many/second (mutually exclusive with -limiter)")
+
 	if err := fs.Parse(args); err != nil {
 		return options{}, fmt.Errorf("scenario: %w", err)
 	}
@@ -113,6 +123,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 
 	opts.cfg.Mix = loadtest.Workload(mix)
 	opts.cfg.Indexes = loadtest.IndexCondition(indexes)
+	opts.cfg.Limiter = loadtest.LimiterKind(limiter)
 	// A bool flag rather than a string enum: there are exactly two conditions and
 	// the tuned one is the opt-in, so `-storage-tuning` reads as what it does.
 	// The Config keeps the enum, because that is what the report records.
@@ -131,6 +142,9 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	}
 	if !opts.cfg.Indexes.Valid() {
 		return options{}, fmt.Errorf("scenario: -indexes %q is not one of full, correctness-only", indexes)
+	}
+	if !opts.cfg.Limiter.Valid() {
+		return options{}, fmt.Errorf("scenario: -limiter %q is not one of none, token-bucket, db", limiter)
 	}
 	// The fault is built here, not in the harness, for the same reason: an
 	// unknown name costs a message rather than a provisioned schema, and the

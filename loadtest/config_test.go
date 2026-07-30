@@ -72,6 +72,18 @@ func TestValidateRejects(t *testing.T) {
 		{"negative work duration", Config{DSN: testDSN, Jobs: 1, WorkDuration: -time.Second}, ErrInvalidConfig},
 		{"negative work jitter", Config{DSN: testDSN, Jobs: 1, WorkJitter: -time.Second}, ErrInvalidConfig},
 		{"connection budget", Config{DSN: testDSN, Jobs: 1, Runners: 16, Workers: 16}, ErrTooManyConnections},
+		{"unknown limiter", Config{DSN: testDSN, Jobs: 1, Limiter: "leaky"}, ErrInvalidConfig},
+		{"negative rate", Config{DSN: testDSN, Jobs: 1, Rate: -1}, ErrInvalidConfig},
+		{
+			"limiter and worker-snooze together",
+			Config{DSN: testDSN, Jobs: 1, Limiter: LimiterTokenBucket, Rate: 10, WorkerSnooze: 10},
+			ErrInvalidConfig,
+		},
+		{
+			"gated with no rate or concurrency",
+			Config{DSN: testDSN, Jobs: 1, Limiter: LimiterTokenBucket},
+			ErrInvalidConfig,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

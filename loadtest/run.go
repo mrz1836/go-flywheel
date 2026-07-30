@@ -492,6 +492,11 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 	report.Retried = h.prog.retried.Load()
 	report.Reclaimed = h.prog.reclaimed.Load()
 	report.ConcurrentExecutions = h.exec.count()
+	if n, err := h.runRowCount(ctx); err == nil {
+		report.RunRows = n
+	} else {
+		h.errs.add(err)
+	}
 
 	if report.ConcurrentExecutions > 0 {
 		// This is the exactly-once guarantee failing, observed in process. It is a
@@ -515,6 +520,7 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 	}
 	report.Drained = counts[string(flywheel.StateSucceeded)]
 	report.Discarded = counts[string(flywheel.StateDiscarded)] + counts[string(flywheel.StateCancelled)]
+	h.noteAdmission(report)
 
 	// The replay phase's outcome, recorded by drive while the runners were up. On a
 	// run with -replay it carries the re-convergence account; it is nil otherwise.
@@ -624,6 +630,43 @@ func (h *Harness) crossCheckSuperseded(ctx context.Context, observed int64) erro
 		)
 	}
 	return nil
+}
+
+// runRowCount reports the total job_runs rows the run wrote — one per attempt,
+// which is one per drained job under the gate and one per deferral besides under
+// claim-then-snooze.
+func (h *Harness) runRowCount(ctx context.Context) (int64, error) {
+	var n int64
+	if err := h.probe.WithContext(ctx).Raw(`SELECT count(*) FROM job_runs`).Scan(&n).Error; err != nil {
+		return 0, fmt.Errorf("loadtest: count job_runs: %w", err)
+	}
+	return n, nil
+}
+
+// noteAdmission records how the run gated its claims and what that cost in audit
+// rows — the A1 finding, stated as the ratio of job_runs written to jobs drained.
+func (h *Harness) noteAdmission(report *Report) {
+	switch {
+	case h.cfg.Limiter.gated():
+		h.notes.add(
+			"Admission: pre-claim %s gate at rate=%d/s burst=%d max-concurrent=%d on resource %q. Work "+
+				"that cannot run yet is never claimed, so RunRows (%d) tracks jobs drained (%d): the audit "+
+				"table grows at the completion rate, not the poll rate.",
+			h.cfg.Limiter, h.cfg.Rate, h.cfg.Burst, h.cfg.MaxConcurrent, limiterResource,
+			report.RunRows, report.Drained,
+		)
+	case h.cfg.WorkerSnooze > 0:
+		ratio := 0.0
+		if report.Drained > 0 {
+			ratio = float64(report.RunRows) / float64(report.Drained)
+		}
+		h.notes.add(
+			"Admission: claim-then-snooze baseline, worker held to %d/s. Every over-budget attempt claimed, "+
+				"took a run stub, and finalized a snooze, so RunRows (%d) is %.1fx jobs drained (%d): the "+
+				"audit table grew at the snooze rate. This is the growth the pre-claim gate removes.",
+			h.cfg.WorkerSnooze, report.RunRows, ratio, report.Drained,
+		)
+	}
 }
 
 // stateCounts reports how many jobs are in each state.

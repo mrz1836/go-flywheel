@@ -154,6 +154,13 @@ type Report struct {
 	// finding, not noise.
 	Reclaimed int64
 
+	// RunRows is the total job_runs rows the run wrote — one per attempt. It is the
+	// pre-claim gate's headline against the claim-then-snooze baseline: a gated run
+	// writes about one row per drained job, where a snoozing run writes one per
+	// deferral too, so its audit table grows at the snooze rate rather than the
+	// completion rate.
+	RunRows int64
+
 	// BlockedClaims counts claim attempts a fault's gate refused before they
 	// reached the database. It is how "the runner backed off during the outage"
 	// becomes a number in the report rather than a narration: a gated call
@@ -300,6 +307,14 @@ type configJSON struct {
 	// Faults is the fault's description, never the value: a Fault is an
 	// interface, so it marshals to an empty object and cannot be read back.
 	Faults string `json:"faults,omitempty"`
+	// Limiter and its parameters record the admission gate the run installed, and
+	// WorkerSnooze the claim-then-snooze baseline it was measured against. All
+	// omit-empty: an ungated run's config section is unchanged.
+	Limiter       string `json:"limiter,omitempty"`
+	Rate          int    `json:"rate,omitempty"`
+	Burst         int    `json:"burst,omitempty"`
+	MaxConcurrent int    `json:"max_concurrent,omitempty"`
+	WorkerSnooze  int    `json:"worker_snooze,omitempty"`
 }
 
 // reportJSON is Report's wire form.
@@ -320,6 +335,7 @@ type reportJSON struct {
 	PeakLockWaits  int64             `json:"peak_lock_waits"`
 	LongestLockWt  float64           `json:"longest_lock_wait_seconds"`
 	Reclaimed      int64             `json:"reclaimed"`
+	RunRows        int64             `json:"run_rows,omitempty"`
 	BlockedClaims  int64             `json:"blocked_claims,omitempty"`
 	Concurrent     int64             `json:"concurrent_executions"`
 	Enqueued       int64             `json:"enqueued"`
@@ -355,6 +371,7 @@ func (r Report) MarshalJSON() ([]byte, error) {
 		PeakLockWaits:  r.PeakLockWaits,
 		LongestLockWt:  r.LongestLockWait,
 		Reclaimed:      r.Reclaimed,
+		RunRows:        r.RunRows,
 		BlockedClaims:  r.BlockedClaims,
 		Concurrent:     r.ConcurrentExecutions,
 		Enqueued:       r.Enqueued,
@@ -408,6 +425,7 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 		PeakLockWaits:        in.PeakLockWaits,
 		LongestLockWait:      in.LongestLockWt,
 		Reclaimed:            in.Reclaimed,
+		RunRows:              in.RunRows,
 		BlockedClaims:        in.BlockedClaims,
 		ConcurrentExecutions: in.Concurrent,
 		Enqueued:             in.Enqueued,
@@ -445,7 +463,21 @@ func configToJSON(c Config) configJSON {
 		Queue:          c.Queue,
 		ExecutorClass:  c.ExecutorClass,
 		Faults:         describeFault(c.Faults),
+		Limiter:        gatedName(c.Limiter),
+		Rate:           c.Rate,
+		Burst:          c.Burst,
+		MaxConcurrent:  c.MaxConcurrent,
+		WorkerSnooze:   c.WorkerSnooze,
 	}
+}
+
+// gatedName renders a limiter kind for the wire, dropping the "none" default to
+// the empty string so an ungated run's config section carries no limiter key.
+func gatedName(k LimiterKind) string {
+	if !k.gated() {
+		return ""
+	}
+	return string(k)
 }
 
 // describeFault renders a configured fault, or "" when there is none.
@@ -475,6 +507,11 @@ func configFromJSON(c configJSON) Config {
 		Timeout:        mustParseDuration(c.Timeout),
 		Queue:          c.Queue,
 		ExecutorClass:  c.ExecutorClass,
+		Limiter:        LimiterKind(c.Limiter),
+		Rate:           c.Rate,
+		Burst:          c.Burst,
+		MaxConcurrent:  c.MaxConcurrent,
+		WorkerSnooze:   c.WorkerSnooze,
 	}
 }
 

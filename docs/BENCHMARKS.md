@@ -94,6 +94,12 @@ done
 go run -tags=loadtest ./loadtest/cmd/scenario -mix fan-out -children 35000 \
   -fail-fraction 0.857 -replay -replay-stagger 10m \
   -out docs/benchmarks/replay-30k.json
+
+# Admission control: the same 50/s budget, enforced pre-claim vs. claim-then-snooze.
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 2000 -mix drain \
+  -limiter token-bucket -rate 50 -out docs/benchmarks/gate-budget.json
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 2000 -mix drain \
+  -worker-snooze 50 -out docs/benchmarks/gate-snooze-baseline.json
 ```
 
 Three things about those four commands are load-bearing, and each was found by getting it wrong first.
@@ -952,6 +958,37 @@ first drain, then 4→5 and 5→6 on the replay). A one-more-try retry could nev
 would have granted a single attempt and discarded.
 
 `docs/benchmarks/replay-30k.json` is the committed artifact.
+
+<br/>
+
+## Admission control: the pre-claim gate vs. claim-then-snooze
+
+Two runs drain the same 2,000 jobs against the same 50-per-second budget. One installs a pre-claim
+`Limiter` — the runners consult it before every claim and take only what it grants. The other has no
+gate and enforces the budget the only way the runtime offered before: the worker is dispatched,
+discovers the downstream is at budget, and returns `Result{Snooze}`. A snooze costs no retry attempt,
+but it is not free — it spent a poll, a claim, a `job_runs` stub, and a finalize to discover the job
+could not run.
+
+| | Pre-claim gate | Claim-then-snooze |
+|---|---|---|
+| Report | `gate-budget.json` | `gate-snooze-baseline.json` |
+| Command | `-limiter token-bucket -rate 50` | `-worker-snooze 50` |
+| Jobs drained | 2,000 | 2,000 |
+| Claims issued | **1,978** | 213,274 |
+| **`job_runs` rows written** | **2,000** | **442,495** |
+| `job_runs` per drained job | **1.0** | **221** |
+
+The headline is the `run_rows` field: the gate wrote one audit row per drained job, and the baseline
+wrote **221**. Under sustained backpressure the queue's dominant work becomes jobs claiming and
+re-scheduling themselves, and `job_runs` grows at the *snooze* rate — 213,274 claims and 442,495
+finalizes to drain two thousand jobs — rather than the completion rate. The gate never claims work it
+cannot run, so that growth drops to zero: the audit table tracks jobs done.
+
+Both runs retire the same 2,000 jobs, so the gate is not throttling throughput below the budget — it is
+removing the wasted claims that reach the budget the expensive way. Its `drain_throughput_per_sec`
+reads ~51, tracking the 50/s budget rather than the poll rate; the baseline's reads in the thousands
+because a snooze counts as a decided attempt, which is the poll rate the gate exists to stop chasing.
 
 <br/>
 

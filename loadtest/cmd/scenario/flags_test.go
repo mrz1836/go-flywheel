@@ -41,6 +41,9 @@ func TestParseFlagsDefaults(t *testing.T) {
 		{"Lease", opts.cfg.Lease, time.Duration(0)},
 		{"SampleInterval", opts.cfg.SampleInterval, time.Second},
 		{"Timeout", opts.cfg.Timeout, 30 * time.Minute},
+		{"Limiter", opts.cfg.Limiter, loadtest.LimiterNone},
+		{"Rate", opts.cfg.Rate, 0},
+		{"WorkerSnooze", opts.cfg.WorkerSnooze, 0},
 		{"out", opts.out, ""},
 		{"quiet", opts.quiet, false},
 	}
@@ -77,6 +80,10 @@ func TestParseFlagsMapsEveryFlag(t *testing.T) {
 		"-timeout", "90s",
 		"-queue", "bench",
 		"-executor-class", "gpu",
+		"-limiter", "token-bucket",
+		"-rate", "10",
+		"-burst", "20",
+		"-max-concurrent", "5",
 		"-out", "/tmp/report.json",
 		"-quiet",
 	}, io.Discard)
@@ -101,6 +108,10 @@ func TestParseFlagsMapsEveryFlag(t *testing.T) {
 		{"Timeout", opts.cfg.Timeout, 90 * time.Second},
 		{"Queue", opts.cfg.Queue, "bench"},
 		{"ExecutorClass", opts.cfg.ExecutorClass, "gpu"},
+		{"Limiter", opts.cfg.Limiter, loadtest.LimiterTokenBucket},
+		{"Rate", opts.cfg.Rate, 10},
+		{"Burst", opts.cfg.Burst, 20},
+		{"MaxConcurrent", opts.cfg.MaxConcurrent, 5},
 		{"out", opts.out, "/tmp/report.json"},
 		{"quiet", opts.quiet, true},
 	}
