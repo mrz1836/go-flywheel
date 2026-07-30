@@ -215,7 +215,8 @@ func (r ProgressExplainReport) Text() string {
 	b.WriteString(
 		"\nEvery statement was captured from flywheel.Progress through a recording GORM logger and\n" +
 			"explained verbatim. The grouped counts read is the rollup's hot path; on jobs_parent_state\n" +
-			"it is an Index Only Scan with no heap fetches at this selectivity.\n")
+			"it is an Index Only Scan with no heap fetches at this selectivity.\n",
+	)
 	for i, stmt := range r.Statements {
 		fmt.Fprintf(&b, "\n--- statement %d ---\n%s\n\nplan:\n", i+1, strings.TrimSpace(stmt.SQL))
 		for _, line := range stmt.Plan {
