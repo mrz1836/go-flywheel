@@ -166,6 +166,10 @@ var (
 	errRunnerNeedsDriver   = errors.New("jobs: runner config requires Driver")
 	errRunnerNeedsRegistry = errors.New("jobs: runner config requires Registry")
 	errRunnerNeedsQueue    = errors.New("jobs: runner config requires at least one queue")
+	// errRunnerNeedsResource is returned when a Limiter is configured without a
+	// Resource. The gate runs before the claim, so the resource must be knowable
+	// without inspecting a job — it is a property of the Runner, not the work.
+	errRunnerNeedsResource = errors.New("jobs: runner config requires Resource when Limiter is set")
 )
 
 // errWorkerPanicked wraps a recovered worker panic.

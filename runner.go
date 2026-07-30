@@ -125,6 +125,34 @@ type RunnerConfig struct {
 	// that specifies no timeout of its own (per-job InsertOpts.Timeout or per-kind
 	// Timeouter). Optional; zero means no default timeout.
 	DefaultTimeout time.Duration
+	// Limiter, when set, admits work before it is claimed: the Runner consults it
+	// on every poll and claims at most what it grants, so a job that cannot run yet
+	// is never claimed, leased, or audited. Nil means unlimited. Setting it requires
+	// Resource.
+	Limiter Limiter
+	// Resource names what this Runner's work consumes, for the Limiter. It is
+	// required when Limiter is set: the gate runs before the claim, so the resource
+	// must be knowable without inspecting a job.
+	//
+	// A Runner is therefore the unit of resource scoping. A host protecting several
+	// downstreams runs one Runner per downstream — each with its own queue and its
+	// own resource (NodeConfig.Runners is a slice) — rather than one Runner sorting
+	// jobs by destination after claiming them. Work that only dispatches other work
+	// runs ungated, or on a resource distinct from the one its children consume, so
+	// a coordinator never holds the capacity its children need.
+	Resource string
+	// LimiterFailClosed controls behavior when the Limiter returns an error. The
+	// zero value (fail-open) claims anyway and logs a warning, because a limiter
+	// outage must not become a work outage. Set it true to treat the error as a
+	// denial instead — the choice a host makes when the Limiter guards a hard
+	// external quota exceeding which has consequences beyond latency.
+	LimiterFailClosed bool
+	// LimiterStarvationInterval bounds how long a gated Runner may go fully denied
+	// while holding in-flight work on the same resource before it warns — the
+	// heuristic for a coordinator sharing a gated runner with the children it
+	// dispatches. Zero selects thirty seconds; a negative value disables the
+	// warning. It has no effect without a Limiter.
+	LimiterStarvationInterval time.Duration
 	// Observer, when set, receives lifecycle events (claim/start/finish/retry) for
 	// metrics or tracing. Optional; a nil Observer installs an internal no-op.
 	Observer Observer
@@ -184,6 +212,9 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 	}
 	if len(cfg.Queues) == 0 {
 		return nil, errRunnerNeedsQueue
+	}
+	if cfg.Limiter != nil && cfg.Resource == "" {
+		return nil, errRunnerNeedsResource
 	}
 	if _, isSQLite := cfg.Driver.(*sqliteDriver); isSQLite && cfg.Concurrency > 1 {
 		return nil, ErrSQLiteConcurrency
@@ -614,12 +645,37 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			return r.stopResult(untilIdle)
 		}
 
-		claimed, claimErr := r.claimAndDispatch(ctx, reserved)
-		if dispatchErr := r.pool.takeErr(); dispatchErr != nil {
-			if untilIdle {
-				return dispatchErr
+		// The pre-claim gate. admit consults the Limiter against the slots already
+		// held and hands back the ones a grant does not cover, so a denial or a
+		// limiter outage never strands a reservation in pool.held.
+		adm := r.admit(ctx, reserved)
+		switch adm.action {
+		case admitPark:
+			// No capacity: the grant was zero. Drain any error a running job left,
+			// then wait out the limiter's own retry hint before asking again.
+			if stop := r.drainDispatchErr(ctx, untilIdle); stop != nil {
+				return stop
 			}
-			r.cfg.Logger.ErrorContext(ctx, "jobs: dispatch failed", "error", dispatchErr)
+			if err := r.sleep(loopCtx, adm.wait); err != nil {
+				return r.ended(ctx, untilIdle)
+			}
+			continue
+		case admitPollErr:
+			// A dead limiter is a poll failure, taken on the same ladder Run backs
+			// off on forever and RunUntilIdle gives up on — so a deadline-less drain
+			// cannot park here indefinitely, as a plain limiter backoff would.
+			if stop := r.drainDispatchErr(ctx, untilIdle); stop != nil {
+				return stop
+			}
+			if stop := r.onPollError(ctx, loopCtx, &backoff, untilIdle, adm.err); stop != nil {
+				return stop
+			}
+			continue
+		}
+
+		claimed, claimErr := r.claimAndDispatch(ctx, adm.toClaim, adm.grant)
+		if stop := r.drainDispatchErr(ctx, untilIdle); stop != nil {
+			return stop
 		}
 		if claimErr != nil {
 			if stop := r.onPollError(ctx, loopCtx, &backoff, untilIdle, claimErr); stop != nil {
@@ -779,6 +835,112 @@ func (r *Runner) claimLimit() int {
 	return r.cfg.Concurrency
 }
 
+// admitAction is what the pre-claim gate decided for one iteration.
+type admitAction int
+
+const (
+	// admitProceed claims admission.toClaim jobs against admission.grant. It is
+	// also the no-limiter and the fail-open outcome, both of which claim the whole
+	// reservation holding no permits (a zero grant).
+	admitProceed admitAction = iota
+	// admitPark means the grant was zero: park admission.wait, then poll again.
+	admitPark
+	// admitPollErr means the Limiter failed under fail-closed: route admission.err
+	// through the poll-error ladder, then poll again.
+	admitPollErr
+)
+
+// admission is the pre-claim gate's decision for one iteration.
+type admission struct {
+	action  admitAction
+	toClaim int
+	grant   Grant
+	wait    time.Duration
+	err     error
+}
+
+// admit consults the Limiter for the reservation the loop already holds and
+// returns what to do with it, having handed back every pool slot the decision
+// does not use so pool.held never strands a reservation behind a denial.
+//
+// Acquire runs on ctx, not the loop context: Stop must not cancel a limiter's
+// database transaction mid-flight, exactly as it must not cancel a Dequeue. The
+// grant is acquired against ctx so it is honored regardless of Stop; the loop
+// sleeps on the loop context so Stop still ends a park promptly.
+//
+// The four outcomes and their pool accounting:
+//
+//   - no Limiter, or fail-open on error: proceed with the whole reservation and a
+//     zero grant, so claimAndDispatch attaches no permit to any job.
+//   - fail-closed on error: release the whole reservation, route the error through
+//     the poll-error ladder.
+//   - zero grant: release the whole reservation, park on the retry hint.
+//   - partial or full grant: release the pool slots the grant did not cover, claim
+//     the rest against the grant.
+func (r *Runner) admit(ctx context.Context, reserved int) admission {
+	if r.cfg.Limiter == nil {
+		return admission{action: admitProceed, toClaim: reserved}
+	}
+	g, err := r.cfg.Limiter.Acquire(ctx, r.cfg.Resource, reserved)
+	switch {
+	case err != nil && r.limiterFailOpen():
+		r.cfg.Logger.WarnContext(ctx, "jobs: limiter failed; admitting anyway",
+			slog.String("resource", r.cfg.Resource), slog.Any("error", err))
+		return admission{action: admitProceed, toClaim: reserved}
+	case err != nil:
+		r.pool.release(reserved)
+		return admission{action: admitPollErr, err: err}
+	case g.N <= 0:
+		r.pool.release(reserved)
+		return admission{action: admitPark, wait: orDuration(g.RetryAfter, r.cfg.PollInterval)}
+	default:
+		// A conforming Limiter never grants more than asked, so toClaim is g.N; the
+		// min guards a misbehaving one from claiming past the pool. The surplus pool
+		// slots are released now; surplus permits (only a misbehaving limiter grants
+		// any) are released by claimAndDispatch as the claim's unused remainder.
+		toClaim := min(reserved, g.N)
+		if surplus := reserved - toClaim; surplus > 0 {
+			r.pool.release(surplus)
+		}
+		return admission{action: admitProceed, toClaim: toClaim, grant: g}
+	}
+}
+
+// limiterFailOpen reports whether a limiter error is bypassed rather than treated
+// as a denial. The config field is inverted — its zero value is fail-open, the
+// documented default — so no defaulting code is needed.
+func (r *Runner) limiterFailOpen() bool { return !r.cfg.LimiterFailClosed }
+
+// drainDispatchErr takes any per-job errors the pool has collected and either
+// returns the first for RunUntilIdle to fail on, or logs them for Run and returns
+// nil. It is factored out of the loop so the gate's park paths drain in-flight
+// errors on the same terms the claim path does.
+func (r *Runner) drainDispatchErr(ctx context.Context, untilIdle bool) error {
+	dispatchErr := r.pool.takeErr()
+	if dispatchErr == nil {
+		return nil
+	}
+	if untilIdle {
+		return dispatchErr
+	}
+	r.cfg.Logger.ErrorContext(ctx, "jobs: dispatch failed", "error", dispatchErr)
+	return nil
+}
+
+// releasePermits hands n of a grant's permits back to the Limiter, on a context
+// detached from cancellation so a drain that cancels the worker still returns the
+// permit rather than leaking it to the limiter's TTL. It is a no-op without a
+// Limiter or for a non-positive n, so the nil-limiter and zero-grant paths call it
+// unconditionally.
+func (r *Runner) releasePermits(ctx context.Context, grant Grant, n int) {
+	if r.cfg.Limiter == nil || n <= 0 {
+		return
+	}
+	r.cfg.Limiter.Release(context.WithoutCancel(ctx), Grant{
+		Resource: grant.Resource, N: n, Token: grant.Token, ExpiresAt: grant.ExpiresAt,
+	})
+}
+
 // claimAndDispatch claims into reserved slots and starts every claimed job in
 // the pool without waiting for any of it, returning how many were claimed.
 //
@@ -788,17 +950,23 @@ func (r *Runner) claimLimit() int {
 // rule — distinct from a job that failed to finalize.
 //
 // Every reservation the claim does not use is released here, so a short claim
-// frees its slots immediately rather than at the end of the iteration.
-func (r *Runner) claimAndDispatch(ctx context.Context, reserved int) (int, error) {
+// frees its slots immediately rather than at the end of the iteration. Grant
+// permits are released in the same lockstep: grant.N were acquired, and grant.N
+// are released across this function — the unused remainder up front, then one per
+// dispatched job when it finishes. A job dispatched past grant.N (a Driver that
+// over-served the reservation, holding no permit) gets a no-op releaser.
+func (r *Runner) claimAndDispatch(ctx context.Context, reserved int, grant Grant) (int, error) {
 	batch, err := r.cfg.Driver.Dequeue(
 		ctx, r.cfg.Queues, r.cfg.ExecutorClass, r.cfg.ClaimAnyClass, reserved, r.cfg.LeaseDuration,
 	)
 	if err != nil {
 		r.pool.release(reserved)
+		r.releasePermits(ctx, grant, grant.N)
 		return 0, err
 	}
 	if len(batch) == 0 {
 		r.pool.release(reserved)
+		r.releasePermits(ctx, grant, grant.N)
 		return 0, nil
 	}
 
@@ -811,6 +979,13 @@ func (r *Runner) claimAndDispatch(ctx context.Context, reserved int) (int, error
 		// counted is one Drain would report as finished.
 		r.pool.admit(len(batch) - reserved)
 	}
+	// Permits the claim did not use: grant.N acquired, at most len(batch) attached
+	// to jobs below. A conforming limiter's grant.N never exceeds the reservation,
+	// so this is the short-claim remainder — and it is still correct if a limiter
+	// over-granted.
+	if unused := grant.N - len(batch); unused > 0 {
+		r.releasePermits(ctx, grant, unused)
+	}
 
 	r.cfg.Observer.OnClaim(ctx, ClaimEvent{
 		ExecutorClass: r.cfg.ExecutorClass,
@@ -819,7 +994,11 @@ func (r *Runner) claimAndDispatch(ctx context.Context, reserved int) (int, error
 	})
 	for i := range batch {
 		raw := batch[i]
-		r.pool.start(func() error { return r.dispatch(ctx, raw) })
+		release := func() {}
+		if i < grant.N {
+			release = func() { r.releasePermits(ctx, grant, 1) }
+		}
+		r.pool.start(func() error { return r.dispatch(ctx, raw, release) })
 	}
 	return len(batch), nil
 }
@@ -839,7 +1018,10 @@ func (r *Runner) pollOnce(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	claimed, claimErr := r.claimAndDispatch(ctx, reserved)
+	// pollOnce is limiter-agnostic: it is a test seam for one claim-to-completion,
+	// and a Grant would need its own accounting here for no gain. It passes a zero
+	// grant, so no permit is attached and releasePermits is a no-op throughout.
+	claimed, claimErr := r.claimAndDispatch(ctx, reserved, Grant{})
 	if waitErr := r.pool.waitIdle(ctx); waitErr != nil {
 		return claimed, waitErr
 	}
@@ -851,7 +1033,15 @@ func (r *Runner) pollOnce(ctx context.Context) (int, error) {
 
 // dispatch runs one claimed job: it pre-allocates the audit stub, runs the
 // worker outside any transaction with panic recovery, then finalizes.
-func (r *Runner) dispatch(ctx context.Context, raw RawJob) error {
+//
+// releasePermit returns this job's limiter permit, if it holds one. Its defer is
+// the first statement so it is registered first and therefore runs last (LIFO),
+// after the heartbeat stop and past every exit: the InsertRunStub failure, the
+// unknown-kind fast-finalize, a recovered panic, a timeout, and a superseded
+// finalize all return the permit.
+func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func()) error {
+	defer releasePermit()
+
 	runID := models.NewID()
 	startedAt := models.ClockFrom(ctx).Now(ctx)
 
