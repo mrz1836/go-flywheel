@@ -117,6 +117,11 @@ type loadWorker struct {
 	// sets it small so a fail cohort exhausts in bounded wall time rather than
 	// climbing the default ladder to its one-minute cap.
 	retryBackoff time.Duration
+	// snooze, when set, is the claim-then-snooze baseline: the worker consults it
+	// before doing any work and returns Result{Snooze} when the downstream is at
+	// budget. It is the mechanism the pre-claim gate is measured against — a snooze
+	// spends a full claim cycle and a job_runs row without advancing the job.
+	snooze *flywheel.TokenBucket
 }
 
 // Kind names the job kind this worker serves.
@@ -141,6 +146,20 @@ func (w loadWorker) Work(ctx context.Context, job *flywheel.Job[loadArgs]) (flyw
 	if w.track != nil {
 		w.track.enter(job.ID)
 		defer w.track.exit(job.ID)
+	}
+
+	// The claim-then-snooze baseline: consult the downstream's budget first, and
+	// defer without doing any work when it is exhausted. The deferral is what the
+	// pre-claim gate removes — this attempt already spent a claim, a run stub, and a
+	// finalize to discover it could not run.
+	if w.snooze != nil {
+		if g, _ := w.snooze.Acquire(ctx, "downstream", 1); g.N == 0 {
+			delay := g.RetryAfter
+			if delay <= 0 {
+				delay = time.Millisecond
+			}
+			return flywheel.Result{Snooze: &delay}, nil
+		}
 	}
 
 	if d := time.Duration(job.Args.WorkNanos); d > 0 {

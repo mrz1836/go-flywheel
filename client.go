@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/mrz1836/go-foundation/ctxutil"
 	"github.com/mrz1836/go-foundation/models"
@@ -152,6 +153,17 @@ func orString(value, fallback string) string {
 // orInt returns value when non-zero, otherwise fallback.
 func orInt(value, fallback int) int {
 	if value == 0 {
+		return fallback
+	}
+	return value
+}
+
+// orDuration returns value when positive, otherwise fallback. Unlike orInt it
+// treats a negative value as unset too: the durations it guards — a limiter's
+// RetryAfter hint, a starvation interval — have no meaningful negative reading, so
+// a non-positive one falls through to the caller's default.
+func orDuration(value, fallback time.Duration) time.Duration {
+	if value <= 0 {
 		return fallback
 	}
 	return value

@@ -16,7 +16,7 @@ import (
 //
 //nolint:gochecknoglobals // shared expectation fixtures for the migrate tests
 var (
-	migrateTables = []string{"jobs", "job_runs", "job_periodics"}
+	migrateTables = []string{"jobs", "job_runs", "job_periodics", "limiter_buckets", "limiter_holds"}
 	// migrateJobColumns are jobs columns whose absence is silent rather than
 	// loud: the runtime writes them through a map-valued Updates, which a missing
 	// column turns into a query error at the first claim rather than a failure at
@@ -33,6 +33,8 @@ var (
 		"idx_jobs_deleted_at",
 		"job_runs_job_attempt",
 		"idx_job_periodics_slug",
+		"limiter_holds_resource",
+		"limiter_holds_expiry",
 	}
 )
 

@@ -109,6 +109,45 @@ func (c StorageCondition) Valid() bool {
 	}
 }
 
+// LimiterKind selects the pre-claim admission gate a run wraps its runners in.
+type LimiterKind string
+
+// Recognized LimiterKind values.
+const (
+	// LimiterNone is the default: the runners claim ungated.
+	LimiterNone LimiterKind = "none"
+	// LimiterTokenBucket wraps each runner in an in-process TokenBucket. Correct
+	// for one process; the harness runs one, so it is the right choice here.
+	LimiterTokenBucket LimiterKind = "token-bucket"
+	// LimiterDB wraps each runner in a shared DBLimiter over the target schema.
+	LimiterDB LimiterKind = "db"
+)
+
+// Valid reports whether k is a recognized LimiterKind.
+func (k LimiterKind) Valid() bool {
+	switch k {
+	case LimiterNone, LimiterTokenBucket, LimiterDB:
+		return true
+	default:
+		return false
+	}
+}
+
+// gated reports whether the run installs an admission limiter.
+func (k LimiterKind) gated() bool {
+	return k == LimiterTokenBucket || k == LimiterDB
+}
+
+// limiterConnections is the extra connection budget the limiter needs: a shared
+// DBLimiter opens its own pool, one connection per runner's serial Acquire, so it
+// never queues behind the work pool. The in-process gate needs none.
+func (c Config) limiterConnections() int {
+	if c.Limiter == LimiterDB {
+		return c.Runners
+	}
+	return 0
+}
+
 // Defaults applied by validate to a zero-valued field.
 const (
 	defaultRunners        = 1
@@ -243,6 +282,26 @@ type Config struct {
 	// the runtime's own default, which is itself a bound.
 	SweepBatchSize int
 
+	// Limiter selects the pre-claim admission gate the runners consult before
+	// claiming: LimiterNone (the default), LimiterTokenBucket (in-process), or
+	// LimiterDB (shared across processes through the target). Rate, Burst, and
+	// MaxConcurrent parameterize it, per second.
+	//
+	// It is the mechanism plan-08's A1 measures against WorkerSnooze: a gated
+	// runner never claims work it cannot run, so job_runs grows at the completion
+	// rate rather than the snooze rate.
+	Limiter       LimiterKind
+	Rate          int
+	Burst         int
+	MaxConcurrent int
+
+	// WorkerSnooze, when positive, is the claim-then-snooze baseline the gate is
+	// measured against: the worker holds completions to this many per second with
+	// its own in-process bucket, returning Result{Snooze} when over budget — which
+	// spends a full claim cycle and a job_runs row per deferral. It is mutually
+	// exclusive with Limiter: the two are the alternatives being compared.
+	WorkerSnooze int
+
 	// Storage selects the storage-parameter condition applied to jobs.
 	Storage StorageCondition
 
@@ -288,10 +347,10 @@ type Config struct {
 
 // connections reports the connection budget this configuration plans for: the
 // work pool, sized to Runners × (Workers + 1) so every runner can hold one
-// claim connection plus one per concurrent worker finalize, and the fixed
-// overhead of the admin and probe pools.
+// claim connection plus one per concurrent worker finalize, the fixed overhead
+// of the admin and probe pools, and a shared limiter's own pool.
 func (c Config) connections() int {
-	return c.Runners*(c.Workers+1) + overheadConnections
+	return c.Runners*(c.Workers+1) + overheadConnections + c.limiterConnections()
 }
 
 // validate returns a normalized copy of c with defaults applied, or an error
@@ -443,6 +502,30 @@ func (c Config) validate() (Config, error) {
 		c.ExecutorClass = defaultExecutorClass
 	}
 
+	if c.Limiter == "" {
+		c.Limiter = LimiterNone
+	}
+	if !c.Limiter.Valid() {
+		return Config{}, fmt.Errorf("loadtest: unknown limiter %q: %w", c.Limiter, ErrInvalidConfig)
+	}
+	if c.Rate < 0 || c.Burst < 0 || c.MaxConcurrent < 0 || c.WorkerSnooze < 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: Rate, Burst, MaxConcurrent and WorkerSnooze must not be negative: %w", ErrInvalidConfig,
+		)
+	}
+	if c.Limiter.gated() && c.WorkerSnooze > 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: -limiter and -worker-snooze are the two alternatives being compared, not a "+
+				"combination: set one or the other: %w", ErrInvalidConfig,
+		)
+	}
+	if c.Limiter.gated() && c.Rate <= 0 && c.MaxConcurrent <= 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: -limiter %q admits everything with neither -rate nor -max-concurrent set: %w",
+			c.Limiter, ErrInvalidConfig,
+		)
+	}
+
 	if c.Faults != nil {
 		if c.Faults.At() <= 0 || c.Faults.At() >= 1 {
 			return Config{}, fmt.Errorf(
@@ -460,9 +543,9 @@ func (c Config) validate() (Config, error) {
 
 	if n := c.connections(); n > maxConnections {
 		return Config{}, fmt.Errorf(
-			"loadtest: Runners×(Workers+1)+%d = %d×%d+%d = %d exceeds the %d-connection budget "+
-				"(postgres defaults to max_connections=100): %w",
-			overheadConnections, c.Runners, c.Workers+1, overheadConnections, n, maxConnections, ErrTooManyConnections,
+			"loadtest: Runners×(Workers+1)+overhead+limiter = %d×%d+%d+%d = %d exceeds the %d-connection "+
+				"budget (postgres defaults to max_connections=100): %w",
+			c.Runners, c.Workers+1, overheadConnections, c.limiterConnections(), n, maxConnections, ErrTooManyConnections,
 		)
 	}
 	return c, nil
