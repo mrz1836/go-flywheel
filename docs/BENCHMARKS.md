@@ -66,6 +66,12 @@ for n in 10000 100000 1000000; do
     -out docs/benchmarks/fairness-plan-$n.txt
 done
 
+# Fairness interleaving: two parents of 10k children, strict FIFO vs. priority banding.
+go run -tags=loadtest ./loadtest/cmd/scenario -mix fairness -parents 2 -children 10000 \
+  -out docs/benchmarks/fairness-fifo.json
+go run -tags=loadtest ./loadtest/cmd/scenario -mix fairness -parents 2 -children 10000 \
+  -fairness round-robin-parent -out docs/benchmarks/fairness-interleave.json
+
 # The worker pool, on the mix where the barrier cost the most: 10% of jobs at 20x.
 go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix mixed-speed \
   -runners 4 -workers 8 -work 10ms -out docs/benchmarks/pool-mixed-8-after.json
@@ -878,6 +884,31 @@ parent's *n*-th child into the same priority band; the shipped `(priority, sched
 interleaves the parents for free at `0.06 ms`. The README's *Fairness across parents* section is the
 how-to; these plans are why it is the mechanism. The default claim path, `ErrSQLiteConcurrency`, and
 SQLite parity are all unchanged, because nothing in the claim path changed.
+
+### Banding interleaves where FIFO starves
+
+The `fairness` mix seeds two parents, each with ten thousand ready children, all available at once, and
+records which parent every claim served. Under strict FIFO — every child at the same priority — the
+claim's `(priority, scheduled_at)` order drains the first parent's whole batch before the second gets a
+single claim. Banding gives each parent's *n*-th child the same priority band, and the same claim
+interleaves them:
+
+| | strict FIFO | priority banding |
+|---|---|---|
+| Claims per parent | 10,000 / 10,000 | 10,000 / 10,000 |
+| **Longest single-parent run** | **10,000** | **13** |
+| **Smallest window share, either parent** | **0 %** | **43.8 %** |
+
+Reports: [`fairness-fifo.json`](benchmarks/fairness-fifo.json),
+[`fairness-interleave.json`](benchmarks/fairness-interleave.json), 64-claim windows.
+
+Both strategies run every child exactly once — the totals are identical — so the difference is order,
+not volume. Under FIFO the first parent runs its entire ten-thousand-child batch before the second is
+seen, and the second holds 0 % of every window until the first is done: textbook head-of-line blocking.
+Banding holds the longest single-parent run to 13 (concurrency jitter around a one-in, one-out
+interleave — the harness records execution order across 32 in-flight workers, a close proxy for claim
+order) and keeps each parent above 43 % of every window while both have work. The claim query is
+byte-identical between the two runs; only the priorities the producer wrote differ.
 
 <br/>
 

@@ -64,6 +64,9 @@ type Harness struct {
 	// outage is the downstream-outage switch the worker reads, nil unless a
 	// DownstreamOutage fault is configured.
 	outage *outageState
+	// fairness records the parent ordinal of each claim in order, nil unless the
+	// run is the fairness mix.
+	fairness *fairnessRecorder
 
 	// inner is the undecorated driver. Each runner wraps it in its own
 	// timingDriver bound to its own histogram shard, so shard selection costs
@@ -331,6 +334,9 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 			h.cfg.Lease = outageLease
 		}
 	}
+	if cfg.Mix == WorkloadFairness {
+		h.fairness = &fairnessRecorder{}
+	}
 
 	h.inner = flywheel.NewPostgresDriverWithOptions(h.work, workDriverOpts(cfg))
 	h.timings = newTimings(cfg.Runners)
@@ -353,7 +359,7 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 	}
 	flywheel.Register(h.registry, loadWorker{
 		track: h.exec, seed: cfg.Seed, failFraction: cfg.FailFraction,
-		retryBackoff: retryBackoff, snooze: snooze, outage: h.outage,
+		retryBackoff: retryBackoff, snooze: snooze, outage: h.outage, fairness: h.fairness,
 	})
 
 	if err = h.buildLimiter(scoped); err != nil {

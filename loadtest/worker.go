@@ -89,6 +89,10 @@ type loadArgs struct {
 	// the job exhausts its budget to discarded. It is how a replay run manufactures
 	// the failures it then recovers.
 	Fail bool `json:"fail,omitempty"`
+	// Group is the parent ordinal a fairness-mix child belongs to, so the worker can
+	// record which parent each claim served without a second query. It is set only on
+	// the fairness mix; every other mix leaves it zero and unread.
+	Group int `json:"g,omitempty"`
 }
 
 // Kind names the job kind.
@@ -160,6 +164,10 @@ type loadWorker struct {
 	// runner's own exponential backoff — capped by MaxRetryBackoff — governs the
 	// retries. Nil on every run but the outage measurement.
 	outage *outageState
+	// fairness, when set, records the parent ordinal of each claim in execution
+	// order, so the report can measure interleaving and non-starvation. Nil on every
+	// run but the fairness mix.
+	fairness *fairnessRecorder
 }
 
 // Kind names the job kind this worker serves.
@@ -210,6 +218,13 @@ func (w loadWorker) Work(ctx context.Context, job *flywheel.Job[loadArgs]) (flyw
 			w.outage.failures.Add(1)
 			return flywheel.Result{}, errTransientLoad
 		}
+	}
+
+	// Record which parent this claim served, in execution order — which tracks claim
+	// order closely enough at WorkNanos 0 to show whether the parents interleave or
+	// one starves the other.
+	if w.fairness != nil {
+		w.fairness.record(job.Args.Group)
 	}
 
 	if d := time.Duration(job.Args.WorkNanos); d > 0 {

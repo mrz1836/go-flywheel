@@ -42,12 +42,13 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.SetOutput(stderr)
 
 	var (
-		opts    options
-		mix     string
-		indexes string
-		fault   string
-		tuned   bool
-		limiter string
+		opts     options
+		mix      string
+		indexes  string
+		fault    string
+		tuned    bool
+		limiter  string
+		fairness string
 	)
 
 	fs.StringVar(&opts.cfg.DSN, "dsn", os.Getenv(dsnEnv),
@@ -59,7 +60,11 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&mix, "mix", string(loadtest.WorkloadDrainOnly),
 		"workload shape: enqueue, drain, steady, fan-out, barrier, mixed-speed")
 	fs.IntVar(&opts.cfg.Children, "children", 0,
-		"children per parent in the fan-out and barrier mixes (0 selects the mix default)")
+		"children per parent in the fan-out, barrier, and fairness mixes (0 selects the mix default)")
+	fs.IntVar(&opts.cfg.Parents, "parents", 0,
+		"parents in the fairness mix, each with -children ready children (0 selects 2)")
+	fs.StringVar(&fairness, "fairness", string(loadtest.FairnessFIFO),
+		"fairness-mix priority strategy: '' (FIFO baseline) or round-robin-parent (banding)")
 	fs.StringVar(&indexes, "indexes", string(loadtest.IndexesFull),
 		"schema condition: full, correctness-only")
 	fs.DurationVar(&opts.cfg.WorkDuration, "work", 0, "simulated per-job work time; zero isolates the database path")
@@ -126,6 +131,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	opts.cfg.Mix = loadtest.Workload(mix)
 	opts.cfg.Indexes = loadtest.IndexCondition(indexes)
 	opts.cfg.Limiter = loadtest.LimiterKind(limiter)
+	opts.cfg.Fairness = loadtest.FairnessStrategy(fairness)
 	// A bool flag rather than a string enum: there are exactly two conditions and
 	// the tuned one is the opt-in, so `-storage-tuning` reads as what it does.
 	// The Config keeps the enum, because that is what the report records.
@@ -139,8 +145,11 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	// the flag the operator typed.
 	if !opts.cfg.Mix.Valid() {
 		return options{}, fmt.Errorf(
-			"scenario: -mix %q is not one of enqueue, drain, steady, fan-out, barrier, mixed-speed", mix,
+			"scenario: -mix %q is not one of enqueue, drain, steady, fan-out, barrier, mixed-speed, fairness", mix,
 		)
+	}
+	if !opts.cfg.Fairness.Valid() {
+		return options{}, fmt.Errorf("scenario: -fairness %q is not '' or round-robin-parent", fairness)
 	}
 	if !opts.cfg.Indexes.Valid() {
 		return options{}, fmt.Errorf("scenario: -indexes %q is not one of full, correctness-only", indexes)

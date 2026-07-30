@@ -207,6 +207,42 @@ type Report struct {
 	// Backoff carries the outage-length backoff account on a downstream-outage run,
 	// and is nil otherwise.
 	Backoff *BackoffReport
+
+	// Fairness carries the interleaving and non-starvation account on a fairness-mix
+	// run, and is nil otherwise.
+	Fairness *FairnessReport
+}
+
+// FairnessReport is the account of a fairness-mix run: whether the parents'
+// claims interleaved or one starved the other. It is present only on the fairness
+// mix.
+//
+// The two findings are MaxConsecutiveSameParent — the longest run of claims from
+// one parent, near the batch size under strict FIFO and a small handful under
+// banding — and MinActiveWindowShare, the smallest slice any still-working parent
+// got in any window, ~1/Parents under banding and ~0 under FIFO.
+type FairnessReport struct {
+	// Strategy is the priority-assignment strategy the run used, "" for FIFO.
+	Strategy string `json:"strategy"`
+	// Parents and ChildrenPerParent describe the seeded shape.
+	Parents           int `json:"parents"`
+	ChildrenPerParent int `json:"children_per_parent"`
+	// ClaimsPerParent is how many claims each parent received. Under either strategy
+	// the totals are equal — every child runs once — so this is the control that
+	// proves the difference is order, not volume.
+	ClaimsPerParent []int64 `json:"claims_per_parent"`
+	// MaxConsecutiveSameParent is the longest run of consecutive claims from one
+	// parent. It is the non-starvation number: near ChildrenPerParent under FIFO,
+	// a small handful under banding.
+	MaxConsecutiveSameParent int `json:"max_consecutive_same_parent"`
+	// WindowSize is how many consecutive claims one interleaving window spans, and
+	// Windows how many there were.
+	WindowSize int `json:"window_size"`
+	Windows    int `json:"windows"`
+	// MinActiveWindowShare is the smallest share any parent with work left got in any
+	// window — the interleaving number. Banding holds it near 1/Parents; FIFO drops
+	// it to ~0 for the parent waiting its turn.
+	MinActiveWindowShare float64 `json:"min_active_window_share"`
 }
 
 // BackoffReport is the account of a downstream-outage run: how a cohort's attempt
@@ -358,6 +394,10 @@ type configJSON struct {
 	// the per-job budget. Both omit-empty, so an ordinary run's config is unchanged.
 	MaxRetryBackoff string `json:"max_retry_backoff,omitempty"`
 	MaxAttempts     int    `json:"max_attempts,omitempty"`
+	// Parents and Fairness record the fairness mix's shape and priority strategy.
+	// Both omit-empty, so no other mix's config section carries them.
+	Parents  int    `json:"parents,omitempty"`
+	Fairness string `json:"fairness,omitempty"`
 }
 
 // reportJSON is Report's wire form.
@@ -394,6 +434,7 @@ type reportJSON struct {
 	StorageParams  map[string]string `json:"storage_params,omitempty"`
 	Replay         *ReplayReport     `json:"replay,omitempty"`
 	Backoff        *BackoffReport    `json:"backoff,omitempty"`
+	Fairness       *FairnessReport   `json:"fairness,omitempty"`
 }
 
 // MarshalJSON renders the report in its wire form.
@@ -431,6 +472,7 @@ func (r Report) MarshalJSON() ([]byte, error) {
 		StorageParams:  r.StorageParams,
 		Replay:         r.Replay,
 		Backoff:        r.Backoff,
+		Fairness:       r.Fairness,
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -486,6 +528,7 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 		StorageParams:        in.StorageParams,
 		Replay:               in.Replay,
 		Backoff:              in.Backoff,
+		Fairness:             in.Fairness,
 	}
 	return nil
 }
@@ -521,6 +564,8 @@ func configToJSON(c Config) configJSON {
 			return ""
 		}(),
 		MaxAttempts: c.MaxAttempts,
+		Parents:     c.Parents,
+		Fairness:    string(c.Fairness),
 	}
 }
 
@@ -567,6 +612,8 @@ func configFromJSON(c configJSON) Config {
 		WorkerSnooze:    c.WorkerSnooze,
 		MaxRetryBackoff: mustParseDuration(c.MaxRetryBackoff),
 		MaxAttempts:     c.MaxAttempts,
+		Parents:         c.Parents,
+		Fairness:        FairnessStrategy(c.Fairness),
 	}
 }
 

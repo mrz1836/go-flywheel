@@ -142,6 +142,12 @@ func (h *Harness) prepareWorkload() (mixPlan, []jobSpec) {
 // provisioning in newHarness, and teardown after collect.
 func (h *Harness) insert(ctx context.Context, p mixPlan, specs []jobSpec) (time.Duration, error) {
 	start := time.Now()
+	if h.cfg.Mix == WorkloadFairness {
+		// The fairness mix assigns priority and parent per row, so it seeds through
+		// its own path rather than seedBulk's single-parent one.
+		err := seedFairness(ctx, h.work, h.cfg, specs, func(n int) { h.prog.enqueued.Add(int64(n)) })
+		return time.Since(start), err
+	}
 	if p.Bulk {
 		err := seedBulk(ctx, h.work, h.cfg, specs, p.ParentID, func(n int) { h.prog.enqueued.Add(int64(n)) })
 		return time.Since(start), err
@@ -627,6 +633,12 @@ func (h *Harness) collect(ctx context.Context, report *Report) error {
 		h.recordBackoff(report)
 	}
 
+	// The fairness account, on a fairness-mix run: whether the parents interleaved
+	// or one starved the other.
+	if h.fairness != nil {
+		h.recordFairness(report)
+	}
+
 	// Superseded is a measurement now: the runtime reports every discarded
 	// attempt through the Observer, so the harness counts events rather than
 	// inferring from row residue after the fact.
@@ -753,6 +765,30 @@ func (h *Harness) recordBackoff(report *Report) {
 // clock-driven run left MaxRetryBackoff zero so the report records the cap the
 // runners actually used rather than the zero the caller passed.
 const defaultOutageBackoffCap = time.Minute
+
+// recordFairness fills in the interleaving account and notes the finding.
+//
+// MaxConsecutiveSameParent is the non-starvation number and MinActiveWindowShare
+// the interleaving one; under FIFO the first is near the batch size and the second
+// near zero, under banding the first is a small handful and the second near
+// 1/Parents.
+func (h *Harness) recordFairness(report *Report) {
+	rep := computeFairness(h.cfg, h.fairness.snapshot())
+	report.Fairness = rep
+
+	strategy := "strict FIFO"
+	if h.cfg.Fairness == FairnessRoundRobinParent {
+		strategy = "priority banding"
+	}
+	h.notes.add(
+		"Fairness (%s): %d parents x %d children. The longest single-parent run was %d claims and the "+
+			"smallest window share any still-working parent got was %.1f%% (window %d). Under strict FIFO the "+
+			"run approaches the batch size and the share approaches zero; banding holds the run to a handful "+
+			"and the share near %.1f%%.",
+		strategy, rep.Parents, rep.ChildrenPerParent, rep.MaxConsecutiveSameParent,
+		100*rep.MinActiveWindowShare, rep.WindowSize, 100.0/float64(rep.Parents),
+	)
+}
 
 // stateCounts reports how many jobs are in each state.
 func (h *Harness) stateCounts(ctx context.Context) (map[string]int64, error) {
