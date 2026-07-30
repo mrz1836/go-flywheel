@@ -60,6 +60,12 @@ go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix enqueue \
 go run -tags=loadtest ./loadtest/cmd/explain -jobs 1000000 -queues 3 \
   -out docs/benchmarks/claim-plans-1m-after.txt
 
+# The parent-fairness claim cost: shipped claim vs. the round-robin CTE, at three depths.
+for n in 10000 100000 1000000; do
+  go run -tags=loadtest ./loadtest/cmd/explain -query claim-fair -jobs $n \
+    -out docs/benchmarks/fairness-plan-$n.txt
+done
+
 # The worker pool, on the mix where the barrier cost the most: 10% of jobs at 20x.
 go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix mixed-speed \
   -runners 4 -workers 8 -work 10ms -out docs/benchmarks/pool-mixed-8-after.json
@@ -828,6 +834,50 @@ Two caveats travel with these numbers, both from the time compression:
   ladder and steps the clock only once a generation has quiesced, so every scheduled retry is claimed
   before its rung is skipped — which makes the attempt counts above exact (`8×`, `25×`, and the `18×`
   where the outage lifts mid-ladder) rather than a function of wall-clock luck.
+
+<br/>
+
+## Parent fairness: the claim cost that chose the mechanism
+
+Equal-priority claims are strict FIFO, so a large batch enqueued first drains before a small later batch
+gets a claim. The obvious fix — interleave parents in the claim itself — means ranking the ready set with
+a window function before the `LIMIT` applies. That is `O(ready)`, and this series targets a deep ready
+set, so whether it is affordable is a measurement, not an assumption.
+
+The `explain` tool seeds an all-claimable table across three queues and EXPLAINs three shapes of a
+single-queue routed claim — the shape that reaches `jobs_ready`, matching the runtime's own claim-plan
+gate — at three depths. F0 is the shipped claim; F1 adds
+`row_number() OVER (PARTITION BY COALESCE(parent_job_id, id))` and orders by `(priority, rank,
+scheduled_at)`; F2 adds the priority-band pre-filter (`WHERE priority <= (SELECT min(priority) …)`).
+
+| rows | ready set | F0 shipped | F1 round-robin CTE | F2 band pre-filter |
+|---|---|---|---|---|
+| 10,000 | 1,667 | **0.019 ms** · index scan, 8 rows | 1.500 ms · scan+sort 1,667 | 0.376 ms |
+| 100,000 | 16,667 | **0.020 ms** · index scan, 8 rows | 15.614 ms · scan+sort 16,667 | 3.901 ms |
+| 1,000,000 | 166,667 | **0.059 ms** · index scan, 8 rows | **216.014 ms** · seq scan 166k, external-merge sort | **102.360 ms** |
+
+Reports: [`fairness-plan-10000.txt`](benchmarks/fairness-plan-10000.txt),
+[`fairness-plan-100000.txt`](benchmarks/fairness-plan-100000.txt),
+[`fairness-plan-1000000.txt`](benchmarks/fairness-plan-1000000.txt).
+
+**F0 is flat; F1 is linear in the ready set.** The shipped claim walks `jobs_ready` in
+`(priority, scheduled_at)` order and stops at the batch size — 8 rows, no sort, `0.02–0.06 ms` whatever
+the depth. The round-robin CTE has to see every ready row before it can number them, so its cost tracks
+the ready set: at a million rows it is **216 ms**, roughly 3,600× the shipped claim, and its sort spills
+to disk. A runner claims on every poll, so 216 ms per claim against a deep queue is disqualifying.
+
+**The band pre-filter does not rescue it.** Narrowing the window's input to the top priority band cuts
+F1's cost by about half, but F2 is still **102 ms** at a million rows, because computing
+`min(priority)` scans the whole ready set before the band can be applied — it is still `O(ready)`, still
+~1,700× the shipped claim. There is no version of the claim-time ranking that stays affordable at this
+depth.
+
+**So fairness is expressed at enqueue time, through priority banding, and the claim path is untouched.**
+The ranking F1 pays on every claim is instead paid once per job by the producer, which writes each
+parent's *n*-th child into the same priority band; the shipped `(priority, scheduled_at)` claim then
+interleaves the parents for free at `0.06 ms`. The README's *Fairness across parents* section is the
+how-to; these plans are why it is the mechanism. The default claim path, `ErrSQLiteConcurrency`, and
+SQLite parity are all unchanged, because nothing in the claim path changed.
 
 <br/>
 

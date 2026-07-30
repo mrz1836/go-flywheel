@@ -645,6 +645,52 @@ tolerate.
 </details>
 
 <details>
+<summary><strong><code>Fairness across parents — priority banding</code></strong></summary>
+<br>
+
+**The claim is `ORDER BY priority, scheduled_at`, so equal-priority work is strict FIFO.** A lower
+priority number is claimed first; ties break by schedule time. That is the right default — it is one
+index seek to the front of the queue, `O(batch)` regardless of how deep the backlog is — but it means a
+large batch enqueued first fully drains before a small batch enqueued a minute later gets a single
+claim. When the two batches belong to different parents (or tenants, or customers), that is
+head-of-line blocking, and bulk enqueue makes the starving batch cheap to create.
+
+**Fairness is expressed through the priority column, at enqueue time — not by reordering the claim.** A
+runtime policy that interleaved parents in the claim would rank the whole ready set with a window
+function before applying the `LIMIT`, which is `O(ready)`: measured against a 166,667-row ready set at
+one million rows, that claim runs in **216 ms** where the shipped claim runs in **0.06 ms**, and a
+priority-band pre-filter still costs 102 ms because computing the band scans the ready set too (see
+[BENCHMARKS](docs/BENCHMARKS.md)). A runner claims on every poll, so paying that on every claim against
+a deep queue is not an option. So the ranking is moved to enqueue time, where it is paid once per job
+and the claim stays `O(batch)`: give each parent's *n*-th child the same priority band, so the claim's
+existing `(priority, scheduled_at)` order interleaves the parents for free.
+
+```go
+// Round-robin two parents by banding their children's priorities. Child i of every
+// parent shares band base+i, so the claim takes one child from each parent per band
+// instead of draining parent A before parent B is seen.
+for i, item := range parentAChildren {
+    item.Opts.Priority = priorityBase + i
+}
+for i, item := range parentBChildren {
+    item.Opts.Priority = priorityBase + i
+}
+```
+
+**Priority still dominates.** Banding interleaves work *of equal urgency*; it does not let a low-priority
+parent jump ahead of a high-priority one. Reserve a range of priority numbers for the band offset (say,
+`base + (i % window)`) so a genuinely more urgent job at a lower base is still claimed first, and the
+banding only decides the order *within* a base.
+
+**A parentless job is its own group of one.** Fairness is keyed on the parent, so a job with no parent
+does not share a band with anyone — id 1000 and id 1001, both parentless and both enqueued at the
+default priority, are claimed in schedule order exactly as they are today. Banding changes nothing for
+work that was never part of a batch; it is a tool for the case where one lineage would otherwise starve
+another.
+
+</details>
+
+<details>
 <summary><strong><code>Admission control — gating a runner before it claims</code></strong></summary>
 <br>
 
