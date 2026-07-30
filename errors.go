@@ -124,6 +124,13 @@ func (e *IndexDriftError) Unwrap() error { return ErrIndexDrift }
 // concurrent dequeue would deadlock.
 var ErrSQLiteConcurrency = errors.New("jobs: sqlite driver requires concurrency 1")
 
+// ErrSQLitePragma reports a SQLite connection missing a pragma the runtime's
+// serialized claim needs (WAL for a file database, a positive busy_timeout, a
+// safe synchronous level). NewSQLiteDriverWithOptions returns it;
+// NewSQLiteDriver logs it through slog.Default() and proceeds, so its
+// one-argument, error-free signature is preserved.
+var ErrSQLitePragma = errors.New("flywheel: sqlite connection is missing a required pragma")
+
 // ErrRunnerStopped is returned by RunUntilIdle when Stop ended the dispatch loop
 // before the queue reached a terminal state. It promised a drained queue and did
 // not deliver one, so it says so rather than returning nil.
