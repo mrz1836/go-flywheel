@@ -449,7 +449,8 @@ res, err := flywheel.CancelByParent(ctx, db, parentID, flywheel.ScopeOpts{})
 preserving a deferred child's schedule. The per-id `CancelJob` and `RetryJob` are guarded to the same
 standard: a job that has already reached a terminal state is left exactly as it is and `ErrJobTerminal`
 is returned, so an operator action can never overwrite a recorded outcome. Re-running a finished job is
-deliberate — `RetryJobWithOptions` with `Force`.
+deliberate — `RetryJobWithOptions` with `Force` — and replaying a whole cohort of failures, with a
+restored retry budget, is its own guide: **Replaying work** below.
 
 **The fan-in barrier runs a continuation once a generation completes.** A worker returns `Result.Barrier`
 alongside its children, and the runtime enqueues the continuation exactly once, after the last child
@@ -475,6 +476,66 @@ when a batch was *spawned* kills a healthy batch that is merely behind a deep ba
 when a batch most needs to survive. `BatchProgress.OldestPendingAge` is the signal instead: it measures
 from the least-recently-scheduled *pending* child, so a host that wants a deadline anchors it to how long
 real work has actually been stalled, not to wall-clock age.
+
+</details>
+
+<details>
+<summary><strong><code>Replaying work — retry vs. re-enqueue</code></strong></summary>
+<br>
+
+**Replaying the failures is the common recovery after an incident, and it is a retry, not a re-enqueue.**
+`ReplayByParent` returns the failed children of a parent to `available` in bounded, per-transaction
+batches; `Replay` does the same for a whole kind or an incident window, unscoped by lineage. Both report
+what they did through the same `ScopeResult` the batch controls use:
+
+```go
+res, err := flywheel.ReplayByParent(ctx, db, parentID, flywheel.ReplayOpts{
+    RetryOpts: flywheel.RetryOpts{ResetAttempts: true}, // restore the retry budget
+    Stagger:   5 * time.Minute,                         // spread arrivals over five minutes
+})
+// res.Changed replayed; res.SkippedTerminal left as they were; res.SkippedRunning left in flight.
+```
+
+**A replay restores the retry budget as headroom, not by rewinding the counter.** A job discarded at
+`attempt == max_attempts` has no budget left, so a plain retry gives it exactly one more attempt before
+it discards again. `ResetAttempts` raises `max_attempts` — to `attempt + Budget`, or the job's original
+budget when `Budget` is zero — so the job gets a real second life. `attempt` is never lowered: it is the
+`job_runs(job_id, attempt)` audit key, so the replay's runs continue the sequence rather than colliding
+with the recorded failures. It is the same mechanism a snooze uses to stay free.
+
+**A replay is bounded by construction.** Empty `States` replays discarded jobs only — never succeeded
+work; naming `StateSucceeded` additionally requires `Force`. An unscoped `Replay` with neither `Kinds`
+nor `FailedSince` is refused with `ErrReplayUnbounded` rather than replaying every discarded job in the
+database by accident.
+
+```go
+// The incident-shaped recovery: one kind, bounded to the outage window, budget of three.
+res, err := flywheel.Replay(ctx, db, flywheel.ReplayOpts{
+    RetryOpts:   flywheel.RetryOpts{ResetAttempts: true, Budget: 3},
+    Kinds:       []string{"fetch_report"},
+    FailedSince: outageStart,
+})
+```
+
+**`Stagger` shapes when the cohort arrives; it is not a rate ceiling.** With `Stagger` set, job *i* of
+*n* becomes claimable at `now + Stagger*i/n`, so 30,000 replayed jobs do not all hit a just-recovered
+dependency at once. The placement is deterministic, so you can predict when the last job lands. It does
+not cap how fast the cohort is claimed once each job is due — an actual claim-rate ceiling is a separate
+capability.
+
+**Retry an existing row; do not re-enqueue it under the same key.** Which mechanism recovers a unit of
+work depends on the intent:
+
+| Intent | Mechanism | Key |
+|---|---|---|
+| Re-run *this job row*, keeping its id, history, and audit trail | `RetryJobWithOptions` / `Replay*` | — |
+| Enqueue a *new* job for the same logical unit, at most once ever | new `Insert` | `UniqueKey` — collides forever, terminal or not |
+| Enqueue a *new* job for a subject that may run again later | new `Insert` | `UniqueActiveKey` — frees on a terminal state |
+
+> A job enqueued with `UniqueKey` can never be re-enqueued: the key collides with the original row
+> forever, terminal or not. That is the guarantee `UniqueKey` exists to provide. To run that unit of work
+> again, retry the original job — its id, lineage, and audit trail are preserved. If the unit is expected
+> to run again later, `UniqueActiveKey` is the key you want.
 
 </details>
 

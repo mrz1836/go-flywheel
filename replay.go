@@ -137,7 +137,7 @@ func applyKindFilter(q *gorm.DB, kinds []string) *gorm.DB {
 // *gorm.DB base bound to the outer handle could not run inside a batch's tx).
 // label names the operation in errors.
 //
-// # Accounting (FR-07-05)
+// # Accounting
 //
 // ScopeResult accounts for the finished-or-finishing work in scope. With no
 // FailedSince window, Changed + SkippedTerminal + SkippedRunning equals the number
@@ -155,9 +155,9 @@ func replay(
 		return ScopeResult{}, fmt.Errorf("flywheel: %s: db is nil", label)
 	}
 	states := opts.replayStates()
-	// Guard (FR-07-04): re-running succeeded work is the destructive case here, so
-	// naming StateSucceeded requires Force explicitly. Refuse the whole call before
-	// any write — a rejected replay changes nothing.
+	// Guard: re-running succeeded work is the destructive case here, so naming
+	// StateSucceeded requires Force explicitly. Refuse the whole call before any
+	// write — a rejected replay changes nothing.
 	if !opts.Force && slices.Contains(states, StateSucceeded) {
 		return ScopeResult{}, ErrJobTerminal
 	}
