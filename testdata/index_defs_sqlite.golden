@@ -7,3 +7,5 @@ jobs_running_leased	CREATE INDEX jobs_running_leased ON jobs (leased_until) WHER
 jobs_state	CREATE INDEX jobs_state ON jobs (state) WHERE deleted_at IS NULL
 jobs_unique_active_key	CREATE UNIQUE INDEX jobs_unique_active_key ON jobs (unique_active_key) WHERE unique_active_key IS NOT NULL AND state IN ('available', 'running', 'retryable', 'scheduled', 'paused')
 jobs_unique_key	CREATE UNIQUE INDEX jobs_unique_key ON jobs (unique_key) WHERE unique_key IS NOT NULL
+limiter_holds_expiry	CREATE INDEX limiter_holds_expiry ON limiter_holds (expires_at)
+limiter_holds_resource	CREATE INDEX limiter_holds_resource ON limiter_holds (resource, expires_at)

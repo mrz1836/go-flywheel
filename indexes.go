@@ -122,13 +122,13 @@ type IndexOpts struct {
 // for.
 //
 // It is the host-owned install step: a host whose migration tool created the
-// three tables from Models calls this once per install or deploy to reach index
-// parity with Migrate, which applies the same set through the same path.
+// runtime's tables from Models calls this once per install or deploy to reach
+// index parity with Migrate, which applies the same set through the same path.
 //
 // It is idempotent and safe to run on every deploy: an absent index is created,
 // a matching index is left untouched, and a re-run over an up-to-date schema does
 // nothing. It creates no tables and alters no columns: on a database that lacks
-// the three tables it fails on the first statement. On a database carrying an
+// the runtime's tables it fails on the first statement. On a database carrying an
 // index whose definition has drifted it returns an IndexDriftError rather than
 // silently leaving the stale index in place — see InstallIndexesWithOptions to
 // reconcile instead.
@@ -144,8 +144,8 @@ func InstallIndexes(ctx context.Context, db *gorm.DB) error {
 // reported as an IndexDriftError and left in place; set IndexOpts.Reconcile to
 // drop and recreate it instead — see IndexOpts.Reconcile for the lock that takes.
 //
-// It creates no tables and alters no columns: on a database that lacks the three
-// tables it fails on the first statement.
+// It creates no tables and alters no columns: on a database that lacks the
+// runtime's tables it fails on the first statement.
 func InstallIndexesWithOptions(ctx context.Context, db *gorm.DB, opts IndexOpts) error {
 	if db == nil {
 		return fmt.Errorf("flywheel: InstallIndexes: db is nil")
@@ -329,9 +329,13 @@ func inspectIndexes(ctx context.Context, db *gorm.DB, set []Index) ([]IndexDrift
 }
 
 // readInstalledIndexDefs reads db's catalog into a name→definition map for the
-// runtime's three tables. The definition is the statement the database actually
-// holds — pg_indexes.indexdef on PostgreSQL, sqlite_master.sql on SQLite — which
-// is the only authority the name-level install cannot fake.
+// runtime's tables. The definition is the statement the database actually holds —
+// pg_indexes.indexdef on PostgreSQL, sqlite_master.sql on SQLite — which is the
+// only authority the name-level install cannot fake.
+//
+// The PostgreSQL branch names the tables explicitly, so a new runtime table's
+// indexes must be added to its IN list or InspectIndexes reports them as
+// perpetually absent; the SQLite branch reads every index and needs no change.
 func readInstalledIndexDefs(ctx context.Context, db *gorm.DB) (map[string]string, error) {
 	out := map[string]string{}
 	switch db.Name() {
@@ -343,7 +347,7 @@ func readInstalledIndexDefs(ctx context.Context, db *gorm.DB) (map[string]string
 		if err := db.WithContext(ctx).Raw(`
 			SELECT indexname, indexdef FROM pg_indexes
 			WHERE schemaname = current_schema()
-			  AND tablename IN ('jobs', 'job_runs', 'job_periodics')`).Scan(&rows).Error; err != nil {
+			  AND tablename IN ('jobs', 'job_runs', 'job_periodics', 'limiter_buckets', 'limiter_holds')`).Scan(&rows).Error; err != nil {
 			return nil, fmt.Errorf("read installed index definitions: %w", err)
 		}
 		for _, r := range rows {
@@ -553,6 +557,21 @@ func runtimeIndexes() []Index {
 			// UpsertPeriodic an upsert rather than an append.
 			Name: "idx_job_periodics_slug", Kind: IndexCorrectness, Table: "job_periodics",
 			DDL: `CREATE UNIQUE INDEX IF NOT EXISTS idx_job_periodics_slug ON job_periodics (slug)`,
+		},
+		{
+			// Performance: the DBLimiter's inline expiry reclaim. Acquire runs
+			// DELETE ... WHERE resource = ? AND expires_at < ? before every held
+			// count, and the composite key serves that predicate directly. It is a
+			// performance index, not a correctness one: admission stays correct
+			// without it (the reclaim still runs), only slower at depth.
+			Name: "limiter_holds_resource", Kind: IndexPerformance, Table: "limiter_holds",
+			DDL: `CREATE INDEX IF NOT EXISTS limiter_holds_resource ON limiter_holds (resource, expires_at)`,
+		},
+		{
+			// Performance: the sweeper's global expiry scan, which is not scoped to a
+			// resource and so wants expires_at leading.
+			Name: "limiter_holds_expiry", Kind: IndexPerformance, Table: "limiter_holds",
+			DDL: `CREATE INDEX IF NOT EXISTS limiter_holds_expiry ON limiter_holds (expires_at)`,
 		},
 	}
 }

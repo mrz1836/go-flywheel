@@ -105,3 +105,33 @@ type jobPeriodicRow struct {
 
 // TableName binds jobPeriodicRow to the job_periodics table.
 func (jobPeriodicRow) TableName() string { return "job_periodics" }
+
+// limiterBucketRow is the DBLimiter's per-resource rate reservoir. The resource
+// string is the primary key — one bucket per protected dependency — and the row
+// doubles as the per-resource mutex a shared Acquire locks. It carries no
+// BeforeCreate: the limiter sets every column and inserts by the meaningful
+// resource key, never Save.
+type limiterBucketRow struct {
+	Resource   string    `gorm:"column:resource;primaryKey"`
+	Tokens     int       `gorm:"column:tokens;not null"`
+	RefilledAt time.Time `gorm:"column:refilled_at;not null"`
+	UpdatedAt  time.Time `gorm:"column:updated_at;not null"`
+}
+
+// TableName binds limiterBucketRow to the limiter_buckets table.
+func (limiterBucketRow) TableName() string { return "limiter_buckets" }
+
+// limiterHoldRow is one DBLimiter concurrency grant: a minted token, the resource
+// it holds, the count it holds (n), and when its reservation lapses without a
+// Release. One row per grant carries the whole batch, so its expiry is a shared
+// TTL — the deliberately-coarse over-admission-on-lapse the crashed-holder case
+// accepts. Like the bucket row it has no BeforeCreate.
+type limiterHoldRow struct {
+	Token     string    `gorm:"column:token;primaryKey"`
+	Resource  string    `gorm:"column:resource;not null"`
+	N         int       `gorm:"column:n;not null"`
+	ExpiresAt time.Time `gorm:"column:expires_at;not null"`
+}
+
+// TableName binds limiterHoldRow to the limiter_holds table.
+func (limiterHoldRow) TableName() string { return "limiter_holds" }
