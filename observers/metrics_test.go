@@ -14,7 +14,7 @@ import (
 
 // recordedCall captures one MetricsRecorder method invocation for assertion.
 type recordedCall struct {
-	method string // "count" | "gauge" | "observe"
+	method string // "count" | "gauge" | "observe" | "histogram"
 	name   string
 	delta  int64
 	value  float64
@@ -46,6 +46,12 @@ func (f *fakeRecorder) Observe(name string, value float64, tags map[string]strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, recordedCall{method: "observe", name: name, value: value, tags: copyTags(tags)})
+}
+
+func (f *fakeRecorder) Histogram(name string, value float64, tags map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, recordedCall{method: "histogram", name: name, value: value, tags: copyTags(tags)})
 }
 
 // only returns the single captured call matching method and name, failing the
@@ -234,6 +240,72 @@ func TestMemRecorderAccumulatesCountGaugeObserve(t *testing.T) {
 	assert.EqualValues(t, 2, snap.Observations[0].Count)
 }
 
+// TestMemRecorderHistogramUsesDefaultBuckets is A2's "given none" half: a
+// recorder built with the zero config records into DefaultLatencyBuckets, and a
+// value lands in the first bound at or above it (le semantics).
+func TestMemRecorderHistogramUsesDefaultBuckets(t *testing.T) {
+	t.Parallel()
+	m := NewMemRecorder()
+	// 3 ms falls in the .005 bucket (index 3 of DefaultLatencyBuckets); 40 ms in
+	// the .05 bucket (index 6); 20 s past the last bound (.,10) lands in +Inf only.
+	m.Histogram("h", 0.003, map[string]string{"q": "default"})
+	m.Histogram("h", 0.040, map[string]string{"q": "default"})
+	m.Histogram("h", 20.0, map[string]string{"q": "default"})
+
+	snap := m.Snapshot()
+	require.Len(t, snap.Histograms, 1)
+	got := snap.Histograms[0]
+	assert.Equal(t, DefaultLatencyBuckets, got.Buckets, "default config uses DefaultLatencyBuckets")
+	require.Len(t, got.Counts, len(DefaultLatencyBuckets))
+
+	assert.EqualValues(t, 1, got.Counts[3], "3ms lands in the .005 bucket")
+	assert.EqualValues(t, 1, got.Counts[6], "40ms lands in the .05 bucket")
+	assert.EqualValues(t, 3, got.Count, "count includes the +Inf overflow value")
+	assert.InDelta(t, 20.043, got.Sum, 1e-9)
+
+	// The overflow value is in no explicit bucket: the cumulative sum of the
+	// per-bucket counts is one short of Count, and Count is the +Inf bucket.
+	var bucketed uint64
+	for _, c := range got.Counts {
+		bucketed += c
+	}
+	assert.EqualValues(t, 2, bucketed, "the 20s value is in +Inf only, not any explicit bucket")
+}
+
+// TestMemRecorderHistogramUsesCustomBuckets is A2's "given custom buckets" half:
+// a recorder built with an unsorted custom set records against a sorted copy of
+// exactly those bounds.
+func TestMemRecorderHistogramUsesCustomBuckets(t *testing.T) {
+	t.Parallel()
+	m := NewMemRecorderWithConfig(HistogramConfig{Buckets: []float64{10, 1, 5}})
+	m.Histogram("h", 3, nil) // 3 <= 5 -> the middle bucket of the sorted {1,5,10}
+
+	snap := m.Snapshot()
+	require.Len(t, snap.Histograms, 1)
+	got := snap.Histograms[0]
+	assert.Equal(t, []float64{1, 5, 10}, got.Buckets, "custom buckets are used, sorted ascending")
+	assert.EqualValues(t, 0, got.Counts[0], "3 is above the 1 bound")
+	assert.EqualValues(t, 1, got.Counts[1], "3 falls in the 5 bound")
+	assert.EqualValues(t, 0, got.Counts[2])
+	assert.EqualValues(t, 1, got.Count)
+}
+
+// TestMemRecorderHistogramAccumulatesPerSeries proves equal-tag observations fold
+// into one series and a distinct tag set is its own.
+func TestMemRecorderHistogramAccumulatesPerSeries(t *testing.T) {
+	t.Parallel()
+	m := NewMemRecorder()
+	m.Histogram("h", 0.001, map[string]string{"kind": "a"})
+	m.Histogram("h", 0.001, map[string]string{"kind": "a"}) // same series
+	m.Histogram("h", 0.001, map[string]string{"kind": "b"}) // distinct series
+
+	snap := m.Snapshot()
+	require.Len(t, snap.Histograms, 2)
+	assert.Equal(t, map[string]string{"kind": "a"}, snap.Histograms[0].Tags)
+	assert.EqualValues(t, 2, snap.Histograms[0].Count, "equal-tag observations accumulate")
+	assert.EqualValues(t, 1, snap.Histograms[1].Count, "a distinct tag set is its own series")
+}
+
 func TestMemRecorderSnapshotIsAnIsolatedCopy(t *testing.T) {
 	t.Parallel()
 	m := NewMemRecorder()
@@ -280,6 +352,7 @@ func TestMemRecorderConcurrentRecordingIsRaceFree(t *testing.T) {
 				m.Count("c", 1, map[string]string{"shard": "x"})
 				m.Gauge("g", float64(i), nil)
 				m.Observe("o", 2.0, nil)
+				m.Histogram("h", 0.002, nil)
 			}
 		}()
 	}
@@ -291,4 +364,6 @@ func TestMemRecorderConcurrentRecordingIsRaceFree(t *testing.T) {
 	require.Len(t, snap.Observations, 1)
 	assert.EqualValues(t, goroutines*perG, snap.Observations[0].Count)
 	assert.InDelta(t, float64(goroutines*perG)*2.0, snap.Observations[0].Sum, 1e-6)
+	require.Len(t, snap.Histograms, 1)
+	assert.EqualValues(t, goroutines*perG, snap.Histograms[0].Count, "every histogram observation is counted")
 }
