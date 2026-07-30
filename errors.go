@@ -205,11 +205,3 @@ var ErrPeriodicNotFound = errors.New("flywheel: periodic not found")
 // runtime refuses the write rather than overwriting a recorded outcome and its
 // finalized_at stamp.
 var ErrJobTerminal = errors.New("flywheel: job has already reached a terminal state")
-
-// ErrResetAttemptsUnsupported is returned by RetryJobWithOptions when a caller
-// sets RetryOpts.ResetAttempts. The field is declared today so the options type
-// is not broken a second time when the replay work lands, but restoring a job's
-// retry budget is not yet implemented — so setting it is refused loudly rather
-// than silently ignored, which is exactly the do-nothing footgun the runtime
-// fails loudly to prevent (compare ErrFollowUpLimit).
-var ErrResetAttemptsUnsupported = errors.New("flywheel: RetryOpts.ResetAttempts is reserved and not yet implemented")
