@@ -17,6 +17,7 @@ func TestEnumWireValuesAreStable(t *testing.T) {
 	assert.Equal(t, "running", string(StateRunning))
 	assert.Equal(t, "retryable", string(StateRetryable))
 	assert.Equal(t, "scheduled", string(StateScheduled))
+	assert.Equal(t, "paused", string(StatePaused))
 	assert.Equal(t, "succeeded", string(StateSucceeded))
 	assert.Equal(t, "cancelled", string(StateCancelled))
 	assert.Equal(t, "discarded", string(StateDiscarded))
@@ -37,12 +38,37 @@ func TestEnumWireValuesAreStable(t *testing.T) {
 	assert.Equal(t, "crashed", string(OutcomeCrashed))
 }
 
+// TestPausedIsNonTerminalButNotClaimable pins the one category the state machine
+// gained with paused: a state that is neither claimable nor terminal. A runner
+// must never claim a paused job, and a "still in flight" scope must still count
+// it — so it belongs to nonTerminalStates and NonTerminalStates but not to
+// claimableStates or TerminalStates.
+func TestPausedIsNonTerminalButNotClaimable(t *testing.T) {
+	t.Parallel()
+
+	assert.NotContains(t, claimableStates, string(StatePaused),
+		"a paused job must never be claimed")
+	assert.Contains(t, nonTerminalStates, string(StatePaused),
+		"a paused job is unfinished work, so RunUntilIdle keeps polling around it")
+
+	nonTerminal := map[JobState]bool{}
+	for _, s := range NonTerminalStates() {
+		nonTerminal[s] = true
+	}
+	assert.True(t, nonTerminal[StatePaused], "paused is a non-terminal state")
+
+	for _, terminal := range TerminalStates() {
+		assert.NotEqual(t, StatePaused, terminal, "paused is not a terminal state")
+	}
+}
+
 // TestEnumValid proves each enum's Valid method accepts its recognized values
 // and rejects an invented one.
 func TestEnumValid(t *testing.T) {
 	t.Parallel()
 
 	assert.True(t, StateAvailable.Valid())
+	assert.True(t, StatePaused.Valid())
 	assert.False(t, JobState("invented").Valid())
 
 	assert.True(t, ErrorTransient.Valid())

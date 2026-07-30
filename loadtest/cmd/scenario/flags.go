@@ -56,7 +56,9 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.IntVar(&opts.cfg.Runners, "runners", 4, "number of independent runner loops")
 	fs.IntVar(&opts.cfg.Workers, "workers", 8, "per-runner concurrency")
 	fs.StringVar(&mix, "mix", string(loadtest.WorkloadDrainOnly),
-		"workload shape: enqueue, drain, steady, fan-out, mixed-speed")
+		"workload shape: enqueue, drain, steady, fan-out, barrier, mixed-speed")
+	fs.IntVar(&opts.cfg.Children, "children", 0,
+		"children per parent in the fan-out and barrier mixes (0 selects the mix default)")
 	fs.StringVar(&indexes, "indexes", string(loadtest.IndexesFull),
 		"schema condition: full, correctness-only")
 	fs.DurationVar(&opts.cfg.WorkDuration, "work", 0, "simulated per-job work time; zero isolates the database path")

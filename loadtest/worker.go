@@ -40,8 +40,12 @@ type loadArgs struct {
 	// Payload is deterministic filler.
 	Payload string `json:"payload"`
 	// Children, when positive, is how many follow-ups this job enqueues on
-	// success. It is zero except in the fan-out mix.
+	// success. It is zero except in the fan-out and barrier mixes.
 	Children int `json:"children,omitempty"`
+	// Barrier, when true, declares a fan-in barrier over this job's children. It is
+	// set only on the barrier mix's parents; the children and the continuation carry
+	// it false.
+	Barrier bool `json:"barrier,omitempty"`
 }
 
 // Kind names the job kind.
@@ -146,7 +150,18 @@ func (w loadWorker) Work(ctx context.Context, job *flywheel.Job[loadArgs]) (flyw
 			Parent: true,
 		}
 	}
-	return flywheel.Result{FollowUps: followUps}, nil
+	result := flywheel.Result{FollowUps: followUps}
+	if job.Args.Barrier {
+		// The barrier mix: declare a continuation over this generation. It is a leaf
+		// (Children zero, Barrier false), so it fans out nothing and declares nothing
+		// — one continuation per parent, run once the whole generation is terminal.
+		result.Barrier = &flywheel.Barrier{
+			Kind:  loadKind,
+			Args:  loadArgs{N: job.Args.N, WorkNanos: job.Args.WorkNanos},
+			Queue: job.Queue,
+		}
+	}
+	return result, nil
 }
 
 // marshalArgs renders a loadArgs into the JSON payload the enqueue path takes.

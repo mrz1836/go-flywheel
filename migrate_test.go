@@ -27,7 +27,7 @@ var (
 		"jobs_unique_key",
 		"jobs_unique_active_key",
 		"jobs_ready",
-		"jobs_parent",
+		"jobs_parent_state",
 		"jobs_running_leased",
 		"jobs_state",
 		"idx_jobs_deleted_at",

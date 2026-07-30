@@ -298,7 +298,7 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 		return h, err
 	}
 
-	h.inner = flywheel.NewPostgresDriver(h.work)
+	h.inner = flywheel.NewPostgresDriverWithOptions(h.work, workDriverOpts(cfg))
 	h.timings = newTimings(cfg.Runners)
 	h.registry = flywheel.NewRegistry()
 	flywheel.Register(h.registry, loadWorker{track: h.exec})

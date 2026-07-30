@@ -29,6 +29,13 @@ const (
 	// runtime does not have. Naming this shape "fan-in" would put a promise in
 	// every committed JSON report that the runtime cannot keep.
 	WorkloadFanOut Workload = "fan-out"
+	// WorkloadBarrier is fan-out plus a fan-in barrier: each seeded parent fans out
+	// children and declares a continuation that the runtime enqueues once the whole
+	// generation reaches a terminal state. It is what measures the barrier's
+	// per-child completion count and the one-continuation-per-parent tail — the
+	// join primitive the fan-out mix's name deliberately did not promise, now that
+	// the runtime has it.
+	WorkloadBarrier Workload = "barrier"
 	// WorkloadMixedSpeed gives a minority of jobs a much longer work duration.
 	//
 	// It is the most informative of the five: a runner's poll waits for the whole
@@ -40,7 +47,7 @@ const (
 // Valid reports whether w is a recognized Workload.
 func (w Workload) Valid() bool {
 	switch w {
-	case WorkloadEnqueueOnly, WorkloadDrainOnly, WorkloadSteady, WorkloadFanOut, WorkloadMixedSpeed:
+	case WorkloadEnqueueOnly, WorkloadDrainOnly, WorkloadSteady, WorkloadFanOut, WorkloadBarrier, WorkloadMixedSpeed:
 		return true
 	default:
 		return false
@@ -155,6 +162,11 @@ type Config struct {
 	Workers int
 	// Mix selects the workload shape.
 	Mix Workload
+	// Children overrides how many children each parent fans out in the fan-out and
+	// barrier mixes. Zero selects the mix's own default (fanOutChildren). It is the
+	// knob that turns a 100k-child parent — the rollup's subject at 1M — into a
+	// scenario, and that sizes a barrier-bearing generation.
+	Children int
 	// Indexes selects the schema condition.
 	Indexes IndexCondition
 	// WorkDuration is the simulated per-job work time; WorkJitter spreads it. A
@@ -268,6 +280,9 @@ func (c Config) validate() (Config, error) {
 			"loadtest: Runners and Workers must not be negative, got %d and %d: %w",
 			c.Runners, c.Workers, ErrInvalidConfig,
 		)
+	}
+	if c.Children < 0 {
+		return Config{}, fmt.Errorf("loadtest: Children must not be negative, got %d: %w", c.Children, ErrInvalidConfig)
 	}
 	if c.Runners == 0 {
 		c.Runners = defaultRunners

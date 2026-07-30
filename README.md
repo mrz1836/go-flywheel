@@ -407,6 +407,78 @@ spawn a coordinator job rather than return N children from one attempt.
 </details>
 
 <details>
+<summary><strong><code>Batch progress, controls, and the fan-in barrier</code></strong></summary>
+<br>
+
+A worker spawns children by returning `FollowUp{Parent: true}`, and a producer sets a child's parent
+with `InsertOpts.Parent`. That lineage pointer is what the batch surface reads.
+
+**The rollup answers "how is this batch doing?" from one call.** `Progress` returns a `BatchProgress`:
+the per-state child counts, the totals, the parent's own state, and the age of the oldest pending child
+— served by a covering index, so it holds at a hundred thousand children.
+
+```go
+p, err := flywheel.Progress(ctx, db, parentID)
+// p.CountsByState["succeeded"], p.Total, p.Terminal, p.Pending
+// p.Pending == 0 means the batch is complete.
+```
+
+An unknown or already-pruned parent is a zero rollup with an empty `ParentState`, not an error: children
+outlive the parent row, so `Progress` reports them either way. `ProgressMany` rolls up several parents in
+a fixed two reads rather than one per parent — a childless or unknown parent still gets an entry, so a
+dashboard tells "no children" from "unknown id". `ProgressByKind` is the parentless form, for a host
+whose batches are defined by what the work is rather than by who spawned it.
+
+**`paused` is a real, operator-visible state, not a `scheduled_at` trick.** A far-future `scheduled_at`
+would be free, but it is indistinguishable from a legitimately deferred job and invisible to every
+rollup and health sample — the exact class of "a condition encoded as a side effect of another field"
+the runtime avoids. `paused` is the one state that is neither claimable nor terminal: a runner never
+picks it up, and it stays held until a resume returns it to `available`. It is unfinished work, so it
+keeps `RunUntilIdle` polling and stays counted as non-terminal.
+
+**Pause, resume, and cancel scope to a whole generation.** Each operates in bounded, per-transaction
+batches — the lease sweep's shape — and reports what it did by reason, so a running attempt is never
+interrupted and a succeeded child is never clobbered:
+
+```go
+res, err := flywheel.CancelByParent(ctx, db, parentID, flywheel.ScopeOpts{})
+// res.Changed cancelled; res.SkippedRunning left in flight; res.SkippedTerminal left as they were.
+```
+
+`PauseByParent` holds every claimable child; `ResumeByParent` returns the paused ones to `available`,
+preserving a deferred child's schedule. The per-id `CancelJob` and `RetryJob` are guarded to the same
+standard: a job that has already reached a terminal state is left exactly as it is and `ErrJobTerminal`
+is returned, so an operator action can never overwrite a recorded outcome. Re-running a finished job is
+deliberate — `RetryJobWithOptions` with `Force`.
+
+**The fan-in barrier runs a continuation once a generation completes.** A worker returns `Result.Barrier`
+alongside its children, and the runtime enqueues the continuation exactly once, after the last child
+reaches *any* terminal state — a half-failed generation still gets its finalizer. It is keyed so a
+retried, discarded, or superseded child can never enqueue it twice, and it fires inside that last child's
+finalize transaction, so no host writes a retry-unsafe counter.
+
+```go
+return flywheel.Result{
+    FollowUps: children,                                  // each with Parent: true
+    Barrier:   &flywheel.Barrier{Kind: "finalize_batch"}, // runs once, when they are all terminal
+}, nil
+```
+
+The continuation reads what the generation produced through `ChildOutputs` — one entry per terminal
+child, its final state paired with its last attempt's recorded output. A barrier-bearing generation is
+bounded by `DriverOpts.BarrierMaxChildren` (default 10,000): the barrier costs an index-only completion
+count per child finalize, so a wider fan-out is refused with `ErrBarrierTooWide`, directing you to a tree
+of bounded generations rather than one that costs `O(children²)`.
+
+**No barrier timeout ships, by design — anchor your own deadline to progress.** A deadline measured from
+when a batch was *spawned* kills a healthy batch that is merely behind a deep backlog, which is precisely
+when a batch most needs to survive. `BatchProgress.OldestPendingAge` is the signal instead: it measures
+from the least-recently-scheduled *pending* child, so a host that wants a deadline anchors it to how long
+real work has actually been stalled, not to wall-clock age.
+
+</details>
+
+<details>
 <summary><strong><code>Concurrency, claim batching, and graceful drain</code></strong></summary>
 <br>
 

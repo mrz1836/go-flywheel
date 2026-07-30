@@ -68,6 +68,12 @@ const (
 	StateRunning   JobState = "running"
 	StateRetryable JobState = "retryable"
 	StateScheduled JobState = "scheduled"
+	// StatePaused is non-terminal but not claimable: an operator has held the job
+	// so no runner picks it up, and it stays held until a resume returns it to
+	// available. It is the one state that is neither claimable nor terminal — a
+	// paused batch is unfinished work, so it keeps RunUntilIdle polling, but no
+	// claim will ever advance it. See PauseByParent/ResumeByParent.
+	StatePaused    JobState = "paused"
 	StateSucceeded JobState = "succeeded"
 	StateCancelled JobState = "cancelled"
 	StateDiscarded JobState = "discarded"
@@ -76,7 +82,7 @@ const (
 // Valid reports whether s is a recognized JobState.
 func (s JobState) Valid() bool {
 	switch s {
-	case StateAvailable, StateRunning, StateRetryable, StateScheduled,
+	case StateAvailable, StateRunning, StateRetryable, StateScheduled, StatePaused,
 		StateSucceeded, StateCancelled, StateDiscarded:
 		return true
 	default:
@@ -212,8 +218,41 @@ type Result struct {
 	Cancel bool
 	// FollowUps are child jobs enqueued atomically with finalization.
 	FollowUps []FollowUp
+	// Barrier, when set, declares a continuation to run once every child in this
+	// result reaches a terminal state. It requires at least one FollowUp with Parent
+	// set — the barrier is scoped to this job's children — and is applied only on a
+	// successful finalize, alongside those children. See Barrier.
+	Barrier *Barrier
 	// CostMicros is the accumulated external-call cost for this attempt.
 	CostMicros int64
+}
+
+// Barrier declares a continuation that runs once every child of this generation
+// has reached a terminal state. A worker returns it alongside the children
+// themselves (Result.FollowUps with Parent set).
+//
+// The continuation is enqueued by whichever child finishes last, inside that
+// child's finalize transaction, and is keyed ("barrier:<parent id>") so a retried,
+// discarded, cancelled, or superseded child can never enqueue it twice. It runs
+// when the last child reaches any terminal state — succeeded, cancelled, or
+// discarded — because a partly-failed generation still needs its finalizer. The
+// continuation reads its children's recorded outputs through ChildOutputs.
+//
+// A barrier-bearing generation is bounded by DriverOpts.BarrierMaxChildren
+// (default 10,000): the barrier costs an index-only completion count per child
+// finalize, so a wider fan-out is refused with ErrBarrierTooWide, directing the
+// host to a tree of bounded generations.
+type Barrier struct {
+	// Kind is the continuation's worker kind. Required.
+	Kind string
+	// Args is the continuation's payload.
+	Args any
+	// Queue and ExecutorClass route the continuation. Empty values inherit the
+	// spawning job's.
+	Queue         string
+	ExecutorClass ExecutorClass
+	// Priority defaults to the spawning job's.
+	Priority int
 }
 
 // FollowUp describes a child job a worker requests be enqueued.
