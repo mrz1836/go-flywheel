@@ -215,6 +215,12 @@ func TestSafeJoinRejectsTraversal(t *testing.T) {
 	_, err = safeJoin(dir, "/etc/passwd")
 	assert.ErrorIs(t, err, errPathTraversal)
 
+	// A traversal that resolves to a *sibling* whose name shares destDir as a string
+	// prefix must still be rejected: the prefix check compares against destDir plus a
+	// separator precisely so filepath.Base(dir)+"-evil" cannot slip through.
+	_, err = safeJoin(dir, ".."+string(filepath.Separator)+filepath.Base(dir)+"-evil"+string(filepath.Separator)+"flywheel")
+	assert.ErrorIs(t, err, errPathTraversal)
+
 	got, err := safeJoin(dir, "flywheel")
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(dir, "flywheel"), got)
