@@ -417,3 +417,108 @@ func TestGatedRunnerReleasesPermitOnEveryFinalizePath(t *testing.T) {
 		})
 	}
 }
+
+// --- A8 (FR-08-10): the coordinator-starvation heuristic ---------------------
+
+// starvedMsg is the exact warning the starvation heuristic logs.
+const starvedMsg = "jobs: gated runner may be starved; the limiter has denied " +
+	"every claim while jobs are in flight on the same resource"
+
+// TestGatedRunnerWarnsWhenCoordinatorsStarveChildren covers both halves of the
+// coordinator rule: the misconfigured shape — work that holds every permit sharing
+// one gated runner with the work it blocks — trips the heuristic, and the
+// documented topology — that work ungated — does not, and completes.
+func TestGatedRunnerWarnsWhenCoordinatorsStarveChildren(t *testing.T) {
+	t.Parallel()
+
+	t.Run("shared gated runner trips the heuristic", func(t *testing.T) {
+		t.Parallel()
+		release := make(chan struct{})
+		var once sync.Once
+		closeRelease := func() { once.Do(func() { close(release) }) }
+		t.Cleanup(closeRelease)
+
+		// Two permits, and workers that hold theirs: they fill the ceiling and the
+		// runner is then denied every further claim while they are in flight.
+		w := &peakWorker{hold: func(context.Context, int) { <-release }}
+		reg := NewRegistry()
+		Register(reg, w)
+		rec := &captureHandler{}
+		r := newGatedRunner(t, RunnerConfig{
+			Driver: newPoolDriver(10), Registry: reg,
+			Limiter:     NewTokenBucket(TokenBucketConfig{MaxConcurrent: 2}),
+			Concurrency: 4, LimiterStarvationInterval: 30 * time.Millisecond, Logger: slog.New(rec),
+		})
+
+		stop := runInBackground(t, r)
+		require.Eventually(t, func() bool { return rec.has(starvedMsg) },
+			3*time.Second, 10*time.Millisecond, "the starvation warning fires while permits are held")
+		closeRelease() // let the blocked jobs finish so the runner can drain
+		stop()
+	})
+
+	t.Run("ungated runner completes without warning", func(t *testing.T) {
+		t.Parallel()
+		w := &peakWorker{hold: func(context.Context, int) { time.Sleep(time.Millisecond) }}
+		reg := NewRegistry()
+		Register(reg, w)
+		rec := &captureHandler{}
+		r := newGatedRunner(t, RunnerConfig{
+			Driver: newPoolDriver(10), Registry: reg, // no Limiter: work that spawns work runs ungated
+			Concurrency: 4, LimiterStarvationInterval: 30 * time.Millisecond, Logger: slog.New(rec),
+		})
+
+		stop := runInBackground(t, r)
+		require.Eventually(t, func() bool { return w.done.Load() == 10 },
+			5*time.Second, 5*time.Millisecond, "the batch completes ungated")
+		stop()
+		assert.False(t, rec.has(starvedMsg), "an ungated runner never warns about starvation")
+	})
+}
+
+// TestStarvationTrackerThresholdAndReset pins the heuristic's timing precisely
+// with an injected clock: it fires only after the denial streak outlasts the
+// threshold with work in flight, at most once per threshold, and it resets on a
+// grant or when nothing is in flight.
+func TestStarvationTrackerThresholdAndReset(t *testing.T) {
+	t.Parallel()
+	rec := &captureHandler{}
+	r := &Runner{
+		cfg:  RunnerConfig{Resource: "provider:z", LimiterStarvationInterval: 100 * time.Millisecond, Logger: slog.New(rec)},
+		pool: newPool(4),
+	}
+	setInFlight := func(n int) { r.pool.mu.Lock(); r.pool.running = n; r.pool.mu.Unlock() }
+	warnings := func() int { return len(rec.recordsFor(starvedMsg)) }
+
+	clk := newManualClock(time.Unix(1_000_000, 0))
+	ctx := models.WithClock(context.Background(), clk)
+	var s starvationTracker
+	setInFlight(2)
+
+	s.denied(ctx, r) // start the streak
+	clk.advance(50 * time.Millisecond)
+	s.denied(ctx, r)
+	assert.Zero(t, warnings(), "no warning before the threshold")
+
+	clk.advance(60 * time.Millisecond) // streak 110ms > 100ms
+	s.denied(ctx, r)
+	assert.Equal(t, 1, warnings(), "one warning once the streak outlasts the threshold")
+
+	clk.advance(10 * time.Millisecond)
+	s.denied(ctx, r)
+	assert.Equal(t, 1, warnings(), "rate-limited to one warning per threshold")
+
+	// A denial with nothing in flight is not starvation: it resets the streak.
+	setInFlight(0)
+	clk.advance(time.Second)
+	s.denied(ctx, r)
+	assert.Equal(t, 1, warnings(), "no warning when nothing is in flight")
+
+	// A grant clears the streak; the next spell re-accumulates from scratch.
+	setInFlight(2)
+	s.granted()
+	s.denied(ctx, r)
+	clk.advance(50 * time.Millisecond)
+	s.denied(ctx, r)
+	assert.Equal(t, 1, warnings(), "a fresh streak has not yet reached the threshold")
+}

@@ -37,6 +37,10 @@ const (
 	// faster than this would cost more write amplification than the lease is
 	// worth.
 	minHeartbeatInterval = time.Second
+	// defaultLimiterStarvationInterval is how long a gated runner may be fully
+	// denied while holding in-flight work on the same resource before it warns,
+	// when RunnerConfig.LimiterStarvationInterval is left zero.
+	defaultLimiterStarvationInterval = 30 * time.Second
 )
 
 // nonTerminalStates are the job states that keep RunUntilIdle polling. paused is
@@ -625,6 +629,7 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 	defer func() { _ = r.pool.waitIdle(context.WithoutCancel(ctx)) }()
 
 	var backoff pollBackoff
+	var starvation starvationTracker
 	for {
 		if err := ctx.Err(); err != nil {
 			return r.stopped(untilIdle, err)
@@ -651,8 +656,10 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 		adm := r.admit(ctx, reserved)
 		switch adm.action {
 		case admitPark:
-			// No capacity: the grant was zero. Drain any error a running job left,
-			// then wait out the limiter's own retry hint before asking again.
+			// No capacity: the grant was zero. Note the denial for the starvation
+			// heuristic, drain any error a running job left, then wait out the
+			// limiter's own retry hint before asking again.
+			starvation.denied(ctx, r)
 			if stop := r.drainDispatchErr(ctx, untilIdle); stop != nil {
 				return stop
 			}
@@ -672,6 +679,9 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			}
 			continue
 		}
+		// A claim got through (a grant, or fail-open/no-limiter): the runner is making
+		// progress, so any starvation streak is over.
+		starvation.granted()
 
 		claimed, claimErr := r.claimAndDispatch(ctx, adm.toClaim, adm.grant)
 		if stop := r.drainDispatchErr(ctx, untilIdle); stop != nil {
@@ -804,6 +814,78 @@ func (r *Runner) onPollError(
 	}
 	_ = r.sleep(loopCtx, delay)
 	return nil
+}
+
+// starvationInterval resolves the starvation-warning threshold: an explicit
+// positive value as given, a negative one as disabled, and zero as the default.
+func (r *Runner) starvationInterval() time.Duration {
+	switch {
+	case r.cfg.LimiterStarvationInterval < 0:
+		return 0
+	case r.cfg.LimiterStarvationInterval > 0:
+		return r.cfg.LimiterStarvationInterval
+	}
+	return defaultLimiterStarvationInterval
+}
+
+// starvationTracker is one dispatch loop's coordinator-deadlock heuristic. It is
+// loop-local, like pollBackoff: a field would be shared state the drain path could
+// reach into for no reason.
+//
+// It watches for the misconfiguration the resource-per-runner design otherwise
+// prevents structurally — coordinators and the children they dispatch on one gated
+// runner sharing a resource, where the coordinators fill every permit and the
+// children can never acquire one, so the queue looks busy and does no work. It is
+// a heuristic, not a proof: it fires when the limiter has denied every
+// claim for a threshold while this runner holds in-flight jobs on the same
+// resource, which is that shape's signature.
+type starvationTracker struct {
+	// firstDeniedAt is when the current unbroken run of denials began; zero when
+	// the last admission was a grant. lastWarnedAt rate-limits the warning to one
+	// per threshold across a sustained spell.
+	firstDeniedAt time.Time
+	lastWarnedAt  time.Time
+}
+
+// granted clears the denial streak: a claim got through, so the runner is making
+// progress and any prior starvation spell is over.
+func (s *starvationTracker) granted() {
+	s.firstDeniedAt = time.Time{}
+	s.lastWarnedAt = time.Time{}
+}
+
+// denied records one zero grant and warns when the streak has outlasted the
+// threshold while in-flight work holds the resource. A denial with nothing in
+// flight is not starvation — there is no coordinator holding a permit — so it
+// resets the streak rather than accumulating toward a false warning.
+func (s *starvationTracker) denied(ctx context.Context, r *Runner) {
+	threshold := r.starvationInterval()
+	if threshold <= 0 {
+		return
+	}
+	inFlight := r.pool.inFlight()
+	if inFlight <= 0 {
+		s.firstDeniedAt = time.Time{}
+		return
+	}
+	now := models.ClockFrom(ctx).Now(ctx)
+	if s.firstDeniedAt.IsZero() {
+		s.firstDeniedAt = now
+		return
+	}
+	if now.Sub(s.firstDeniedAt) <= threshold {
+		return
+	}
+	if !s.lastWarnedAt.IsZero() && now.Sub(s.lastWarnedAt) < threshold {
+		return
+	}
+	s.lastWarnedAt = now
+	r.cfg.Logger.WarnContext(ctx,
+		"jobs: gated runner may be starved; the limiter has denied every claim while jobs are in flight on the same resource",
+		slog.String("resource", r.cfg.Resource),
+		slog.Int("in_flight", inFlight),
+		slog.Duration("denied_for", now.Sub(s.firstDeniedAt)),
+	)
 }
 
 // stopped wraps the reason the loop ended, naming which entry point ended.
