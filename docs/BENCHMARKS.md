@@ -1161,3 +1161,159 @@ go test -tags=loadtest ./loadtest/...
 # The Go benchmark entry points, for benchstat comparison across a change.
 go test -tags=loadtest -run='^$' -bench='BenchmarkClaim100k|BenchmarkEnqueue100k' -benchtime=1x ./loadtest/
 ```
+
+<br/>
+
+## Latency percentiles and the histogram
+
+The runtime records claim, finalize, sweep, and worker durations as **Prometheus histograms** — bucketed,
+not summed — so `histogram_quantile` over a scrape yields p50/p99, the question a mean cannot answer. The
+default boundaries (`observers.DefaultLatencyBuckets`) span `0.0005s` to `10s`, the range a database round
+trip occupies; a host whose latencies sit elsewhere widens them with `NewMemRecorderWithConfig`. The
+series a `/metrics` scrape exposes and the question each answers are catalogued in
+[`RUNBOOK.md`](RUNBOOK.md).
+
+**The histogram is cross-checked against an independent oracle.** The `/metrics` claim histogram and the
+harness's own timing driver measure the same claims through entirely separate code, so agreement is
+evidence the buckets are right. On a 20,000-job full-index drain the harness measured a claim p99 of
+**2.42 ms**; a `histogram_quantile(0.99)` computed in Go over the scraped
+`flywheel_claim_duration_seconds_bucket` series read **3.05 ms** — a **0.63 ms** difference, inside the
+**1.5 ms** width of the bucket the value falls in. The Prometheus figure sits slightly higher because it
+includes the runner's driver-wrapper overhead and excludes the empty polls the harness times, and it is a
+`histogram_quantile` interpolation over coarser buckets than the harness's own. The check runs as a Go
+test — a self-contained Prometheus-text validator, no `promtool` required:
+
+```bash
+go test -tags=loadtest -run TestMetricsOracleClaimP99AgreesWithHarness ./loadtest/
+```
+
+Percentiles carry the harness histogram's published **±15.5 %** relative error (`MaxRelativeError` in each
+report's `histogram` object); count, min, max, and mean are exact. The Prometheus buckets are coarser
+still at the sub-millisecond end, which the oracle's one-bucket-width tolerance accounts for.
+
+<br/>
+
+## The load matrix — representative subset
+
+The full matrix is the cross product of depth × workers × mix × index condition. Published here is a
+representative subset at **100,000 jobs**, `-runners 4`, no simulated work, across two worker counts, three
+mixes, and both index conditions — one committed JSON per cell under
+[`docs/benchmarks/matrix/`](benchmarks/matrix/), produced by:
+
+```bash
+go run -tags=loadtest ./loadtest/cmd/matrix \
+  -depths 100000 -workers 8,16 -mixes enqueue,drain,steady -indexes full,correctness-only \
+  -out docs/benchmarks/matrix/
+```
+
+**Drain throughput and claim p99, jobs/s and milliseconds:**
+
+| Mix | Index | 8 workers | 16 workers |
+|---|---|---|---|
+| **drain** | full | **10,242 j/s**, claim p99 **2.42 ms** | **11,105 j/s**, claim p99 7.66 ms |
+| **drain** | correctness-only | 408 j/s, claim p99 61.3 ms | 684 j/s, claim p99 77.5 ms |
+| **steady** | full | 3,166 j/s, claim p99 3.83 ms | 1,623 j/s, claim p99 3.83 ms |
+| **steady** | correctness-only | 832 j/s, claim p99 38.7 ms | 1,210 j/s, claim p99 50.0 ms |
+| **enqueue** (single-row API) | full | 9,631 j/s | 9,677 j/s |
+| **enqueue** (single-row API) | correctness-only | 10,249 j/s | 10,250 j/s |
+
+Finalize p99 tracked claim under load: 2.42 ms (drain full w8) to 19.4 ms (drain correctness-only w16).
+Sweep p99 ran 1.2–12.5 ms on the full-index cells and reached 1.96 s on the correctness-only w16 drain,
+where the sweep contends with a claim that has no `jobs_running_leased` to probe.
+
+**Pass thresholds, as numbers with the measured value beside them:**
+
+- **Full-index drain sustains ≥ 9,000 j/s at 100k** — measured 10,242 (w8) and 11,105 (w16).
+- **Full-index claim p99 stays under 10 ms** — measured 2.42 ms (w8), 7.66 ms (w16); more workers raise
+  contention, so the p99 climbs with worker count while throughput does too.
+- **The performance indexes are worth ≈ 25× on drain throughput** — 10,242 vs 408 j/s at w8, the
+  clean reproduction of the claim-index finding: correctness-only omits `jobs_ready`, so every claim is
+  the 61 ms sequential-scan-and-sort the baseline table recorded before the index fix.
+- **The steady mix is producer-API-bound**, not worker-bound: its single-row enqueue is the ceiling, so
+  more workers do not raise throughput (w16 < w8) and only add claim contention. A deployment that needs
+  steady throughput batches its enqueues (`InsertMany`) rather than adding runners.
+
+**One finding from the matrix run itself:** at `-runners 4`, a cell above ~20 workers exceeds PostgreSQL's
+default `max_connections` — the harness needs `Runners × (Workers + 1) + overhead` connections, so
+`4 × (32 + 1) + 6 = 138 > 90` is refused before the run starts. The documented full matrix's 32- and
+64-worker cells therefore require either a raised `max_connections` or fewer runners; the subset here uses
+8 and 16 workers, which fit the default budget.
+
+### The full matrix, as documented procedure
+
+The complete 96-cell matrix — depth ∈ {100k, 500k, 1M} × workers ∈ {8, 16, 32, 64} × mix ∈ {enqueue,
+drain, steady, barrier} × index ∈ {full, correctness-only} — is shipped as a command, run against a server
+whose `max_connections` admits the high-worker cells:
+
+```bash
+go run -tags=loadtest ./loadtest/cmd/matrix \
+  -dsn "$FLYWHEEL_LOADTEST_DATABASE_URL" -full -out docs/benchmarks/matrix/
+```
+
+<br/>
+
+## The bounded 1M soak
+
+A **1,000,000-job working set**, steady mix (one job enqueued for every job retired, so the non-terminal
+population holds at a million), storage parameters tuned, retention on a 2-minute window, over a bounded
+**10m49s** wall-clock window — long enough to cross ten autovacuum cycles, which is the threshold below
+which a bloat slope means nothing.
+
+`docs/benchmarks/soak.json`, produced by:
+
+```bash
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 1000000 -mix steady \
+  -duration 8m -timeout 25m -work 2ms -retention 2m -retention-interval 30s \
+  -sample-interval 5s -storage-tuning -out docs/benchmarks/soak.json
+```
+
+| | |
+|---|---|
+| Jobs drained (DrainThroughput × Duration) | **≈ 3,215,000** |
+| Sustained drain throughput | **4,957 jobs/s** |
+| **Concurrent executions, whole run** | **0** |
+| Superseded attempts | **0** |
+| Claim p50 / p99 | 0.78 ms / **7.66 ms** |
+| Finalize p50 / p99 | 0.78 ms / **3.83 ms** |
+| Sweep p50 / p99 (643 passes) | 3.83 ms / 200 ms |
+| Autovacuum cycles on `jobs` | **10** |
+| Dead tuples, peak → final | 1,795,064 → **29,836** |
+| Dead-tuple slope, final third | **−199,222/min** |
+
+**The soak's job is to show two things, and it shows both.**
+
+- **Exactly-once holds at scale.** Across roughly 3.2 million drained jobs under continuous churn,
+  `concurrent_executions` is **0** and `superseded` is **0** — the same guarantee the chaos scenarios
+  assert on thousands of jobs, held across millions. This is the headline: a soak that drains three
+  million jobs and never runs one twice.
+- **Autovacuum keeps pace — bloat does not grow without bound.** Dead tuples on `jobs` do not climb
+  monotonically; they saw-tooth (peaking near 1.8 M mid-cycle, ending at **29,836** right after a vacuum),
+  and their slope over the final third is **negative**. Ten autovacuum cycles fired in the window, past
+  the three-cycle floor below which a slope is noise. The table size approaches its steady-state working
+  set (≈ 2 GB: a million live rows plus the two-minute terminal backlog retention has not yet pruned)
+  rather than growing without limit.
+
+Maintenance stayed bounded throughout: 643 sweep passes with a p99 of 200 ms, and the batched sweep and
+retention prune held no snapshot open — the bounded-maintenance property the 65,535-parameter rewrite
+exists to guarantee, now observed across a million-row working set for eleven minutes.
+
+Two honest bounds on this run: peak client RSS reached 1.9 GB (the harness's own buffering, not the
+server — see the RSS caveat), and the absolute table size over this bounded window is still filling toward
+its steady state; the **full-length final-third table slope** — the tuned arm *shrinking* at −4.8 MB/min
+over 33 minutes — is the separately published storage-parameter A/B above, which is the run to read for the
+asymptotic plateau.
+
+### The 24-hour soak, as documented procedure
+
+Per the scope decision for this series, the literal 24-hour run is **shipped as a command, not executed**.
+The bounded soak above shows the plateau across ten autovacuum cycles; the 24-hour version extends the
+same closed loop to establish it across a full day:
+
+```bash
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 1000000 -mix steady \
+  -duration 24h -timeout 25h -work 2ms -retention 30m -retention-interval 5m \
+  -sample-interval 30s -storage-tuning -metrics-addr :9090 -out docs/benchmarks/soak-24h.json
+```
+
+It is marked **procedure-shipped-not-executed**: the honest status, by choice, rather than a number this
+series did not measure.
