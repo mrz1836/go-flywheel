@@ -72,6 +72,28 @@ func (l *countingLimiter) grantedCount() int {
 	return l.granted
 }
 
+// manualClock is a models.Clock a test advances by hand, so a token bucket's
+// refill and RetryAfter can be asserted exactly rather than raced against the
+// wall clock.
+type manualClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newManualClock(anchor time.Time) *manualClock { return &manualClock{now: anchor} }
+
+func (c *manualClock) Now(context.Context) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *manualClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
 // grantAll grants everything asked, minting a token per grant.
 func grantAll() func(string, int) (Grant, error) {
 	return func(resource string, n int) (Grant, error) {
