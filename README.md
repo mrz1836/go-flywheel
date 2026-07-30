@@ -570,6 +570,13 @@ flywheel.RunnerConfig{
     // zero selects 30s. The delay starts at PollInterval, doubles per consecutive
     // failure with jitter, and resets on the first success.
     MaxPollBackoff: 30 * time.Second,
+
+    // Optional. Base and ceiling of the per-job retry ladder; zero selects 1s and
+    // 1m. A retry's delay starts at RetryBackoffBase, doubles per attempt with
+    // jitter, and holds flat at MaxRetryBackoff. Size the ceiling against
+    // MaxAttempts to match the retry cadence to how long the dependency stays down.
+    RetryBackoffBase: 30 * time.Second,
+    MaxRetryBackoff:  30 * time.Minute,
 }
 ```
 
@@ -583,6 +590,19 @@ a retry storm aimed at a recovering database, plus an unbounded log volume.
 blip and gives up once the ladder saturates — `⌈log₂(MaxPollBackoff / PollInterval)⌉ + 1` attempts, about
 51 seconds at the defaults. The bound is the ladder, not the context, so a caller that passes no deadline
 still gets an answer.
+
+**A per-job retry has its own ladder, and its ceiling is sized against the attempt budget.** A failed
+attempt is rescheduled after a delay that starts at `RetryBackoffBase` (default 1s), doubles per attempt
+with jitter, and holds flat at `MaxRetryBackoff` (default 1m) — separate from the poll ladder above, and
+overridable per worker via `Retryable.NextRetry`. The default ceiling suits a dependency that recovers in
+seconds: at the defaults a 25-attempt budget saturates at a minute after seven rungs and is spent in about
+nineteen minutes. It serves a multi-hour outage poorly — the job fails permanently while the dependency is
+still down, and most of those attempts ran a minute apart while it could not possibly succeed. Raise the
+pair together to stretch the same budget across the outage. With `RetryBackoffBase: 30s` and
+`MaxRetryBackoff: 30m` the ladder climbs `30s → 1m → 2m → 4m → 8m → 16m` and then holds at 30m, so
+`MaxAttempts: 8` spans about an hour and `MaxAttempts: 20` spans most of a workday (~7h). The cap only
+widens the spacing of the later rungs, never the first-attempt delay. Pick the outage length you must ride
+out, then choose the ceiling and `MaxAttempts` so their ladder covers it.
 
 **Drain is explicit.** `Stop` and `Drain` are safe before `Run`, concurrently with it, and after it
 returns:
