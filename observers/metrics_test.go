@@ -71,17 +71,24 @@ func (f *fakeRecorder) only(t *testing.T, method, name string) recordedCall {
 	return found[0]
 }
 
-func TestMetricsObserverOnClaimCountsByExecutorClass(t *testing.T) {
+func TestMetricsObserverOnClaimCountsAndTimesTheClaim(t *testing.T) {
 	t.Parallel()
 	rec := &fakeRecorder{}
 	NewMetrics(rec).OnClaim(context.Background(), flywheel.ClaimEvent{
-		ExecutorClass: "local", Queues: []string{"default"}, Claimed: 3,
+		ExecutorClass: "local", Queues: []string{"default", "high"}, Claimed: 3,
+		Duration: 4 * time.Millisecond,
 	})
 
-	require.Len(t, rec.calls, 1)
+	// A claim counts the batch and times the round trip.
+	require.Len(t, rec.calls, 2)
 	c := rec.only(t, "count", MetricJobsClaimed)
 	assert.EqualValues(t, 3, c.delta, "the batch size is the counter delta")
 	assert.Equal(t, map[string]string{TagExecutorClass: "local"}, c.tags)
+
+	h := rec.only(t, "histogram", MetricClaimDuration)
+	assert.InDelta(t, 0.004, h.value, 1e-9, "claim duration is recorded in seconds")
+	assert.Equal(t, map[string]string{TagExecutorClass: "local", TagQueue: "default,high"}, h.tags,
+		"the queue tag is the runner's whole queue set")
 }
 
 func TestMetricsObserverOnStartCountsByKindAndQueue(t *testing.T) {
@@ -97,23 +104,29 @@ func TestMetricsObserverOnStartCountsByKindAndQueue(t *testing.T) {
 	assert.Equal(t, map[string]string{TagKind: "k", TagQueue: "q"}, c.tags)
 }
 
-func TestMetricsObserverOnFinishSuccessCountsAndObservesNoError(t *testing.T) {
+func TestMetricsObserverOnFinishSuccessCountsAndTimesNoError(t *testing.T) {
 	t.Parallel()
 	rec := &fakeRecorder{}
 	NewMetrics(rec).OnFinish(context.Background(), flywheel.FinishEvent{
-		JobEvent: flywheel.JobEvent{Kind: "k", Queue: "q"},
-		Outcome:  flywheel.OutcomeSuccess,
-		Duration: 1500 * time.Millisecond,
+		JobEvent:         flywheel.JobEvent{Kind: "k", Queue: "q"},
+		Outcome:          flywheel.OutcomeSuccess,
+		Duration:         1500 * time.Millisecond,
+		FinalizeDuration: 20 * time.Millisecond,
 	})
 
-	// Success: a finished count and a duration observation, and no error count.
-	require.Len(t, rec.calls, 2)
+	// Success: a finished count, a worker-body histogram, a finalize histogram,
+	// and no error count.
+	require.Len(t, rec.calls, 3)
 	finished := rec.only(t, "count", MetricJobsFinished)
 	assert.Equal(t, map[string]string{TagKind: "k", TagQueue: "q", TagOutcome: "success"}, finished.tags)
 
-	dur := rec.only(t, "observe", MetricJobDuration)
-	assert.InDelta(t, 1.5, dur.value, 1e-9, "duration is observed in seconds")
+	dur := rec.only(t, "histogram", MetricJobDuration)
+	assert.InDelta(t, 1.5, dur.value, 1e-9, "worker duration is a histogram in seconds")
 	assert.Equal(t, map[string]string{TagKind: "k", TagOutcome: "success"}, dur.tags)
+
+	fin := rec.only(t, "histogram", MetricFinalizeDuration)
+	assert.InDelta(t, 0.02, fin.value, 1e-9, "finalize duration is a separate histogram")
+	assert.Equal(t, map[string]string{TagKind: "k", TagOutcome: "success"}, fin.tags)
 
 	for _, c := range rec.calls {
 		assert.NotEqual(t, MetricJobsErrored, c.name, "a success records no error counter")
@@ -131,8 +144,8 @@ func TestMetricsObserverOnFinishErrorAlsoCountsErrored(t *testing.T) {
 		Duration:   2 * time.Second,
 	})
 
-	// Error: finished count, duration observation, and an errored count by class.
-	require.Len(t, rec.calls, 3)
+	// Error: finished count, worker+finalize histograms, and an errored count by class.
+	require.Len(t, rec.calls, 4)
 	finished := rec.only(t, "count", MetricJobsFinished)
 	assert.Equal(t, "error", finished.tags[TagOutcome])
 
@@ -140,7 +153,7 @@ func TestMetricsObserverOnFinishErrorAlsoCountsErrored(t *testing.T) {
 	assert.EqualValues(t, 1, errored.delta)
 	assert.Equal(t, map[string]string{TagKind: "k", TagErrorClass: "transient"}, errored.tags)
 
-	dur := rec.only(t, "observe", MetricJobDuration)
+	dur := rec.only(t, "histogram", MetricJobDuration)
 	assert.InDelta(t, 2.0, dur.value, 1e-9)
 	assert.Equal(t, "error", dur.tags[TagOutcome])
 }
@@ -206,6 +219,19 @@ func TestMetricsObserverSupersedeIsNotCountedAsFinished(t *testing.T) {
 	assert.Equal(t, 1, finished,
 		"only the state-advancing finalization counts as finished; the discarded one has its own series")
 	assert.EqualValues(t, 1, rec.only(t, "count", MetricJobsSuperseded).delta)
+}
+
+func TestMetricsObserverOnSweepTimesTheSweep(t *testing.T) {
+	t.Parallel()
+	rec := &fakeRecorder{}
+	NewMetrics(rec).OnSweep(context.Background(), flywheel.SweepEvent{
+		Duration: 12 * time.Millisecond, Reclaimed: 4,
+	})
+
+	require.Len(t, rec.calls, 1, "a sweep records one untagged duration histogram")
+	h := rec.only(t, "histogram", MetricSweepDuration)
+	assert.InDelta(t, 0.012, h.value, 1e-9)
+	assert.Nil(t, h.tags, "the sweep is a single series with no tags")
 }
 
 func TestMetricsObserverImplementsObserver(t *testing.T) {

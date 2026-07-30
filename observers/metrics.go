@@ -113,13 +113,20 @@ type HistogramConfig struct {
 // event into MetricsRecorder calls, per this taxonomy:
 //
 //	OnClaim  -> Count(flywheel_jobs_claimed_total, batch, {executor_class})
+//	            Histogram(flywheel_claim_duration_seconds, secs, {executor_class, queue})
 //	OnStart  -> Count(flywheel_jobs_started_total, 1, {kind, queue})
 //	OnFinish -> Count(flywheel_jobs_finished_total, 1, {kind, queue, outcome})
-//	            Observe(flywheel_job_duration_seconds, secs, {kind, outcome})
+//	            Histogram(flywheel_job_duration_seconds, secs, {kind, outcome})
+//	            Histogram(flywheel_finalize_duration_seconds, secs, {kind, outcome})
 //	            and, when the attempt carried a classified error,
 //	            Count(flywheel_jobs_errored_total, 1, {kind, error_class})
 //	OnRetry  -> Count(flywheel_jobs_retried_total, 1, {kind, error_class})
 //	OnSupersede -> Count(flywheel_jobs_superseded_total, 1, {kind, queue})
+//	OnSweep  -> Histogram(flywheel_sweep_duration_seconds, secs, {})
+//
+// The duration series are histograms, not summaries, so p50/p99 are derivable:
+// flywheel_job_duration_seconds was upgraded from the summary Observe form. A
+// host that still records via Observe keeps a summary — the two coexist.
 //
 // Note what OnSupersede does *not* do: it does not count into
 // flywheel_jobs_finished_total. A superseded attempt advanced nothing, so
@@ -141,10 +148,17 @@ func NewMetrics(rec MetricsRecorder) *MetricsObserver {
 // Compile-time proof MetricsObserver satisfies the flywheel.Observer contract.
 var _ flywheel.Observer = (*MetricsObserver)(nil)
 
-// OnClaim counts the jobs claimed in a batch, sliced by executor class.
+// OnClaim counts the jobs claimed in a batch, sliced by executor class, and
+// records the claim round-trip duration sliced by class and queue set. The queue
+// tag is the runner's whole queue set joined, so a single-queue runner tags its
+// own name and a multi-queue runner keeps one bounded series per configuration.
 func (m *MetricsObserver) OnClaim(_ context.Context, ev flywheel.ClaimEvent) {
 	m.rec.Count(MetricJobsClaimed, int64(ev.Claimed), map[string]string{
 		TagExecutorClass: string(ev.ExecutorClass),
+	})
+	m.rec.Histogram(MetricClaimDuration, ev.Duration.Seconds(), map[string]string{
+		TagExecutorClass: string(ev.ExecutorClass),
+		TagQueue:         strings.Join(ev.Queues, ","),
 	})
 }
 
@@ -164,7 +178,11 @@ func (m *MetricsObserver) OnFinish(_ context.Context, ev flywheel.FinishEvent) {
 		TagQueue:   ev.Queue,
 		TagOutcome: string(ev.Outcome),
 	})
-	m.rec.Observe(MetricJobDuration, ev.Duration.Seconds(), map[string]string{
+	m.rec.Histogram(MetricJobDuration, ev.Duration.Seconds(), map[string]string{
+		TagKind:    ev.Kind,
+		TagOutcome: string(ev.Outcome),
+	})
+	m.rec.Histogram(MetricFinalizeDuration, ev.FinalizeDuration.Seconds(), map[string]string{
 		TagKind:    ev.Kind,
 		TagOutcome: string(ev.Outcome),
 	})
@@ -195,6 +213,13 @@ func (m *MetricsObserver) OnSupersede(_ context.Context, ev flywheel.SupersedeEv
 		TagKind:  ev.Kind,
 		TagQueue: ev.Queue,
 	})
+}
+
+// OnSweep records the stuck-lease reclaim pass duration. It carries no tags: a
+// deployment runs one scheduler, so the sweep is a single series whose slow tail
+// is the database-load signal to watch.
+func (m *MetricsObserver) OnSweep(_ context.Context, ev flywheel.SweepEvent) {
+	m.rec.Histogram(MetricSweepDuration, ev.Duration.Seconds(), nil)
 }
 
 // MemRecorder is a concurrent-safe, in-memory MetricsRecorder. It is three things

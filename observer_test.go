@@ -19,6 +19,7 @@ type recordingObserver struct {
 	finishes   []FinishEvent
 	retries    []RetryEvent
 	supersedes []SupersedeEvent
+	sweeps     []SweepEvent
 }
 
 func (o *recordingObserver) OnClaim(_ context.Context, ev ClaimEvent) {
@@ -49,6 +50,19 @@ func (o *recordingObserver) OnSupersede(_ context.Context, ev SupersedeEvent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.supersedes = append(o.supersedes, ev)
+}
+
+func (o *recordingObserver) OnSweep(_ context.Context, ev SweepEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.sweeps = append(o.sweeps, ev)
+}
+
+// snapshotSweeps returns the sweep events recorded so far.
+func (o *recordingObserver) snapshotSweeps() []SweepEvent {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]SweepEvent(nil), o.sweeps...)
 }
 
 // snapshotSupersedes returns the supersede events recorded so far. It is

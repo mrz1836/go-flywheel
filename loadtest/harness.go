@@ -212,6 +212,11 @@ func (o harnessObserver) OnSupersede(_ context.Context, ev flywheel.SupersedeEve
 	o.prog.busyNanos.Add(ev.Duration.Nanoseconds())
 }
 
+// OnSweep is not counted: a reclaim is the scheduler's maintenance, not progress
+// toward drain. The harness measures the sweep's effect through the jobs that
+// re-run after it, not through the pass itself.
+func (harnessObserver) OnSweep(context.Context, flywheel.SweepEvent) {}
+
 // noteset collects measurement caveats. It is a type rather than a slice because
 // notes are appended from the sampler goroutine as well as the run goroutine —
 // whether pgstattuple was available is not known until the first sample.

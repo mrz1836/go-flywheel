@@ -169,3 +169,34 @@ func TestSchedulerSweepReclaimsExpiredLeases(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, reclaimed)
 }
+
+// TestSchedulerSweepFiresOnSweep proves the scheduler reports each sweep pass
+// through the configured Observer, carrying the reclaimed count so sweep timing
+// joins the same telemetry stream as claims and finalizes.
+func TestSchedulerSweepFiresOnSweep(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	obs := &recordingObserver{}
+	sched := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db), Observer: obs})
+
+	now := time.Now().UTC()
+	jobID := models.NewID()
+	require.NoError(t, db.Exec(
+		`INSERT INTO jobs(id, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, executor_class, leased_until, tags, created_at, updated_at, metadata)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		jobID, "test.k", "default", "{}", 100, string(StateRunning), 1, 25, now, string(AnyClass), now.Add(-time.Minute), "[]", now, now, "{}",
+	).Error)
+	require.NoError(t, db.Exec(
+		`INSERT INTO job_runs(id, job_id, attempt, executor_class, executor_id, started_at, outcome, created_at)
+		 VALUES (?,?,?,?,?,?,?,?)`,
+		models.NewID(), jobID, 1, "local", "h1", now.Add(-time.Hour), string(OutcomeStarted), now.Add(-time.Hour),
+	).Error)
+
+	reclaimed, err := sched.Sweep(clockCtx(context.Background(), models.NewFixedClock(now)))
+	require.NoError(t, err)
+	require.Equal(t, 1, reclaimed)
+
+	sweeps := obs.snapshotSweeps()
+	require.Len(t, sweeps, 1, "one pass fires exactly one OnSweep")
+	assert.Equal(t, 1, sweeps[0].Reclaimed, "the event carries the reclaimed count")
+}
