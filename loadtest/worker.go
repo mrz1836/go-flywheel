@@ -5,6 +5,7 @@ package loadtest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,11 @@ import (
 
 	flywheel "github.com/mrz1836/go-flywheel"
 )
+
+// errTransientLoad is the error a fail-marked job returns. Left unclassified, the
+// runtime treats it as transient — retried until the budget is exhausted, then
+// discarded — which is the failure a replay run recovers.
+var errTransientLoad = errors.New("loadtest: simulated transient failure")
 
 // loadKind is the job kind every seeded job carries. One kind is enough: the
 // harness measures the runtime's paths, and a second kind would only exercise
@@ -46,6 +52,10 @@ type loadArgs struct {
 	// set only on the barrier mix's parents; the children and the continuation carry
 	// it false.
 	Barrier bool `json:"barrier,omitempty"`
+	// Fail, when true, makes the worker return a transient error every attempt, so
+	// the job exhausts its budget to discarded. It is how a replay run manufactures
+	// the failures it then recovers.
+	Fail bool `json:"fail,omitempty"`
 }
 
 // Kind names the job kind.
@@ -97,10 +107,26 @@ func (e *execTracker) count() int64 { return e.violations.Load() }
 // loadWorker is the harness's only worker.
 type loadWorker struct {
 	track *execTracker
+	// seed and failFraction decide which runtime-fanned children fail, matching the
+	// generator's shouldFail so a child's outcome is a property of the workload
+	// rather than of which worker claimed it.
+	seed         int64
+	failFraction float64
+	// retryBackoff overrides the runner's retry delay for this worker's transient
+	// failures. Zero defers to the runner's own exponential backoff; a replay run
+	// sets it small so a fail cohort exhausts in bounded wall time rather than
+	// climbing the default ladder to its one-minute cap.
+	retryBackoff time.Duration
 }
 
 // Kind names the job kind this worker serves.
 func (loadWorker) Kind() string { return loadKind }
+
+// NextRetry overrides the runner's retry backoff with a fixed delay when the run
+// configured one. Returning zero defers to the runner's own exponential backoff,
+// which is what every non-replay run gets — those runs never fail a job, so this is
+// never called for them.
+func (w loadWorker) NextRetry(error, int) time.Duration { return w.retryBackoff }
 
 // Work simulates the job's cost and returns.
 //
@@ -128,6 +154,9 @@ func (w loadWorker) Work(ctx context.Context, job *flywheel.Job[loadArgs]) (flyw
 	}
 
 	if job.Args.Children <= 0 {
+		if job.Args.Fail {
+			return flywheel.Result{}, errTransientLoad
+		}
 		return flywheel.Result{}, nil
 	}
 
@@ -143,9 +172,10 @@ func (w loadWorker) Work(ctx context.Context, job *flywheel.Job[loadArgs]) (flyw
 	// args, which is a heavier promise than this shape needs.
 	followUps := make([]flywheel.FollowUp, job.Args.Children)
 	for i := range followUps {
+		childN := job.Args.N*job.Args.Children + i
 		followUps[i] = flywheel.FollowUp{
 			Kind:   loadKind,
-			Args:   loadArgs{N: job.Args.N*job.Args.Children + i, WorkNanos: job.Args.WorkNanos},
+			Args:   loadArgs{N: childN, WorkNanos: job.Args.WorkNanos, Fail: shouldFail(w.seed, childN, w.failFraction)},
 			Queue:  job.Queue,
 			Parent: true,
 		}

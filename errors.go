@@ -203,13 +203,13 @@ var ErrPeriodicNotFound = errors.New("flywheel: periodic not found")
 // ErrJobTerminal is returned when an operator action targets a job that has
 // already reached a terminal state (succeeded, cancelled, discarded). The
 // runtime refuses the write rather than overwriting a recorded outcome and its
-// finalized_at stamp.
+// finalized_at stamp. A bulk Replay whose States name StateSucceeded without
+// Force is refused with it too: re-running succeeded work must be deliberate.
 var ErrJobTerminal = errors.New("flywheel: job has already reached a terminal state")
 
-// ErrResetAttemptsUnsupported is returned by RetryJobWithOptions when a caller
-// sets RetryOpts.ResetAttempts. The field is declared today so the options type
-// is not broken a second time when the replay work lands, but restoring a job's
-// retry budget is not yet implemented — so setting it is refused loudly rather
-// than silently ignored, which is exactly the do-nothing footgun the runtime
-// fails loudly to prevent (compare ErrFollowUpLimit).
-var ErrResetAttemptsUnsupported = errors.New("flywheel: RetryOpts.ResetAttempts is reserved and not yet implemented")
+// ErrReplayUnbounded is returned by Replay when neither Kinds nor FailedSince is
+// set. An unscoped replay of every discarded job in the database is almost never
+// the intent, so the runtime refuses it rather than doing something enormous by
+// accident. Bound it by kind or a failure window, or use ReplayByParent to bound
+// it by lineage.
+var ErrReplayUnbounded = errors.New("flywheel: replay must be bounded by kind, lineage, or a failure window")

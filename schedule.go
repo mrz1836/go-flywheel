@@ -263,12 +263,23 @@ type RetryOpts struct {
 	// operator "retry now" can never silently re-run finished work. Re-running a
 	// completed job is a legitimate action; it just has to be deliberate.
 	Force bool
-	// ResetAttempts would restore the job's retry budget. It is reserved for the
-	// replay work and not yet implemented: setting it today is rejected with
-	// ErrResetAttemptsUnsupported rather than silently ignored, so the field cannot
-	// become a knob that does nothing. It is declared now so the options type is not
-	// broken a second time when the replay work lands.
+	// ResetAttempts restores the job's retry budget by raising max_attempts so the
+	// job has Budget attempts remaining. It never lowers attempt: the attempt counter
+	// is the audit key for job_runs and stays strictly monotonic, so the budget is
+	// expressed as headroom rather than as a rewind — the same mechanism a snooze uses
+	// to stay free. Without it a retry grants no new headroom, so a job discarded at
+	// attempt == max_attempts is re-claimed exactly once and discarded again on that
+	// attempt, which is rarely what "replay the failures" intends.
 	ResetAttempts bool
+	// Budget is the number of attempts to grant when ResetAttempts is set. Zero (or
+	// negative) restores the job's original max_attempts as headroom — max_attempts
+	// becomes attempt + max_attempts — while a positive value sets max_attempts to
+	// attempt + Budget. It is ignored when ResetAttempts is false.
+	Budget int
+	// Delay, when > 0, schedules the job that far in the future instead of making it
+	// immediately available. The claim gates on scheduled_at <= now in both drivers,
+	// so a future scheduled_at defers the re-run without any state change.
+	Delay time.Duration
 }
 
 // RetryJob forces a job back to available so a runner re-claims it on the next
@@ -290,13 +301,13 @@ func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
 
 // RetryJobWithOptions is RetryJob with explicit options. Force retries a job that
 // has already reached a terminal state; without it a terminal job returns
-// ErrJobTerminal. ResetAttempts is reserved and, if set, returns
-// ErrResetAttemptsUnsupported. It returns ErrJobNotFound when no live job has the
-// id. See RetryOpts.
+// ErrJobTerminal. ResetAttempts restores the job's retry budget by raising
+// max_attempts (see RetryOpts.Budget) rather than rewinding attempt, so a job
+// discarded at attempt == max_attempts gets real headroom and the job_runs audit
+// sequence stays continuous. Delay schedules the re-run into the future instead of
+// making the job immediately available. It returns ErrJobNotFound when no live job
+// has the id. See RetryOpts.
 func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts RetryOpts) error {
-	if opts.ResetAttempts {
-		return ErrResetAttemptsUnsupported
-	}
 	now := models.ClockFrom(ctx).Now(ctx)
 	q := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id)
 	if !opts.Force {
@@ -307,7 +318,7 @@ func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts Retry
 		// defeated by a state added to the vocabulary but missed here.
 		q = q.Where("state IN ?", nonTerminalStateStrings())
 	}
-	res := q.Updates(map[string]any{
+	upd := map[string]any{
 		"state":        string(StateAvailable),
 		"leased_until": nil,
 		// An attempt may still be running against this job. Clearing its token is
@@ -315,9 +326,13 @@ func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts Retry
 		// asked for.
 		"lease_token":  nil,
 		"finalized_at": nil,
-		"scheduled_at": now,
+		// Delay 0 makes the job immediately claimable (scheduled_at == now); a
+		// positive Delay defers the re-run, gated by the claim's scheduled_at <= now.
+		"scheduled_at": now.Add(opts.Delay),
 		"updated_at":   now,
-	})
+	}
+	applyRetryBudget(upd, opts)
+	res := q.Updates(upd)
 	if res.Error != nil {
 		return fmt.Errorf("flywheel: retry job %q: %w", id, res.Error)
 	}
@@ -325,6 +340,26 @@ func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts Retry
 		return classifyRetryMiss(ctx, db, id)
 	}
 	return nil
+}
+
+// applyRetryBudget adds the max_attempts reset to a retry's column map when
+// opts.ResetAttempts is set. The budget is restored as headroom above the current
+// attempt — max_attempts = attempt + Budget, or attempt + max_attempts (the
+// original budget) when Budget is non-positive — applied in-SQL per row, mirroring
+// the free-snooze path's gorm.Expr in jobFinalizeUpdate. attempt itself is never
+// written, so it stays strictly monotonic as the job_runs(job_id, attempt) audit
+// key and a replayed job's next run continues the sequence rather than colliding
+// with it. It is shared by RetryJobWithOptions and the bulk replay engine, so the
+// two cannot drift on the arithmetic that makes a replay obviously correct.
+func applyRetryBudget(upd map[string]any, opts RetryOpts) {
+	if !opts.ResetAttempts {
+		return
+	}
+	if opts.Budget <= 0 {
+		upd["max_attempts"] = gorm.Expr("attempt + max_attempts")
+	} else {
+		upd["max_attempts"] = gorm.Expr("attempt + ?", opts.Budget)
+	}
 }
 
 // classifyRetryMiss explains why RetryJobWithOptions's UPDATE matched no row,

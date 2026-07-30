@@ -21,7 +21,20 @@ const (
 	streamPayload  uint64 = 2
 	streamPriority uint64 = 3
 	streamID       uint64 = 4
+	// streamFail domain-separates the per-job fail decision. It is applied as a
+	// hash of the job ordinal rather than a sequential draw, because a fail-fanout
+	// cohort's children are decided by ordinal — the seed path and any runtime path
+	// must agree on a given child without depending on draw order. Keeping it a
+	// distinct stream means adding the fail dimension does not shift the values the
+	// other quantities draw.
+	streamFail uint64 = 5
 )
+
+// replayParentID is the synthetic parent the fail-fanout cohort's children are
+// seeded under, so ReplayByParent has a lineage to scope to. No parent row is
+// written for it: parent_job_id carries no foreign key, and the replay reasons
+// about the children that reference it.
+const replayParentID = "lt-replay-parent"
 
 // Workload shape constants.
 const (
@@ -71,6 +84,10 @@ type jobSpec struct {
 	Children int
 	// Payload is deterministic filler that gives the row a realistic width.
 	Payload string
+	// Fail marks a job whose worker returns a transient error every attempt, so it
+	// exhausts its budget to discarded. It is how a replay run manufactures the
+	// failures it then recovers.
+	Fail bool
 }
 
 // mixPlan is the shape decision for one run: how many rows to generate, and the
@@ -91,6 +108,10 @@ type mixPlan struct {
 	// Barrier reports whether each parent declares a fan-in barrier over its
 	// children, which the runtime completes with one continuation per parent.
 	Barrier bool
+	// ParentID, when non-empty, seeds the rows directly as leaf children of that
+	// parent rather than fanning them out at runtime. It is how a replay cohort gets
+	// a lineage to scope ReplayByParent to and a controllable per-child budget.
+	ParentID string
 }
 
 // TotalJobs reports how many jobs the run will process, parents plus children,
@@ -152,10 +173,18 @@ func plan(cfg Config) mixPlan {
 	case WorkloadEnqueueOnly, WorkloadSteady:
 		p.Bulk = false
 	case WorkloadFanOut:
-		// One parent per (1 + children) jobs, so the run's total job count is
-		// still Config.Jobs and a fan-out report is comparable with a drain one.
-		p.Children = childCount(cfg)
-		p.Rows = max(1, cfg.Jobs/(1+p.Children))
+		if cfg.FailFraction > 0 {
+			// Replay shape: seed the children directly under one parent, as leaves
+			// (no runtime fan-out), so each carries a small MaxAttempts and a lineage
+			// for ReplayByParent. -children is the cohort size here.
+			p.Rows = childCount(cfg)
+			p.ParentID = replayParentID
+		} else {
+			// One parent per (1 + children) jobs, so the run's total job count is
+			// still Config.Jobs and a fan-out report is comparable with a drain one.
+			p.Children = childCount(cfg)
+			p.Rows = max(1, cfg.Jobs/(1+p.Children))
+		}
 	case WorkloadBarrier:
 		// The same fan-out shape, plus a barrier: each parent declares a
 		// continuation over its children. The continuation is one extra job per
@@ -203,9 +232,30 @@ func generate(cfg Config) []jobSpec {
 			Priority:  100 + priority.IntN(priorityBands),
 			Children:  p.Children,
 			Payload:   drawPayload(payload),
+			Fail:      shouldFail(cfg.Seed, i, cfg.FailFraction),
 		}
 	}
 	return specs
+}
+
+// shouldFail decides whether job ordinal n fails, deterministically and
+// independently of draw order — so the seed path and a runtime fan-out agree on a
+// given child by ordinal alone. It mixes the run seed, the fail stream, and the
+// ordinal into a uniform value in [0,1) with a splitmix64 finalizer and compares it
+// to the fraction. A fraction of zero never fails; a fraction at or above one is
+// caught by Config.validate.
+func shouldFail(seed int64, n int, fraction float64) bool {
+	if fraction <= 0 {
+		return false
+	}
+	//nolint:gosec // reproducible hashing, not security; wraparound is intended
+	x := uint64(seed)*0x9E3779B97F4A7C15 + uint64(n)*0xD6E8FEB86659FD93 + streamFail
+	x ^= x >> 30
+	x *= 0xBF58476D1CE4E5B9
+	x ^= x >> 27
+	x *= 0x94D049BB133111EB
+	x ^= x >> 31
+	return float64(x>>11)/float64(uint64(1)<<53) < fraction
 }
 
 // drawWork picks one job's simulated work duration: the slow mode with
@@ -266,6 +316,11 @@ func workloadDigest(specs []jobSpec) string {
 		binary.BigEndian.PutUint64(scratch[:], uint64(len(s.Payload)))
 		_, _ = h.Write(scratch[:])
 		_, _ = h.Write([]byte(s.Payload))
+		var fail byte
+		if s.Fail {
+			fail = 1
+		}
+		_, _ = h.Write([]byte{fail})
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
