@@ -125,6 +125,7 @@ The runtime is built from focused, composable pieces:
 - **One-call lifecycle** — `Node` runs N runners + the scheduler + an optional health/metrics server and drains cleanly on shutdown ([node.go](node.go))
 - **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `UpsertPeriodic` ([scheduler.go](scheduler.go), [schedule.go](schedule.go))
 - **Bounded worker pool** — `Concurrency` slots that refill independently, so one slow job never idles the rest; explicit `Stop`/`Drain` with an in-flight count ([runner.go](runner.go))
+- **Pre-claim admission** — an optional `Limiter` gates a runner before it claims, keyed on an arbitrary downstream resource; a job that cannot run yet is never claimed, leased, or audited. Ships an in-process token bucket and a shared database-backed limiter ([limiter.go](limiter.go), [limiter_db.go](limiter_db.go))
 - **Retries with backoff** — exponential backoff with jitter, overridable per worker; consecutive poll failures climb their own ladder so a failing database is not hammered ([runner.go](runner.go))
 - **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](runner.go))
 - **Lease-based recovery** — orphaned, crashed jobs reclaimed via `leased_until` sweeps ([scheduler.go](scheduler.go))
@@ -620,6 +621,74 @@ names how many jobs were still in flight, and only then is the scheduler and hea
 A zero `DrainTimeout` waits for in-flight work however long it takes — genuinely unbounded, since the
 heartbeat renews a running job's lease indefinitely. Size it to the longest drain your deployment will
 tolerate.
+
+</details>
+
+<details>
+<summary><strong><code>Admission control — gating a runner before it claims</code></strong></summary>
+<br>
+
+**A `Limiter` is consulted before every claim, so work that cannot run yet is never claimed.** Without
+one, the only backpressure is *claim-then-snooze*: a worker is dispatched, discovers the downstream is
+at budget, and returns `Result{Snooze}`. A snooze spends no retry attempt, but it does spend a poll, a
+claim, a `job_runs` audit row, and a finalize — so under sustained backpressure the queue's dominant
+work becomes jobs re-scheduling themselves and `job_runs` grows at the snooze rate. A pre-claim gate
+removes all of that: at a 50/s budget it claims 50 jobs a second and writes 50 audit rows a second,
+where the same workload under claim-then-snooze wrote 221× the rows (see [BENCHMARKS](docs/BENCHMARKS.md)).
+
+**The gate is keyed on an arbitrary resource string, not on the queue or executor class.** The thing
+that needs protecting is a *downstream dependency* — a provider, an API tenant, an external account —
+and its budget has nothing to do with which pool runs the job. `Resource` names it:
+
+```go
+limiter := flywheel.NewTokenBucket(flywheel.TokenBucketConfig{
+    Rate: 50, Interval: time.Second, // 50 operations/second to this downstream
+    Burst:         50,               // bucket capacity; defaults to Rate
+    MaxConcurrent: 5,                // optional: at most 5 in flight at once
+})
+
+flywheel.RunnerConfig{
+    Queues:   []string{"provider-x"},
+    Limiter:  limiter,
+    Resource: "provider:x", // required when Limiter is set
+}
+```
+
+**A `Runner` is the unit of resource scoping.** The gate runs *before* the claim, so the resource must
+be knowable without inspecting a job — which makes it a property of the runner, not the work. A host
+protecting several downstreams runs one runner per downstream, each over its own queue, rather than one
+runner sorting jobs by destination after claiming them (`NodeConfig.Runners` is a slice, so N gated
+runners live in one process). This is the concrete answer to **queue-per-destination**: per-destination
+limiting requires per-destination queues, the same conclusion the claim path reaches from the other
+direction — a multi-queue claim cannot be indexed, so a queue is best served by its own runner (see
+[BENCHMARKS](docs/BENCHMARKS.md)).
+
+**Work that spawns work runs ungated, or on a distinct resource.** A coordinator whose only job is to
+dispatch children must not consume the capacity those children need: put it on an ungated runner, or
+one whose resource differs from the resource its children consume. Because resource is a runner
+property, a coordinator on its own runner already has a different resource by construction — the
+deadlock is only reachable by placing coordinators and their children on one gated runner sharing a
+resource, and a runner in that shape logs a starvation warning (`LimiterStarvationInterval`).
+
+**Pick the limiter by process count.** `NewTokenBucket` is in-process and correct for one process — a
+deployment running N processes against one downstream gets N times the budget. `NewDBLimiter` shares
+one budget across every process on the database; it is a round trip per claim, so it suits budgets in
+the tens-to-hundreds per second. Its concurrency reservations carry a `HoldTTL` so a crashed holder's
+capacity self-heals — set it **above the longest expected job**, since a TTL shorter than the work
+reclaims capacity from a healthy holder and over-admits.
+
+```go
+limiter, err := flywheel.NewDBLimiter(db, flywheel.DBLimiterConfig{
+    MaxConcurrent: 10,
+    HoldTTL:       5 * time.Minute, // longer than any job this resource runs
+})
+// Optional: reclaim expired holds proactively. Acquire also reclaims inline, so
+// correctness never depends on the sweeper running.
+go limiter.RunSweeper(ctx)
+```
+
+**A limiter outage is not a work outage.** When the limiter returns an error the runner claims anyway
+and logs, by default. A host guarding a hard external quota sets `LimiterFailClosed` to defer instead.
 
 </details>
 
