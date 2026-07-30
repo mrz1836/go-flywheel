@@ -880,8 +880,6 @@ for an at-a-glance report of queue health, schedules, and recent failures.
 
 </details>
 
-<br/>
-
 <details>
 <summary><strong><code>Retention and scheduler maintenance</code></strong></summary>
 <br/>
