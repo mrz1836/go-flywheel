@@ -121,20 +121,123 @@ func TestUpsertPeriodicThenSchedulerFiresWhenDue(t *testing.T) {
 	assert.Positive(t, jobCount(t, db, "test.success"))
 }
 
-func TestRetryJobReturnsTerminalJobToAvailable(t *testing.T) {
+func TestRetryJobActiveJobReturnsToAvailable(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]JobState{
+		"available": StateAvailable,
+		"running":   StateRunning,
+		"retryable": StateRetryable,
+		"scheduled": StateScheduled,
+		"paused":    StatePaused,
+	}
+
+	for name, state := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
+			base := time.Now().UTC().Truncate(time.Second)
+			leased := base.Add(time.Minute)
+			finalized := base.Add(-time.Hour)
+			token := "tok"
+			ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
+
+			seedJob(t, db, jobRow{
+				ID: "j", Kind: "k", State: string(state),
+				LeasedUntil: &leased, LeaseToken: &token, FinalizedAt: &finalized,
+			})
+
+			require.NoError(t, RetryJob(ctx, db, "j"))
+
+			row := jobRowByID(t, db, "j")
+			assert.Equal(t, string(StateAvailable), row.State)
+			assert.Nil(t, row.LeasedUntil, "retry releases the lease")
+			assert.Nil(t, row.LeaseToken, "retry clears the fence so a running attempt cannot finalize over the re-run")
+			assert.Nil(t, row.FinalizedAt, "retry clears the finalization stamp")
+			assert.True(t, row.ScheduledAt.Equal(base), "the job is scheduled for now so it is re-claimed at once")
+		})
+	}
+}
+
+// TestRetryJobTerminalJobIsRefused is A4: a terminal job — a succeeded one above
+// all — is left exactly as it is and ErrJobTerminal is returned, so a "retry now"
+// can never silently re-run finished work. It fails against the earlier unguarded
+// RetryJob, which returned any job to available.
+func TestRetryJobTerminalJobIsRefused(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]JobState{
+		"succeeded": StateSucceeded,
+		"cancelled": StateCancelled,
+		"discarded": StateDiscarded,
+	}
+
+	for name, state := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
+			base := time.Now().UTC().Truncate(time.Second)
+			finalized := base.Add(-time.Hour)
+			ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
+
+			seedJob(t, db, jobRow{
+				ID: "j-terminal", Kind: "k", State: string(state), FinalizedAt: &finalized,
+			})
+
+			require.ErrorIs(t, RetryJob(ctx, db, "j-terminal"), ErrJobTerminal)
+
+			row := jobRowByID(t, db, "j-terminal")
+			assert.Equal(t, string(state), row.State, "a terminal job keeps its recorded outcome")
+			require.NotNil(t, row.FinalizedAt)
+			assert.True(t, row.FinalizedAt.Equal(finalized), "finalized_at is not cleared")
+		})
+	}
+}
+
+// TestRetryJobForceRerunsTerminalJob proves the escape hatch: Force retries a
+// terminal job deliberately, returning even a succeeded one to available.
+func TestRetryJobForceRerunsTerminalJob(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	ctx := context.Background()
 
-	seedJob(t, db, jobRow{ID: "j-discarded", Kind: "k", State: string(StateDiscarded)})
-	require.NoError(t, RetryJob(ctx, db, "j-discarded"))
-	assert.Equal(t, string(StateAvailable), jobState(t, db, "j-discarded"))
+	seedJob(t, db, jobRow{ID: "j-done", Kind: "k", State: string(StateSucceeded)})
+	require.NoError(t, RetryJobWithOptions(ctx, db, "j-done", RetryOpts{Force: true}))
+	assert.Equal(t, string(StateAvailable), jobState(t, db, "j-done"),
+		"Force re-runs a succeeded job")
+}
+
+func TestRetryJobRejectsResetAttempts(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	seedJob(t, db, jobRow{ID: "j", Kind: "k", State: string(StateAvailable)})
+
+	err := RetryJobWithOptions(context.Background(), db, "j", RetryOpts{ResetAttempts: true})
+	require.ErrorIs(t, err, ErrResetAttemptsUnsupported,
+		"a reserved field that does nothing is refused loudly, not silently ignored")
+	assert.Equal(t, string(StateAvailable), jobState(t, db, "j"), "the rejected call changed nothing")
 }
 
 func TestRetryJobMissingReturnsErrJobNotFound(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	require.ErrorIs(t, RetryJob(context.Background(), db, "nope"), ErrJobNotFound)
+	require.ErrorIs(t, RetryJobWithOptions(context.Background(), db, "nope", RetryOpts{Force: true}), ErrJobNotFound,
+		"Force skips the state guard, so a miss is a missing job, never a terminal one")
+}
+
+func TestRetryJobSoftDeletedReturnsErrJobNotFound(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+
+	seedJob(t, db, jobRow{ID: "j-gone", Kind: "k", State: string(StateAvailable)})
+	require.NoError(t, db.Delete(&jobRow{}, "id = ?", "j-gone").Error)
+
+	// A soft-deleted job is invisible to the guarded update and the classifying
+	// count alike, so it reads as missing rather than terminal — even under Force.
+	require.ErrorIs(t, RetryJob(ctx, db, "j-gone"), ErrJobNotFound)
+	require.ErrorIs(t, RetryJobWithOptions(ctx, db, "j-gone", RetryOpts{Force: true}), ErrJobNotFound)
 }
 
 func TestCancelJobMovesToCancelled(t *testing.T) {

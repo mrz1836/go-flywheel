@@ -53,12 +53,26 @@ func run(args []string, stdout, stderr *os.File) error {
 	ctx, cancel := context.WithTimeout(ctx, opts.timeout)
 	defer cancel()
 
+	// The progress query is a single read plan, not a matrix: it has its own
+	// characterization and its own artifact text, but shares the claim path's
+	// write-even-on-failure and console-summary contract.
+	if opts.query == "progress" {
+		report, runErr := loadtest.ExplainProgress(ctx, opts.cfg)
+		if writeErr := writeArtifact(report.Text(), opts.out, stdout); writeErr != nil {
+			return errors.Join(runErr, writeErr)
+		}
+		if !opts.quiet {
+			printProgressSummary(stderr, report)
+		}
+		return runErr
+	}
+
 	report, runErr := loadtest.ExplainClaim(ctx, opts.cfg)
 
 	// The artifact is written even when the run failed. A matrix that died on its
 	// last variant still measured every one before it, and discarding those would
 	// make a partial result indistinguishable from no result.
-	if writeErr := writeArtifact(report, opts.out, stdout); writeErr != nil {
+	if writeErr := writeArtifact(report.Text(), opts.out, stdout); writeErr != nil {
 		return errors.Join(runErr, writeErr)
 	}
 	if !opts.quiet {
@@ -67,9 +81,9 @@ func run(args []string, stdout, stderr *os.File) error {
 	return runErr
 }
 
-// writeArtifact renders the report to the chosen destination.
-func writeArtifact(report loadtest.ExplainReport, path string, stdout *os.File) error {
-	data := []byte(report.Text())
+// writeArtifact renders the artifact text to the chosen destination.
+func writeArtifact(text, path string, stdout *os.File) error {
+	data := []byte(text)
 
 	if path == "" {
 		if _, err := stdout.Write(data); err != nil {
@@ -138,3 +152,32 @@ func printSummary(w *os.File, r loadtest.ExplainReport) {
 // collapseSpace flattens a note onto one console line. The artifact wraps them;
 // a terminal summary should not.
 func collapseSpace(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// printProgressSummary writes the progress-plan finding to stderr: one line per
+// captured statement naming its top scan node, so a reader sees whether the rollup
+// reached an Index Only Scan without reading the full plan.
+//
+// Write errors are ignored for the same reason printSummary ignores them: the
+// artifact is already written, and a truncated console line must not fail a
+// completed run.
+func printProgressSummary(w *os.File, r loadtest.ProgressExplainReport) {
+	p := func(format string, args ...any) { _, _ = fmt.Fprintf(w, format, args...) }
+	p("\njobs=%d parent-children=%d schema=%s\n", r.Jobs, r.ParentChildren, r.Schema)
+	for i, stmt := range r.Statements {
+		scan := "(no scan node found)"
+		for _, line := range stmt.Plan {
+			t := strings.TrimSpace(line)
+			if strings.HasPrefix(t, "->") {
+				t = strings.TrimSpace(t[2:])
+			}
+			if strings.Contains(t, "Scan") {
+				scan = t
+				break
+			}
+		}
+		if len(scan) > 90 {
+			scan = scan[:89] + "…"
+		}
+		p("  statement %d: %s\n", i+1, scan)
+	}
+}

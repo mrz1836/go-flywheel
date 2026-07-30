@@ -80,7 +80,7 @@ func seedAPI(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onIn
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("loadtest: seed interrupted after %d jobs: %w", i, err)
 		}
-		payload, err := marshalArgs(specToArgs(spec))
+		payload, err := marshalArgs(specToArgs(spec, cfg.Mix))
 		if err != nil {
 			return err
 		}
@@ -112,7 +112,7 @@ func seedInsertMany(
 
 	items := make([]flywheel.BatchItem, len(specs))
 	for i, spec := range specs {
-		payload, err := marshalArgs(specToArgs(spec))
+		payload, err := marshalArgs(specToArgs(spec, cfg.Mix))
 		if err != nil {
 			return err
 		}
@@ -219,7 +219,7 @@ func seedBulkFrom(
 
 	rows := make([]bulkJobRow, len(specs))
 	for i, spec := range specs {
-		payload, err := marshalArgs(specToArgs(spec))
+		payload, err := marshalArgs(specToArgs(spec, cfg.Mix))
 		if err != nil {
 			return err
 		}
@@ -256,13 +256,17 @@ func seedBulkFrom(
 	return nil
 }
 
-// specToArgs renders a generated spec into the worker's args.
-func specToArgs(spec jobSpec) loadArgs {
+// specToArgs renders a generated spec into the worker's args for the given mix.
+// A barrier-mix parent — a spec that fans out children — carries the barrier flag
+// so its worker declares the continuation; every other spec, including the mix's
+// dynamically-enqueued children and continuations, carries it false.
+func specToArgs(spec jobSpec, mix Workload) loadArgs {
 	return loadArgs{
 		N:         spec.N,
 		WorkNanos: spec.WorkNanos,
 		Payload:   spec.Payload,
 		Children:  spec.Children,
+		Barrier:   mix == WorkloadBarrier && spec.Children > 0,
 	}
 }
 

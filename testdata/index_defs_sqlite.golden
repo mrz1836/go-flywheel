@@ -1,9 +1,9 @@
 idx_job_periodics_slug	CREATE UNIQUE INDEX idx_job_periodics_slug ON job_periodics (slug)
 idx_jobs_deleted_at	CREATE INDEX idx_jobs_deleted_at ON jobs (deleted_at) WHERE deleted_at IS NOT NULL
 job_runs_job_attempt	CREATE UNIQUE INDEX job_runs_job_attempt ON job_runs (job_id, attempt)
-jobs_parent	CREATE INDEX jobs_parent ON jobs (parent_job_id) WHERE parent_job_id IS NOT NULL
+jobs_parent_state	CREATE INDEX jobs_parent_state ON jobs (parent_job_id, state) WHERE parent_job_id IS NOT NULL AND deleted_at IS NULL
 jobs_ready	CREATE INDEX jobs_ready ON jobs (queue, priority, scheduled_at) WHERE state IN ('available', 'retryable', 'scheduled') AND deleted_at IS NULL
 jobs_running_leased	CREATE INDEX jobs_running_leased ON jobs (leased_until) WHERE state = 'running'
 jobs_state	CREATE INDEX jobs_state ON jobs (state) WHERE deleted_at IS NULL
-jobs_unique_active_key	CREATE UNIQUE INDEX jobs_unique_active_key ON jobs (unique_active_key) WHERE unique_active_key IS NOT NULL AND state IN ('available', 'running', 'retryable', 'scheduled')
+jobs_unique_active_key	CREATE UNIQUE INDEX jobs_unique_active_key ON jobs (unique_active_key) WHERE unique_active_key IS NOT NULL AND state IN ('available', 'running', 'retryable', 'scheduled', 'paused')
 jobs_unique_key	CREATE UNIQUE INDEX jobs_unique_key ON jobs (unique_key) WHERE unique_key IS NOT NULL

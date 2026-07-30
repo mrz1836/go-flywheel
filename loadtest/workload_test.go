@@ -171,6 +171,61 @@ func TestPlanShapesEachMix(t *testing.T) {
 			t.Errorf("SlowWork = %v, want %d× BaseWork (%v)", p.SlowWork, slowFactor, p.BaseWork)
 		}
 	})
+
+	t.Run("barrier is fan-out plus one continuation per parent", func(t *testing.T) {
+		t.Parallel()
+		cfg := cfg
+		cfg.Mix = WorkloadBarrier
+		p := plan(cfg)
+		if !p.Barrier {
+			t.Error("the barrier mix must declare a barrier")
+		}
+		if p.Children != fanOutChildren {
+			t.Errorf("Children = %d, want %d", p.Children, fanOutChildren)
+		}
+		// One parent per (2 + children) jobs, and TotalJobs counts the continuation.
+		if p.Rows != 90 {
+			t.Errorf("Rows = %d, want 90 parents for 1000 jobs at 2+9 each", p.Rows)
+		}
+		if p.TotalJobs() != p.Rows*(2+fanOutChildren) {
+			t.Errorf("TotalJobs = %d, want the continuation counted per parent", p.TotalJobs())
+		}
+	})
+
+	t.Run("children overrides the fan-out width", func(t *testing.T) {
+		t.Parallel()
+		for _, mix := range []Workload{WorkloadFanOut, WorkloadBarrier} {
+			cfg := cfg
+			cfg.Mix = mix
+			cfg.Children = 100
+			if p := plan(cfg); p.Children != 100 {
+				t.Errorf("%s: Children = %d, want the -children override of 100", mix, p.Children)
+			}
+		}
+	})
+}
+
+// TestWorkDriverOptsRaisesBoundsForWideFanOut proves the harness lifts the
+// runtime's follow-up and barrier ceilings when -children exceeds them, so a
+// wide-generation run does not fail every parent's finalize, and leaves the zero
+// value (the runtime default) for a run within them.
+func TestWorkDriverOptsRaisesBoundsForWideFanOut(t *testing.T) {
+	t.Parallel()
+
+	within := workDriverOpts(Config{Mix: WorkloadBarrier, Children: 1000})
+	if within.FollowUpLimit != 0 || within.BarrierMaxChildren != 0 {
+		t.Errorf("within the ceiling the opts must be the runtime default, got %+v", within)
+	}
+
+	wide := workDriverOpts(Config{Mix: WorkloadBarrier, Children: 100_000})
+	if wide.FollowUpLimit != 100_000 || wide.BarrierMaxChildren != 100_000 {
+		t.Errorf("a wide barrier must raise both bounds, got %+v", wide)
+	}
+
+	fanOut := workDriverOpts(Config{Mix: WorkloadFanOut, Children: 100_000})
+	if fanOut.FollowUpLimit != 100_000 || fanOut.BarrierMaxChildren != 0 {
+		t.Errorf("a wide fan-out raises only the follow-up bound, got %+v", fanOut)
+	}
 }
 
 // TestMixedSpeedProducesBothModes proves the bimodal claim is real in the

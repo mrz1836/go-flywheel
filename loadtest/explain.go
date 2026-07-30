@@ -354,6 +354,10 @@ type ExplainReport struct {
 // hand-copied index list.
 type claimSQLRecorder struct {
 	sql string
+	// all accumulates every statement, in order, for a caller that emits more than
+	// one per capture — the progress rollup runs several reads. captureClaimSQL
+	// still reads sql, the last one, which is all a single-Dequeue capture needs.
+	all []string
 }
 
 // LogMode is part of logger.Interface. The recorder has one mode.
@@ -365,12 +369,12 @@ func (r *claimSQLRecorder) Info(context.Context, string, ...any)  {}
 func (r *claimSQLRecorder) Warn(context.Context, string, ...any)  {}
 func (r *claimSQLRecorder) Error(context.Context, string, ...any) {}
 
-// Trace records the statement. It keeps the last one rather than accumulating:
-// each capture drives exactly one Dequeue, and reading the field straight after
-// is what makes the pairing unambiguous.
+// Trace records the statement, both as the last one seen and appended to the full
+// list. A single-Dequeue capture reads sql; a multi-statement capture reads all.
 func (r *claimSQLRecorder) Trace(_ context.Context, _ time.Time, fc func() (string, int64), _ error) {
 	sql, _ := fc()
 	r.sql = sql
+	r.all = append(r.all, sql)
 }
 
 // captureClaimSQL runs one Dequeue through the real PostgreSQL driver and
@@ -769,7 +773,7 @@ func seedClaimable(ctx context.Context, db *gorm.DB, cfg ExplainConfig, queues, 
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("loadtest: seed interrupted after %d jobs: %w", i, err)
 		}
-		payload, err := marshalArgs(specToArgs(spec))
+		payload, err := marshalArgs(specToArgs(spec, WorkloadDrainOnly))
 		if err != nil {
 			return err
 		}

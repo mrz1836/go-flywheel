@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"math/rand/v2"
 	"time"
+
+	flywheel "github.com/mrz1836/go-flywheel"
 )
 
 // Random streams. Each generated quantity draws from its own PCG stream, keyed
@@ -86,13 +88,54 @@ type mixPlan struct {
 	SlowShare          float64
 	// Bulk reports whether this mix seeds through the bulk path.
 	Bulk bool
+	// Barrier reports whether each parent declares a fan-in barrier over its
+	// children, which the runtime completes with one continuation per parent.
+	Barrier bool
 }
 
-// TotalJobs reports how many jobs the run will process, parents plus children.
-// It is what the drain is measured against, so a fan-out run's denominator
-// counts the children it will create rather than only the rows it inserted.
+// TotalJobs reports how many jobs the run will process, parents plus children,
+// plus one barrier continuation per parent when the mix declares a barrier. It is
+// what the drain fraction is measured against, so a barrier run's denominator
+// counts the continuation the runtime enqueues rather than only the rows it seeded.
 func (p mixPlan) TotalJobs() int {
-	return p.Rows * (1 + p.Children)
+	total := p.Rows * (1 + p.Children)
+	if p.Barrier {
+		total += p.Rows
+	}
+	return total
+}
+
+// childCount is how many children each parent fans out: the configured override
+// when set, otherwise the fan-out default. It sizes both the fan-out and barrier
+// mixes.
+func childCount(cfg Config) int {
+	if cfg.Children > 0 {
+		return cfg.Children
+	}
+	return fanOutChildren
+}
+
+// runtimeFanOutCeiling mirrors the runtime's default FollowUpLimit /
+// BarrierMaxChildren (defaultFollowUpLimit, defaultBarrierMaxChildren). It is
+// duplicated here because those defaults are unexported; workDriverOpts only ever
+// raises a bound above it, never lowers one, so a drift in the runtime's default
+// cannot make the harness stricter than the runtime.
+const runtimeFanOutCeiling = 10_000
+
+// workDriverOpts sizes the runner driver's fan-out and barrier bounds to the run's
+// child count, so a -children beyond the runtime's default ceiling does not fail
+// every parent's finalize with ErrFollowUpLimit or ErrBarrierTooWide. A run at or
+// below the ceiling gets the zero value, which is exactly the runtime default.
+func workDriverOpts(cfg Config) flywheel.DriverOpts {
+	var opts flywheel.DriverOpts
+	c := childCount(cfg)
+	if (cfg.Mix == WorkloadFanOut || cfg.Mix == WorkloadBarrier) && c > runtimeFanOutCeiling {
+		opts.FollowUpLimit = c
+	}
+	if cfg.Mix == WorkloadBarrier && c > runtimeFanOutCeiling {
+		opts.BarrierMaxChildren = c
+	}
+	return opts
 }
 
 // plan decides the run's shape from its mix.
@@ -111,8 +154,16 @@ func plan(cfg Config) mixPlan {
 	case WorkloadFanOut:
 		// One parent per (1 + children) jobs, so the run's total job count is
 		// still Config.Jobs and a fan-out report is comparable with a drain one.
-		p.Children = fanOutChildren
-		p.Rows = max(1, cfg.Jobs/(1+fanOutChildren))
+		p.Children = childCount(cfg)
+		p.Rows = max(1, cfg.Jobs/(1+p.Children))
+	case WorkloadBarrier:
+		// The same fan-out shape, plus a barrier: each parent declares a
+		// continuation over its children. The continuation is one extra job per
+		// parent, so the parent budget leaves room for it — one parent per
+		// (2 + children) jobs — keeping the run's total near Config.Jobs.
+		p.Children = childCount(cfg)
+		p.Barrier = true
+		p.Rows = max(1, cfg.Jobs/(2+p.Children))
 	case WorkloadMixedSpeed:
 		base := cfg.WorkDuration
 		if base <= 0 {

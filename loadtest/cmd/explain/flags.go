@@ -23,6 +23,9 @@ const dsnEnv = "FLYWHEEL_LOADTEST_DATABASE_URL"
 // options is everything the explain main takes from its command line.
 type options struct {
 	cfg loadtest.ExplainConfig
+	// query selects which runtime query to characterize: "claim" (the default, the
+	// claim predicate matrix) or "progress" (the batch rollup plan).
+	query string
 	// out is where the artifact is written; empty means stdout.
 	out string
 	// quiet suppresses the human-readable summary, for a run whose output is
@@ -48,6 +51,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 
 	fs.StringVar(&opts.cfg.DSN, "dsn", os.Getenv(dsnEnv),
 		"PostgreSQL target (default $"+dsnEnv+")")
+	fs.StringVar(&opts.query, "query", "claim", "runtime query to characterize: claim or progress")
 	fs.IntVar(&opts.cfg.Jobs, "jobs", 1_000_000, "number of claimable rows to seed")
 	fs.IntVar(&opts.cfg.Queues, "queues", 3, "number of distinct queues the rows are spread across")
 	fs.Int64Var(&opts.cfg.Seed, "seed", 1, "run seed; equal seeds produce byte-identical workloads")
@@ -68,6 +72,9 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	}
 	if opts.timeout <= 0 {
 		return options{}, fmt.Errorf("explain: -timeout must be positive, got %s", opts.timeout)
+	}
+	if opts.query != "claim" && opts.query != "progress" {
+		return options{}, fmt.Errorf("explain: -query must be claim or progress, got %q", opts.query)
 	}
 	if opts.cfg.DSN == "" {
 		return options{}, fmt.Errorf("explain: no target: pass -dsn or set %s", dsnEnv)
