@@ -185,6 +185,89 @@ func (r ExplainReport) writePlans(b *strings.Builder) {
 	}
 }
 
+// Text renders the fairness-cost report as the committed artifact.
+//
+// The shape mirrors the claim characterization: a header, a summary table whose
+// every number is parsed from the plan below it, the caveats, and then the full
+// plans. The finding a reader is looking for is one row: whether F1 scans the
+// whole ready set where F0 stops at the batch size.
+func (r FairnessExplainReport) Text() string {
+	var b strings.Builder
+
+	b.WriteString("go-flywheel — parent-fairness claim cost characterization\n")
+	b.WriteString(strings.Repeat("=", ruleWidth) + "\n\n")
+
+	field := func(name, value string) { fmt.Fprintf(&b, "%-14s %s\n", name+":", value) }
+	field("target", r.Target)
+	field("server", r.Server)
+	field("schema", r.Schema)
+	field("jobs seeded", fmt.Sprintf("%s, all claimable", withThousands(int64(r.Jobs))))
+	field("ready set", withThousands(r.ReadySet)+" rows match the routed claim predicate")
+	field("queues", strings.Join(r.Queues, ", ")+" (seeded across all)")
+	field("claim queue", strings.Join(r.ClaimQueues, ", ")+" (single queue — where jobs_ready is reached)")
+	field("classes", strings.Join(quoteEmpty(r.Classes), ", "))
+	field("claim limit", strconv.Itoa(r.Limit))
+	field("seed", strconv.FormatInt(r.Seed, 10))
+	field("jobs relation", humanBytes(r.TableBytes)+" (table plus indexes, at measurement time)")
+	b.WriteString("\nvariants\n")
+	for _, cell := range r.Cells {
+		fmt.Fprintf(&b, "  %-4s %s\n", cell.Variant.Name, cell.Variant.Desc)
+	}
+	b.WriteString("\n")
+
+	b.WriteString("summary\n")
+	b.WriteString(strings.Repeat("-", ruleWidth) + "\n")
+	for _, col := range summaryColumns {
+		fmt.Fprintf(&b, "%-*s", col.width, col.head)
+	}
+	b.WriteString("\n" + strings.Repeat("-", ruleWidth) + "\n")
+	for _, cell := range r.Cells {
+		s := cell.Summary
+		sorted := "no"
+		if s.Sorted {
+			sorted = "YES"
+		}
+		values := []string{
+			cell.Variant.Name, truncate(s.Scan, summaryColumns[1].width-1), withThousands(s.ScanRows), sorted,
+			withThousands(s.RowsRemoved), withThousands(s.SharedHit), withThousands(s.SharedRead),
+			strconv.FormatFloat(s.ExecutionMS, 'f', 3, 64),
+		}
+		for i, v := range values {
+			fmt.Fprintf(&b, "%-*s", summaryColumns[i].width, v)
+		}
+		b.WriteString("\n")
+		if s.SortMethod != "" {
+			fmt.Fprintf(&b, "%-*ssort method: %s\n", summaryColumns[0].width, "", s.SortMethod)
+		}
+	}
+	b.WriteString(strings.Repeat("-", ruleWidth) + "\n\n")
+
+	if len(r.Notes) > 0 {
+		b.WriteString("notes\n")
+		for _, n := range r.Notes {
+			b.WriteString(wrapBullet(n, ruleWidth) + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("statements\n")
+	b.WriteString(strings.Repeat("=", ruleWidth) + "\n")
+	for _, cell := range r.Cells {
+		fmt.Fprintf(&b, "\n--- %s ---\n%s\n", cell.Variant.Name, strings.TrimSpace(cell.Variant.SQL))
+	}
+
+	b.WriteString("\nplans\n")
+	b.WriteString(strings.Repeat("=", ruleWidth) + "\n")
+	for _, cell := range r.Cells {
+		fmt.Fprintf(&b, "\n--- %s ---\n", cell.Variant.Name)
+		for _, line := range cell.Plan {
+			b.WriteString(line + "\n")
+		}
+	}
+
+	return trimLineEnds(b.String())
+}
+
 // truncate shortens s to width, marking that it did so. A silently clipped node
 // description reads as a different node.
 func truncate(s string, width int) string {

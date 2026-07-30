@@ -67,6 +67,20 @@ func run(args []string, stdout, stderr *os.File) error {
 		return runErr
 	}
 
+	// The fairness query is a cost comparison — the shipped claim against the
+	// ranked candidates — with its own artifact text, but it shares the claim
+	// path's write-even-on-failure and console-summary contract.
+	if opts.query == "claim-fair" {
+		report, runErr := loadtest.ExplainFairness(ctx, opts.cfg)
+		if writeErr := writeArtifact(report.Text(), opts.out, stdout); writeErr != nil {
+			return errors.Join(runErr, writeErr)
+		}
+		if !opts.quiet {
+			printFairnessSummary(stderr, report)
+		}
+		return runErr
+	}
+
 	report, runErr := loadtest.ExplainClaim(ctx, opts.cfg)
 
 	// The artifact is written even when the run failed. A matrix that died on its
@@ -152,6 +166,37 @@ func printSummary(w *os.File, r loadtest.ExplainReport) {
 // collapseSpace flattens a note onto one console line. The artifact wraps them;
 // a terminal summary should not.
 func collapseSpace(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// printFairnessSummary writes the fairness-cost finding to stderr: one line per
+// variant naming its scan and the rows it returned, so a reader sees whether the
+// ranked variant scanned the whole ready set without reading the full plan.
+//
+// Write errors are ignored for the same reason printSummary ignores them: the
+// artifact is already written, and a truncated console line must not fail a
+// completed run.
+func printFairnessSummary(w *os.File, r loadtest.FairnessExplainReport) {
+	p := func(format string, args ...any) { _, _ = fmt.Fprintf(w, format, args...) }
+	if len(r.Cells) == 0 {
+		p("\nno variants measured\n")
+		return
+	}
+	p("\njobs=%d ready-set=%d limit=%d seed=%d schema=%s\n", r.Jobs, r.ReadySet, r.Limit, r.Seed, r.Schema)
+	p("%-6s %-42s %12s %6s %10s\n", "var", "scan node", "scan rows", "sort", "exec ms")
+	for _, cell := range r.Cells {
+		s := cell.Summary
+		mark := "no"
+		if s.Sorted {
+			mark = "YES"
+		}
+		scan := s.Scan
+		if len(scan) > 42 {
+			scan = scan[:41] + "…"
+		}
+		p("%-6s %-42s %12d %6s %10.3f\n", cell.Variant.Name, scan, s.ScanRows, mark, s.ExecutionMS)
+	}
+	p("\nF0 stops at LIMIT=%d; a ranked variant scanning near the %d-row ready set is the O(ready) cost.\n",
+		r.Limit, r.ReadySet)
+}
 
 // printProgressSummary writes the progress-plan finding to stderr: one line per
 // captured statement naming its top scan node, so a reader sees whether the rollup
