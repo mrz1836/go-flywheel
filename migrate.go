@@ -21,18 +21,23 @@ import (
 // loader reads from these models, and four of them are correctness-bearing. See
 // [Migrate] for the contract that decides between the two modes.
 func Models() []any {
-	return []any{&jobRow{}, &jobRunRow{}, &jobPeriodicRow{}}
+	return []any{
+		&jobRow{}, &jobRunRow{}, &jobPeriodicRow{},
+		&limiterBucketRow{}, &limiterHoldRow{},
+	}
 }
 
-// Migrate is the library-owned install: it brings up the three job tables (jobs,
-// job_runs, job_periodics) — with their NOT-NULL constraints, column defaults,
-// and the jobs soft-delete column — plus the partial/unique indexes GORM
-// AutoMigrate cannot express. A host in this mode calls Migrate(db) and nothing
-// else.
+// Migrate is the library-owned install: it brings up the runtime's tables — the
+// three job tables (jobs, job_runs, job_periodics) and the two limiter tables
+// (limiter_buckets, limiter_holds) the DBLimiter uses — with their NOT-NULL
+// constraints, column defaults, and the jobs soft-delete column, plus the
+// partial/unique indexes GORM AutoMigrate cannot express. A host in this mode
+// calls Migrate(db) and nothing else. The limiter tables are additive: a host
+// that never constructs a DBLimiter simply leaves them empty.
 //
 // # Choosing an install mode
 //
-// The runtime owns three tables and there are two ways to install them. They are
+// The runtime owns five tables and there are two ways to install them. They are
 // not layers. A host picks exactly one; running both means two migration
 // authorities against one database.
 //
@@ -45,12 +50,12 @@ func Models() []any {
 //	Runtime runs DDL at startup?  yes, every start         no
 //	Co-located host schema safe?  only if the host's       yes — the tables are in
 //	                              tooling excludes the     your loader
-//	                              three tables
+//	                              runtime tables
 //	Pick this when                the database is the      the runtime's tables share a
 //	                              runtime's alone          database with an app schema
 //
 // The last row is the rule: a shared database means host-owned. A migration tool
-// that cannot see the three tables will propose dropping them, and a runtime
+// that cannot see the runtime tables will propose dropping them, and a runtime
 // that runs its own DDL inside a versioned schema is a second migration
 // authority with no coordination.
 //

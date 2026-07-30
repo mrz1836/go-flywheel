@@ -48,6 +48,14 @@ type Harness struct {
 	// sched is the scheduler's pool, schema-scoped, sized to its activity count
 	// so a maintenance pass never queues behind the runners it is measuring.
 	sched *gorm.DB
+	// limiterDB is the shared DBLimiter's own pool, opened only for -limiter db so
+	// its Acquire never queues behind the work pool. Nil otherwise.
+	limiterDB *gorm.DB
+
+	// limiter is the pre-claim gate every runner shares, nil on an ungated run. One
+	// instance keys per resource, so sharing it is what makes the whole run's claim
+	// rate track a single budget rather than Runners budgets.
+	limiter flywheel.Limiter
 
 	// inner is the undecorated driver. Each runner wraps it in its own
 	// timingDriver bound to its own histogram shard, so shard selection costs
@@ -314,11 +322,69 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 	if cfg.FailFraction > 0 {
 		retryBackoff = replayRetryBackoff
 	}
+	// The claim-then-snooze baseline: an in-process bucket the worker consults, so a
+	// job it cannot run yet spends a full claim and a job_runs row deferring itself.
+	var snooze *flywheel.TokenBucket
+	if cfg.WorkerSnooze > 0 {
+		snooze = flywheel.NewTokenBucket(flywheel.TokenBucketConfig{
+			Rate: cfg.WorkerSnooze, Interval: time.Second, Burst: cfg.WorkerSnooze,
+		})
+	}
 	flywheel.Register(h.registry, loadWorker{
-		track: h.exec, seed: cfg.Seed, failFraction: cfg.FailFraction, retryBackoff: retryBackoff,
+		track: h.exec, seed: cfg.Seed, failFraction: cfg.FailFraction,
+		retryBackoff: retryBackoff, snooze: snooze,
 	})
 
+	if err = h.buildLimiter(scoped); err != nil {
+		return h, err
+	}
+
 	return h, nil
+}
+
+// limiterResource is the single resource every gated harness runner keys on: the
+// run protects one simulated downstream, so one resource is the whole budget.
+const limiterResource = "loadtest:downstream"
+
+// limiterResourceFor names the resource a runner passes alongside a limiter, and
+// the empty string when there is none — NewRunner requires a Resource only when a
+// Limiter is set.
+func limiterResourceFor(l flywheel.Limiter) string {
+	if l == nil {
+		return ""
+	}
+	return limiterResource
+}
+
+// buildLimiter constructs the shared pre-claim gate for a gated run, opening the
+// DBLimiter its own pool so its Acquire never queues behind the work pool. An
+// ungated run leaves h.limiter nil, which the runners read as unlimited.
+func (h *Harness) buildLimiter(scopedDSN string) error {
+	switch h.cfg.Limiter {
+	case LimiterTokenBucket:
+		h.limiter = flywheel.NewTokenBucket(flywheel.TokenBucketConfig{
+			Rate: h.cfg.Rate, Interval: time.Second, Burst: h.cfg.Burst, MaxConcurrent: h.cfg.MaxConcurrent,
+		})
+	case LimiterDB:
+		db, err := openPool(scopedDSN, h.cfg.limiterConnections())
+		if err != nil {
+			return fmt.Errorf("loadtest: open limiter pool: %w", err)
+		}
+		h.limiterDB = db
+		holdTTL := time.Duration(0)
+		if h.cfg.MaxConcurrent > 0 {
+			holdTTL = leaseFor(h.cfg) * 4 // comfortably longer than any job, per HoldTTL's rule
+		}
+		lim, err := flywheel.NewDBLimiter(db, flywheel.DBLimiterConfig{
+			Rate: h.cfg.Rate, Interval: time.Second, Burst: h.cfg.Burst,
+			MaxConcurrent: h.cfg.MaxConcurrent, HoldTTL: holdTTL,
+		})
+		if err != nil {
+			return fmt.Errorf("loadtest: build limiter: %w", err)
+		}
+		h.limiter = lim
+	}
+	return nil
 }
 
 // replayRetryBackoff is the fixed retry delay a fail-fraction run gives its worker,
@@ -378,7 +444,7 @@ func (h *Harness) Close(ctx context.Context) error {
 
 	h.stopRunners()
 
-	for _, db := range []*gorm.DB{h.work, h.probe, h.sched} {
+	for _, db := range []*gorm.DB{h.work, h.probe, h.sched, h.limiterDB} {
 		if db == nil {
 			continue
 		}
@@ -449,6 +515,10 @@ func (h *Harness) startRunners(ctx context.Context) error {
 			HeartbeatInterval: h.cfg.Heartbeat,
 			Observer:          harnessObserver{prog: h.prog},
 			Logger:            discardLogger(),
+			// Every runner shares one limiter keyed on one resource, so the run's
+			// combined claim rate tracks a single budget. Nil on an ungated run.
+			Limiter:  h.limiter,
+			Resource: limiterResourceFor(h.limiter),
 		})
 		if err != nil {
 			return fmt.Errorf("loadtest: build runner %d: %w", i, err)

@@ -62,7 +62,7 @@ func readCatalogIndexDefs(t *testing.T, db *gorm.DB) map[string]string {
 		require.NoError(t, db.Raw(`
 			SELECT indexname, indexdef FROM pg_indexes
 			WHERE schemaname = current_schema()
-			  AND tablename IN ('jobs', 'job_runs', 'job_periodics')`).Scan(&rows).Error)
+			  AND tablename IN ('jobs', 'job_runs', 'job_periodics', 'limiter_buckets', 'limiter_holds')`).Scan(&rows).Error)
 		for _, r := range rows {
 			if !want[r.Indexname] {
 				continue
