@@ -36,10 +36,10 @@ type BatchProgress struct {
 	Pending  int `json:"pending"`
 	// OldestPendingAge is how long the least-recently-scheduled pending child has
 	// been waiting (the sample instant minus its scheduled_at). It is zero when
-	// nothing is pending. It is the signal a host anchors a batch deadline to
-	// (FR-06-14 in the plan): a stalled-behind-backlog batch is distinguished from a
-	// healthy one by how old its oldest pending child is, not by how long ago it was
-	// spawned.
+	// nothing is pending. It is the signal a host anchors a batch deadline to: a
+	// stalled-behind-backlog batch is distinguished from a healthy one by how old its
+	// oldest pending child is, not by how long ago it was spawned — so a deadline
+	// measured from spawn time would kill a healthy batch that is merely behind.
 	//
 	// It is populated only by Progress. ProgressMany and ProgressByKind leave it
 	// zero: the oldest-pending read is a per-batch ordered scan that does not batch

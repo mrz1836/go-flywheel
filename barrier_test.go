@@ -118,9 +118,9 @@ func TestBarrierFiresWhenLastChildCompletes(t *testing.T) {
 	assert.Nil(t, p.BarrierKind, "the barrier gate is cleared once it fires")
 }
 
-// TestBarrierFiresOnAnyTerminalState is FR-06-12: a half-failed generation still
-// gets its finalizer. The three children end succeeded, discarded, and cancelled,
-// and the barrier fires when the last of them reaches its terminal state.
+// TestBarrierFiresOnAnyTerminalState proves a half-failed generation still gets
+// its finalizer. The three children end succeeded, discarded, and cancelled, and
+// the barrier fires when the last of them reaches its terminal state.
 func TestBarrierFiresOnAnyTerminalState(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
