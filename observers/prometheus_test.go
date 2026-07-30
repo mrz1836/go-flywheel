@@ -16,9 +16,12 @@ import (
 
 func TestWritePrometheusRendersKnownExposition(t *testing.T) {
 	t.Parallel()
-	m := NewMemRecorder()
+	// Compact custom buckets keep the golden readable; the cumulative/+Inf
+	// arithmetic is exercised in full by TestWriteHistogramFamilies below.
+	m := NewMemRecorderWithConfig(HistogramConfig{Buckets: []float64{0.005, 0.05}})
 	m.Count(MetricJobsClaimed, 5, map[string]string{TagExecutorClass: "local"})
 	m.Observe(MetricJobDuration, 1.5, map[string]string{TagKind: "k", TagOutcome: "success"})
+	m.Histogram(MetricClaimDuration, 0.003, map[string]string{TagExecutorClass: "local", TagQueue: "default"})
 
 	qh := flywheel.QueueHealth{
 		CountsByState:  map[string]int64{"available": 2, "running": 1},
@@ -38,6 +41,16 @@ func TestWritePrometheusRendersKnownExposition(t *testing.T) {
 		"# TYPE flywheel_job_duration_seconds summary\n" +
 		"flywheel_job_duration_seconds_sum{kind=\"k\",outcome=\"success\"} 1.5\n" +
 		"flywheel_job_duration_seconds_count{kind=\"k\",outcome=\"success\"} 1\n" +
+		"# HELP flywheel_claim_duration_seconds Claim round-trip duration in seconds.\n" +
+		"# TYPE flywheel_claim_duration_seconds histogram\n" +
+		"flywheel_claim_duration_seconds_bucket{executor_class=\"local\",le=\"0.005\",queue=\"default\"} 1\n" +
+		"flywheel_claim_duration_seconds_bucket{executor_class=\"local\",le=\"0.05\",queue=\"default\"} 1\n" +
+		"flywheel_claim_duration_seconds_bucket{executor_class=\"local\",le=\"+Inf\",queue=\"default\"} 1\n" +
+		"flywheel_claim_duration_seconds_sum{executor_class=\"local\",queue=\"default\"} 0.003\n" +
+		"flywheel_claim_duration_seconds_count{executor_class=\"local\",queue=\"default\"} 1\n" +
+		"# HELP flywheel_metrics_dropped_series_total Series dropped because the recorder's MaxSeries ceiling was reached.\n" +
+		"# TYPE flywheel_metrics_dropped_series_total counter\n" +
+		"flywheel_metrics_dropped_series_total 0\n" +
 		"# HELP flywheel_queue_jobs Jobs in the queue by state.\n" +
 		"# TYPE flywheel_queue_jobs gauge\n" +
 		"flywheel_queue_jobs{state=\"available\"} 2\n" +
@@ -52,6 +65,41 @@ func TestWritePrometheusRendersKnownExposition(t *testing.T) {
 		"# TYPE flywheel_queue_oldest_ready_seconds gauge\n" +
 		"flywheel_queue_oldest_ready_seconds 600\n"
 	assert.Equal(t, want, buf.String(), "the full exposition is deterministic and well-formed")
+}
+
+// TestWriteHistogramFamilies exercises the cumulative-bucket and +Inf arithmetic
+// that the compact golden does not: three values, one past the last bound, so the
+// buckets are cumulative and +Inf exceeds the last explicit bucket.
+func TestWriteHistogramFamilies(t *testing.T) {
+	t.Parallel()
+	m := NewMemRecorderWithConfig(HistogramConfig{Buckets: []float64{0.01, 0.1, 1}})
+	m.Histogram(MetricSweepDuration, 0.005, nil) // <= 0.01
+	m.Histogram(MetricSweepDuration, 0.05, nil)  // <= 0.1
+	m.Histogram(MetricSweepDuration, 5, nil)     // past the last bound -> +Inf only
+
+	var buf bytes.Buffer
+	require.NoError(t, WritePrometheus(&buf, m, flywheel.QueueHealth{}))
+	out := buf.String()
+
+	assert.Contains(t, out, "# TYPE flywheel_sweep_duration_seconds histogram")
+	assert.Contains(t, out, `flywheel_sweep_duration_seconds_bucket{le="0.01"} 1`, "one value at/below 0.01")
+	assert.Contains(t, out, `flywheel_sweep_duration_seconds_bucket{le="0.1"} 2`, "cumulative: 0.005 and 0.05")
+	assert.Contains(t, out, `flywheel_sweep_duration_seconds_bucket{le="1"} 2`, "the 5s value is not yet counted")
+	assert.Contains(t, out, `flywheel_sweep_duration_seconds_bucket{le="+Inf"} 3`, "+Inf carries the full count")
+	assert.Contains(t, out, "flywheel_sweep_duration_seconds_count 3")
+}
+
+// TestWritePrometheusRendersDroppedSeries proves the overflow counter reports a
+// nonzero value once the recorder's ceiling is exceeded.
+func TestWritePrometheusRendersDroppedSeries(t *testing.T) {
+	t.Parallel()
+	m := NewMemRecorderWithConfig(HistogramConfig{MaxSeries: 1})
+	m.Count("a", 1, nil)
+	m.Count("b", 1, nil) // past the ceiling -> dropped
+
+	var buf bytes.Buffer
+	require.NoError(t, WritePrometheus(&buf, m, flywheel.QueueHealth{}))
+	assert.Contains(t, buf.String(), "flywheel_metrics_dropped_series_total 1")
 }
 
 func TestWritePrometheusAccumulatesEqualTagCounters(t *testing.T) {

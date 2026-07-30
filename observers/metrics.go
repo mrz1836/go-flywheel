@@ -54,6 +54,22 @@ const (
 	MetricJobsSuperseded = "flywheel_jobs_superseded_total"
 )
 
+// Duration histogram names. Unlike MetricJobDuration's historical summary form,
+// these are bucketed distributions (recorded via Histogram), so p50/p99 — the
+// question "how slow is the slow tail?" — are derivable, not just a mean.
+const (
+	// MetricClaimDuration is the claim round-trip time. It is the queue's
+	// contention signal: a rising p99 with flat depth means executors are
+	// contending, not that work is arriving faster.
+	MetricClaimDuration = "flywheel_claim_duration_seconds"
+	// MetricFinalizeDuration is how long persisting an outcome took, distinct from
+	// the worker body: a slow finalize is a database problem, a slow worker a
+	// downstream one.
+	MetricFinalizeDuration = "flywheel_finalize_duration_seconds"
+	// MetricSweepDuration is how long one lease-reclaim sweep pass took.
+	MetricSweepDuration = "flywheel_sweep_duration_seconds"
+)
+
 // Tag keys. They are the label dimensions the taxonomy slices each metric by.
 const (
 	TagExecutorClass = "executor_class"

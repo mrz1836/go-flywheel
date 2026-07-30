@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"slices"
 	"strconv"
@@ -16,14 +17,20 @@ import (
 // Queue-health gauge metric names. They are sampled fresh on each scrape from a
 // flywheel.QueueHealth, not accumulated in the recorder.
 const (
-	MetricQueueJobs         = "flywheel_queue_jobs"
-	MetricQueueReady        = "flywheel_queue_ready"
-	MetricQueueInFlight     = "flywheel_queue_inflight"
-	MetricQueueOldestReady  = "flywheel_queue_oldest_ready_seconds"
+	MetricQueueJobs        = "flywheel_queue_jobs"
+	MetricQueueReady       = "flywheel_queue_ready"
+	MetricQueueInFlight    = "flywheel_queue_inflight"
+	MetricQueueOldestReady = "flywheel_queue_oldest_ready_seconds"
+	// MetricDroppedSeries counts on-demand series the recorder refused because its
+	// MaxSeries ceiling was reached — cardinality overflow made visible on the
+	// scrape rather than only as memory growth.
+	MetricDroppedSeries     = "flywheel_metrics_dropped_series_total"
 	metricsContentType      = "text/plain; version=0.0.4; charset=utf-8"
 	prometheusTypeCounter   = "counter"
 	prometheusTypeGauge     = "gauge"
 	prometheusTypeSummary   = "summary"
+	prometheusTypeHistogram = "histogram"
+	histogramLeLabel        = "le"
 	queueStateLabelStateKey = "state"
 )
 
@@ -40,6 +47,10 @@ var metricHelp = map[string]string{
 	MetricJobsRetried:      "Total worker attempts scheduled for a retry.",
 	MetricJobsSuperseded:   "Total worker attempts whose outcome was discarded because their claim was lost.",
 	MetricJobDuration:      "Worker attempt duration in seconds (sum and count).",
+	MetricClaimDuration:    "Claim round-trip duration in seconds.",
+	MetricFinalizeDuration: "Finalize (outcome persistence) duration in seconds.",
+	MetricSweepDuration:    "Lease-reclaim sweep duration in seconds.",
+	MetricDroppedSeries:    "Series dropped because the recorder's MaxSeries ceiling was reached.",
 	MetricQueueJobs:        "Jobs in the queue by state.",
 	MetricQueueReady:       "Jobs claimable right now.",
 	MetricQueueInFlight:    "Jobs currently running.",
@@ -57,7 +68,9 @@ func WritePrometheus(w io.Writer, rec *MemRecorder, qh flywheel.QueueHealth) err
 
 	writeCounterFamilies(ew, snap.Counters)
 	writeSummaryFamilies(ew, snap.Observations)
+	writeHistogramFamilies(ew, snap.Histograms)
 	writeGaugeFamilies(ew, snap.Gauges)
+	writeDroppedSeries(ew, snap.DroppedSeries)
 	writeQueueHealth(ew, qh)
 
 	return ew.err
@@ -127,6 +140,41 @@ func writeSummaryFamilies(ew *errWriter, series []ObservationSeries) {
 	}
 }
 
+// writeHistogramFamilies renders each bucketed distribution as a histogram
+// family: cumulative name_bucket{le="…"} series in ascending bound order ending
+// in le="+Inf", then name_sum and name_count. The cumulative count at bound k is
+// every observation at or below it; the +Inf bucket is the total count, which
+// includes any value that fell past the last explicit bound.
+func writeHistogramFamilies(ew *errWriter, series []HistogramSeries) {
+	var current string
+	for i := range series {
+		s := series[i]
+		if s.Name != current {
+			writeFamilyHeader(ew, s.Name, prometheusTypeHistogram)
+			current = s.Name
+		}
+		var cumulative uint64
+		for j, bound := range s.Buckets {
+			cumulative += s.Counts[j]
+			ew.printf("%s_bucket%s %s\n", s.Name, formatBucketLabels(s.Tags, bound), strconv.FormatUint(cumulative, 10))
+		}
+		// The +Inf bucket carries the total: every value, overflow included, is <= +Inf.
+		ew.printf("%s_bucket%s %s\n", s.Name, formatBucketLabels(s.Tags, math.Inf(1)), strconv.FormatUint(s.Count, 10))
+
+		labels := formatLabels(s.Tags)
+		ew.printf("%s_sum%s %s\n", s.Name, labels, formatFloat(s.Sum))
+		ew.printf("%s_count%s %s\n", s.Name, labels, strconv.FormatUint(s.Count, 10))
+	}
+}
+
+// writeDroppedSeries renders the recorder's cardinality-overflow counter. It is
+// always emitted, at zero when nothing has been dropped, so an alert can watch it
+// without the series appearing only after the first overflow.
+func writeDroppedSeries(ew *errWriter, dropped int64) {
+	writeFamilyHeader(ew, MetricDroppedSeries, prometheusTypeCounter)
+	ew.printf("%s %s\n", MetricDroppedSeries, strconv.FormatInt(dropped, 10))
+}
+
 // writeQueueHealth renders the four queue-health gauge families from qh.
 func writeQueueHealth(ew *errWriter, qh flywheel.QueueHealth) {
 	writeFamilyHeader(ew, MetricQueueJobs, prometheusTypeGauge)
@@ -176,6 +224,17 @@ func formatLabels(tags map[string]string) string {
 	}
 	b.WriteByte('}')
 	return b.String()
+}
+
+// formatBucketLabels renders a histogram bucket's label set: the series tags plus
+// the le upper bound, sorted and escaped like any label set. le is formatted the
+// Prometheus way, so math.Inf(1) becomes the "+Inf" catch-all bucket. A tag named
+// le would be shadowed by the bound, but the runtime never tags with it.
+func formatBucketLabels(tags map[string]string, le float64) string {
+	withLe := make(map[string]string, len(tags)+1)
+	maps.Copy(withLe, tags)
+	withLe[histogramLeLabel] = formatFloat(le)
+	return formatLabels(withLe)
 }
 
 // escapeLabelValue escapes the three characters a Prometheus label value must
