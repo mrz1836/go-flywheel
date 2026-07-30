@@ -186,6 +186,19 @@ func (m *MetricsObserver) OnSupersede(_ context.Context, ev flywheel.SupersedeEv
 // adapter tests assert against, and the source of the process-lifetime counters
 // the local `/metrics` endpoint renders. A series is identified by its name plus
 // its sorted tag set, so repeated calls with equal tags accumulate into one cell.
+//
+// # Cardinality
+//
+// The recorder holds one cell per distinct series and never evicts, so an
+// unbounded tag — a job id, a per-request identifier, a raw error string — will
+// mint a new series on every call and exhaust the process's memory. Tag by kind,
+// queue, class, and outcome: dimensions with a small, fixed range. The MaxSeries
+// ceiling (HistogramConfig.MaxSeries, default 10,000, combined across counters,
+// gauges, observations, and histograms) is the backstop, not a license: once it
+// is reached, new series are dropped and counted in Snapshot.DroppedSeries rather
+// than growing without limit. Dropping the *new* series keeps the established
+// ones stable — an operator can reason about a fixed set that stopped growing,
+// where an LRU under cardinality pressure produces series that appear and vanish.
 type MemRecorder struct {
 	mu         sync.Mutex
 	counters   map[string]*counterCell
@@ -274,6 +287,14 @@ func NewMemRecorderWithConfig(cfg HistogramConfig) *MemRecorder {
 // Compile-time proof MemRecorder satisfies MetricsRecorder.
 var _ MetricsRecorder = (*MemRecorder)(nil)
 
+// atSeriesCap reports whether the recorder already holds its maximum number of
+// distinct series, counted across all four maps combined. The caller holds m.mu.
+// A new-series insert past this point is dropped and counted rather than growing
+// a map, which is what keeps a runaway tag from exhausting memory.
+func (m *MemRecorder) atSeriesCap() bool {
+	return len(m.counters)+len(m.gauges)+len(m.observed)+len(m.histograms) >= m.maxSeries
+}
+
 // Count adds delta to the named counter series.
 func (m *MemRecorder) Count(name string, delta int64, tags map[string]string) {
 	key := seriesKey(name, tags)
@@ -281,6 +302,10 @@ func (m *MemRecorder) Count(name string, delta int64, tags map[string]string) {
 	defer m.mu.Unlock()
 	cell, ok := m.counters[key]
 	if !ok {
+		if m.atSeriesCap() {
+			m.droppedSeries++
+			return
+		}
 		cell = &counterCell{name: name, tags: copyTags(tags)}
 		m.counters[key] = cell
 	}
@@ -294,6 +319,10 @@ func (m *MemRecorder) Gauge(name string, value float64, tags map[string]string) 
 	defer m.mu.Unlock()
 	cell, ok := m.gauges[key]
 	if !ok {
+		if m.atSeriesCap() {
+			m.droppedSeries++
+			return
+		}
 		cell = &gaugeCell{name: name, tags: copyTags(tags)}
 		m.gauges[key] = cell
 	}
@@ -308,6 +337,10 @@ func (m *MemRecorder) Observe(name string, value float64, tags map[string]string
 	defer m.mu.Unlock()
 	cell, ok := m.observed[key]
 	if !ok {
+		if m.atSeriesCap() {
+			m.droppedSeries++
+			return
+		}
 		cell = &observedCell{name: name, tags: copyTags(tags)}
 		m.observed[key] = cell
 	}
@@ -326,6 +359,10 @@ func (m *MemRecorder) Histogram(name string, value float64, tags map[string]stri
 	defer m.mu.Unlock()
 	cell, ok := m.histograms[key]
 	if !ok {
+		if m.atSeriesCap() {
+			m.droppedSeries++
+			return
+		}
 		cell = &histogramCell{
 			name:    name,
 			tags:    copyTags(tags),

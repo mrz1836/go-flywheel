@@ -3,6 +3,7 @@ package observers
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -336,6 +337,85 @@ func TestMemRecorderSnapshotSortsEverySeriesType(t *testing.T) {
 	assert.Equal(t, "c_a", snap.Counters[0].Name, "counters are name-sorted")
 	assert.Equal(t, "g_a", snap.Gauges[0].Name, "gauges are name-sorted")
 	assert.Equal(t, "o_a", snap.Observations[0].Name, "observations are name-sorted")
+}
+
+// counterFor returns the counter series whose tag k equals v, or a zero value.
+func counterFor(snap Snapshot, k, v string) CounterSeries {
+	for _, c := range snap.Counters {
+		if c.Tags[k] == v {
+			return c
+		}
+	}
+	return CounterSeries{}
+}
+
+// TestMemRecorderBoundDropsNewKeepsEstablished is A4: with MaxSeries 100 and
+// 10,000 distinct tag combinations, the map is bounded at 100, DroppedSeries
+// reports 9,900, and the first-100 established series keep accumulating.
+func TestMemRecorderBoundDropsNewKeepsEstablished(t *testing.T) {
+	t.Parallel()
+	m := NewMemRecorderWithConfig(HistogramConfig{MaxSeries: 100})
+	for i := 0; i < 10_000; i++ {
+		m.Count("c", 1, map[string]string{"id": strconv.Itoa(i)})
+	}
+
+	snap := m.Snapshot()
+	assert.Len(t, snap.Counters, 100, "the map is bounded at MaxSeries")
+	assert.EqualValues(t, 9_900, snap.DroppedSeries, "every insert past the ceiling is dropped and counted")
+
+	// id=0 was among the first 100 inserted, so it has a cell. Recording into it
+	// accumulates (the drop only ever refuses a brand-new series) and adds no drop.
+	m.Count("c", 5, map[string]string{"id": "0"})
+	snap = m.Snapshot()
+	assert.EqualValues(t, 6, counterFor(snap, "id", "0").Value, "an established series keeps accumulating")
+	assert.EqualValues(t, 9_900, snap.DroppedSeries, "recording into an existing series drops nothing")
+}
+
+// TestMemRecorderBoundIsCombinedAcrossSeriesTypes proves the ceiling counts every
+// series type together: two counters, a gauge, and a histogram exhaust a
+// MaxSeries of 3, so the fourth distinct series — whatever its type — is dropped.
+func TestMemRecorderBoundIsCombinedAcrossSeriesTypes(t *testing.T) {
+	t.Parallel()
+	m := NewMemRecorderWithConfig(HistogramConfig{MaxSeries: 3})
+	m.Count("c1", 1, nil)
+	m.Gauge("g1", 1, nil)
+	m.Observe("o1", 1, nil)
+	// The budget is spent; a fourth series of any type is refused.
+	m.Histogram("h1", 1, nil)
+	m.Count("c2", 1, nil)
+
+	snap := m.Snapshot()
+	assert.Len(t, snap.Counters, 1)
+	assert.Len(t, snap.Gauges, 1)
+	assert.Len(t, snap.Observations, 1)
+	assert.Empty(t, snap.Histograms, "the histogram was past the combined ceiling")
+	assert.EqualValues(t, 2, snap.DroppedSeries, "both the histogram and the second counter were dropped")
+}
+
+// TestMemRecorderBoundIsRaceFree exercises the drop path under concurrency: many
+// goroutines racing distinct new series against a tight ceiling must not corrupt
+// the map or the dropped counter.
+func TestMemRecorderBoundIsRaceFree(t *testing.T) {
+	t.Parallel()
+	m := NewMemRecorderWithConfig(HistogramConfig{MaxSeries: 50})
+	const goroutines, perG = 8, 500
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(base int) {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				m.Count("c", 1, map[string]string{"id": strconv.Itoa(base*perG + i)})
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	snap := m.Snapshot()
+	assert.Len(t, snap.Counters, 50, "the map never exceeds the ceiling under load")
+	// Every attempt either created one of the 50 series or was dropped; nothing is lost.
+	assert.EqualValues(t, goroutines*perG-50, snap.DroppedSeries, "kept plus dropped equals every attempt")
 }
 
 func TestMemRecorderConcurrentRecordingIsRaceFree(t *testing.T) {
