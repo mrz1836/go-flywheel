@@ -267,9 +267,9 @@ func TestMemRecorderAccumulatesCountGaugeObserve(t *testing.T) {
 	assert.EqualValues(t, 2, snap.Observations[0].Count)
 }
 
-// TestMemRecorderHistogramUsesDefaultBuckets is A2's "given none" half: a
-// recorder built with the zero config records into DefaultLatencyBuckets, and a
-// value lands in the first bound at or above it (le semantics).
+// TestMemRecorderHistogramUsesDefaultBuckets proves a recorder built with the zero
+// config records into DefaultLatencyBuckets, and a value lands in the first bound
+// at or above it (le semantics).
 func TestMemRecorderHistogramUsesDefaultBuckets(t *testing.T) {
 	t.Parallel()
 	m := NewMemRecorder()
@@ -299,9 +299,8 @@ func TestMemRecorderHistogramUsesDefaultBuckets(t *testing.T) {
 	assert.EqualValues(t, 2, bucketed, "the 20s value is in +Inf only, not any explicit bucket")
 }
 
-// TestMemRecorderHistogramUsesCustomBuckets is A2's "given custom buckets" half:
-// a recorder built with an unsorted custom set records against a sorted copy of
-// exactly those bounds.
+// TestMemRecorderHistogramUsesCustomBuckets proves a recorder built with an
+// unsorted custom set records against a sorted copy of exactly those bounds.
 func TestMemRecorderHistogramUsesCustomBuckets(t *testing.T) {
 	t.Parallel()
 	m := NewMemRecorderWithConfig(HistogramConfig{Buckets: []float64{10, 1, 5}})
@@ -375,7 +374,7 @@ func counterFor(snap Snapshot, k, v string) CounterSeries {
 	return CounterSeries{}
 }
 
-// TestMemRecorderBoundDropsNewKeepsEstablished is A4: with MaxSeries 100 and
+// TestMemRecorderBoundDropsNewKeepsEstablished proves that with MaxSeries 100 and
 // 10,000 distinct tag combinations, the map is bounded at 100, DroppedSeries
 // reports 9,900, and the first-100 established series keep accumulating.
 func TestMemRecorderBoundDropsNewKeepsEstablished(t *testing.T) {

@@ -90,10 +90,10 @@ func TestSQLitePragmaCheckAcceptsHardenedFile(t *testing.T) {
 	assert.NotNil(t, d)
 }
 
-// TestSQLitePragmaCheckAcceptsInMemoryShapes is FR-10-08: both real consumer
-// in-memory shapes — bare :memory: with a single connection, and the library's
-// own shared-cache DSN — must construct successfully. An in-memory database
-// cannot use WAL, so the check exempts journal_mode for it.
+// TestSQLitePragmaCheckAcceptsInMemoryShapes proves both real in-memory shapes —
+// bare :memory: with a single connection, and the library's own shared-cache DSN
+// — construct successfully. An in-memory database cannot use WAL, so the check
+// exempts journal_mode for it.
 func TestSQLitePragmaCheckAcceptsInMemoryShapes(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -113,9 +113,9 @@ func TestSQLitePragmaCheckAcceptsInMemoryShapes(t *testing.T) {
 	}
 }
 
-// TestSQLitePragmaCheckSkip is FR-10-09: SkipPragmaCheck bypasses verification, so
-// even a misconfigured connection constructs — the escape hatch for a host that
-// has hardened its connection by other means.
+// TestSQLitePragmaCheckSkip proves SkipPragmaCheck bypasses verification, so even
+// a misconfigured connection constructs — the escape hatch for a host that has
+// hardened its connection by other means.
 func TestSQLitePragmaCheckSkip(t *testing.T) {
 	db := openSQLiteRaw(t, fileDSN(t, ""), 0) // no WAL: would fail the check
 

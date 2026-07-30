@@ -20,9 +20,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestMetricsOracleClaimP99AgreesWithHarness is acceptance A1: the runtime's
-// Prometheus histogram and the harness's independent timing are two measurements
-// of the same claims, computed by different code, and must agree. It runs a real
+// TestMetricsOracleClaimP99AgreesWithHarness cross-checks the runtime's Prometheus
+// histogram against the harness's independent timing: two measurements of the same
+// claims, computed by different code, that must agree. It runs a real
 // drain with -metrics-addr, scrapes /metrics, validates the exposition format,
 // computes histogram_quantile(0.99) over the claim histogram in Go, and asserts it
 // agrees with the harness's own Claim.P99 within one bucket width.

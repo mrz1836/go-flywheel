@@ -82,7 +82,7 @@ type Harness struct {
 	// Config.MetricsAddr is set. It is wired alongside harnessObserver so the
 	// runtime's histograms accumulate in metricsRec, which metricsServer renders
 	// on /metrics. It is a second, independent view of the same run the harness's
-	// timingDriver measures — the pair the A1 oracle cross-checks.
+	// timingDriver measures — the pair the metrics oracle cross-checks.
 	metricsObs    *observers.MetricsObserver
 	metricsRec    *observers.MemRecorder
 	metricsServer *http.Server
