@@ -92,6 +92,8 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		"jobs deleted per retention transaction (default: the runtime's own; never unbounded)")
 	fs.IntVar(&opts.cfg.SweepBatchSize, "sweep-batch", 0,
 		"expired leases reclaimed per sweep transaction (default: the runtime's own; never unbounded)")
+	fs.StringVar(&opts.cfg.MetricsAddr, "metrics-addr", "",
+		"serve the Prometheus /metrics exposition on this host:port for the run (empty disables)")
 	fs.BoolVar(&tuned, "storage-tuning", false,
 		"apply the tuned fillfactor and autovacuum settings to jobs")
 	fs.IntVar(&opts.cfg.TerminalSeed, "terminal-seed", 0,

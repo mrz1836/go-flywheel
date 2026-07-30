@@ -323,6 +323,13 @@ type Config struct {
 	// the runtime's own default, which is itself a bound.
 	SweepBatchSize int
 
+	// MetricsAddr, when non-empty, serves the runtime's Prometheus /metrics
+	// exposition on this host:port for the life of the run. It wires an
+	// observers.MetricsObserver alongside the harness's own, so the runtime's
+	// histograms accumulate in one recorder — the source the A1 oracle scrapes and
+	// compares against the harness's independent timings. Empty disables it.
+	MetricsAddr string
+
 	// Limiter selects the pre-claim admission gate the runners consult before
 	// claiming: LimiterNone (the default), LimiterTokenBucket (in-process), or
 	// LimiterDB (shared across processes through the target). Rate, Burst, and

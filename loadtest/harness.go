@@ -4,12 +4,16 @@ package loadtest
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	flywheel "github.com/mrz1836/go-flywheel"
+	"github.com/mrz1836/go-flywheel/observers"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -73,6 +77,15 @@ type Harness struct {
 	// nothing on the hot path.
 	inner   flywheel.Driver
 	timings *timings
+
+	// metricsObs is the runtime's MetricsObserver, non-nil only when
+	// Config.MetricsAddr is set. It is wired alongside harnessObserver so the
+	// runtime's histograms accumulate in metricsRec, which metricsServer renders
+	// on /metrics. It is a second, independent view of the same run the harness's
+	// timingDriver measures — the pair the A1 oracle cross-checks.
+	metricsObs    *observers.MetricsObserver
+	metricsRec    *observers.MemRecorder
+	metricsServer *http.Server
 
 	registry *flywheel.Registry
 
@@ -371,6 +384,16 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 		return h, err
 	}
 
+	// The optional /metrics endpoint. It records into its own MemRecorder through a
+	// MetricsObserver wired beside the harness's own, and serves the exposition on
+	// the probe pool's health sample — separate from the work pool, so a scrape
+	// never queues behind the drain it is measuring.
+	if cfg.MetricsAddr != "" {
+		if err = h.startMetricsServer(cfg.MetricsAddr); err != nil {
+			return h, err
+		}
+	}
+
 	return h, nil
 }
 
@@ -476,6 +499,55 @@ func (h *Harness) Note(format string, args ...any) { h.notes.add(format, args...
 // Schema returns the isolated schema this run provisioned.
 func (h *Harness) Schema() string { return h.schema }
 
+// startMetricsServer builds the runtime MetricsObserver and serves its Prometheus
+// exposition on addr for the life of the run. The listener is bound synchronously
+// so a bad address fails newHarness rather than surfacing as a missed scrape; the
+// Serve loop then runs in its own goroutine — deliberately not in h.wg, which
+// stopRunners waits on before Close shuts this server down — until Close closes it.
+func (h *Harness) startMetricsServer(addr string) error {
+	h.metricsRec = observers.NewMemRecorder()
+	h.metricsObs = observers.NewMetrics(h.metricsRec)
+
+	sample := func(ctx context.Context) (flywheel.QueueHealth, error) {
+		return flywheel.SampleQueueHealth(ctx, h.probe)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", observers.MetricsHandler(h.metricsRec, sample))
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("loadtest: bind metrics address %q: %w", addr, err)
+	}
+	h.metricsServer = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if serveErr := h.metricsServer.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			h.errs.add(fmt.Errorf("loadtest: metrics server: %w", serveErr))
+		}
+	}()
+	return nil
+}
+
+// runnerObserver is the Observer wired into every runner: the harness's own, plus
+// the runtime MetricsObserver when /metrics is enabled, fanned out through Multi.
+func (h *Harness) runnerObserver() flywheel.Observer {
+	base := harnessObserver{prog: h.prog}
+	if h.metricsObs == nil {
+		return base
+	}
+	return observers.NewMulti(base, h.metricsObs)
+}
+
+// schedulerObserver is the Observer the sweep reports through: the runtime
+// MetricsObserver when /metrics is enabled, or an untyped nil otherwise so the
+// scheduler defaults to its no-op (a typed nil *MetricsObserver would defeat that
+// nil check and panic in OnSweep).
+func (h *Harness) schedulerObserver() flywheel.Observer {
+	if h.metricsObs == nil {
+		return nil
+	}
+	return h.metricsObs
+}
+
 // Close stops every runner, closes every pool, and drops the run's schema. It is
 // safe to call on a partially constructed Harness, which is what the error paths
 // in newHarness rely on, and it reports the first failure while still attempting
@@ -487,6 +559,12 @@ func (h *Harness) Close(ctx context.Context) error {
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+
+	// The metrics server samples the probe pool, so it must stop before that pool
+	// closes below — otherwise a scrape racing teardown would 500 on a closed pool.
+	if h.metricsServer != nil {
+		fail(h.metricsServer.Close())
 	}
 
 	h.stopRunners()
@@ -564,7 +642,7 @@ func (h *Harness) startRunners(ctx context.Context) error {
 			// MaxRetryBackoff caps the runners' own retry ladder. Zero on every run
 			// but the outage measurement, where it is the number under test.
 			MaxRetryBackoff: h.cfg.MaxRetryBackoff,
-			Observer:        harnessObserver{prog: h.prog},
+			Observer:        h.runnerObserver(),
 			Logger:          discardLogger(),
 			// Every runner shares one limiter keyed on one resource, so the run's
 			// combined claim rate tracks a single budget. Nil on an ungated run.
@@ -611,6 +689,9 @@ func (h *Harness) startRunners(ctx context.Context) error {
 		DB:     h.sched,
 		Client: flywheel.NewClient(h.sched),
 		Driver: sweeper,
+		// The same MetricsObserver the runners hold, so the sweep's duration lands
+		// in the one recorder /metrics renders. Nil (no-op) when /metrics is off.
+		Observer: h.schedulerObserver(),
 		// Only the sweep is wanted. The periodic tick is pushed far out rather
 		// than disabled because there is no way to disable it, and a run that
 		// installs no periodic definitions has nothing for it to find anyway; the
