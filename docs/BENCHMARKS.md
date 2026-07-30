@@ -60,6 +60,18 @@ go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix enqueue \
 go run -tags=loadtest ./loadtest/cmd/explain -jobs 1000000 -queues 3 \
   -out docs/benchmarks/claim-plans-1m-after.txt
 
+# The parent-fairness claim cost: shipped claim vs. the round-robin CTE, at three depths.
+for n in 10000 100000 1000000; do
+  go run -tags=loadtest ./loadtest/cmd/explain -query claim-fair -jobs $n \
+    -out docs/benchmarks/fairness-plan-$n.txt
+done
+
+# Fairness interleaving: two parents of 10k children, strict FIFO vs. priority banding.
+go run -tags=loadtest ./loadtest/cmd/scenario -mix fairness -parents 2 -children 10000 \
+  -out docs/benchmarks/fairness-fifo.json
+go run -tags=loadtest ./loadtest/cmd/scenario -mix fairness -parents 2 -children 10000 \
+  -fairness round-robin-parent -out docs/benchmarks/fairness-interleave.json
+
 # The worker pool, on the mix where the barrier cost the most: 10% of jobs at 20x.
 go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix mixed-speed \
   -runners 4 -workers 8 -work 10ms -out docs/benchmarks/pool-mixed-8-after.json
@@ -67,6 +79,23 @@ go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix mixed-speed \
 # The poll-error ladder, against a 60-second database outage at 50% drained.
 go run -tags=loadtest ./loadtest/cmd/scenario -jobs 10000 -mix drain \
   -fault pause-database:60s -out docs/benchmarks/poll-backoff-after.json
+
+# The retry-backoff cap, against a simulated dependency outage. The worker fails
+# transiently while an injected clock — advanced between drain rounds — compresses
+# the ladder into seconds. The number is attempt volume per cohort.
+for cap in 30m 1m; do
+  [ "$cap" = 30m ] && out=backoff-outage.json || out=backoff-outage-1m.json
+  go run -tags=loadtest ./loadtest/cmd/scenario -jobs 10000 -mix drain \
+    -fault downstream-outage:4h -backoff-cap "$cap" -max-attempts 8 \
+    -out "docs/benchmarks/$out"
+done
+# The same at a budget sized to ride the outage out: the cap decides survival.
+for cap in 30m 1m; do
+  [ "$cap" = 30m ] && out=backoff-survive-30m.json || out=backoff-survive-1m.json
+  go run -tags=loadtest ./loadtest/cmd/scenario -jobs 10000 -mix drain \
+    -fault downstream-outage:4h -backoff-cap "$cap" -max-attempts 25 \
+    -out "docs/benchmarks/$out"
+done
 
 # Bounded maintenance at depth: a 1M drain under mass lease expiry.
 go run -tags=loadtest ./loadtest/cmd/scenario -jobs 1000000 -mix drain \
@@ -752,6 +781,134 @@ Two caveats that travel with these numbers:
 - **Throughput is unchanged because the outage is the whole story.** Both runs spend 60 of their
   ~61 seconds gated. The ladder buys a database that is not hammered while it recovers and a log that
   does not fill a disk; it does not buy throughput, and it is not published as though it did.
+
+<br/>
+
+## A dependency outage: the retry-backoff cap
+
+The poll ladder above governs how a *runner* retries a database it cannot reach. A separate ladder
+governs how a *job* retries a dependency that fails its work, and it has its own ceiling —
+`MaxRetryBackoff`, one minute by default. When a dependency's outages are measured in hours, the
+one-minute ceiling spends a job's whole attempt budget in minutes; raising the ceiling spreads the same
+budget across the outage.
+
+The harness fails every worker transiently for a simulated outage and lets the runners' own backoff
+ladder reschedule the cohort. Time is compressed: an advanceable clock is injected into the runners, and
+the harness steps it forward between drain rounds once each retry generation has quiesced, so a
+multi-hour ladder runs in seconds of wall time without shortening a single rung. Every run is 10,000
+jobs draining a no-op worker; the number is the attempt volume — one `job_runs` row per attempt.
+
+**A short budget: the cap is free.** With `-max-attempts 8`, eight attempts fit below both ceilings
+(the ladder reaches 64 s before it would clamp), so the cohort is discarded either way for the same
+attempt volume:
+
+| `-backoff-cap` | Attempts | Per job | Outcome | Sim time the ladder rode out |
+|---|---|---|---|---|
+| `1m` | **80,000** | 8.0 | 10,000 discarded | 3 m 35 s |
+| `30m` | **80,000** | 8.0 | 10,000 discarded | 3 m 49 s |
+
+Reports: [`backoff-outage-1m.json`](benchmarks/backoff-outage-1m.json),
+[`backoff-outage.json`](benchmarks/backoff-outage.json). The exponential ladder makes attempt volume
+nearly cap-independent: raising the ceiling costs nothing in attempts or audit rows.
+
+**A budget sized for the outage: the cap decides survival.** The point of the cap is a budget large
+enough to ride out a long outage. At `-max-attempts 25` against a four-hour outage, the two ceilings
+diverge completely:
+
+| `-backoff-cap` | Attempts | Per job | Outcome | Sim time the ladder rode out |
+|---|---|---|---|---|
+| `1m` | 250,000 | 25.0 | **10,000 discarded** | 24 m 55 s |
+| `30m` | **180,000** | 18.0 | **10,000 drained** | **4 h 27 m** |
+
+Reports: [`backoff-survive-1m.json`](benchmarks/backoff-survive-1m.json),
+[`backoff-survive-30m.json`](benchmarks/backoff-survive-30m.json).
+
+The one-minute cap saturates at 60 s after seven rungs, so twenty-five attempts span under twenty-five
+minutes — the budget is spent while the four-hour outage is still going, and every job is discarded
+having burned all 25 attempts against a dependency that could not answer. The thirty-minute cap keeps
+climbing (`1s → 2s → … → 17m → 30m`), so the same twenty-five-attempt budget spans four and a half
+hours; the outage lifts around attempt eighteen and the whole cohort *survives* — drained, not
+discarded, on **fewer** attempts (18 vs 25 per job). The cap is not a throughput knob and does not buy
+one; it buys the difference between riding out an outage and failing every job partway through it.
+
+Two caveats travel with these numbers, both from the time compression:
+
+- **Simulated time, wall-clock measurement.** The four-and-a-half-hour ladder ran in 3 m 38 s of wall
+  time. The compressed clock governs only when the runtime considers a retry due; `StartedAt`,
+  `Duration`, and the throughput figures are real time, as everywhere else in this document.
+- **Attempt volume is the deliverable, not survival timing.** The harness sizes the outage far past the
+  ladder and steps the clock only once a generation has quiesced, so every scheduled retry is claimed
+  before its rung is skipped — which makes the attempt counts above exact (`8×`, `25×`, and the `18×`
+  where the outage lifts mid-ladder) rather than a function of wall-clock luck.
+
+<br/>
+
+## Parent fairness: the claim cost that chose the mechanism
+
+Equal-priority claims are strict FIFO, so a large batch enqueued first drains before a small later batch
+gets a claim. The obvious fix — interleave parents in the claim itself — means ranking the ready set with
+a window function before the `LIMIT` applies. That is `O(ready)`, and this series targets a deep ready
+set, so whether it is affordable is a measurement, not an assumption.
+
+The `explain` tool seeds an all-claimable table across three queues and EXPLAINs three shapes of a
+single-queue routed claim — the shape that reaches `jobs_ready`, matching the runtime's own claim-plan
+gate — at three depths. F0 is the shipped claim; F1 adds
+`row_number() OVER (PARTITION BY COALESCE(parent_job_id, id))` and orders by `(priority, rank,
+scheduled_at)`; F2 adds the priority-band pre-filter (`WHERE priority <= (SELECT min(priority) …)`).
+
+| rows | ready set | F0 shipped | F1 round-robin CTE | F2 band pre-filter |
+|---|---|---|---|---|
+| 10,000 | 1,667 | **0.019 ms** · index scan, 8 rows | 1.500 ms · scan+sort 1,667 | 0.376 ms |
+| 100,000 | 16,667 | **0.020 ms** · index scan, 8 rows | 15.614 ms · scan+sort 16,667 | 3.901 ms |
+| 1,000,000 | 166,667 | **0.059 ms** · index scan, 8 rows | **216.014 ms** · seq scan 166k, external-merge sort | **102.360 ms** |
+
+Reports: [`fairness-plan-10000.txt`](benchmarks/fairness-plan-10000.txt),
+[`fairness-plan-100000.txt`](benchmarks/fairness-plan-100000.txt),
+[`fairness-plan-1000000.txt`](benchmarks/fairness-plan-1000000.txt).
+
+**F0 is flat; F1 is linear in the ready set.** The shipped claim walks `jobs_ready` in
+`(priority, scheduled_at)` order and stops at the batch size — 8 rows, no sort, `0.02–0.06 ms` whatever
+the depth. The round-robin CTE has to see every ready row before it can number them, so its cost tracks
+the ready set: at a million rows it is **216 ms**, roughly 3,600× the shipped claim, and its sort spills
+to disk. A runner claims on every poll, so 216 ms per claim against a deep queue is disqualifying.
+
+**The band pre-filter does not rescue it.** Narrowing the window's input to the top priority band cuts
+F1's cost by about half, but F2 is still **102 ms** at a million rows, because computing
+`min(priority)` scans the whole ready set before the band can be applied — it is still `O(ready)`, still
+~1,700× the shipped claim. There is no version of the claim-time ranking that stays affordable at this
+depth.
+
+**So fairness is expressed at enqueue time, through priority banding, and the claim path is untouched.**
+The ranking F1 pays on every claim is instead paid once per job by the producer, which writes each
+parent's *n*-th child into the same priority band; the shipped `(priority, scheduled_at)` claim then
+interleaves the parents for free at `0.06 ms`. The README's *Fairness across parents* section is the
+how-to; these plans are why it is the mechanism. The default claim path, `ErrSQLiteConcurrency`, and
+SQLite parity are all unchanged, because nothing in the claim path changed.
+
+### Banding interleaves where FIFO starves
+
+The `fairness` mix seeds two parents, each with ten thousand ready children, all available at once, and
+records which parent every claim served. Under strict FIFO — every child at the same priority — the
+claim's `(priority, scheduled_at)` order drains the first parent's whole batch before the second gets a
+single claim. Banding gives each parent's *n*-th child the same priority band, and the same claim
+interleaves them:
+
+| | strict FIFO | priority banding |
+|---|---|---|
+| Claims per parent | 10,000 / 10,000 | 10,000 / 10,000 |
+| **Longest single-parent run** | **10,000** | **13** |
+| **Smallest window share, either parent** | **0 %** | **43.8 %** |
+
+Reports: [`fairness-fifo.json`](benchmarks/fairness-fifo.json),
+[`fairness-interleave.json`](benchmarks/fairness-interleave.json), 64-claim windows.
+
+Both strategies run every child exactly once — the totals are identical — so the difference is order,
+not volume. Under FIFO the first parent runs its entire ten-thousand-child batch before the second is
+seen, and the second holds 0 % of every window until the first is done: textbook head-of-line blocking.
+Banding holds the longest single-parent run to 13 (concurrency jitter around a one-in, one-out
+interleave — the harness records execution order across 32 in-flight workers, a close proxy for claim
+order) and keeps each parent above 43 % of every window while both have work. The claim query is
+byte-identical between the two runs; only the priorities the producer wrote differ.
 
 <br/>
 

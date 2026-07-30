@@ -51,7 +51,8 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 
 	fs.StringVar(&opts.cfg.DSN, "dsn", os.Getenv(dsnEnv),
 		"PostgreSQL target (default $"+dsnEnv+")")
-	fs.StringVar(&opts.query, "query", "claim", "runtime query to characterize: claim or progress")
+	fs.StringVar(&opts.query, "query", "claim",
+		"runtime query to characterize: claim, claim-fair, or progress")
 	fs.IntVar(&opts.cfg.Jobs, "jobs", 1_000_000, "number of claimable rows to seed")
 	fs.IntVar(&opts.cfg.Queues, "queues", 3, "number of distinct queues the rows are spread across")
 	fs.Int64Var(&opts.cfg.Seed, "seed", 1, "run seed; equal seeds produce byte-identical workloads")
@@ -73,8 +74,8 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	if opts.timeout <= 0 {
 		return options{}, fmt.Errorf("explain: -timeout must be positive, got %s", opts.timeout)
 	}
-	if opts.query != "claim" && opts.query != "progress" {
-		return options{}, fmt.Errorf("explain: -query must be claim or progress, got %q", opts.query)
+	if opts.query != "claim" && opts.query != "claim-fair" && opts.query != "progress" {
+		return options{}, fmt.Errorf("explain: -query must be claim, claim-fair, or progress, got %q", opts.query)
 	}
 	if opts.cfg.DSN == "" {
 		return options{}, fmt.Errorf("explain: no target: pass -dsn or set %s", dsnEnv)

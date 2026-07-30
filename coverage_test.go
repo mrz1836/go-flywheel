@@ -67,13 +67,13 @@ func TestValidationErrorErrorAndUnwrap(t *testing.T) {
 
 func TestRunnerBackoffWithinJitterBounds(t *testing.T) {
 	t.Parallel()
-	r := &Runner{cfg: RunnerConfig{RetryBackoffBase: time.Second}}
+	r := &Runner{cfg: RunnerConfig{RetryBackoffBase: time.Second, MaxRetryBackoff: defaultMaxRetryBackoff}}
 	low := r.backoff(0)
 	assert.Positive(t, low, "attempt below 1 is treated as 1 and still produces a positive delay")
 
 	big := r.backoff(100)
-	assert.LessOrEqual(t, big, time.Duration(float64(maxRetryBackoff)*1.25))
-	assert.GreaterOrEqual(t, big, time.Duration(float64(maxRetryBackoff)*0.75),
+	assert.LessOrEqual(t, big, time.Duration(float64(defaultMaxRetryBackoff)*1.25))
+	assert.GreaterOrEqual(t, big, time.Duration(float64(defaultMaxRetryBackoff)*0.75),
 		"a large attempt caps near the max backoff modulo jitter")
 }
 

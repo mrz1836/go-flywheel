@@ -570,6 +570,13 @@ flywheel.RunnerConfig{
     // zero selects 30s. The delay starts at PollInterval, doubles per consecutive
     // failure with jitter, and resets on the first success.
     MaxPollBackoff: 30 * time.Second,
+
+    // Optional. Base and ceiling of the per-job retry ladder; zero selects 1s and
+    // 1m. A retry's delay starts at RetryBackoffBase, doubles per attempt with
+    // jitter, and holds flat at MaxRetryBackoff. Size the ceiling against
+    // MaxAttempts to match the retry cadence to how long the dependency stays down.
+    RetryBackoffBase: 30 * time.Second,
+    MaxRetryBackoff:  30 * time.Minute,
 }
 ```
 
@@ -583,6 +590,19 @@ a retry storm aimed at a recovering database, plus an unbounded log volume.
 blip and gives up once the ladder saturates — `⌈log₂(MaxPollBackoff / PollInterval)⌉ + 1` attempts, about
 51 seconds at the defaults. The bound is the ladder, not the context, so a caller that passes no deadline
 still gets an answer.
+
+**A per-job retry has its own ladder, and its ceiling is sized against the attempt budget.** A failed
+attempt is rescheduled after a delay that starts at `RetryBackoffBase` (default 1s), doubles per attempt
+with jitter, and holds flat at `MaxRetryBackoff` (default 1m) — separate from the poll ladder above, and
+overridable per worker via `Retryable.NextRetry`. The default ceiling suits a dependency that recovers in
+seconds: at the defaults a 25-attempt budget saturates at a minute after seven rungs and is spent in about
+nineteen minutes. It serves a multi-hour outage poorly — the job fails permanently while the dependency is
+still down, and most of those attempts ran a minute apart while it could not possibly succeed. Raise the
+pair together to stretch the same budget across the outage. With `RetryBackoffBase: 30s` and
+`MaxRetryBackoff: 30m` the ladder climbs `30s → 1m → 2m → 4m → 8m → 16m` and then holds at 30m, so
+`MaxAttempts: 8` spans about an hour and `MaxAttempts: 20` spans most of a workday (~7h). The cap only
+widens the spacing of the later rungs, never the first-attempt delay. Pick the outage length you must ride
+out, then choose the ceiling and `MaxAttempts` so their ladder covers it.
 
 **Drain is explicit.** `Stop` and `Drain` are safe before `Run`, concurrently with it, and after it
 returns:
@@ -621,6 +641,52 @@ names how many jobs were still in flight, and only then is the scheduler and hea
 A zero `DrainTimeout` waits for in-flight work however long it takes — genuinely unbounded, since the
 heartbeat renews a running job's lease indefinitely. Size it to the longest drain your deployment will
 tolerate.
+
+</details>
+
+<details>
+<summary><strong><code>Fairness across parents — priority banding</code></strong></summary>
+<br>
+
+**The claim is `ORDER BY priority, scheduled_at`, so equal-priority work is strict FIFO.** A lower
+priority number is claimed first; ties break by schedule time. That is the right default — it is one
+index seek to the front of the queue, `O(batch)` regardless of how deep the backlog is — but it means a
+large batch enqueued first fully drains before a small batch enqueued a minute later gets a single
+claim. When the two batches belong to different parents (or tenants, or customers), that is
+head-of-line blocking, and bulk enqueue makes the starving batch cheap to create.
+
+**Fairness is expressed through the priority column, at enqueue time — not by reordering the claim.** A
+runtime policy that interleaved parents in the claim would rank the whole ready set with a window
+function before applying the `LIMIT`, which is `O(ready)`: measured against a 166,667-row ready set at
+one million rows, that claim runs in **216 ms** where the shipped claim runs in **0.06 ms**, and a
+priority-band pre-filter still costs 102 ms because computing the band scans the ready set too (see
+[BENCHMARKS](docs/BENCHMARKS.md)). A runner claims on every poll, so paying that on every claim against
+a deep queue is not an option. So the ranking is moved to enqueue time, where it is paid once per job
+and the claim stays `O(batch)`: give each parent's *n*-th child the same priority band, so the claim's
+existing `(priority, scheduled_at)` order interleaves the parents for free.
+
+```go
+// Round-robin two parents by banding their children's priorities. Child i of every
+// parent shares band base+i, so the claim takes one child from each parent per band
+// instead of draining parent A before parent B is seen.
+for i, item := range parentAChildren {
+    item.Opts.Priority = priorityBase + i
+}
+for i, item := range parentBChildren {
+    item.Opts.Priority = priorityBase + i
+}
+```
+
+**Priority still dominates.** Banding interleaves work *of equal urgency*; it does not let a low-priority
+parent jump ahead of a high-priority one. Reserve a range of priority numbers for the band offset (say,
+`base + (i % window)`) so a genuinely more urgent job at a lower base is still claimed first, and the
+banding only decides the order *within* a base.
+
+**A parentless job is its own group of one.** Fairness is keyed on the parent, so a job with no parent
+does not share a band with anyone — id 1000 and id 1001, both parentless and both enqueued at the
+default priority, are claimed in schedule order exactly as they are today. Banding changes nothing for
+work that was never part of a batch; it is a tool for the case where one lineage would otherwise starve
+another.
 
 </details>
 

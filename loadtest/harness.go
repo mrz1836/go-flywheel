@@ -57,6 +57,17 @@ type Harness struct {
 	// rate track a single budget rather than Runners budgets.
 	limiter flywheel.Limiter
 
+	// clock is the advanceable simulated clock a clock-driven fault runs on, nil on
+	// every other run. It is injected into the runners' context so the runtime's
+	// sense of when a retry is due is the harness's to compress.
+	clock *harnessClock
+	// outage is the downstream-outage switch the worker reads, nil unless a
+	// DownstreamOutage fault is configured.
+	outage *outageState
+	// fairness records the parent ordinal of each claim in order, nil unless the
+	// run is the fairness mix.
+	fairness *fairnessRecorder
+
 	// inner is the undecorated driver. Each runner wraps it in its own
 	// timingDriver bound to its own histogram shard, so shard selection costs
 	// nothing on the hot path.
@@ -311,6 +322,22 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 		return h, err
 	}
 
+	// A clock-driven fault runs on an advanceable clock and needs a lease that
+	// survives time compression: the advancer only steps the clock once nothing is
+	// running, so a lease longer than any single step cannot expire mid-flight.
+	// leaseFor honors an explicit Lease, so this only fills the zero.
+	if _, ok := cfg.Faults.(clockDrivenFault); ok {
+		h.clock = newHarnessClock()
+		h.outage = &outageState{}
+		if cfg.Lease == 0 {
+			cfg.Lease = outageLease
+			h.cfg.Lease = outageLease
+		}
+	}
+	if cfg.Mix == WorkloadFairness {
+		h.fairness = &fairnessRecorder{}
+	}
+
 	h.inner = flywheel.NewPostgresDriverWithOptions(h.work, workDriverOpts(cfg))
 	h.timings = newTimings(cfg.Runners)
 	h.registry = flywheel.NewRegistry()
@@ -332,7 +359,7 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 	}
 	flywheel.Register(h.registry, loadWorker{
 		track: h.exec, seed: cfg.Seed, failFraction: cfg.FailFraction,
-		retryBackoff: retryBackoff, snooze: snooze,
+		retryBackoff: retryBackoff, snooze: snooze, outage: h.outage, fairness: h.fairness,
 	})
 
 	if err = h.buildLimiter(scoped); err != nil {
@@ -391,6 +418,21 @@ func (h *Harness) buildLimiter(scopedDSN string) error {
 // so a fail cohort's attempts exhaust quickly and deterministically instead of
 // following the runner's exponential ladder up to its one-minute cap.
 const replayRetryBackoff = 250 * time.Millisecond
+
+// outageLease is the simulated lease a clock-driven run gives its runners when
+// none was set. It is comfortably longer than any single clock advance (which is
+// bounded by MaxRetryBackoff), so a claim cannot expire while the advancer steps
+// the clock — the advancer only steps once nothing is running, but a generous
+// lease removes the race by construction.
+const outageLease = time.Hour
+
+// outagePollBackoff caps the runners' poll ladder on a clock-driven run. Between
+// advances the queue is quiesced — every retry is scheduled in the simulated
+// future — so an ordinary run's ladder would climb toward its 30s ceiling and the
+// runner would then sit out the moment the advancer releases the next generation.
+// A tight ceiling keeps the runner polling fast enough to claim each released
+// batch promptly, which is what keeps the compressed run to seconds.
+const outagePollBackoff = 10 * time.Millisecond
 
 // openPool opens one gorm connection pool with a fixed size.
 func openPool(dsn string, maxOpen int) (*gorm.DB, error) {
@@ -511,10 +553,14 @@ func (h *Harness) startRunners(ctx context.Context) error {
 			// drain; it is not on the hot path, which never sleeps while work
 			// remains.
 			PollInterval:      5 * time.Millisecond,
+			MaxPollBackoff:    h.pollBackoffCap(),
 			LeaseDuration:     leaseFor(h.cfg),
 			HeartbeatInterval: h.cfg.Heartbeat,
-			Observer:          harnessObserver{prog: h.prog},
-			Logger:            discardLogger(),
+			// MaxRetryBackoff caps the runners' own retry ladder. Zero on every run
+			// but the outage measurement, where it is the number under test.
+			MaxRetryBackoff: h.cfg.MaxRetryBackoff,
+			Observer:        harnessObserver{prog: h.prog},
+			Logger:          discardLogger(),
 			// Every runner shares one limiter keyed on one resource, so the run's
 			// combined claim rate tracks a single budget. Nil on an ungated run.
 			Limiter:  h.limiter,
@@ -666,6 +712,122 @@ func (h *Harness) orphanedByFaults() int64 {
 		n += g.orphaned.Load()
 	}
 	return n
+}
+
+// clockDriven reports whether the run's fault runs on the advanceable simulated
+// clock — the outage measurement's time-compression path.
+func (h *Harness) clockDriven() bool { return h.clock != nil }
+
+// pollBackoffCap is the runners' poll-ladder ceiling: tight on a clock-driven run
+// so the runner keeps polling fast through the quiesced gaps between advances,
+// and the runtime's own default (selected by zero) on every other run.
+func (h *Harness) pollBackoffCap() time.Duration {
+	if h.clockDriven() {
+		return outagePollBackoff
+	}
+	return 0
+}
+
+// advancerInterval is how often the clock advancer checks whether the current
+// retry generation has quiesced. It is faster than the runners' poll ladder
+// ceiling so an advance never waits on the advancer's own cadence.
+const advancerInterval = 20 * time.Millisecond
+
+// runClockAdvancer compresses simulated time so a multi-hour backoff ladder runs
+// in seconds. It steps the clock forward only once the current generation has
+// quiesced — nothing running and nothing due at the present instant — so every
+// scheduled retry is actually claimed before its rung is skipped, which is what
+// makes attempt volume deterministic rather than a function of wall-clock luck.
+func (h *Harness) runClockAdvancer(ctx context.Context) {
+	ticker := time.NewTicker(advancerInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		done, err := h.advanceClockOnce(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			h.errs.add(err)
+			continue
+		}
+		if done {
+			return
+		}
+	}
+}
+
+// advanceClockOnce steps the clock forward when the queue has quiesced, and
+// reports whether the drain is complete.
+//
+// It advances only when nothing is claimable at the present instant and nothing
+// is running: while a job is actionable the runners own the moment, and advancing
+// past it would skip a rung the ladder was meant to climb. When the only
+// remaining work is scheduled in the simulated future, it jumps the clock forward
+// to release that generation to the runners.
+//
+// Whole-rung jump vs. fine step. Attempt volume is invariant to how many jobs a
+// single advance releases — a job inside the outage fails every attempt whether it
+// is claimed alone or with its cohort — so while the whole pending generation sits
+// before the outage's end, it jumps to the *latest* pending instant and releases
+// the rung at once. That collapses O(jobs) advances into O(rungs). Only when the
+// pending set straddles the outage boundary — where the exact instant decides
+// success versus failure — does it fall back to the *earliest* instant and step
+// finely, so the boundary is resolved at full precision. The measurement sizes the
+// outage far past the ladder, so the fast path is the one it runs.
+func (h *Harness) advanceClockOnce(ctx context.Context) (done bool, err error) {
+	now := h.clock.Now(ctx)
+
+	var row struct {
+		Actionable int64
+		Pending    int64
+		MinAt      *time.Time
+		MaxAt      *time.Time
+	}
+	if err := h.probe.WithContext(ctx).Raw(`
+		SELECT
+		  count(*) FILTER (
+		    WHERE state = 'running'
+		       OR (state IN ('available','retryable','scheduled') AND scheduled_at <= ?)
+		  ) AS actionable,
+		  count(*) FILTER (
+		    WHERE state IN ('available','retryable','scheduled') AND scheduled_at > ?
+		  ) AS pending,
+		  min(scheduled_at) FILTER (
+		    WHERE state IN ('available','retryable','scheduled') AND scheduled_at > ?
+		  ) AS min_at,
+		  max(scheduled_at) FILTER (
+		    WHERE state IN ('available','retryable','scheduled') AND scheduled_at > ?
+		  ) AS max_at
+		FROM jobs`, now, now, now, now,
+	).Scan(&row).Error; err != nil {
+		return false, fmt.Errorf("loadtest: advance clock: %w", err)
+	}
+
+	if row.Actionable > 0 {
+		// The runners still have work at the present instant; leave the clock alone.
+		return false, nil
+	}
+	if row.Pending == 0 || row.MinAt == nil || row.MaxAt == nil {
+		// Nothing runnable and nothing scheduled: every job is terminal.
+		return true, nil
+	}
+
+	target := *row.MaxAt
+	if end := h.outage.end(); !end.IsZero() && !row.MaxAt.Before(end) {
+		// The rung straddles the outage boundary: step to the earliest instant so
+		// the success/fail boundary is resolved precisely rather than jumped over.
+		target = *row.MinAt
+	}
+	// The nudge makes the <= comparison at claim time include the target instant.
+	h.clock.advanceTo(target.Add(time.Microsecond))
+	return false, nil
 }
 
 // blockedClaims reports how many claim attempts the gates refused.

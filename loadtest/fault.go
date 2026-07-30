@@ -54,6 +54,16 @@ type windowedFault interface {
 	Window() time.Duration
 }
 
+// clockDrivenFault is the marker a fault carries when its window is measured in
+// simulated time rather than wall time. The harness switches on it to inject the
+// advanceable clock, size a lease long enough to survive time compression, run
+// the clock advancer, and inject the fault at the start of the drive rather than
+// on a drain fraction. A fault without it takes the ordinary wall-clock path.
+type clockDrivenFault interface {
+	Fault
+	clockDriven()
+}
+
 // gate blocks a driver's access to the database.
 //
 // It is two atomic bools, which matters: a fault fires from its own goroutine
@@ -448,6 +458,94 @@ func (m MassLeaseExpiry) Inject(ctx context.Context, h *Harness) (func(), error)
 		expired, reclaimed,
 	)
 	return nil, nil //nolint:nilnil // a permanent fault has no revert; the interface documents nil
+}
+
+// DownstreamOutage makes every worker fail transiently for a simulated window,
+// so the runner's own exponential backoff — capped by MaxRetryBackoff — governs
+// how the cohort is retried. It is the fault the configurable cap exists for:
+// PauseDatabase gates the database and exercises the poll ladder, where this
+// gates the work and exercises the retry ladder.
+//
+// # Why it is clock-driven
+//
+// A real outage-length ladder cannot run in wall time: a thirty-minute cap
+// schedules retries half an hour apart, and a run that waited them out would take
+// hours. So the window is measured in simulated time, and the harness advances an
+// injected clock between drain rounds — the runner schedules a retry at now+backoff
+// and re-claims it once the clock reaches that instant, which compresses a
+// multi-hour ladder into seconds without shortening a rung. The worker reads the
+// same clock, so the outage lifts the moment simulated time passes its end.
+//
+// # Why it does not reach through a gate
+//
+// The gate faults (KillWorker, PauseDatabase) stop the driver, which exercises
+// how the runner polls a database it cannot reach. This fault leaves the database
+// reachable and fails the work instead, which is the only shape that drives a job
+// down the retry ladder attempt by attempt — the thing the cap changes.
+type DownstreamOutage struct {
+	// For is how long, in simulated time, the outage lasts. Sized well past the
+	// backoff ladder's span, it holds the whole cohort down until its attempt
+	// budget is spent, which is what makes attempt volume the number.
+	For time.Duration
+}
+
+// clockDriven marks the fault as needing the advanceable clock. The harness
+// switches on this interface to inject the clock, size a long lease, and run the
+// advancer; a fault without it takes the ordinary wall-clock drive path.
+func (DownstreamOutage) clockDriven() {}
+
+// At reports where the fault fires. The harness injects a clock-driven fault at
+// the start of the drive rather than on a drain fraction — the whole cohort must
+// meet the outage, not the tail of it — so this value only satisfies the
+// (0,1) config check and is not a scheduling point.
+func (DownstreamOutage) At() float64 { return 0.5 }
+
+// Window reports the simulated outage length. The advancing clock, not a
+// wall-clock timer, is what ends it, so the fault scheduler never reverts this
+// fault on a real-time deadline; Inject returns a nil revert for the same reason.
+func (o DownstreamOutage) Window() time.Duration { return o.For }
+
+// Describe renders the fault for a report.
+func (o DownstreamOutage) Describe() string {
+	return fmt.Sprintf("fail every worker transiently for a simulated %s outage", o.For)
+}
+
+// Validate rejects a run the outage cannot be measured in: a zero window, a mix
+// that starts no runner, or simulated work. The work must be a no-op because time
+// is compressed — a job that slept would sleep in wall time while the clock jumped
+// hours around it, and its lease would race the advance.
+func (o DownstreamOutage) Validate(cfg Config) error {
+	if o.For <= 0 {
+		return fmt.Errorf("loadtest: DownstreamOutage.For must be positive, got %s: %w", o.For, ErrInvalidConfig)
+	}
+	if cfg.Mix == WorkloadEnqueueOnly {
+		return fmt.Errorf(
+			"loadtest: DownstreamOutage needs a mix that drains, got %q: the enqueue mix starts no runner, "+
+				"so there is nothing to retry: %w",
+			cfg.Mix, ErrInvalidConfig,
+		)
+	}
+	if cfg.WorkDuration > 0 || cfg.WorkJitter > 0 {
+		return fmt.Errorf(
+			"loadtest: DownstreamOutage requires -work 0: time is compressed, so a job that slept would "+
+				"sleep in wall time while the simulated clock jumped hours around it: %w",
+			ErrInvalidConfig,
+		)
+	}
+	return nil
+}
+
+// Inject opens the outage window at the current simulated instant. The fault is
+// permanent — the advancing clock lifts it, not a revert — so revert is nil.
+func (o DownstreamOutage) Inject(ctx context.Context, h *Harness) (func(), error) {
+	if h.outage == nil || h.clock == nil {
+		return nil, fmt.Errorf(
+			"loadtest: DownstreamOutage needs the clock-driven harness path, which was not provisioned: %w",
+			ErrInvalidConfig,
+		)
+	}
+	h.outage.begin(h.clock.Now(ctx).Add(o.For))
+	return nil, nil //nolint:nilnil // permanent; the advancing clock lifts the outage, there is nothing to revert
 }
 
 // --- scheduling -------------------------------------------------------------

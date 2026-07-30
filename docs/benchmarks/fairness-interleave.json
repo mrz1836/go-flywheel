@@ -1,0 +1,333 @@
+{
+    "claim": {
+        "count": 9042,
+        "max": "20.540916ms",
+        "mean": "902.76µs",
+        "min": "176.709µs",
+        "nanos": {
+            "max": 20540916,
+            "mean": 902760,
+            "min": 176709,
+            "p50": 781563,
+            "p95": 1563125,
+            "p99": 2421583
+        },
+        "p50": "781.563µs",
+        "p95": "1.563125ms",
+        "p99": "2.421583ms"
+    },
+    "concurrent_executions": 0,
+    "config": {
+        "executor_class": "loadtest",
+        "fairness": "round-robin-parent",
+        "heartbeat": "0s",
+        "indexes": "full",
+        "jobs": 100000,
+        "lease": "5s",
+        "mix": "fairness",
+        "parents": 2,
+        "queue": "default",
+        "runners": 4,
+        "sample_interval": "1s",
+        "seed": 1,
+        "target": "postgres://localhost:5432/flywheel_test",
+        "timeout": "30m0s",
+        "work_duration": "0s",
+        "work_jitter": "0s",
+        "workers": 8
+    },
+    "discarded": 0,
+    "drain_throughput_per_sec": 8871.337605886034,
+    "drained": 20000,
+    "duration": "2.254451458s",
+    "duration_nanos": 2254451458,
+    "enqueue_throughput_per_sec": 72972.58213576752,
+    "enqueued": 20000,
+    "fairness": {
+        "children_per_parent": 10000,
+        "claims_per_parent": [
+            10000,
+            10000
+        ],
+        "max_consecutive_same_parent": 13,
+        "min_active_window_share": 0.4375,
+        "parents": 2,
+        "strategy": "round-robin-parent",
+        "window_size": 64,
+        "windows": 313
+    },
+    "finalize": {
+        "count": 20000,
+        "max": "125.3315ms",
+        "mean": "1.49461ms",
+        "min": "287.75µs",
+        "nanos": {
+            "max": 125331500,
+            "mean": 1494610,
+            "min": 287750,
+            "p50": 1210792,
+            "p95": 2421583,
+            "p99": 4843165
+        },
+        "p50": "1.210792ms",
+        "p95": "2.421583ms",
+        "p99": "4.843165ms"
+    },
+    "histogram": {
+        "Buckets": 83,
+        "MaxExponent": 37,
+        "MaxRelativeError": 0.1552734375,
+        "MinExponent": 10,
+        "SubBucketsPerOctave": 3
+    },
+    "longest_lock_wait_seconds": 0,
+    "notes": [
+        "Seeding used the bulk path, so EnqueueThroughput is the harness's batch-insert rate rather than the runtime's producer API. The enqueue and steady mixes measure the API.",
+        "RSS is the harness client process, not the PostgreSQL server. Mechanism: getrusage(RUSAGE_SELF).ru_maxrss (peak resident set; darwin has no current-RSS source in the standard library, so the sampled series is a monotone high-water envelope).",
+        "pgstattuple is not installed in this database, so FreePercent and DeadTuplePercent are absent rather than zero. CREATE EXTENSION pgstattuple to collect them.",
+        "LockWaits is an instantaneous sample of pg_locks: it counts requests ungranted at the moment of the sample, and lock waits under normal contention are far shorter than the sampling interval. A run of zeroes means the sampler did not catch one, not that there was no contention. LongestLockWait is the companion that survives sampling: it measures how long the longest blocked backend has been waiting, which stays non-zero for the duration of a wait rather than only at the instant it is sampled. Both are scoped to this database.",
+        "MaxXactAge is sampled server-side from pg_stat_activity, and its guarantee is one-sided: a sampler at interval I always observes a transaction living longer than I, at an age of at least L-I, and may miss one shorter than I entirely. It is therefore the right instrument for an unbounded maintenance transaction and the wrong one for a bounded batch. For bounded maintenance the exact figure is Sweep.Max, which is client-side, is not bucketed, and covers exactly one transaction per call - at the cost of including pool acquisition, which the server-side age excludes.",
+        "MaxXactAge and the lock-wait pair count client backends only. An autovacuum worker carries an xact_start like any other backend and runs for minutes on a churning table, so including it would report vacuum duration as maintenance-transaction age - a quantity AutovacuumCount already reports, in the one field meant to answer whether a maintenance pass held a snapshot open.",
+        "MaxXactAge and the lock-wait pair are scoped to the database, not to this run's schema. The harness isolates a run by schema within one database, so a concurrent run against the same database - or an interactive query against it - is visible in these three numbers. Use a dedicated database for a run whose contention figures are being published.",
+        "WALBytes is the delta in pg_stat_wal, which is cluster-wide: PostgreSQL offers no per-database breakdown, so any other activity on the same server is included.",
+        "SlotUtilization is attempt time over slots × wall time, and it is a floor: an attempt's duration runs from its run stub to its finalize, so the claim, stub, and finalize round trips around it are capacity the pool was using and this does not count. It read 14.7% over 4 runners × 8 workers.",
+        "Index condition \"full\" installed 16 indexes: idx_job_periodics_slug, idx_jobs_deleted_at, job_periodics_pkey, job_runs_job_attempt, job_runs_pkey, jobs_parent_state, jobs_pkey, jobs_ready, jobs_running_leased, jobs_state, jobs_unique_active_key, jobs_unique_key, limiter_buckets_pkey, limiter_holds_expiry, limiter_holds_pkey, limiter_holds_resource.",
+        "Storage condition \"default\" installed reloptions: jobs=\"\", job_runs=\"\".",
+        "Fairness (priority banding): 2 parents x 10000 children. The longest single-parent run was 13 claims and the smallest window share any still-working parent got was 43.8% (window 64). Under strict FIFO the run approaches the batch size and the share approaches zero; banding holds the run to a handful and the share near 50.0%."
+    ],
+    "peak_lock_waits": 0,
+    "peak_rss_bytes": 69304320,
+    "peak_xact_age_seconds": 0.003817,
+    "reclaimed": 0,
+    "retried": 0,
+    "run_rows": 20000,
+    "schema": "lt_dkc399vdy1b4_1qaz_1",
+    "slot_utilization": 0.1473290810288318,
+    "started_at": "2026-07-30T13:40:28.652943-04:00",
+    "storage": [
+        {
+            "At": "2026-07-30T13:40:29.654416-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 256,
+                "jobs": 3815,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 3752,
+                "jobs": 6591,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 1359872,
+                "jobs": 3235840,
+                "limiter_buckets": 8192,
+                "limiter_holds": 24576
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 1864,
+                "jobs": 20000,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.001452,
+            "RSS": 69271552,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8,
+                "limiter_buckets": 1,
+                "limiter_holds": 3
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 3923968,
+                "jobs": 18513920,
+                "limiter_buckets": 16384,
+                "limiter_holds": 32768
+            },
+            "WALBytes": 0
+        },
+        {
+            "At": "2026-07-30T13:40:30.654419-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 0,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 1650,
+                "jobs": 1497,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 21914,
+                "jobs": 37910,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 2514944,
+                "jobs": 3743744,
+                "limiter_buckets": 8192,
+                "limiter_holds": 24576
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 10969,
+                "jobs": 19784,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0.003817,
+            "RSS": 69304320,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8,
+                "limiter_buckets": 1,
+                "limiter_holds": 3
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 7692288,
+                "jobs": 20422656,
+                "limiter_buckets": 16384,
+                "limiter_holds": 32768
+            },
+            "WALBytes": 17230038
+        },
+        {
+            "At": "2026-07-30T13:40:30.907405-04:00",
+            "AutoanalyzeCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "AutovacuumCount": {
+                "job_periodics": 0,
+                "job_runs": 0,
+                "jobs": 1,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "DeadTuplePercent": null,
+            "DeadTuples": {
+                "job_periodics": 0,
+                "job_runs": 6931,
+                "jobs": 6851,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "FreePercent": null,
+            "IdxScans": {
+                "job_periodics": 0,
+                "job_runs": 37836,
+                "jobs": 65361,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "IndexBytes": {
+                "job_periodics": 16384,
+                "job_runs": 2629632,
+                "jobs": 3768320,
+                "limiter_buckets": 8192,
+                "limiter_holds": 24576
+            },
+            "LiveTuples": {
+                "job_periodics": 0,
+                "job_runs": 18921,
+                "jobs": 19851,
+                "limiter_buckets": 0,
+                "limiter_holds": 0
+            },
+            "LockWaits": 0,
+            "LongestLockWait": 0,
+            "MaxXactAge": 0,
+            "RSS": 69304320,
+            "SeqScans": {
+                "job_periodics": 2,
+                "job_runs": 2,
+                "jobs": 8,
+                "limiter_buckets": 1,
+                "limiter_holds": 3
+            },
+            "TableBytes": {
+                "job_periodics": 24576,
+                "job_runs": 8159232,
+                "jobs": 21176320,
+                "limiter_buckets": 16384,
+                "limiter_holds": 32768
+            },
+            "WALBytes": 0
+        }
+    ],
+    "storage_params": {
+        "job_periodics": "",
+        "job_runs": "",
+        "jobs": "",
+        "limiter_buckets": "",
+        "limiter_holds": ""
+    },
+    "superseded": 0,
+    "sweep": {
+        "count": 3,
+        "max": "2.253834ms",
+        "mean": "1.706583ms",
+        "min": "1.387833ms",
+        "nanos": {
+            "max": 2253834,
+            "mean": 1706583,
+            "min": 1387833,
+            "p50": 1563125,
+            "p95": 2253834,
+            "p99": 2253834
+        },
+        "p50": "1.563125ms",
+        "p95": "2.253834ms",
+        "p99": "2.253834ms"
+    },
+    "workload_digest": "71b6938df45ebd670bbf4b1cc167de83248f18d052c649a31b7cf1f7354ec928"
+}
