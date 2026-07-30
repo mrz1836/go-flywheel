@@ -274,17 +274,19 @@ func extractBinaryWithCap(data []byte, binaryName, destDir string, maxBytes int6
 
 // safeJoin joins name onto destDir, rejecting entries that escape destDir
 // (absolute paths or ".." traversal — the Zip Slip defense).
+//
+// The guard is the prefix check on the cleaned target: after filepath.Clean
+// resolves any ".." segments, the result must be destDir itself or sit beneath
+// destDir + a separator. Comparing against the trailing separator rejects both a
+// traversal that Clean resolves outside destDir ("../escape") and a sibling whose
+// name merely shares destDir as a string prefix ("/tmp/dir-evil" vs "/tmp/dir").
 func safeJoin(destDir, name string) (string, error) {
 	if filepath.IsAbs(name) {
 		return "", fmt.Errorf("%w: %s", errPathTraversal, name)
 	}
 	destDir = filepath.Clean(destDir)
 	target := filepath.Clean(filepath.Join(destDir, name))
-	rel, err := filepath.Rel(destDir, target)
-	if err != nil {
-		return "", fmt.Errorf("resolve archive path: %w", err)
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if target != destDir && !strings.HasPrefix(target, destDir+string(os.PathSeparator)) {
 		return "", fmt.Errorf("%w: %s", errPathTraversal, name)
 	}
 	return target, nil
