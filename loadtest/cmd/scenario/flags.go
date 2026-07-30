@@ -98,6 +98,8 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		"fan-out mix: share of children that fail transiently, in [0,1); seeds the cohort under one parent")
 	fs.IntVar(&opts.cfg.MaxAttempts, "max-attempts", 0,
 		"seeded jobs' retry budget (0 selects the runtime default; a replay run defaults it small)")
+	fs.DurationVar(&opts.cfg.MaxRetryBackoff, "backoff-cap", 0,
+		"cap on the runners' exponential retry delay (0 selects the runtime default of one minute)")
 	fs.BoolVar(&opts.cfg.Replay, "replay", false,
 		"replay the discarded children after the initial drain and assert the cohort re-converges")
 	fs.DurationVar(&opts.cfg.ReplayStagger, "replay-stagger", 0,

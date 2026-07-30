@@ -203,6 +203,45 @@ type Report struct {
 	// Replay carries the replay phase's re-convergence account on a -replay run,
 	// and is nil otherwise.
 	Replay *ReplayReport
+
+	// Backoff carries the outage-length backoff account on a downstream-outage run,
+	// and is nil otherwise.
+	Backoff *BackoffReport
+}
+
+// BackoffReport is the account of a downstream-outage run: how a cohort's attempt
+// budget was spent against an outage the runner rode out on its own backoff
+// ladder. It is present only on a run with the downstream-outage fault.
+//
+// The headline is Attempts per cohort — the A2 number. The exponential ladder
+// means the count barely moves with the cap (a job that fails through the outage
+// spends the same handful of attempts either way); what the cap changes is how
+// far apart those attempts fall, which is SimSpanCovered. A one-minute cap and a
+// thirty-minute cap discard the same cohort for the same attempt volume, but the
+// thirty-minute cap does it over an outage thirty times longer.
+type BackoffReport struct {
+	// MaxRetryBackoff is the cap the runners used, resolved (never the zero the
+	// caller may have passed).
+	MaxRetryBackoff string `json:"max_retry_backoff"`
+	// OutageWindow is the simulated outage the workers failed through.
+	OutageWindow string `json:"outage_window"`
+	// SimSpanCovered is how far simulated time advanced — the wall-clock-free span
+	// the ladder rode out before the cohort's budget was spent.
+	SimSpanCovered string `json:"sim_span_covered"`
+	// Cohort is the seeded job count the attempt volume is measured per.
+	Cohort int `json:"cohort"`
+	// MaxAttempts is the per-job retry budget the cohort was seeded with.
+	MaxAttempts int `json:"max_attempts"`
+	// Attempts is the total job_runs the cohort produced — the A2 number.
+	Attempts int64 `json:"attempts"`
+	// AttemptsPerJob is Attempts over Cohort.
+	AttemptsPerJob float64 `json:"attempts_per_job"`
+	// TransientFailures is how many attempts the outage forced to fail.
+	TransientFailures int64 `json:"transient_failures"`
+	// Drained is how many jobs eventually succeeded (the outage lifted before their
+	// budget was spent); Discarded is how many exhausted their budget inside it.
+	Drained   int64 `json:"drained"`
+	Discarded int64 `json:"discarded"`
 }
 
 // ReplayReport is the account of a replay phase: what it recovered and whether the
@@ -315,6 +354,10 @@ type configJSON struct {
 	Burst         int    `json:"burst,omitempty"`
 	MaxConcurrent int    `json:"max_concurrent,omitempty"`
 	WorkerSnooze  int    `json:"worker_snooze,omitempty"`
+	// MaxRetryBackoff and MaxAttempts record the runners' retry ladder: the cap and
+	// the per-job budget. Both omit-empty, so an ordinary run's config is unchanged.
+	MaxRetryBackoff string `json:"max_retry_backoff,omitempty"`
+	MaxAttempts     int    `json:"max_attempts,omitempty"`
 }
 
 // reportJSON is Report's wire form.
@@ -350,6 +393,7 @@ type reportJSON struct {
 	Schema         string            `json:"schema,omitempty"`
 	StorageParams  map[string]string `json:"storage_params,omitempty"`
 	Replay         *ReplayReport     `json:"replay,omitempty"`
+	Backoff        *BackoffReport    `json:"backoff,omitempty"`
 }
 
 // MarshalJSON renders the report in its wire form.
@@ -386,6 +430,7 @@ func (r Report) MarshalJSON() ([]byte, error) {
 		Schema:         r.Schema,
 		StorageParams:  r.StorageParams,
 		Replay:         r.Replay,
+		Backoff:        r.Backoff,
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -440,6 +485,7 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 		Schema:               in.Schema,
 		StorageParams:        in.StorageParams,
 		Replay:               in.Replay,
+		Backoff:              in.Backoff,
 	}
 	return nil
 }
@@ -468,6 +514,13 @@ func configToJSON(c Config) configJSON {
 		Burst:          c.Burst,
 		MaxConcurrent:  c.MaxConcurrent,
 		WorkerSnooze:   c.WorkerSnooze,
+		MaxRetryBackoff: func() string {
+			if c.MaxRetryBackoff > 0 {
+				return c.MaxRetryBackoff.String()
+			}
+			return ""
+		}(),
+		MaxAttempts: c.MaxAttempts,
 	}
 }
 
@@ -493,25 +546,27 @@ func describeFault(f Fault) string {
 // target that does not exist.
 func configFromJSON(c configJSON) Config {
 	return Config{
-		Jobs:           c.Jobs,
-		Seed:           c.Seed,
-		Runners:        c.Runners,
-		Workers:        c.Workers,
-		Mix:            Workload(c.Mix),
-		Indexes:        IndexCondition(c.Indexes),
-		WorkDuration:   mustParseDuration(c.WorkDuration),
-		WorkJitter:     mustParseDuration(c.WorkJitter),
-		Lease:          mustParseDuration(c.Lease),
-		Heartbeat:      mustParseDuration(c.Heartbeat),
-		SampleInterval: mustParseDuration(c.SampleInterval),
-		Timeout:        mustParseDuration(c.Timeout),
-		Queue:          c.Queue,
-		ExecutorClass:  c.ExecutorClass,
-		Limiter:        LimiterKind(c.Limiter),
-		Rate:           c.Rate,
-		Burst:          c.Burst,
-		MaxConcurrent:  c.MaxConcurrent,
-		WorkerSnooze:   c.WorkerSnooze,
+		Jobs:            c.Jobs,
+		Seed:            c.Seed,
+		Runners:         c.Runners,
+		Workers:         c.Workers,
+		Mix:             Workload(c.Mix),
+		Indexes:         IndexCondition(c.Indexes),
+		WorkDuration:    mustParseDuration(c.WorkDuration),
+		WorkJitter:      mustParseDuration(c.WorkJitter),
+		Lease:           mustParseDuration(c.Lease),
+		Heartbeat:       mustParseDuration(c.Heartbeat),
+		SampleInterval:  mustParseDuration(c.SampleInterval),
+		Timeout:         mustParseDuration(c.Timeout),
+		Queue:           c.Queue,
+		ExecutorClass:   c.ExecutorClass,
+		Limiter:         LimiterKind(c.Limiter),
+		Rate:            c.Rate,
+		Burst:           c.Burst,
+		MaxConcurrent:   c.MaxConcurrent,
+		WorkerSnooze:    c.WorkerSnooze,
+		MaxRetryBackoff: mustParseDuration(c.MaxRetryBackoff),
+		MaxAttempts:     c.MaxAttempts,
 	}
 }
 

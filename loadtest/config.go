@@ -329,6 +329,12 @@ type Config struct {
 	// exhausts quickly.
 	MaxAttempts int
 
+	// MaxRetryBackoff caps the runners' exponential retry delay, threaded to
+	// RunnerConfig.MaxRetryBackoff verbatim. Zero leaves the runtime's own default
+	// (one minute) in place. It is the knob the downstream-outage measurement
+	// varies: a longer cap spreads the same attempt budget across a longer outage.
+	MaxRetryBackoff time.Duration
+
 	// Replay runs a replay phase after the initial drain: the discarded children are
 	// replayed under their parent with a restored budget, then the run awaits a
 	// second drain and asserts the cohort re-converges — every job terminal, no
@@ -471,6 +477,11 @@ func (c Config) validate() (Config, error) {
 	if c.MaxAttempts < 0 || c.ReplayBudget < 0 || c.ReplayStagger < 0 {
 		return Config{}, fmt.Errorf(
 			"loadtest: MaxAttempts, ReplayBudget and ReplayStagger must not be negative: %w", ErrInvalidConfig,
+		)
+	}
+	if c.MaxRetryBackoff < 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: MaxRetryBackoff must not be negative, got %s: %w", c.MaxRetryBackoff, ErrInvalidConfig,
 		)
 	}
 	if c.Replay {

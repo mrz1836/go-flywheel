@@ -68,6 +68,23 @@ go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -mix mixed-speed \
 go run -tags=loadtest ./loadtest/cmd/scenario -jobs 10000 -mix drain \
   -fault pause-database:60s -out docs/benchmarks/poll-backoff-after.json
 
+# The retry-backoff cap, against a simulated dependency outage. The worker fails
+# transiently while an injected clock — advanced between drain rounds — compresses
+# the ladder into seconds. The number is attempt volume per cohort.
+for cap in 30m 1m; do
+  [ "$cap" = 30m ] && out=backoff-outage.json || out=backoff-outage-1m.json
+  go run -tags=loadtest ./loadtest/cmd/scenario -jobs 10000 -mix drain \
+    -fault downstream-outage:4h -backoff-cap "$cap" -max-attempts 8 \
+    -out "docs/benchmarks/$out"
+done
+# The same at a budget sized to ride the outage out: the cap decides survival.
+for cap in 30m 1m; do
+  [ "$cap" = 30m ] && out=backoff-survive-30m.json || out=backoff-survive-1m.json
+  go run -tags=loadtest ./loadtest/cmd/scenario -jobs 10000 -mix drain \
+    -fault downstream-outage:4h -backoff-cap "$cap" -max-attempts 25 \
+    -out "docs/benchmarks/$out"
+done
+
 # Bounded maintenance at depth: a 1M drain under mass lease expiry.
 go run -tags=loadtest ./loadtest/cmd/scenario -jobs 1000000 -mix drain \
   -work 2ms -lease 1s -fault mass-lease-expiry -timeout 60m -sample-interval 5s \
@@ -752,6 +769,65 @@ Two caveats that travel with these numbers:
 - **Throughput is unchanged because the outage is the whole story.** Both runs spend 60 of their
   ~61 seconds gated. The ladder buys a database that is not hammered while it recovers and a log that
   does not fill a disk; it does not buy throughput, and it is not published as though it did.
+
+<br/>
+
+## A dependency outage: the retry-backoff cap
+
+The poll ladder above governs how a *runner* retries a database it cannot reach. A separate ladder
+governs how a *job* retries a dependency that fails its work, and it has its own ceiling —
+`MaxRetryBackoff`, one minute by default. When a dependency's outages are measured in hours, the
+one-minute ceiling spends a job's whole attempt budget in minutes; raising the ceiling spreads the same
+budget across the outage.
+
+The harness fails every worker transiently for a simulated outage and lets the runners' own backoff
+ladder reschedule the cohort. Time is compressed: an advanceable clock is injected into the runners, and
+the harness steps it forward between drain rounds once each retry generation has quiesced, so a
+multi-hour ladder runs in seconds of wall time without shortening a single rung. Every run is 10,000
+jobs draining a no-op worker; the number is the attempt volume — one `job_runs` row per attempt.
+
+**A short budget: the cap is free.** With `-max-attempts 8`, eight attempts fit below both ceilings
+(the ladder reaches 64 s before it would clamp), so the cohort is discarded either way for the same
+attempt volume:
+
+| `-backoff-cap` | Attempts | Per job | Outcome | Sim time the ladder rode out |
+|---|---|---|---|---|
+| `1m` | **80,000** | 8.0 | 10,000 discarded | 3 m 35 s |
+| `30m` | **80,000** | 8.0 | 10,000 discarded | 3 m 49 s |
+
+Reports: [`backoff-outage-1m.json`](benchmarks/backoff-outage-1m.json),
+[`backoff-outage.json`](benchmarks/backoff-outage.json). The exponential ladder makes attempt volume
+nearly cap-independent: raising the ceiling costs nothing in attempts or audit rows.
+
+**A budget sized for the outage: the cap decides survival.** The point of the cap is a budget large
+enough to ride out a long outage. At `-max-attempts 25` against a four-hour outage, the two ceilings
+diverge completely:
+
+| `-backoff-cap` | Attempts | Per job | Outcome | Sim time the ladder rode out |
+|---|---|---|---|---|
+| `1m` | 250,000 | 25.0 | **10,000 discarded** | 24 m 55 s |
+| `30m` | **180,000** | 18.0 | **10,000 drained** | **4 h 27 m** |
+
+Reports: [`backoff-survive-1m.json`](benchmarks/backoff-survive-1m.json),
+[`backoff-survive-30m.json`](benchmarks/backoff-survive-30m.json).
+
+The one-minute cap saturates at 60 s after seven rungs, so twenty-five attempts span under twenty-five
+minutes — the budget is spent while the four-hour outage is still going, and every job is discarded
+having burned all 25 attempts against a dependency that could not answer. The thirty-minute cap keeps
+climbing (`1s → 2s → … → 17m → 30m`), so the same twenty-five-attempt budget spans four and a half
+hours; the outage lifts around attempt eighteen and the whole cohort *survives* — drained, not
+discarded, on **fewer** attempts (18 vs 25 per job). The cap is not a throughput knob and does not buy
+one; it buys the difference between riding out an outage and failing every job partway through it.
+
+Two caveats travel with these numbers, both from the time compression:
+
+- **Simulated time, wall-clock measurement.** The four-and-a-half-hour ladder ran in 3 m 38 s of wall
+  time. The compressed clock governs only when the runtime considers a retry due; `StartedAt`,
+  `Duration`, and the throughput figures are real time, as everywhere else in this document.
+- **Attempt volume is the deliverable, not survival timing.** The harness sizes the outage far past the
+  ladder and steps the clock only once a generation has quiesced, so every scheduled retry is claimed
+  before its rung is skipped — which makes the attempt counts above exact (`8×`, `25×`, and the `18×`
+  where the outage lifts mid-ladder) rather than a function of wall-clock luck.
 
 <br/>
 
