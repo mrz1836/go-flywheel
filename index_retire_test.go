@@ -9,76 +9,71 @@ import (
 	"gorm.io/gorm"
 )
 
-// migratedSchemaWithRetiredJobsParent stands up the full runtime schema and then
-// re-creates jobs_parent — the index jobs_parent_state supersedes — so the
-// installer and the parity check face the exact straggler a database upgraded
-// across the retirement still carries. jobs_parent is intentionally absent from
-// IndexSet, so it cannot be built from there: reconstructing the pre-upgrade state
-// is the one case a test in this package spells an index the runtime no longer
-// declares, and it is the historical definition, captured, not invented.
-func migratedSchemaWithRetiredJobsParent(t *testing.T) *gorm.DB {
+// schemaWithForeignJobsIndex stands up the full runtime schema and then creates
+// jobs_parent on jobs — an index the runtime declares in neither IndexSet nor
+// retiredIndexNames. It stands in for any index a host adds on a runtime table
+// for its own purposes: the installer must leave it strictly alone. jobs_parent
+// is a convenient stand-in because it is spelled from a real historical
+// definition, but nothing about it is special now that retiredIndexNames is
+// empty — it is just a name the runtime does not own.
+func schemaWithForeignJobsIndex(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := newDB(t)
 	require.NoError(t, db.Exec(
 		`CREATE INDEX IF NOT EXISTS jobs_parent ON jobs (parent_job_id) WHERE parent_job_id IS NOT NULL`,
-	).Error, "reconstruct the retired index a pre-upgrade database still carries")
+	).Error, "create a foreign index the runtime neither declares nor retires")
 	return db
 }
 
-// TestInstallIndexesDropsTheRetiredJobsParent proves the auto-drop: a database
-// still carrying jobs_parent has it removed on the next InstallIndexes, with no
-// opt-in and without disturbing the covering jobs_parent_state.
-func TestInstallIndexesDropsTheRetiredJobsParent(t *testing.T) {
+// TestInstallIndexesLeavesAForeignIndexAlone proves the safety property behind an
+// empty retiredIndexNames: an index the runtime declares in neither IndexSet nor
+// retiredIndexNames is never dropped. The installer touches only what it owns, so
+// a host's own index on a runtime table survives every InstallIndexes.
+func TestInstallIndexesLeavesAForeignIndexAlone(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	db := migratedSchemaWithRetiredJobsParent(t)
-	require.True(t, sqliteHasIndex(t, db, "jobs_parent"), "precondition: the retired index is present")
+	db := schemaWithForeignJobsIndex(t)
+	require.True(t, sqliteHasIndex(t, db, "jobs_parent"), "precondition: the foreign index is present")
 
-	require.NoError(t, InstallIndexes(ctx, db), "a retired straggler is dropped, not reported as an error")
+	require.NoError(t, InstallIndexes(ctx, db), "a foreign index is left alone, not an error")
 
-	assert.False(t, sqliteHasIndex(t, db, "jobs_parent"), "the retired index is dropped")
-	assert.True(t, sqliteHasIndex(t, db, "jobs_parent_state"), "the covering index survives")
+	assert.True(t, sqliteHasIndex(t, db, "jobs_parent"), "the foreign index survives — the runtime does not own it")
+	assert.True(t, sqliteHasIndex(t, db, "jobs_parent_state"), "the runtime's own index is present")
 
-	// Idempotent: a second run has nothing to drop and still succeeds.
+	// Idempotent: a second run still leaves the foreign index alone.
 	require.NoError(t, InstallIndexes(ctx, db))
+	assert.True(t, sqliteHasIndex(t, db, "jobs_parent"))
 }
 
-// TestMigrateDropsTheRetiredJobsParent proves the drop is uniform across the two
-// install paths: Migrate removes the straggler too, not only InstallIndexes.
-func TestMigrateDropsTheRetiredJobsParent(t *testing.T) {
+// TestMigrateLeavesAForeignIndexAlone proves the same across the other install
+// path: Migrate does not drop a foreign index either.
+func TestMigrateLeavesAForeignIndexAlone(t *testing.T) {
 	t.Parallel()
-	db := migratedSchemaWithRetiredJobsParent(t)
+	db := schemaWithForeignJobsIndex(t)
 
 	require.NoError(t, Migrate(db))
-	assert.False(t, sqliteHasIndex(t, db, "jobs_parent"), "Migrate drops the retired index")
+	assert.True(t, sqliteHasIndex(t, db, "jobs_parent"), "Migrate leaves a foreign index alone")
 	assert.True(t, sqliteHasIndex(t, db, "jobs_parent_state"))
 }
 
-// TestInspectIndexesSurfacesTheRetiredStraggler proves the read-only parity check
-// reports a surviving retired index as an informational straggler — Retired set,
-// Expected empty — so a host that hand-applies DDL and never calls InstallIndexes
-// still sees it, even once the auto-drop is gone. It is not counted as drift: it
-// carries no expected definition and never becomes an IndexDriftError.
-func TestInspectIndexesSurfacesTheRetiredStraggler(t *testing.T) {
+// TestInspectIndexesIgnoresAForeignIndex proves the read-only parity check reports
+// nothing for a foreign index: it is not in the desired set, so it is not drift,
+// and retiredIndexNames is empty, so it is not a straggler. An empty result means
+// the runtime's own schema is at parity, and a host's extra index is invisible to
+// the check rather than a false positive.
+func TestInspectIndexesIgnoresAForeignIndex(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
-	db := migratedSchemaWithRetiredJobsParent(t)
-
-	drift, err := InspectIndexes(ctx, db)
+	drift, err := InspectIndexes(context.Background(), schemaWithForeignJobsIndex(t))
 	require.NoError(t, err)
-	require.Len(t, drift, 1, "the schema is at parity except for the retired straggler")
-	assert.Equal(t, "jobs_parent", drift[0].Name)
-	assert.True(t, drift[0].Retired, "a superseded index is reported as retired, not drift")
-	assert.NotEmpty(t, drift[0].Installed, "the straggler's installed definition is reported")
-	assert.Empty(t, drift[0].Expected, "a retired index has no expected definition")
+	assert.Empty(t, drift, "a foreign index is neither drift nor a retired straggler")
 }
 
-// TestInspectIndexesIsCleanOnAFreshInstallWithNoStraggler is the companion: a
-// freshly migrated schema — which never had jobs_parent — reports no straggler,
-// so the retired check adds no noise to the common case.
-func TestInspectIndexesIsCleanOnAFreshInstallWithNoStraggler(t *testing.T) {
+// TestInspectIndexesIsCleanOnAFreshInstall is the companion: a freshly migrated
+// schema reports no drift and no straggler, so the parity check is quiet in the
+// common case.
+func TestInspectIndexesIsCleanOnAFreshInstall(t *testing.T) {
 	t.Parallel()
 	drift, err := InspectIndexes(context.Background(), newDB(t))
 	require.NoError(t, err)
-	assert.Empty(t, drift, "a fresh install carries no retired straggler")
+	assert.Empty(t, drift, "a fresh install is at parity")
 }

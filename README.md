@@ -328,10 +328,6 @@ for _, idx := range must(flywheel.IndexSet("postgres")) {
 > declarative `schema apply` *does* inspect the database and would drop them, which is one more reason a
 > shared database wants versioned mode.)
 
-A host that owns its schema history but still wants the installer can have both:
-`MigrateWithOptions(db, MigrateOpts{SkipColumnReconcile: true})` skips the routing-column reconciliation
-pass, so the runtime issues no `ALTER TABLE` of its own inside a versioned schema.
-
 **The install compares indexes by definition, not by name.** `CREATE INDEX IF NOT EXISTS` matches on the
 name alone, so a database already carrying an index of that name keeps its old definition through an
 install that reports success — a re-keyed index or a dropped `WHERE` predicate lands nowhere and the
