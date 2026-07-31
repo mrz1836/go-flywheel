@@ -319,40 +319,13 @@ func TestRecentFailuresSurfacesRunsQueryError(t *testing.T) {
 // --- migrate.go error branches ----------------------------------------------
 
 // TestMigrateSurfacesErrorsOnClosedDB proves Migrate surfaces the failure of its
-// first step (the column-rename reconcile) against a closed connection.
+// first step (AutoMigrate) against a closed connection.
 func TestMigrateSurfacesErrorsOnClosedDB(t *testing.T) {
 	t.Parallel()
 	db := newBareSQLite(t)
 	closeDB(t, db)
 
 	require.Error(t, Migrate(db), "Migrate against a closed DB surfaces an error")
-}
-
-// TestReconcileColumnRenamesSurfacesExecError proves the legacy column-rename
-// step surfaces a failed ALTER TABLE ... RENAME COLUMN, both directly and through
-// Migrate's wrapper. A legacy-shaped jobs table forces the rename branch, and a
-// read-only PRAGMA makes the ALTER fail.
-func TestReconcileColumnRenamesSurfacesExecError(t *testing.T) {
-	t.Parallel()
-	db := newBareSQLite(t)
-
-	// Pin a single connection so the read-only PRAGMA stays in effect for the
-	// rename ALTER under the shared-cache pool.
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
-
-	// A legacy-shaped jobs table carrying the old run_on column (and no
-	// executor_class) forces the rename branch; the read-only PRAGMA then makes the
-	// ALTER TABLE ... RENAME COLUMN exec fail, exercising the error return.
-	require.NoError(t, db.Exec(`CREATE TABLE jobs (id text primary key, run_on text)`).Error)
-	require.NoError(t, db.Exec(`PRAGMA query_only = ON`).Error)
-
-	require.Error(t, reconcileColumnRenames(db), "a failed rename ALTER surfaces an error")
-
-	// Drive the same failure through Migrate so its reconcile-column-renames error
-	// wrapper (the first step) is exercised too.
-	require.Error(t, Migrate(db), "Migrate wraps a column-rename failure")
 }
 
 // --- read.go ListJobs error branch ------------------------------------------

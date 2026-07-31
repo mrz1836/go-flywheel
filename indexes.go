@@ -442,13 +442,11 @@ func normalizeIndexDef(def string) string {
 // from IndexSet but absent from here too is left strictly alone, so an index a host
 // added for its own purposes on the same table is never touched.
 //
-// It carries the same sunset as reconcileColumnRenames: jobs_parent — superseded
-// by the covering jobs_parent_state — is dropped here until v0.17.0, at which point
-// this list empties and the drop becomes a no-op. Any database that has run one
-// Migrate or InstallIndexes since the retirement no longer has jobs_parent to drop,
-// so the removal changes nothing for a host that stayed current.
+// The list is currently empty: the runtime declares no superseded index. It stays
+// as the seam a future retirement adds a name to — until then applyIndexes drops
+// nothing here and InspectIndexes reports no straggler.
 func retiredIndexNames() []string {
-	return []string{"jobs_parent"}
+	return nil
 }
 
 // runtimeIndexes is the dialect-independent index set. PostgreSQL and SQLite
