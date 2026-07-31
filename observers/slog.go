@@ -89,6 +89,22 @@ func (s *SlogObserver) OnSupersede(ctx context.Context, ev flywheel.SupersedeEve
 	)
 }
 
+// OnSweep logs a completed stuck-lease reclaim pass. It logs at the configured
+// level (debug) when the pass reclaimed nothing — routine maintenance — and at
+// info when it reclaimed leases, because a nonzero reclaim means an executor died
+// mid-attempt and an operator scanning info-level logs should see that.
+func (s *SlogObserver) OnSweep(ctx context.Context, ev flywheel.SweepEvent) {
+	level := s.level
+	if ev.Reclaimed > 0 {
+		level = slog.LevelInfo
+	}
+	s.logger.LogAttrs(
+		ctx, level, "flywheel: lease sweep completed",
+		slog.Int("reclaimed", ev.Reclaimed),
+		slog.Duration("duration", ev.Duration),
+	)
+}
+
 // OnRetry logs a scheduled retry.
 func (s *SlogObserver) OnRetry(ctx context.Context, ev flywheel.RetryEvent) {
 	s.logger.LogAttrs(

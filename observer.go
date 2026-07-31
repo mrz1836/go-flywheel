@@ -66,6 +66,13 @@ type Observer interface {
 	// A nonzero rate here means work is being executed twice. The lease is too
 	// short for the workload, or the heartbeat is disabled or failing.
 	OnSupersede(ctx context.Context, ev SupersedeEvent)
+	// OnSweep fires once per stuck-lease reclaim pass, after the sweep completes.
+	// Unlike the per-attempt events it is driven by the Scheduler, not the Runner,
+	// so a host that wants sweep timing must pass the same Observer to both
+	// RunnerConfig.Observer and SchedulerConfig.Observer. It is the maintenance
+	// counterpart to OnClaim: a rising sweep duration is a database-load signal,
+	// and a nonzero Reclaimed is the count of leases a crashed executor left behind.
+	OnSweep(ctx context.Context, ev SweepEvent)
 }
 
 // ClaimEvent describes one claimed batch.
@@ -73,6 +80,10 @@ type ClaimEvent struct {
 	ExecutorClass ExecutorClass
 	Queues        []string
 	Claimed       int
+	// Duration is how long the claim round trip took. It is the queue's contention
+	// signal: a rising claim p99 with flat depth means executors are contending for
+	// the same rows, not that work is arriving faster.
+	Duration time.Duration
 }
 
 // JobEvent identifies one attempt. It is embedded in the finish and retry events.
@@ -94,8 +105,12 @@ type FinishEvent struct {
 	ErrorClass ErrorClass
 	// Err is the worker error, or nil on success.
 	Err error
-	// Duration is the wall time the attempt took.
+	// Duration is the wall time the worker body took.
 	Duration time.Duration
+	// FinalizeDuration is how long persisting the outcome took, distinct from
+	// Duration because the two fail differently: a slow worker is a downstream
+	// problem, a slow finalize is a database problem.
+	FinalizeDuration time.Duration
 }
 
 // RetryEvent reports an attempt that has been scheduled to retry.
@@ -130,6 +145,18 @@ type SupersedeEvent struct {
 	LeaseToken string
 }
 
+// SweepEvent reports one completed stuck-lease reclaim pass.
+type SweepEvent struct {
+	// Duration is how long the sweep pass took. A rising value is a database-load
+	// signal — the reclaim's indexed scan is contending — read alongside claim
+	// duration rather than in isolation.
+	Duration time.Duration
+	// Reclaimed is how many expired leases the pass returned to available. A
+	// steadily nonzero value means executors are dying mid-attempt often enough
+	// that the sweep, not clean finalization, is recovering their work.
+	Reclaimed int
+}
+
 // noopObserver is the default Observer when RunnerConfig.Observer is nil: every
 // method is a no-op, so the dispatch hot path never needs a nil check.
 type noopObserver struct{}
@@ -139,3 +166,4 @@ func (noopObserver) OnStart(context.Context, JobEvent)           {}
 func (noopObserver) OnFinish(context.Context, FinishEvent)       {}
 func (noopObserver) OnRetry(context.Context, RetryEvent)         {}
 func (noopObserver) OnSupersede(context.Context, SupersedeEvent) {}
+func (noopObserver) OnSweep(context.Context, SweepEvent)         {}

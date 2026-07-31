@@ -3,8 +3,11 @@ package flywheel
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/gorm"
 )
@@ -18,19 +21,148 @@ type sqliteDriver struct {
 	baseDriver
 }
 
-// NewSQLiteDriver returns a Driver backed by a SQLite connection, with the
-// default batching options. The connection should be opened with the
-// _txlock=immediate DSN parameter so the write lock is taken up front: a
-// transaction that starts deferred and upgrades to a write mid-claim can fail
-// with SQLITE_BUSY even against a single writer.
-func NewSQLiteDriver(db *gorm.DB) Driver {
-	return NewSQLiteDriverWithOptions(db, DriverOpts{})
+// SQLiteOpts configures SQLite driver construction. It embeds the batching
+// DriverOpts so a host can set the batch sizes and the pragma-check policy in one
+// value.
+type SQLiteOpts struct {
+	DriverOpts
+	// SkipPragmaCheck disables the connection verification. Use it only when the
+	// connection is configured by other means and the check's queries are
+	// unwelcome — a shared pool the host has already hardened, say.
+	SkipPragmaCheck bool
 }
 
-// NewSQLiteDriverWithOptions returns a Driver backed by a SQLite connection,
-// with opts controlling its batching. A zero opts is exactly NewSQLiteDriver.
-func NewSQLiteDriverWithOptions(db *gorm.DB, opts DriverOpts) Driver {
-	return &sqliteDriver{baseDriver{db: db, opts: opts}}
+// NewSQLiteDriver returns a Driver backed by a SQLite connection, with the
+// default batching options. It verifies the connection's pragmas and logs any
+// failure through slog.Default(), returning the driver regardless so its
+// one-argument, error-free signature is preserved.
+//
+// The connection should be opened with the _txlock=immediate DSN parameter so the
+// write lock is taken up front: a transaction that starts deferred and upgrades
+// to a write mid-claim can fail with SQLITE_BUSY even against a single writer.
+// _txlock is a DSN parameter PRAGMA cannot report, so the check warns about it
+// rather than failing. A host that wants a missing pragma to be fatal should call
+// NewSQLiteDriverWithOptions.
+func NewSQLiteDriver(db *gorm.DB) Driver {
+	if err := checkSQLitePragmas(db); err != nil {
+		slog.Default().Error(
+			"flywheel: sqlite connection check failed; the serialized claim can deadlock under load — "+
+				"use NewSQLiteDriverWithOptions to make this fatal, or see the embedder checklist in docs/RUNBOOK.md",
+			"error", err,
+		)
+	}
+	return &sqliteDriver{baseDriver{db: db, opts: DriverOpts{}}}
+}
+
+// NewSQLiteDriverWithOptions returns a Driver backed by a SQLite connection, with
+// opts controlling batching and the pragma-check policy. Unless
+// opts.SkipPragmaCheck is set it verifies the connection is configured for
+// concurrent job claiming, returning ErrSQLitePragma (naming the offending
+// pragma) on a hard failure.
+//
+// The runtime's SQLite claim is a serialized SELECT-then-UPDATE that must take
+// the write lock up front; without BEGIN IMMEDIATE semantics a concurrent reader
+// can hold a shared lock the claim then cannot upgrade, deadlocking under exactly
+// the load the runtime is for. The check reports a misconfigured connection at
+// construction rather than as an intermittent failure later.
+func NewSQLiteDriverWithOptions(db *gorm.DB, opts SQLiteOpts) (Driver, error) {
+	if !opts.SkipPragmaCheck {
+		if err := checkSQLitePragmas(db); err != nil {
+			return nil, err
+		}
+	}
+	return &sqliteDriver{baseDriver{db: db, opts: opts.DriverOpts}}, nil
+}
+
+// checkSQLitePragmas verifies the connection pragmas the serialized claim relies
+// on, returning ErrSQLitePragma (naming the pragma) on a hard failure. A file
+// database must be in WAL so readers do not block the claim's writer; an
+// in-memory database — which cannot use WAL — is exempt from that one requirement
+// but, like any database, still needs a positive busy_timeout to absorb the brief
+// claim lock and a safe synchronous level so a committed outcome survives a crash.
+// foreign_keys and _txlock are warned about (file databases only), never fatal.
+func checkSQLitePragmas(db *gorm.DB) error {
+	journalMode, err := scanPragmaString(db, "journal_mode")
+	if err != nil {
+		return fmt.Errorf("%w: reading journal_mode: %w", ErrSQLitePragma, err)
+	}
+	inMemory := strings.EqualFold(journalMode, "memory")
+	if !inMemory && !strings.EqualFold(journalMode, "wal") {
+		return fmt.Errorf(
+			"%w: journal_mode is %q, want wal — open with the _pragma=journal_mode(WAL) DSN parameter",
+			ErrSQLitePragma, journalMode,
+		)
+	}
+
+	busyTimeout, err := scanPragmaInt(db, "busy_timeout")
+	if err != nil {
+		return fmt.Errorf("%w: reading busy_timeout: %w", ErrSQLitePragma, err)
+	}
+	if busyTimeout <= 0 {
+		return fmt.Errorf(
+			"%w: busy_timeout is %d, want > 0 — open with the _pragma=busy_timeout(5000) DSN parameter",
+			ErrSQLitePragma, busyTimeout,
+		)
+	}
+
+	synchronous, err := scanPragmaInt(db, "synchronous")
+	if err != nil {
+		return fmt.Errorf("%w: reading synchronous: %w", ErrSQLitePragma, err)
+	}
+	// 1 = NORMAL, 2 = FULL are safe; 0 = OFF risks losing a committed outcome on
+	// power loss, which for a durable job runtime is exactly the failure it exists
+	// to prevent.
+	if synchronous != 1 && synchronous != 2 {
+		return fmt.Errorf(
+			"%w: synchronous is %d, want NORMAL(1) or FULL(2), not OFF(0)",
+			ErrSQLitePragma, synchronous,
+		)
+	}
+
+	if !inMemory {
+		warnSQLitePragmas(db)
+	}
+	return nil
+}
+
+// warnSQLitePragmas logs the non-fatal connection concerns for a file database:
+// foreign_keys off (a host FK onto job_runs would be unenforced; the runtime
+// declares none) and a DSN missing _txlock=immediate (the claim's write lock is
+// taken lazily and can hit SQLITE_BUSY under load). Neither refuses the
+// connection — a false negative that rejects a working connection is a worse
+// failure than a documented requirement — and neither fires for an in-memory
+// database, where a single writer makes both moot.
+func warnSQLitePragmas(db *gorm.DB) {
+	if foreignKeys, err := scanPragmaInt(db, "foreign_keys"); err == nil && foreignKeys == 0 {
+		slog.Default().Warn(
+			"flywheel: sqlite foreign_keys is off; a host FK onto job_runs will be unenforced (the runtime declares none)",
+		)
+	}
+
+	// _txlock is a DSN parameter PRAGMA cannot report, so it is read off the
+	// dialector when that is the glebarez driver and skipped otherwise.
+	if d, ok := db.Dialector.(*sqlite.Dialector); ok {
+		if !strings.Contains(strings.ToLower(d.DSN), "_txlock=immediate") {
+			slog.Default().Warn(
+				"flywheel: sqlite DSN lacks _txlock=immediate; the claim's write lock is taken lazily and can " +
+					"hit SQLITE_BUSY under load — see the embedder checklist in docs/RUNBOOK.md",
+			)
+		}
+	}
+}
+
+// scanPragmaString reads a text-valued PRAGMA from db.
+func scanPragmaString(db *gorm.DB, pragma string) (string, error) {
+	var v string
+	err := db.Raw("PRAGMA " + pragma).Row().Scan(&v)
+	return v, err
+}
+
+// scanPragmaInt reads an integer-valued PRAGMA from db.
+func scanPragmaInt(db *gorm.DB, pragma string) (int, error) {
+	var v int
+	err := db.Raw("PRAGMA " + pragma).Row().Scan(&v)
+	return v, err
 }
 
 // Sweep reclaims expired leases in bounded batches.

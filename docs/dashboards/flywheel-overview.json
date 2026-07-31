@@ -1,0 +1,560 @@
+{
+    "__inputs": [
+        {
+            "description": "The Prometheus data source scraping the runtime's /metrics endpoint.",
+            "label": "Prometheus",
+            "name": "DS_PROMETHEUS",
+            "pluginId": "prometheus",
+            "pluginName": "Prometheus",
+            "type": "datasource"
+        }
+    ],
+    "__requires": [
+        {
+            "id": "grafana",
+            "name": "Grafana",
+            "type": "grafana",
+            "version": "10.0.0"
+        },
+        {
+            "id": "prometheus",
+            "name": "Prometheus",
+            "type": "datasource",
+            "version": "1.0.0"
+        }
+    ],
+    "annotations": {
+        "list": []
+    },
+    "description": "Latency percentiles, queue health, and reliability signals for the go-flywheel durable job runtime, derived from its Prometheus /metrics exposition. Import against your Prometheus data source.",
+    "editable": true,
+    "graphTooltip": 1,
+    "panels": [
+        {
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 0
+            },
+            "id": 100,
+            "title": "Latency (p50 / p99)",
+            "type": "row"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "description": "Claim round-trip latency. A rising p99 with flat queue depth is contention, not arrival rate.",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 1
+            },
+            "id": 1,
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.5, sum(rate(flywheel_claim_duration_seconds_bucket[$__rate_interval])) by (le))",
+                    "legendFormat": "claim p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.99, sum(rate(flywheel_claim_duration_seconds_bucket[$__rate_interval])) by (le))",
+                    "legendFormat": "claim p99",
+                    "refId": "B"
+                }
+            ],
+            "title": "Claim latency",
+            "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "description": "Finalize (outcome persistence) latency. A slow finalize is a database problem, distinct from a slow worker body.",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 1
+            },
+            "id": 2,
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.5, sum(rate(flywheel_finalize_duration_seconds_bucket[$__rate_interval])) by (le))",
+                    "legendFormat": "finalize p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.99, sum(rate(flywheel_finalize_duration_seconds_bucket[$__rate_interval])) by (le))",
+                    "legendFormat": "finalize p99",
+                    "refId": "B"
+                }
+            ],
+            "title": "Finalize latency",
+            "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "description": "Worker-body duration, sliced by kind. This is downstream work time, not runtime overhead.",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 9
+            },
+            "id": 3,
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.5, sum(rate(flywheel_job_duration_seconds_bucket[$__rate_interval])) by (le, kind))",
+                    "legendFormat": "{{kind}} p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.99, sum(rate(flywheel_job_duration_seconds_bucket[$__rate_interval])) by (le, kind))",
+                    "legendFormat": "{{kind}} p99",
+                    "refId": "B"
+                }
+            ],
+            "title": "Worker duration by kind",
+            "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "description": "Lease-reclaim sweep duration. A rising sweep p99 is a database-load signal; read it alongside claim latency.",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 9
+            },
+            "id": 4,
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.5, sum(rate(flywheel_sweep_duration_seconds_bucket[$__rate_interval])) by (le))",
+                    "legendFormat": "sweep p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.99, sum(rate(flywheel_sweep_duration_seconds_bucket[$__rate_interval])) by (le))",
+                    "legendFormat": "sweep p99",
+                    "refId": "B"
+                }
+            ],
+            "title": "Sweep latency",
+            "type": "timeseries"
+        },
+        {
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 17
+            },
+            "id": 101,
+            "title": "Queue health",
+            "type": "row"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "description": "Queue lag: how long the oldest ready job has been claimable. A growing value is the canonical under-capacity signal.",
+            "fieldConfig": {
+                "defaults": {
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 30
+                            },
+                            {
+                                "color": "red",
+                                "value": 300
+                            }
+                        ]
+                    },
+                    "unit": "s"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 0,
+                "y": 18
+            },
+            "id": 5,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "area",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ]
+                }
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "max(flywheel_queue_oldest_ready_seconds)",
+                    "legendFormat": "oldest ready age",
+                    "refId": "A"
+                }
+            ],
+            "title": "Queue lag (oldest ready age)",
+            "type": "stat"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "description": "Claimable-right-now depth and in-flight count. Depth rising with flat latency means work is arriving faster than it drains.",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 8,
+                "y": 18
+            },
+            "id": 6,
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(flywheel_queue_ready)",
+                    "legendFormat": "ready",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(flywheel_queue_inflight)",
+                    "legendFormat": "in flight",
+                    "refId": "B"
+                }
+            ],
+            "title": "Ready vs in-flight",
+            "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "description": "Jobs by state. A growing discarded count is permanent failure; a growing retryable count is transient failure being reworked.",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 16,
+                "y": 18
+            },
+            "id": 7,
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "flywheel_queue_jobs",
+                    "legendFormat": "{{state}}",
+                    "refId": "A"
+                }
+            ],
+            "title": "Jobs by state",
+            "type": "timeseries"
+        },
+        {
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 26
+            },
+            "id": 102,
+            "title": "Reliability",
+            "type": "row"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "description": "Supersede rate: work executed and discarded because a claim was lost. A nonzero rate means the lease is too short or the heartbeat is failing.",
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "ops"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 27
+            },
+            "id": 8,
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(rate(flywheel_jobs_superseded_total[$__rate_interval]))",
+                    "legendFormat": "superseded/s",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(rate(flywheel_jobs_retried_total[$__rate_interval]))",
+                    "legendFormat": "retried/s",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(rate(flywheel_jobs_errored_total[$__rate_interval]))",
+                    "legendFormat": "errored/s",
+                    "refId": "C"
+                }
+            ],
+            "title": "Supersede / retry / error rates",
+            "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "description": "Metrics cardinality overflow. A nonzero value means a recorder hit its MaxSeries ceiling and dropped series — an unbounded tag is in use.",
+            "fieldConfig": {
+                "defaults": {
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "red",
+                                "value": 1
+                            }
+                        ]
+                    },
+                    "unit": "short"
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 27
+            },
+            "id": 9,
+            "options": {
+                "colorMode": "value",
+                "graphMode": "area",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ]
+                }
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "max(flywheel_metrics_dropped_series_total)",
+                    "legendFormat": "dropped series",
+                    "refId": "A"
+                }
+            ],
+            "title": "Dropped series (cardinality overflow)",
+            "type": "stat"
+        }
+    ],
+    "refresh": "30s",
+    "schemaVersion": 39,
+    "tags": [
+        "flywheel",
+        "jobs",
+        "queue"
+    ],
+    "templating": {
+        "list": []
+    },
+    "time": {
+        "from": "now-6h",
+        "to": "now"
+    },
+    "timezone": "",
+    "title": "Flywheel — Overview",
+    "uid": "flywheel-overview",
+    "version": 1,
+    "weekStart": ""
+}

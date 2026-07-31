@@ -271,6 +271,10 @@ type FollowUp struct {
 }
 
 // InsertOpts configures a single Insert.
+//
+// For worked recipes and a decision table covering UniqueKey, UniqueActiveKey,
+// the bucketed-key pattern, and correlating side effects to an attempt, see
+// docs/COOKBOOK.md.
 type InsertOpts struct {
 	Queue string
 	// UniqueKey enforces idempotency forever: an insert collides with any job

@@ -63,3 +63,10 @@ func (m *Multi) OnSupersede(ctx context.Context, ev flywheel.SupersedeEvent) {
 		o.OnSupersede(ctx, ev)
 	}
 }
+
+// OnSweep delivers the sweep event to every child in order.
+func (m *Multi) OnSweep(ctx context.Context, ev flywheel.SweepEvent) {
+	for _, o := range m.observers {
+		o.OnSweep(ctx, ev)
+	}
+}

@@ -1174,6 +1174,11 @@ the cutoff. Pending and running work is never touched, whatever its age.
 ## 📚 Documentation
 
 - **API Reference** – Dive into the godocs at [pkg.go.dev/github.com/mrz1836/go-flywheel](https://pkg.go.dev/github.com/mrz1836/go-flywheel)
+- **Contract** – The exactly-once guarantees and their limits in [`docs/CONTRACT.md`](docs/CONTRACT.md)
+- **Cookbook** – Unique-key recipes for deduplication and side-effect correlation in [`docs/COOKBOOK.md`](docs/COOKBOOK.md)
+- **Runbook** – Operating the runtime and reading its metrics in [`docs/RUNBOOK.md`](docs/RUNBOOK.md)
+- **Tuning** – Sizing the knobs from measured numbers in [`docs/TUNING.md`](docs/TUNING.md)
+- **Dashboards** – An importable Grafana dashboard over the metrics in [`docs/dashboards/`](docs/dashboards/)
 - **Benchmarks** – The measured 100k baseline, environment, and index comparison in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
 - **Test Suite** – Review both the [unit tests](integration_test.go) (powered by [`testify`](https://github.com/stretchr/testify))
 

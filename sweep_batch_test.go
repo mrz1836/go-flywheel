@@ -62,7 +62,8 @@ func TestSweepReclaimsEveryExpiredLeaseAcrossBatches(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	seedExpiredLeases(t, db, 250, now)
 
-	d := NewSQLiteDriverWithOptions(db, DriverOpts{SweepBatchSize: 40})
+	d, err := NewSQLiteDriverWithOptions(db, SQLiteOpts{DriverOpts: DriverOpts{SweepBatchSize: 40}})
+	require.NoError(t, err)
 	reclaimed, err := d.Sweep(context.Background(), now)
 	require.NoError(t, err)
 
@@ -84,7 +85,8 @@ func TestSweepReclaimsABacklogThatIsAnExactMultipleOfTheBatch(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	seedExpiredLeases(t, db, 100, now)
 
-	d := NewSQLiteDriverWithOptions(db, DriverOpts{SweepBatchSize: 25})
+	d, err := NewSQLiteDriverWithOptions(db, SQLiteOpts{DriverOpts: DriverOpts{SweepBatchSize: 25}})
+	require.NoError(t, err)
 	reclaimed, err := d.Sweep(context.Background(), now)
 	require.NoError(t, err)
 
@@ -135,7 +137,8 @@ func TestSweepDrainsTheBacklogOnSQLiteWithoutSkipLocked(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	seedExpiredLeases(t, db, 75, now)
 
-	d := NewSQLiteDriverWithOptions(db, DriverOpts{SweepBatchSize: 10})
+	d, err := NewSQLiteDriverWithOptions(db, SQLiteOpts{DriverOpts: DriverOpts{SweepBatchSize: 10}})
+	require.NoError(t, err)
 	reclaimed, err := d.Sweep(context.Background(), now)
 	require.NoError(t, err)
 	assert.Equal(t, 75, reclaimed)
