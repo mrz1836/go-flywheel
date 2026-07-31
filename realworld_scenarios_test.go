@@ -89,6 +89,8 @@ func (o *recordObserver) OnSupersede(_ context.Context, ev SupersedeEvent) {
 	o.supersedes = append(o.supersedes, ev)
 }
 
+func (o *recordObserver) OnSweep(context.Context, SweepEvent) {}
+
 func (o *recordObserver) outcomeCount(outcome RunOutcome) int {
 	o.mu.Lock()
 	defer o.mu.Unlock()

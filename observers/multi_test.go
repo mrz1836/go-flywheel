@@ -29,6 +29,7 @@ func (o orderObs) OnClaim(context.Context, flywheel.ClaimEvent)   { o.record("cl
 func (o orderObs) OnStart(context.Context, flywheel.JobEvent)     { o.record("start") }
 func (o orderObs) OnFinish(context.Context, flywheel.FinishEvent) { o.record("finish") }
 func (o orderObs) OnRetry(context.Context, flywheel.RetryEvent)   { o.record("retry") }
+func (o orderObs) OnSweep(context.Context, flywheel.SweepEvent)   { o.record("sweep") }
 func (o orderObs) OnSupersede(context.Context, flywheel.SupersedeEvent) {
 	o.record("supersede")
 }
@@ -100,6 +101,7 @@ func (c *countObs) OnStart(context.Context, flywheel.JobEvent)           {}
 func (c *countObs) OnFinish(context.Context, flywheel.FinishEvent)       { c.finishes++ }
 func (c *countObs) OnRetry(context.Context, flywheel.RetryEvent)         {}
 func (c *countObs) OnSupersede(context.Context, flywheel.SupersedeEvent) {}
+func (c *countObs) OnSweep(context.Context, flywheel.SweepEvent)         {}
 
 // BenchmarkMultiObserverOnFinish measures the per-event fan-out cost of
 // dispatching one finish event across N child observers.

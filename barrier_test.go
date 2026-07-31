@@ -223,14 +223,15 @@ func TestBarrierContinuationInheritsParentRouting(t *testing.T) {
 func TestBarrierRejectsTooWide(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	d := NewSQLiteDriverWithOptions(db, DriverOpts{BarrierMaxChildren: 2})
+	d, err := NewSQLiteDriverWithOptions(db, SQLiteOpts{DriverOpts: DriverOpts{BarrierMaxChildren: 2}})
+	require.NoError(t, err)
 	ctx := context.Background()
 
 	seedClaimable(t, db, 1)
 	parent := claimOne(t, d, ctx)
 	runID := models.NewID()
 	require.NoError(t, d.InsertRunStub(ctx, runID, parent, time.Now(), "local", "exec"))
-	_, err := d.Finalize(ctx, parent, runID, Result{
+	_, err = d.Finalize(ctx, parent, runID, Result{
 		FollowUps: barrierFollowUps("child", 3),
 		Barrier:   &Barrier{Kind: "finalize"},
 	}, nil, time.Now())

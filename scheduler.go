@@ -28,6 +28,7 @@ type Scheduler struct {
 	client               *Client
 	driver               Driver
 	logger               *slog.Logger
+	observer             Observer
 	backfillCap          int
 	tickInterval         time.Duration
 	sweepInterval        time.Duration
@@ -62,6 +63,12 @@ type SchedulerConfig struct {
 	Driver Driver
 	// Logger logs tick and sweep failures. Optional; defaults to slog.Default().
 	Logger *slog.Logger
+	// Observer receives a SweepEvent after each stuck-lease reclaim pass, so sweep
+	// timing joins the same telemetry stream as claims and finalizes. Optional;
+	// defaults to a no-op. Pass the same Observer instance the runners hold, so one
+	// recorder accumulates every series — a MetricsObserver here is what records
+	// flywheel_sweep_duration_seconds.
+	Observer Observer
 	// BackfillCap bounds how many missed buckets a single due definition
 	// enqueues on catch-up. Optional; defaults to 10.
 	BackfillCap int
@@ -166,6 +173,7 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 		client:            cfg.Client,
 		driver:            cfg.Driver,
 		logger:            cfg.Logger,
+		observer:          cfg.Observer,
 		backfillCap:       cfg.BackfillCap,
 		tickInterval:      cfg.TickInterval,
 		sweepInterval:     cfg.SweepInterval,
@@ -178,6 +186,9 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 	}
 	if s.logger == nil {
 		s.logger = slog.Default()
+	}
+	if s.observer == nil {
+		s.observer = noopObserver{}
 	}
 	if s.backfillCap <= 0 {
 		s.backfillCap = defaultBackfillCap
@@ -428,8 +439,17 @@ func (s *Scheduler) Tick(ctx context.Context) (int, error) {
 //
 // It runs through the configured Driver, so a host that wrapped its Driver
 // observes the sweep exactly as it observes a claim or a finalize.
+//
+// The pass is timed and reported through the configured Observer: OnSweep fires
+// after every pass, carrying the duration and the reclaimed count, whether the
+// pass succeeded or a partial batch failed. That keeps sweep timing in the same
+// telemetry stream as claim and finalize timing.
 func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
-	return s.driver.Sweep(ctx, models.ClockFrom(ctx).Now(ctx))
+	start := models.ClockFrom(ctx).Now(ctx)
+	n, err := s.driver.Sweep(ctx, start)
+	duration := models.ClockFrom(ctx).Now(ctx).Sub(start)
+	s.observer.OnSweep(ctx, SweepEvent{Duration: duration, Reclaimed: n})
+	return n, err
 }
 
 // PruneRetention hard-deletes terminal jobs (and their job_runs) finalized

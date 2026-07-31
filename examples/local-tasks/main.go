@@ -165,6 +165,12 @@ func (o runLogObserver) OnSupersede(ctx context.Context, ev flywheel.SupersedeEv
 		"kind", ev.Kind, "discarded_outcome", ev.Outcome, "duration_ms", ev.Duration.Milliseconds())
 }
 
+// OnSweep logs a stuck-lease reclaim pass. In this single-runner demo the
+// scheduler is the one that fires it; a nonzero reclaim means a worker died.
+func (o runLogObserver) OnSweep(ctx context.Context, ev flywheel.SweepEvent) {
+	o.log.InfoContext(ctx, "lease sweep completed", "reclaimed", ev.Reclaimed, "duration_ms", ev.Duration.Milliseconds())
+}
+
 // scriptsDir resolves the bundled scripts directory from this source file so the
 // example runs from any working directory.
 func scriptsDir() string {

@@ -1054,9 +1054,11 @@ func (r *Runner) releasePermits(ctx context.Context, grant Grant, n int) {
 // dispatched job when it finishes. A job dispatched past grant.N (a Driver that
 // over-served the reservation, holding no permit) gets a no-op releaser.
 func (r *Runner) claimAndDispatch(ctx context.Context, reserved int, grant Grant) (int, error) {
+	claimStart := models.ClockFrom(ctx).Now(ctx)
 	batch, err := r.cfg.Driver.Dequeue(
 		ctx, r.cfg.Queues, r.cfg.ExecutorClass, r.cfg.ClaimAnyClass, reserved, r.cfg.LeaseDuration,
 	)
+	claimDuration := models.ClockFrom(ctx).Now(ctx).Sub(claimStart)
 	if err != nil {
 		r.pool.release(reserved)
 		r.releasePermits(ctx, grant, grant.N)
@@ -1089,6 +1091,7 @@ func (r *Runner) claimAndDispatch(ctx context.Context, reserved int, grant Grant
 		ExecutorClass: r.cfg.ExecutorClass,
 		Queues:        r.cfg.Queues,
 		Claimed:       len(batch),
+		Duration:      claimDuration,
 	})
 	for i := range batch {
 		raw := batch[i]
@@ -1159,7 +1162,8 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 		if err != nil {
 			return err
 		}
-		r.observe(ctx, raw, jobEv, out, unknown, startedAt, finishedAt)
+		finalizeDuration := models.ClockFrom(ctx).Now(ctx).Sub(finishedAt)
+		r.observe(ctx, raw, jobEv, out, unknown, startedAt, finishedAt, finalizeDuration)
 		return nil
 	}
 
@@ -1216,7 +1220,8 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 		// here would describe an outcome the database does not hold.
 		return err
 	}
-	r.observe(ctx, raw, jobEv, out, finalErr, startedAt, finishedAt)
+	finalizeDuration := models.ClockFrom(ctx).Now(ctx).Sub(finishedAt)
+	r.observe(ctx, raw, jobEv, out, finalErr, startedAt, finishedAt, finalizeDuration)
 	return nil
 }
 
@@ -1229,7 +1234,8 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 // decision independently and could diverge, and the observer was told an outcome
 // before the driver had agreed to it.
 func (r *Runner) observe(
-	ctx context.Context, raw RawJob, ev JobEvent, out FinalizeOutcome, finalErr error, startedAt, finishedAt time.Time,
+	ctx context.Context, raw RawJob, ev JobEvent, out FinalizeOutcome, finalErr error,
+	startedAt, finishedAt time.Time, finalizeDuration time.Duration,
 ) {
 	duration := finishedAt.Sub(startedAt)
 
@@ -1245,11 +1251,12 @@ func (r *Runner) observe(
 	}
 
 	r.cfg.Observer.OnFinish(ctx, FinishEvent{
-		JobEvent:   ev,
-		Outcome:    out.RunOutcome,
-		ErrorClass: out.ErrorClass,
-		Err:        finalErr,
-		Duration:   duration,
+		JobEvent:         ev,
+		Outcome:          out.RunOutcome,
+		ErrorClass:       out.ErrorClass,
+		Err:              finalErr,
+		Duration:         duration,
+		FinalizeDuration: finalizeDuration,
 	})
 
 	if out.State == StateRetryable {
