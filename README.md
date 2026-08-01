@@ -121,22 +121,22 @@ and a full audit trail.
 
 The runtime is built from focused, composable pieces:
 
-- **Typed workers** — generic `Worker[A]` interface, registered by `Kind()` ([registry.go](registry.go))
-- **One-call lifecycle** — `Node` runs N runners + the scheduler + an optional health/metrics server and drains cleanly on shutdown ([node.go](node.go))
-- **Bounded concurrency** — a runner keeps up to `Concurrency` jobs in flight, each slot refilling independently so one slow job never idles the rest; explicit `Stop`/`Drain` with an in-flight count ([runner.go](runner.go))
-- **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `UpsertPeriodic` ([scheduler.go](scheduler.go), [schedule.go](schedule.go))
-- **Retries with backoff** — exponential backoff with jitter, overridable per worker; consecutive poll failures climb their own ladder so a failing database is not hammered ([runner.go](runner.go))
-- **Lease-based recovery** — orphaned, crashed jobs reclaimed via `leased_until` sweeps ([scheduler.go](scheduler.go))
-- **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](runner.go))
-- **Per-run audit** — append-only `job_runs` table records every attempt, outcome, timing, and cost ([read.go](read.go))
-- **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work ([client.go](client.go))
-- **Outbox pattern** — enqueue on the caller's own `*gorm.DB` transaction for exactly-once side effects ([client.go](client.go))
-- **Follow-up jobs (DAG)** — workers return child jobs that are enqueued atomically ([types.go](types.go))
-- **Bulk enqueue** — `InsertMany` writes N jobs in bounded, dialect-aware chunks, honoring the outbox transaction and per-row idempotency ([batch.go](batch.go))
-- **Free-form routing** — a `ExecutorClass` label routes jobs to executor pools; empty is the wildcard ([types.go](types.go))
-- **Pre-claim admission** — an optional `Limiter` gates a runner before it claims, keyed on an arbitrary downstream resource; a job that cannot run yet is never claimed, leased, or audited. Ships an in-process token bucket and a shared database-backed limiter ([limiter.go](limiter.go), [limiter_db.go](limiter_db.go))
-- **Observability built in** — a dependency-free `Observer` seam with ready-made metrics, slog, and Prometheus adapters, queue-health/lag inspection, a `/metrics` endpoint, and `flywheel status` ([observer.go](observer.go), [observers/](observers), [health.go](health.go))
-- **Postgres + SQLite** — `FOR UPDATE SKIP LOCKED` and `BEGIN IMMEDIATE` drivers ([driver_postgres.go](driver_postgres.go), [driver_sqlite.go](driver_sqlite.go))
+- **Typed workers** — generic `Worker[A]` interface, registered by `Kind()` ([registry.go](internal/core/registry.go))
+- **One-call lifecycle** — `Node` runs N runners + the scheduler + an optional health/metrics server and drains cleanly on shutdown ([node.go](internal/node/node.go))
+- **Bounded concurrency** — a runner keeps up to `Concurrency` jobs in flight, each slot refilling independently so one slow job never idles the rest; explicit `Stop`/`Drain` with an in-flight count ([runner.go](internal/core/runner.go))
+- **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `UpsertPeriodic` ([scheduler.go](internal/core/scheduler.go), [schedule.go](internal/core/schedule.go))
+- **Retries with backoff** — exponential backoff with jitter, overridable per worker; consecutive poll failures climb their own ladder so a failing database is not hammered ([runner.go](internal/core/runner.go))
+- **Lease-based recovery** — orphaned, crashed jobs reclaimed via `leased_until` sweeps ([scheduler.go](internal/core/scheduler.go))
+- **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](internal/core/runner.go))
+- **Per-run audit** — append-only `job_runs` table records every attempt, outcome, timing, and cost ([read.go](internal/core/read.go))
+- **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work ([client.go](internal/core/client.go))
+- **Outbox pattern** — enqueue on the caller's own `*gorm.DB` transaction for exactly-once side effects ([client.go](internal/core/client.go))
+- **Follow-up jobs (DAG)** — workers return child jobs that are enqueued atomically ([types.go](internal/core/types.go))
+- **Bulk enqueue** — `InsertMany` writes N jobs in bounded, dialect-aware chunks, honoring the outbox transaction and per-row idempotency ([batch.go](internal/core/batch.go))
+- **Free-form routing** — a `ExecutorClass` label routes jobs to executor pools; empty is the wildcard ([types.go](internal/core/types.go))
+- **Pre-claim admission** — an optional `Limiter` gates a runner before it claims, keyed on an arbitrary downstream resource; a job that cannot run yet is never claimed, leased, or audited. Ships an in-process token bucket and a shared database-backed limiter ([limiter.go](internal/core/limiter.go), [limiter_db.go](internal/core/limiter_db.go))
+- **Observability built in** — a dependency-free `Observer` seam with ready-made metrics, slog, and Prometheus adapters, queue-health/lag inspection, a `/metrics` endpoint, and `flywheel status` ([observer.go](internal/core/observer.go), [observers/](observers), [health.go](internal/core/health.go))
+- **Postgres + SQLite** — `FOR UPDATE SKIP LOCKED` and `BEGIN IMMEDIATE` drivers ([driver_postgres.go](internal/core/driver_postgres.go), [driver_sqlite.go](internal/core/driver_sqlite.go))
 - **Generic workers** — ready-made `ExecWorker`, `ShellWorker`, `PythonWorker`, `MageWorker` (magex/mage), and `HTTPWorker` so local scripts and build tasks need no custom Go ([workers/](workers))
 
 <br/>
@@ -978,7 +978,7 @@ A complete, runnable version of this is [`examples/split-executors`](examples/sp
 <summary><strong><code>Observability, health, and metrics</code></strong></summary>
 <br>
 
-The runtime is self-diagnosing. The `Observer` seam ([observer.go](observer.go)) reports every
+The runtime is self-diagnosing. The `Observer` seam ([observer.go](internal/core/observer.go)) reports every
 attempt's lifecycle — claim, start, finish, retry, supersede — with no metrics dependency in the core,
 and the [`observers/`](observers) package ships ready adapters that plug straight in:
 
@@ -987,7 +987,7 @@ and the [`observers/`](observers) package ships ready adapters that plug straigh
 - `observers.NewSlog(logger)` logs each event at debug level; `observers.NewMulti(...)` fans events
   out to several observers at once.
 
-`SampleQueueHealth` ([health.go](health.go)) reads a point-in-time gauge snapshot — depth by state,
+`SampleQueueHealth` ([health.go](internal/core/health.go)) reads a point-in-time gauge snapshot — depth by state,
 ready / in-flight counts, and the **oldest-ready age (lag)**, the canonical "are the runners falling
 behind?" signal — and `RecentFailures` lists what was discarded recently and why. Give a `Node` a
 metrics handler and its health server also serves Prometheus text at `/metrics` (recorder counters
@@ -1178,7 +1178,7 @@ command, the config reference, and the macOS launchd setup.
 - **Tuning** – Sizing the knobs from measured numbers in [`docs/TUNING.md`](docs/TUNING.md)
 - **Dashboards** – An importable Grafana dashboard over the metrics in [`docs/dashboards/`](docs/dashboards/)
 - **Benchmarks** – The measured 100k baseline, environment, and index comparison in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
-- **Test Suite** – Review the [test suite](integration_test.go) (powered by [`testify`](https://github.com/stretchr/testify))
+- **Test Suite** – Review the [test suite](internal/core/integration_test.go) (powered by [`testify`](https://github.com/stretchr/testify))
 
 <br/>
 

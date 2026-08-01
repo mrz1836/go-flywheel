@@ -1,12 +1,14 @@
-// Package flywheel is a durable, Postgres- and SQLite-backed background-work
-// runtime: it enqueues, dispatches, retries, audits, schedules, and recovers
-// typed jobs.
+// Package core is the implementation of the durable, Postgres- and
+// SQLite-backed background-work runtime: it enqueues, dispatches, retries,
+// audits, schedules, and recovers typed jobs. Consumers do not import it
+// directly — the root flywheel package is an API-stable facade over it, and the
+// internal/ boundary is what keeps this seam private.
 //
-// The package is self-contained: it owns its own row and typed structs
-// (RawJob, Job[A]) and reaches the database through a two-implementation Driver
-// seam, so the runtime code never sees the SQL dialect. It depends only on
-// gorm, the cron parser, and the standard library — no host application
-// packages — which is what lets it ship as a standalone module.
+// It owns the runtime's row and typed structs (RawJob, Job[A]) and reaches the
+// database through a two-implementation Driver seam, so the runtime code never
+// sees the SQL dialect. It depends only on gorm, the cron parser, and the
+// standard library — no host application packages — which is what lets the whole
+// module ship standalone behind the facade.
 package core
 
 import (

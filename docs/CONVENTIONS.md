@@ -23,8 +23,9 @@ names *what kind of operation is speaking*.
   database sweep, driver and pragma construction, and the library-level sentinels (`ErrValidation`,
   `ErrUnsupportedDialect`, `ErrIndexDrift`, `ErrSQLitePragma`, `ErrFollowUpLimit`, `ErrBarrierTooWide`).
 
-The dividing line is the operation, not the file: a file that does both (`errors.go`, `scheduler.go`,
-`driver_sqlite.go`) carries both prefixes, one per operation. When you add a message, ask which of the
+The dividing line is the operation, not the file: a file that does both (`internal/core/errors.go`,
+`internal/core/scheduler.go`, `internal/core/driver_sqlite.go`) carries both prefixes, one per operation.
+When you add a message, ask which of the
 two an operator would `grep` for — a job stuck in the runtime, or a schema/admin task — and match it.
 
 **These strings are an observable contract, not decoration.** Tests match on the literal prefix and
@@ -109,7 +110,8 @@ package, and builds the examples. It encodes two `go doc` traps, because both lo
 works:
 
 - `go doc ./...` is invalid — `go doc` rejects the wildcard (*too many periods*). Use a per-package
-  loop: `go doc .`, then `go doc ./config`, `./observers`, `./workers`, `./cmd/flywheel`.
+  loop: `go doc .` (the facade), then `go doc ./internal/core` and `./internal/node` (the implementation
+  behind it), then `./config`, `./observers`, `./workers`, `./cmd/flywheel`.
 - `go doc` has no build-tag support (no `-tags` flag, and `GOFLAGS=-tags` is ignored), so it cannot
   reach a package that is entirely behind a build tag. The `loadtest` package is proven with
   `go build -tags=loadtest ./loadtest/...` instead.

@@ -1,3 +1,8 @@
+// Package node hosts the Node lifecycle: it wires one or more runners, an
+// optional scheduler, and an optional health server into a single Run call that
+// starts them together and drains cleanly on context cancellation. It is a leaf
+// over internal/core, re-exported through the root flywheel facade as Node,
+// NodeConfig, HealthConfig, and NewNode.
 package node
 
 import (

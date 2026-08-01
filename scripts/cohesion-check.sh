@@ -145,7 +145,7 @@ fi
 #    doc comments included, is well-formed instead.
 # ---------------------------------------------------------------------------
 section "go doc (per package — ./... and -tags are invalid)"
-for pkg in . ./config ./observers ./workers ./cmd/flywheel; do
+for pkg in . ./internal/core ./internal/node ./config ./observers ./workers ./cmd/flywheel; do
     if go doc "$pkg" >/dev/null; then echo "  ok   go doc $pkg"; else echo "  FAIL go doc $pkg"; fail=1; fi
 done
 if go build -tags=loadtest ./loadtest/... >/dev/null; then echo "  ok   go build -tags=loadtest ./loadtest/... (go doc can't reach a tagged package)"; else echo "  FAIL go build -tags=loadtest ./loadtest/..."; fail=1; fi
