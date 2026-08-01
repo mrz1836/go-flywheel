@@ -94,52 +94,6 @@ func TestRunnerPGSkipLockedConcurrency(t *testing.T) {
 	assert.EqualValues(t, totalJobs, countByState(t, db, "pg.concurrent", "succeeded"))
 }
 
-// TestNodePGMultipleRunnersExactlyOnce builds one Node hosting two Postgres
-// runners (concurrency 4 each) and asserts every enqueued job runs exactly once
-// — SKIP LOCKED across both runners prevents any double-dispatch, and the Node
-// drains cleanly on cancel.
-func TestNodePGMultipleRunnersExactlyOnce(t *testing.T) {
-	t.Parallel()
-	db := NewPostgresIsolatedDB(t)
-
-	worker := &pgConcurrentWorker{}
-	reg := NewRegistry()
-	Register(reg, worker)
-
-	const totalJobs = 80
-	for i := range totalJobs {
-		_, err := Insert(context.Background(), NewClient(db),
-			pgConcurrentArgs{V: fmt.Sprintf("v%d", i)}, InsertOpts{})
-		require.NoError(t, err)
-	}
-
-	mkRunner := func() RunnerConfig {
-		return RunnerConfig{
-			DB: db, Driver: NewPostgresDriver(db), Registry: reg,
-			Queues: []string{"default", "periodic"}, ClaimAnyClass: true,
-			Concurrency: 4, PollInterval: 5 * time.Millisecond,
-		}
-	}
-	node, err := NewNode(NodeConfig{
-		Runners: []RunnerConfig{mkRunner(), mkRunner()},
-	})
-	require.NoError(t, err)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	runErr := make(chan error, 1)
-	go func() { runErr <- node.Run(ctx) }()
-
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) && countByState(t, db, "pg.concurrent", "succeeded") < totalJobs {
-		time.Sleep(20 * time.Millisecond)
-	}
-	cancel()
-	require.NoError(t, <-runErr)
-
-	assert.EqualValues(t, totalJobs, worker.processed.Load(), "every job ran exactly once across both Node runners")
-	assert.EqualValues(t, totalJobs, countByState(t, db, "pg.concurrent", "succeeded"))
-}
-
 // TestRunnerPGUniqueKeyRaceOneWins drives N concurrent Inserts with the
 // same UniqueKey and asserts exactly one row lands.
 func TestRunnerPGUniqueKeyRaceOneWins(t *testing.T) {

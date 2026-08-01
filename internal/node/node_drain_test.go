@@ -1,4 +1,4 @@
-package core
+package node
 
 import (
 	"context"
@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	core "github.com/mrz1836/go-flywheel/internal/core"
+	ft "github.com/mrz1836/go-flywheel/internal/flywheeltest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -31,15 +33,15 @@ type nodeDrainWorker struct {
 
 func (*nodeDrainWorker) Kind() string { return "test.nodedrain" }
 
-func (w *nodeDrainWorker) Work(ctx context.Context, _ *Job[nodeDrainArgs]) (Result, error) {
+func (w *nodeDrainWorker) Work(ctx context.Context, _ *core.Job[nodeDrainArgs]) (core.Result, error) {
 	close(w.started)
 	select {
 	case <-w.release:
 		w.completed.Store(true)
-		return Result{}, nil
+		return core.Result{}, nil
 	case <-ctx.Done():
 		w.cancelled.Store(true)
-		return Result{}, ctx.Err()
+		return core.Result{}, ctx.Err()
 	}
 }
 
@@ -53,16 +55,16 @@ func (w *nodeDrainWorker) Work(ctx context.Context, _ *Job[nodeDrainArgs]) (Resu
 // in-flight job runs to its own completion, and only then does the node tear down.
 func TestNodeAwaitDrainDrainsEachRunnerBeforeReturning(t *testing.T) {
 	t.Parallel()
-	db := newWALFileDB(t)
-	reg := NewRegistry()
+	db := ft.NewWALFileDB(t)
+	reg := core.NewRegistry()
 	w := &nodeDrainWorker{started: make(chan struct{}), release: make(chan struct{})}
-	Register(reg, w)
+	core.Register(reg, w)
 
 	// No DrainTimeout: the drain waits for in-flight work however long it takes.
-	node, err := NewNode(NodeConfig{Runners: []RunnerConfig{sqliteRunner(db, reg)}})
+	node, err := NewNode(NodeConfig{Runners: []core.RunnerConfig{sqliteRunner(db, reg)}})
 	require.NoError(t, err)
 
-	id, err := Insert(context.Background(), NewClient(db), nodeDrainArgs{}, InsertOpts{})
+	id, err := core.Insert(context.Background(), core.NewClient(db), nodeDrainArgs{}, core.InsertOpts{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -88,7 +90,7 @@ func TestNodeAwaitDrainDrainsEachRunnerBeforeReturning(t *testing.T) {
 	}
 
 	assert.True(t, w.completed.Load(), "the worker ran to its own completion")
-	assert.Equal(t, string(StateSucceeded), jobState(t, db, id),
+	assert.Equal(t, string(core.StateSucceeded), ft.JobState(t, db, id),
 		"the drained job recorded its success rather than being retried")
 }
 
@@ -99,20 +101,20 @@ func TestNodeAwaitDrainDrainsEachRunnerBeforeReturning(t *testing.T) {
 // know how many it abandoned.
 func TestNodeDrainTimeoutWarningNamesTheInFlightCount(t *testing.T) {
 	t.Parallel()
-	db := newWALFileDB(t)
-	reg := NewRegistry()
+	db := ft.NewWALFileDB(t)
+	reg := core.NewRegistry()
 	w := &blockingWorker{started: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
-	Register(reg, w)
+	core.Register(reg, w)
 
-	rec := &recordingHandler{}
+	rec := &ft.RecordingHandler{}
 	node, err := NewNode(NodeConfig{
-		Runners:      []RunnerConfig{sqliteRunner(db, reg)},
+		Runners:      []core.RunnerConfig{sqliteRunner(db, reg)},
 		DrainTimeout: 100 * time.Millisecond,
 		Logger:       slog.New(rec),
 	})
 	require.NoError(t, err)
 
-	_, err = Insert(context.Background(), NewClient(db), blockingArgs{}, InsertOpts{})
+	_, err = core.Insert(context.Background(), core.NewClient(db), blockingArgs{}, core.InsertOpts{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -130,7 +132,7 @@ func TestNodeDrainTimeoutWarningNamesTheInFlightCount(t *testing.T) {
 	}
 
 	var warned bool
-	for _, entry := range rec.records() {
+	for _, entry := range rec.Records() {
 		if entry["level"] != slog.LevelWarn.String() {
 			continue
 		}

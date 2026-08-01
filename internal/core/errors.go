@@ -195,14 +195,6 @@ var (
 	errSchedulerNeedsDriver = errors.New("jobs: scheduler config requires Driver")
 )
 
-// errNodeNeedsRunner is returned by NewNode for a config with no runners.
-//
-// There is no companion "node scheduler config" error: NewNode wraps whatever
-// NewSchedulerWithConfig returns rather than re-deriving its own verdict, so a
-// caller sees the specific field that was missing instead of a generic message
-// that names three.
-var errNodeNeedsRunner = errors.New("jobs: node config requires at least one runner")
-
 // errPeriodicNoSchedule is returned when a periodic definition has neither a
 // cron expression nor an interval.
 var errPeriodicNoSchedule = errors.New("jobs: periodic has no schedule")

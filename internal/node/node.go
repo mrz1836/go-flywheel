@@ -1,4 +1,4 @@
-package core
+package node
 
 import (
 	"context"
@@ -9,8 +9,14 @@ import (
 	"sync"
 	"time"
 
+	core "github.com/mrz1836/go-flywheel/internal/core"
 	"gorm.io/gorm"
 )
+
+// errNodeNeedsRunner is returned by New for a config with no runners.
+//
+//nolint:gochecknoglobals // package-level sentinel
+var errNodeNeedsRunner = errors.New("jobs: node config requires at least one runner")
 
 // defaultHealthShutdownTimeout bounds the health server's graceful shutdown.
 const defaultHealthShutdownTimeout = 5 * time.Second
@@ -42,14 +48,14 @@ type NodeConfig struct {
 	// Runners are the dispatch loops this Node hosts. Each may claim a different
 	// set of queues at a different concurrency for a different executor class. At
 	// least one is required.
-	Runners []RunnerConfig
+	Runners []core.RunnerConfig
 	// Scheduler, when non-nil, runs periodic ticks plus the stuck-lease sweep.
 	// Leave it nil on a pure worker node where another process owns scheduling.
-	Scheduler *SchedulerConfig
+	Scheduler *core.SchedulerConfig
 	// Health configures the optional liveness/readiness server.
 	Health HealthConfig
 	// Logger logs the Node's own lifecycle events. Optional; defaults to
-	// slog.Default(). It does not override a RunnerConfig.Logger.
+	// slog.Default(). It does not override a core.RunnerConfig.Logger.
 	Logger *slog.Logger
 	// DrainTimeout bounds how long Run waits for in-flight work after ctx is
 	// cancelled before returning regardless. Zero waits for in-flight work however
@@ -75,14 +81,14 @@ type NodeConfig struct {
 // boilerplate every host re-implements into a single Run call.
 type Node struct {
 	cfg       NodeConfig
-	runners   []*Runner
-	scheduler *Scheduler
+	runners   []*core.Runner
+	scheduler *core.Scheduler
 	logger    *slog.Logger
 }
 
 // NewNode validates cfg and constructs the Node. Each runner is built through
-// NewRunner (so the SQLite concurrency-1 guard and every zero-value default
-// still apply) and the scheduler, when configured, through NewSchedulerWithConfig.
+// core.NewRunner (so the SQLite concurrency-1 guard and every zero-value default
+// still apply) and the scheduler, when configured, through core.NewSchedulerWithConfig.
 func NewNode(cfg NodeConfig) (*Node, error) {
 	if len(cfg.Runners) == 0 {
 		return nil, errNodeNeedsRunner
@@ -92,9 +98,9 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		logger = slog.Default()
 	}
 
-	runners := make([]*Runner, 0, len(cfg.Runners))
+	runners := make([]*core.Runner, 0, len(cfg.Runners))
 	for i := range cfg.Runners {
-		r, err := NewRunner(cfg.Runners[i])
+		r, err := core.NewRunner(cfg.Runners[i])
 		if err != nil {
 			return nil, fmt.Errorf("flywheel: node runner[%d]: %w", i, err)
 		}
@@ -102,13 +108,13 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 
 	// The scheduler config is validated by its own constructor rather than here.
-	// Two authorities on one config drift: a field added to SchedulerConfig gets
+	// Two authorities on one config drift: a field added to core.SchedulerConfig gets
 	// checked in one place and not the other, and the two entry points then
 	// accept different configurations.
-	var scheduler *Scheduler
+	var scheduler *core.Scheduler
 	if cfg.Scheduler != nil {
 		var err error
-		if scheduler, err = NewSchedulerWithConfig(*cfg.Scheduler); err != nil {
+		if scheduler, err = core.NewSchedulerWithConfig(*cfg.Scheduler); err != nil {
 			return nil, fmt.Errorf("flywheel: node scheduler: %w", err)
 		}
 	}
@@ -232,7 +238,7 @@ func (n *Node) drainRunners(logCtx, drainCtx context.Context) {
 		// The count comes off the error, taken at the instant the deadline arrived,
 		// rather than from a second InFlight call that would race the jobs finishing.
 		inFlight := -1
-		var timeout *DrainTimeoutError
+		var timeout *core.DrainTimeoutError
 		if errors.As(err, &timeout) {
 			inFlight = timeout.InFlight
 		}

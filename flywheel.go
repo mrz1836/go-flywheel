@@ -15,6 +15,7 @@ import (
 	"time"
 
 	core "github.com/mrz1836/go-flywheel/internal/core"
+	node "github.com/mrz1836/go-flywheel/internal/node"
 	"gorm.io/gorm"
 )
 
@@ -53,7 +54,7 @@ type FinishEvent = core.FinishEvent
 type FollowUp = core.FollowUp
 type Grant = core.Grant
 type HTTPDoer = core.HTTPDoer
-type HealthConfig = core.HealthConfig
+type HealthConfig = node.HealthConfig
 type Index = core.Index
 type IndexDrift = core.IndexDrift
 type IndexDriftError = core.IndexDriftError
@@ -71,8 +72,8 @@ type Limiter = core.Limiter
 type ListJobsParams = core.ListJobsParams
 type ListRunsParams = core.ListRunsParams
 type MigrateOpts = core.MigrateOpts
-type Node = core.Node
-type NodeConfig = core.NodeConfig
+type Node = node.Node
+type NodeConfig = node.NodeConfig
 type Observer = core.Observer
 type OverviewParams = core.OverviewParams
 type PeriodicSpec = core.PeriodicSpec
@@ -267,7 +268,7 @@ func NewFakeHTTPDoer() *FakeHTTPDoer {
 }
 
 func NewNode(cfg NodeConfig) (*Node, error) {
-	return core.NewNode(cfg)
+	return node.NewNode(cfg)
 }
 
 func NewPostgresDriver(db *gorm.DB) Driver {
