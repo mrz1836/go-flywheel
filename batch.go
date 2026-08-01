@@ -23,10 +23,10 @@ const jobRowColumns = 24
 // to it rather than rejected.
 const (
 	// defaultPostgresChunk is the default rows-per-INSERT on PostgreSQL, whose wire
-	// protocol caps a statement at 65535 bind parameters (65535/22 ≈ 2978 rows).
+	// protocol caps a statement at 65535 bind parameters (65535/24 ≈ 2730 rows).
 	defaultPostgresChunk = 1000
 	// defaultSQLiteChunk is the default rows-per-INSERT on SQLite, whose
-	// SQLITE_MAX_VARIABLE_NUMBER is 32766 (32766/22 ≈ 1489 rows).
+	// SQLITE_MAX_VARIABLE_NUMBER is 32766 (32766/24 ≈ 1365 rows).
 	defaultSQLiteChunk = 500
 
 	// maxPostgresChunk and maxSQLiteChunk are the hard per-statement ceilings a
