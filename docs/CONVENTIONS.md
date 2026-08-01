@@ -95,3 +95,46 @@ The same discipline covers the rest of the seams a change leaves behind. A `//no
 a site-specific reason after the `//` — never a bare suppression — and is removed when the reason no
 longer applies. Dead unexported code is deleted, not commented out; the `unused` linter is the gate that
 keeps this honest, so nothing dead survives a green lint.
+
+<br>
+
+## Verifying cohesion
+
+Cohesion is a property you prove, not eyeball. It has two layers.
+
+**The fast, doc-focused gate — `scripts/cohesion-check.sh`.** Run it from anywhere; it resolves every
+relative link and `#anchor` in `README.md` and `docs/*.md` (there is no one-liner for the anchor half —
+it computes GitHub heading slugs), re-runs the README voice grep and the hygiene grep, renders godoc per
+package, and builds the examples. It encodes two `go doc` traps, because both look right and neither
+works:
+
+- `go doc ./...` is invalid — `go doc` rejects the wildcard (*too many periods*). Use a per-package
+  loop: `go doc .`, then `go doc ./config`, `./observers`, `./workers`, `./cmd/flywheel`.
+- `go doc` has no build-tag support (no `-tags` flag, and `GOFLAGS=-tags` is ignored), so it cannot
+  reach a package that is entirely behind a build tag. The `loadtest` package is proven with
+  `go build -tags=loadtest ./loadtest/...` instead.
+
+```bash
+./scripts/cohesion-check.sh                        # links + voice/hygiene greps + godoc + examples + lint
+COHESION_SKIP_LINT=1 ./scripts/cohesion-check.sh   # skip the slow golangci-lint passes
+```
+
+**The full gate — `magex` is the authority.** The doc gate does not replace the build/test gate CI runs:
+
+```bash
+magex format:fix && magex lint && magex vet && magex test    # then: magex test:race
+# Lint under every build tag (what magex lint covers):
+golangci-lint run ./...
+golangci-lint run --build-tags=integration ./...
+golangci-lint run --build-tags=loadtest ./loadtest/...
+# Integration suite against a local PostgreSQL:
+export FLYWHEEL_TEST_DATABASE_URL="postgres://$USER@localhost:5432/flywheel_test?sslmode=disable"
+export FLYWHEEL_REQUIRE_POSTGRES=1
+go test -tags=integration -race -count=1 ./...
+# The secret scan CI runs — gitleaks specifically, not the full `go-pre-commit run lint`,
+# which fails on this repo by a known pre-existing rss_*.go GOOS collision, unrelated to any change:
+go-pre-commit run gitleaks --all-files
+```
+
+After `magex format:fix`, check `git status` and revert any reformatted committed JSON or snapshot churn
+that is not part of your change — it reformats benchmark reports it should not touch.
