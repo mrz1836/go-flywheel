@@ -7,7 +7,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
 // recordingObserver captures every lifecycle event for assertion. It is
@@ -83,16 +82,36 @@ func (o *recordingObserver) snapshot() (claims []ClaimEvent, starts []JobEvent, 
 		append([]RetryEvent(nil), o.retries...)
 }
 
-// newObservedRunner builds a SQLite runner wired to obs.
-func newObservedRunner(t *testing.T, db *gorm.DB, reg *Registry, obs Observer) *Runner {
-	t.Helper()
-	r, err := NewRunner(RunnerConfig{
-		DB: db, Driver: NewSQLiteDriver(db), Registry: reg,
-		Queues: []string{"default", "periodic"}, ClaimAnyClass: true,
-		Concurrency: 1, Observer: obs,
-	})
-	require.NoError(t, err)
-	return r
+// claimedTotal returns the total number of jobs claimed across every OnClaim
+// event, matching the running int an event-counting scenario reconciles against.
+func (o *recordingObserver) claimedTotal() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	n := 0
+	for _, c := range o.claims {
+		n += c.Claimed
+	}
+	return n
+}
+
+// startCount returns how many OnStart events were recorded — once per attempt.
+func (o *recordingObserver) startCount() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return len(o.starts)
+}
+
+// outcomeCount returns how many OnFinish events carried the given outcome.
+func (o *recordingObserver) outcomeCount(outcome RunOutcome) int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	n := 0
+	for _, f := range o.finishes {
+		if f.Outcome == outcome {
+			n++
+		}
+	}
+	return n
 }
 
 func TestNewRunnerDefaultsObserverToNoop(t *testing.T) {
@@ -109,7 +128,7 @@ func TestObserverReceivesClaimStartFinishOnSuccess(t *testing.T) {
 	reg := NewRegistry()
 	Register(reg, &successWorker{})
 	obs := &recordingObserver{}
-	r := newObservedRunner(t, db, reg, obs)
+	r := rwRunner(t, db, reg, func(c *RunnerConfig) { c.Observer = obs })
 	ctx := context.Background()
 
 	id, err := Insert(ctx, NewClient(db), successArgs{V: "x"}, InsertOpts{})
@@ -141,7 +160,7 @@ func TestObserverOnRetryFiresForTransientError(t *testing.T) {
 	reg := NewRegistry()
 	Register(reg, &retryWorker{failuresBefore: 1})
 	obs := &recordingObserver{}
-	r := newObservedRunner(t, db, reg, obs)
+	r := rwRunner(t, db, reg, func(c *RunnerConfig) { c.Observer = obs })
 	ctx := context.Background()
 
 	id, err := Insert(ctx, NewClient(db), retryArgs{V: "x"}, InsertOpts{})
@@ -167,7 +186,7 @@ func TestObserverOnFinishForUnknownKindHasNoStart(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	obs := &recordingObserver{}
-	r := newObservedRunner(t, db, NewRegistry(), obs) // empty registry
+	r := rwRunner(t, db, NewRegistry(), func(c *RunnerConfig) { c.Observer = obs }) // empty registry
 	ctx := context.Background()
 
 	id, err := Insert(ctx, NewClient(db), successArgs{V: "orphan"}, InsertOpts{})

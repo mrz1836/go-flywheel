@@ -3,7 +3,6 @@ package flywheel
 import (
 	"context"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,87 +20,10 @@ import (
 // through the public API on an in-memory SQLite database.
 
 // --- shared real-world test helpers -----------------------------------------
-
-// rwRunner builds a single-concurrency SQLite Runner that claims every executor
-// class on the default and periodic queues, with a tight poll interval so
-// backoff/snooze scenarios drain fast. The optional mutators tweak the config
-// (backoff base, observer, default timeout, ...).
-func rwRunner(t testing.TB, db *gorm.DB, reg *Registry, mutators ...func(*RunnerConfig)) *Runner {
-	t.Helper()
-	cfg := RunnerConfig{
-		DB:            db,
-		Driver:        NewSQLiteDriver(db),
-		Registry:      reg,
-		Queues:        []string{"default", "periodic"},
-		ExecutorClass: "local",
-		ClaimAnyClass: true,
-		Concurrency:   1,
-		PollInterval:  2 * time.Millisecond,
-	}
-	for _, m := range mutators {
-		m(&cfg)
-	}
-	r, err := NewRunner(cfg)
-	if err != nil {
-		t.Fatalf("rwRunner: %v", err)
-	}
-	return r
-}
-
-// recordObserver captures the lifecycle events the Runner emits so a scenario can
-// reconcile observed counters against the driven outcomes.
-type recordObserver struct {
-	mu         sync.Mutex
-	claimed    int
-	starts     int
-	finishes   []FinishEvent
-	retries    []RetryEvent
-	supersedes []SupersedeEvent
-}
-
-func (o *recordObserver) OnClaim(_ context.Context, ev ClaimEvent) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.claimed += ev.Claimed
-}
-
-func (o *recordObserver) OnStart(_ context.Context, _ JobEvent) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.starts++
-}
-
-func (o *recordObserver) OnFinish(_ context.Context, ev FinishEvent) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.finishes = append(o.finishes, ev)
-}
-
-func (o *recordObserver) OnRetry(_ context.Context, ev RetryEvent) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.retries = append(o.retries, ev)
-}
-
-func (o *recordObserver) OnSupersede(_ context.Context, ev SupersedeEvent) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.supersedes = append(o.supersedes, ev)
-}
-
-func (o *recordObserver) OnSweep(context.Context, SweepEvent) {}
-
-func (o *recordObserver) outcomeCount(outcome RunOutcome) int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	n := 0
-	for _, f := range o.finishes {
-		if f.Outcome == outcome {
-			n++
-		}
-	}
-	return n
-}
+//
+// rwRunner (the generic observed runner) and recordingObserver (the shared
+// event-recording double) live in helpers_test.go and observer_test.go
+// respectively, so every suite builds on the same two.
 
 // --- ingestion fan-out DAG ---------------------------------------------------
 
@@ -341,7 +263,7 @@ func TestRealWorldRateLimitSnooze(t *testing.T) {
 	const limited = 5
 	const startMaxAttempts = 4
 
-	obs := &recordObserver{}
+	obs := &recordingObserver{}
 	w := &rateLimitWorker{limited: limited}
 	reg := NewRegistry()
 	Register(reg, w)
@@ -400,7 +322,7 @@ func TestRealWorldTransientBackoff(t *testing.T) {
 
 	const failures = 3
 
-	obs := &recordObserver{}
+	obs := &recordingObserver{}
 	w := &transientWorker{failuresBefore: failures}
 	reg := NewRegistry()
 	Register(reg, w)
@@ -773,7 +695,7 @@ func TestRealWorldObservabilityCountersReconcile(t *testing.T) {
 	db := newDB(t)
 	ctx := context.Background()
 
-	obs := &recordObserver{}
+	obs := &recordingObserver{}
 	reg := NewRegistry()
 	Register(reg, &successWorker{})                                                            // succeeds once
 	Register(reg, &transientWorker{failuresBefore: 2})                                         // 2 failures + 1 success
@@ -795,9 +717,9 @@ func TestRealWorldObservabilityCountersReconcile(t *testing.T) {
 
 	// Attempts: success(1) + transient(3) + permanent(1) = 5.
 	const wantAttempts = 5
-	obs.mu.Lock()
-	starts, claimed, finishCount, retryCount := obs.starts, obs.claimed, len(obs.finishes), len(obs.retries)
-	obs.mu.Unlock()
+	_, _, finishes, retries := obs.snapshot()
+	starts, claimed := obs.startCount(), obs.claimedTotal()
+	finishCount, retryCount := len(finishes), len(retries)
 	assert.Equal(t, wantAttempts, starts, "OnStart fires once per attempt")
 	assert.Equal(t, wantAttempts, finishCount, "OnFinish fires once per attempt")
 	assert.GreaterOrEqual(t, claimed, wantAttempts, "every attempt was claimed at least once")

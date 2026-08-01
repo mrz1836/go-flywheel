@@ -11,30 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
-
-// newWALFileDB opens a fresh file-backed SQLite database in WAL mode — the same
-// configuration the local daemon uses — so a Node's runner can write while the
-// test polls the DB to observe progress, without hitting shared-cache LOCKED
-// errors. Migrate stands up the full schema.
-func newWALFileDB(t *testing.T) *gorm.DB {
-	t.Helper()
-	dsn := "file:" + t.TempDir() + "/flywheel.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate"
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		if sqlDB, derr := db.DB(); derr == nil {
-			_ = sqlDB.Close()
-		}
-	})
-	require.NoError(t, Migrate(db))
-	return db
-}
 
 // freeAddr reserves and releases an ephemeral loopback port, returning its
 // address for a server to bind. The brief reserve/release window is tolerated by

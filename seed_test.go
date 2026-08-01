@@ -13,19 +13,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// newSeedDB builds a SQLite database with the *whole* schema, indexes included.
-//
-// The shared newDB helper applies 2 of the 8 indexes and omits
-// job_runs_job_attempt, so a collision test written against it would insert both
-// rows happily and pass while proving nothing. Migrate on a bare database is the
-// library-owned install, which is exactly the topped-up schema these tests need.
-func newSeedDB(t *testing.T) *gorm.DB {
-	t.Helper()
-	db := newBareSQLite(t)
-	require.NoError(t, Migrate(db))
-	return db
-}
-
 // enqueueSeedJob enqueues one job and returns its id, so a seeded run has a real job to
 // belong to.
 func enqueueSeedJob(t *testing.T, ctx context.Context, db *gorm.DB) string { //nolint:revive // ctx-after-t matches the test helper convention
@@ -60,7 +47,7 @@ func TestSeedRunMatchesARuntimeWrittenRow(t *testing.T) {
 	const failure = "upstream refused the connection"
 
 	ctx := context.Background()
-	db := newSeedDB(t)
+	db := newDB(t)
 	driver := NewSQLiteDriver(db)
 
 	// The runtime's own path: a stub committed before the worker body, then a
@@ -118,7 +105,7 @@ func TestSeedRunAppliesDefaults(t *testing.T) {
 
 	now := time.Date(2026, 7, 25, 9, 30, 0, 0, time.UTC)
 	ctx := models.WithClock(context.Background(), models.NewFixedClock(now))
-	db := newSeedDB(t)
+	db := newDB(t)
 
 	runID, err := SeedRun(ctx, db, RunSeed{JobID: enqueueSeedJob(t, ctx, db), Attempt: 1, ExecutorID: "exec-1"})
 	require.NoError(t, err)
@@ -140,7 +127,7 @@ func TestSeedRunRejectsAttemptCollision(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	db := newSeedDB(t)
+	db := newDB(t)
 	jobID := enqueueSeedJob(t, ctx, db)
 
 	_, err := SeedRun(ctx, db, RunSeed{JobID: jobID, Attempt: 2, ExecutorID: "exec-1"})
@@ -165,7 +152,7 @@ func TestSeedRunHonorsTx(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	db := newSeedDB(t)
+	db := newDB(t)
 	jobID := enqueueSeedJob(t, ctx, db)
 
 	var rolledBackID string
@@ -208,7 +195,7 @@ func TestSeedRunRequiresIdentityFields(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := SeedRun(context.Background(), newSeedDB(t), tc.seed)
+			_, err := SeedRun(context.Background(), newDB(t), tc.seed)
 			require.ErrorIs(t, err, ErrValidation)
 
 			var verr *ValidationError
@@ -232,7 +219,7 @@ func TestSeedRunTruncatesLongErrors(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	db := newSeedDB(t)
+	db := newDB(t)
 
 	long := ""
 	for len(long) <= maxErrorMessage {

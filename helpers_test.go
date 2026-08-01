@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/mrz1836/go-foundation/models"
+	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -194,4 +196,66 @@ func newSchedulerCfg(t testing.TB, cfg SchedulerConfig) *Scheduler {
 		t.Fatalf("newSchedulerCfg: %v", err)
 	}
 	return s
+}
+
+// newSingleConnMemoryDB opens a bare `:memory:` SQLite database capped at one
+// connection, which is the shape an embedding host's test boundary uses: each
+// pooled connection to a bare `:memory:` DSN gets its own private empty
+// database, so the cap is not a tuning choice but a correctness requirement.
+func newSingleConnMemoryDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	require.NoError(t, Migrate(db))
+	return db
+}
+
+// newWALFileDB opens a fresh file-backed SQLite database in WAL mode — the same
+// configuration the local daemon uses — so a Node's runner can write while the
+// test polls the DB to observe progress, without hitting shared-cache LOCKED
+// errors. Migrate stands up the full schema.
+func newWALFileDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dsn := "file:" + t.TempDir() + "/flywheel.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if sqlDB, derr := db.DB(); derr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	require.NoError(t, Migrate(db))
+	return db
+}
+
+// rwRunner builds a single-concurrency SQLite Runner that claims every executor
+// class on the default and periodic queues, with a tight poll interval so
+// backoff/snooze scenarios drain fast. The optional mutators tweak the config
+// (backoff base, observer, default timeout, ...). It is the generic observed
+// runner the real-world scenarios, the observer suite, and the supersede suite
+// all build on.
+func rwRunner(t testing.TB, db *gorm.DB, reg *Registry, mutators ...func(*RunnerConfig)) *Runner {
+	t.Helper()
+	cfg := RunnerConfig{
+		DB:            db,
+		Driver:        NewSQLiteDriver(db),
+		Registry:      reg,
+		Queues:        []string{"default", "periodic"},
+		ExecutorClass: "local",
+		ClaimAnyClass: true,
+		Concurrency:   1,
+		PollInterval:  2 * time.Millisecond,
+	}
+	for _, m := range mutators {
+		m(&cfg)
+	}
+	r, err := NewRunner(cfg)
+	if err != nil {
+		t.Fatalf("rwRunner: %v", err)
+	}
+	return r
 }
