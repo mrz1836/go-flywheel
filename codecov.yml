@@ -35,6 +35,12 @@ ignore:
   - "examples/**"
   - "mocks/**"
   - "testing/**"
+  # flywheel.go is the auto-generated, API-stable facade over internal/core:
+  # nothing but type aliases, re-exported sentinels, and one-line forwarding
+  # functions. Its surface is proven identical to internal/core by a compile-time
+  # check, and consumers exercise it end-to-end, so it is excluded like generated
+  # code rather than padded with a smoke test that asserts x() calls core.x().
+  - "flywheel.go"
 
 # Parsers
 # --------------

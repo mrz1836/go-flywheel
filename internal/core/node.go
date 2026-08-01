@@ -1,0 +1,351 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"sync"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+// defaultHealthShutdownTimeout bounds the health server's graceful shutdown.
+const defaultHealthShutdownTimeout = 5 * time.Second
+
+// HealthConfig configures a Node's optional in-process health server. It uses
+// only net/http from the standard library, so enabling it adds no dependency. A
+// zero value (empty Addr) disables the server.
+type HealthConfig struct {
+	// Addr is the listen address (e.g. ":8080"). Empty disables the server.
+	Addr string
+	// Readiness reports whether the node is ready to serve work. When nil, the
+	// Node installs a default that pings the first runner's database. /healthz is
+	// always a shallow liveness 200; /readyz gates its 200 on Readiness.
+	Readiness func(ctx context.Context) error
+	// MetricsHandler, when non-nil, is served at /metrics. The Node stays format-
+	// agnostic: a host passes any http.Handler (e.g. observers.MetricsHandler for
+	// Prometheus), and a nil handler simply leaves /metrics unrouted (404). Liveness
+	// and readiness are unaffected either way.
+	MetricsHandler http.Handler
+	// ShutdownTimeout bounds the health server's graceful shutdown. Optional;
+	// defaults to five seconds.
+	ShutdownTimeout time.Duration
+}
+
+// NodeConfig declares everything a Node runs: one or more runners, an optional
+// scheduler, and an optional health server. It is the one-call replacement for a
+// hand-wired runner + scheduler + health-server + signal-drain main().
+type NodeConfig struct {
+	// Runners are the dispatch loops this Node hosts. Each may claim a different
+	// set of queues at a different concurrency for a different executor class. At
+	// least one is required.
+	Runners []RunnerConfig
+	// Scheduler, when non-nil, runs periodic ticks plus the stuck-lease sweep.
+	// Leave it nil on a pure worker node where another process owns scheduling.
+	Scheduler *SchedulerConfig
+	// Health configures the optional liveness/readiness server.
+	Health HealthConfig
+	// Logger logs the Node's own lifecycle events. Optional; defaults to
+	// slog.Default(). It does not override a RunnerConfig.Logger.
+	Logger *slog.Logger
+	// DrainTimeout bounds how long Run waits for in-flight work after ctx is
+	// cancelled before returning regardless. Zero waits for in-flight work however
+	// long it takes.
+	//
+	// Zero is genuinely unbounded, not lease-bounded: a running job's lease is
+	// renewed on the heartbeat for as long as its worker is alive, so there is no
+	// expiry to fall back on. Set it to the longest drain the deployment will
+	// tolerate — on timeout the still-running jobs keep their leases and are
+	// recovered by the lease sweep, and the warning names how many there were.
+	//
+	// Sizing it needs to account for the workers only. The scheduler also waits
+	// for its in-flight maintenance pass, but that wait is bounded by one batch
+	// rather than one backlog: the lease sweep and the retention prune both work
+	// in bounded transactions, so neither can hold shutdown open for the length
+	// of whatever it happened to be draining.
+	DrainTimeout time.Duration
+}
+
+// Node is a self-contained job-runtime process: it owns its runners, an optional
+// scheduler, and an optional health server, starts them together, and drains
+// cleanly when its context is cancelled. It turns the ~100 lines of lifecycle
+// boilerplate every host re-implements into a single Run call.
+type Node struct {
+	cfg       NodeConfig
+	runners   []*Runner
+	scheduler *Scheduler
+	logger    *slog.Logger
+}
+
+// NewNode validates cfg and constructs the Node. Each runner is built through
+// NewRunner (so the SQLite concurrency-1 guard and every zero-value default
+// still apply) and the scheduler, when configured, through NewSchedulerWithConfig.
+func NewNode(cfg NodeConfig) (*Node, error) {
+	if len(cfg.Runners) == 0 {
+		return nil, errNodeNeedsRunner
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	runners := make([]*Runner, 0, len(cfg.Runners))
+	for i := range cfg.Runners {
+		r, err := NewRunner(cfg.Runners[i])
+		if err != nil {
+			return nil, fmt.Errorf("flywheel: node runner[%d]: %w", i, err)
+		}
+		runners = append(runners, r)
+	}
+
+	// The scheduler config is validated by its own constructor rather than here.
+	// Two authorities on one config drift: a field added to SchedulerConfig gets
+	// checked in one place and not the other, and the two entry points then
+	// accept different configurations.
+	var scheduler *Scheduler
+	if cfg.Scheduler != nil {
+		var err error
+		if scheduler, err = NewSchedulerWithConfig(*cfg.Scheduler); err != nil {
+			return nil, fmt.Errorf("flywheel: node scheduler: %w", err)
+		}
+	}
+
+	if cfg.Health.Addr != "" && cfg.Health.Readiness == nil {
+		cfg.Health.Readiness = dbPinger(cfg.Runners[0].DB)
+	}
+
+	return &Node{cfg: cfg, runners: runners, scheduler: scheduler, logger: logger}, nil
+}
+
+// Run starts every component and blocks until ctx is cancelled and all components
+// have drained, bounded by DrainTimeout when one is set. It returns the first
+// non-cancellation error any component reported, or nil on a clean drain. Signal
+// handling stays with the caller: pass a context from signal.NotifyContext.
+//
+// Cancelling ctx is a *drain* request, not an abort. Every runner is told to stop
+// claiming, then drained; only once the drain has finished — or run out of
+// DrainTimeout — is the rest of the node torn down.
+func (n *Node) Run(ctx context.Context) error {
+	// The components run on a context detached from the caller's. That is what
+	// makes the drain above real: a runner's run context reaches every worker it
+	// dispatches, so deriving it from ctx would abort in-flight work the instant
+	// the host cancelled and leave the drain that follows with nothing to wait for.
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(n.runners)+2)
+	// fail records a component's first real (non-cancellation) error and tears
+	// down its siblings by cancelling the shared run context.
+	fail := func(err error) {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- err
+			cancel()
+		}
+	}
+
+	for i := range n.runners {
+		r := n.runners[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fail(r.Run(runCtx))
+		}()
+	}
+	if n.scheduler != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fail(n.scheduler.Run(runCtx))
+		}()
+	}
+	if n.cfg.Health.Addr != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fail(n.serveHealth(runCtx))
+		}()
+	}
+
+	n.logger.InfoContext(ctx, "flywheel: node started",
+		"runners", len(n.runners),
+		"scheduler", n.scheduler != nil,
+		"health_addr", n.cfg.Health.Addr)
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		drainCtx, cancelDrain := n.drainContext()
+		defer cancelDrain()
+
+		n.drainRunners(ctx, drainCtx)
+		// The runners have stopped claiming and have had their whole drain budget.
+		// What is left is the scheduler and the health server, which have no
+		// in-flight work to protect and stop on the run context.
+		cancel()
+		n.awaitComponents(drainCtx, done)
+	}
+
+	if firstErr := drainErrors(errCh); firstErr != nil {
+		n.logger.ErrorContext(ctx, "flywheel: node stopped with error", "error", firstErr)
+		return firstErr
+	}
+	n.logger.InfoContext(ctx, "flywheel: node drained and stopped")
+	return nil
+}
+
+// drainContext bounds the whole shutdown sequence. It is built on a fresh
+// background context rather than the caller's, which is already cancelled by the
+// time it is needed.
+//
+// A zero DrainTimeout waits for in-flight work however long it takes.
+func (n *Node) drainContext() (context.Context, context.CancelFunc) {
+	if n.cfg.DrainTimeout <= 0 {
+		return context.Background(), func() {}
+	}
+	return context.WithTimeout(context.Background(), n.cfg.DrainTimeout)
+}
+
+// drainRunners expresses the Node's drain in terms of the Runner's
+// rather than duplicating it: waiting on component goroutines conflates "the
+// loop returned" with "in-flight work finished".
+//
+// Every runner is stopped before any is drained, so none picks up fresh work
+// while a sibling is still finishing — the alternative drains runner 0 while
+// runner 1 keeps claiming. The Drain calls then share one deadline, because
+// DrainTimeout bounds the node's shutdown and not each runner's separately.
+func (n *Node) drainRunners(logCtx, drainCtx context.Context) {
+	for _, r := range n.runners {
+		r.Stop()
+	}
+	for i, r := range n.runners {
+		err := r.Drain(drainCtx)
+		if err == nil {
+			continue
+		}
+		// The count comes off the error, taken at the instant the deadline arrived,
+		// rather than from a second InFlight call that would race the jobs finishing.
+		inFlight := -1
+		var timeout *DrainTimeoutError
+		if errors.As(err, &timeout) {
+			inFlight = timeout.InFlight
+		}
+		n.logger.WarnContext(logCtx, "flywheel: node drain timed out with jobs still in flight",
+			"runner", i,
+			"in_flight", inFlight,
+			"drain_timeout", n.cfg.DrainTimeout.String(),
+			"error", err)
+	}
+}
+
+// awaitComponents waits for the scheduler and health server to exit, bounded by
+// the same deadline the runners' drain spent. A runner whose drain timed out may
+// still be parked on its own in-flight job, which is why this wait is bounded
+// too: the drain budget has already been spent once and must not be spent twice.
+func (n *Node) awaitComponents(drainCtx context.Context, done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-drainCtx.Done():
+	}
+}
+
+// serveHealth runs the liveness/readiness server until ctx is cancelled, then
+// shuts it down gracefully. A listen failure is returned (and stops the Node);
+// a clean shutdown returns nil.
+func (n *Node) serveHealth(ctx context.Context) error {
+	shutdownTimeout := n.cfg.Health.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = defaultHealthShutdownTimeout
+	}
+	srv := &http.Server{
+		Addr:              n.cfg.Health.Addr,
+		Handler:           healthMux(n.cfg.Health.Readiness, n.cfg.Health.MetricsHandler),
+		ReadHeaderTimeout: shutdownTimeout,
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+		// ctx is already cancelled; the graceful shutdown needs a fresh deadline.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			n.logger.ErrorContext(ctx, "flywheel: health server shutdown", "error", err)
+		}
+	}()
+
+	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("flywheel: health server: %w", err)
+	}
+	<-shutdownDone
+	return nil
+}
+
+// healthMux builds the health server's routes: /healthz is an unconditional
+// liveness 200, /readyz returns 200 only when readiness (if set) reports nil, and
+// /metrics is served only when metricsHandler is non-nil (otherwise it 404s,
+// leaving liveness and readiness untouched).
+func healthMux(readiness func(ctx context.Context) error, metricsHandler http.Handler) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if readiness != nil {
+			if err := readiness(r.Context()); err != nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("unavailable"))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
+	if metricsHandler != nil {
+		mux.Handle("/metrics", metricsHandler)
+	}
+	return mux
+}
+
+// dbPinger returns a readiness check that pings db. A nil db yields a check that
+// always reports ready — there is nothing to probe.
+func dbPinger(db *gorm.DB) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if db == nil {
+			return nil
+		}
+		sqlDB, err := db.DB()
+		if err != nil {
+			return fmt.Errorf("flywheel: readiness: %w", err)
+		}
+		if err := sqlDB.PingContext(ctx); err != nil {
+			return fmt.Errorf("flywheel: readiness ping: %w", err)
+		}
+		return nil
+	}
+}
+
+// drainErrors non-blockingly collects the first error buffered on errCh. It does
+// not close the channel, so it is safe even if a component is still shutting down
+// after a drain timeout.
+func drainErrors(errCh <-chan error) error {
+	var first error
+	for {
+		select {
+		case err := <-errCh:
+			if first == nil {
+				first = err
+			}
+		default:
+			return first
+		}
+	}
+}
