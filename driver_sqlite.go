@@ -23,7 +23,7 @@ type sqliteDriver struct {
 
 // SQLiteOpts configures SQLite driver construction. It embeds the batching
 // DriverOpts so a host can set the batch sizes and the pragma-check policy in one
-// value.
+// value. The zero value takes the default batch sizes and runs the pragma check.
 type SQLiteOpts struct {
 	DriverOpts
 	// SkipPragmaCheck disables the connection verification. Use it only when the

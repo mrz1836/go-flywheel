@@ -256,7 +256,9 @@ func periodicViewFromRow(r jobPeriodicRow) PeriodicView {
 	return v
 }
 
-// RetryOpts configures a RetryJobWithOptions call.
+// RetryOpts configures a RetryJobWithOptions call. The zero value is a plain,
+// guarded retry: a terminal job is refused with ErrJobTerminal, no retry budget is
+// restored, and the re-run is immediate — exactly what RetryJob issues.
 type RetryOpts struct {
 	// Force retries a job that has already reached a terminal state — including a
 	// succeeded one. Without it a terminal job is refused with ErrJobTerminal, so an

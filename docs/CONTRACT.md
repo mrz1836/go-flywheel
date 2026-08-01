@@ -112,3 +112,9 @@ The rule underneath the table: **the runtime makes the job's own state exactly-o
 each external effect idempotent, and `Job.RunID` is the key you build that on.** A worker whose external
 effects are all idempotent on `Job.RunID` inherits end-to-end exactly-once behavior — the state advance
 from the runtime, the side-effect deduplication from you.
+
+<br>
+
+*The `jobs:` / `flywheel:` log prefixes are an observable contract of a different kind — greppable, and
+matched by tests. That rule, and the other conventions a change to the runtime inherits, live in
+[`CONVENTIONS.md`](CONVENTIONS.md).*
