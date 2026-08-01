@@ -148,6 +148,27 @@ func TestSlogObserverSupersedeLogsAtWarn(t *testing.T) {
 	assert.Equal(t, "running", attrs["job_state"].String())
 }
 
+// TestSlogObserverSweepLevelTracksReclaimed proves OnSweep logs at the configured
+// (debug) level when the pass reclaimed nothing — routine maintenance — and lifts
+// to info when it reclaimed a lease, because a nonzero reclaim means an executor
+// died mid-attempt and an operator on info-level logs should see that.
+func TestSlogObserverSweepLevelTracksReclaimed(t *testing.T) {
+	t.Parallel()
+	h := &capturingHandler{level: slog.LevelDebug}
+	obs := NewSlog(slog.New(h))
+	ctx := context.Background()
+
+	obs.OnSweep(ctx, flywheel.SweepEvent{Reclaimed: 0, Duration: 3 * time.Millisecond})
+	obs.OnSweep(ctx, flywheel.SweepEvent{Reclaimed: 2, Duration: 4 * time.Millisecond})
+
+	records := h.snapshot()
+	require.Len(t, records, 2, "both sweep passes are logged")
+	assert.Equal(t, "flywheel: lease sweep completed", records[0].Message)
+	assert.Equal(t, slog.LevelDebug, records[0].Level, "a no-op reclaim stays at the routine debug level")
+	assert.Equal(t, slog.LevelInfo, records[1].Level, "a nonzero reclaim lifts to info so an operator sees it")
+	assert.EqualValues(t, 2, attrsOf(records[1])["reclaimed"].Int64())
+}
+
 func TestNewSlogNilLoggerDoesNotPanic(t *testing.T) {
 	t.Parallel()
 	obs := NewSlog(nil)

@@ -2,6 +2,9 @@ package flywheel
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -199,4 +202,127 @@ func TestSchedulerSweepFiresOnSweep(t *testing.T) {
 	sweeps := obs.snapshotSweeps()
 	require.Len(t, sweeps, 1, "one pass fires exactly one OnSweep")
 	assert.Equal(t, 1, sweeps[0].Reclaimed, "the event carries the reclaimed count")
+}
+
+// --- logMaintenanceError: suppress the shutdown, log the rest ----------------
+
+// TestLogMaintenanceErrorSuppressesShutdownErrors proves a cancellation or
+// deadline — what a clean drain looks like from inside a maintenance activity —
+// is swallowed, while any other failure is logged. Without this every ordinary
+// shutdown would gain an error line the unbounded implementation never produced.
+func TestLogMaintenanceErrorSuppressesShutdownErrors(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	sched := newScheduler(t, db)
+	h := &captureHandler{}
+	sched.logger = slog.New(h)
+	ctx := context.Background()
+
+	sched.logMaintenanceError(ctx, "jobs: suppressed cancel", context.Canceled)
+	sched.logMaintenanceError(ctx, "jobs: suppressed deadline", context.DeadlineExceeded)
+	sched.logMaintenanceError(ctx, "jobs: suppressed wrapped", fmt.Errorf("sweep: %w", context.Canceled))
+	assert.Empty(t, h.messages, "a cancelled or deadline-exceeded maintenance error is not logged")
+
+	sched.logMaintenanceError(ctx, "jobs: real failure", errors.New("disk full"))
+	require.Len(t, h.recordsFor("jobs: real failure"), 1, "a genuine failure is logged")
+	assert.Equal(t, "disk full", h.recordsFor("jobs: real failure")[0].attrs["error"].String())
+}
+
+// --- intervalBuckets / cronBuckets: bounded allocation, exact buckets --------
+
+// TestIntervalBucketsGuardsAndBounds pins the closed-form skip-ahead: a
+// non-positive interval and a start after now do no work, a normal run returns
+// exactly the missed fires and the next, and a run past the cap keeps only the
+// most recent limit while still reporting the true next fire.
+func TestIntervalBucketsGuardsAndBounds(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(n int) time.Time { return t0.Add(time.Duration(n) * time.Minute) }
+
+	t.Run("non-positive interval does no work", func(t *testing.T) {
+		t.Parallel()
+		buckets, next := intervalBuckets(t0, 0, at(60), 5)
+		assert.Empty(t, buckets, "a zero interval has no valid schedule and cannot loop")
+		assert.Equal(t, t0, next)
+	})
+	t.Run("start after now has no missed fire", func(t *testing.T) {
+		t.Parallel()
+		buckets, next := intervalBuckets(at(60), 60, t0, 5)
+		assert.Empty(t, buckets)
+		assert.Equal(t, at(60), next, "the first fire is start itself, still in the future")
+	})
+	t.Run("under the cap returns every missed fire", func(t *testing.T) {
+		t.Parallel()
+		buckets, next := intervalBuckets(t0, 60, at(3), 10)
+		assert.Equal(t, []time.Time{t0, at(1), at(2), at(3)}, buckets)
+		assert.Equal(t, at(4), next, "the next fire is strictly after now")
+	})
+	t.Run("past the cap keeps only the most recent limit", func(t *testing.T) {
+		t.Parallel()
+		buckets, next := intervalBuckets(t0, 60, at(60), 10)
+		require.Len(t, buckets, 10, "allocation is bounded by limit, not the 61-fire history")
+		assert.Equal(t, at(51), buckets[0], "the oldest kept fire is now-limit+1")
+		assert.Equal(t, at(60), buckets[9], "the newest kept fire is the one at now")
+		assert.Equal(t, at(61), next)
+	})
+	t.Run("a non-positive limit is unbounded", func(t *testing.T) {
+		t.Parallel()
+		buckets, next := intervalBuckets(t0, 60, at(3), 0)
+		assert.Equal(t, []time.Time{t0, at(1), at(2), at(3)}, buckets)
+		assert.Equal(t, at(4), next)
+	})
+}
+
+// TestCronBucketsRingBufferBounds pins the ring-buffer cap: the unbounded branch
+// returns every missed fire, a capped run keeps only the most recent limit in
+// order, and a malformed expression is surfaced.
+func TestCronBucketsRingBufferBounds(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(n int) time.Time { return t0.Add(time.Duration(n) * time.Minute) }
+
+	t.Run("a non-positive limit returns every fire", func(t *testing.T) {
+		t.Parallel()
+		buckets, next, err := cronBuckets("* * * * *", t0, at(3), 0)
+		require.NoError(t, err)
+		assert.Equal(t, []time.Time{t0, at(1), at(2), at(3)}, buckets)
+		assert.Equal(t, at(4), next)
+	})
+	t.Run("the ring keeps only the most recent limit, in order", func(t *testing.T) {
+		t.Parallel()
+		buckets, next, err := cronBuckets("* * * * *", t0, at(3), 2)
+		require.NoError(t, err)
+		assert.Equal(t, []time.Time{at(2), at(3)}, buckets, "the two most recent fires, oldest first")
+		assert.Equal(t, at(4), next, "next is the true next fire, not one the ring dropped")
+	})
+	t.Run("a limit above the fire count returns them all", func(t *testing.T) {
+		t.Parallel()
+		buckets, _, err := cronBuckets("* * * * *", t0, at(3), 10)
+		require.NoError(t, err)
+		assert.Equal(t, []time.Time{t0, at(1), at(2), at(3)}, buckets)
+	})
+	t.Run("a malformed expression is surfaced", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := cronBuckets("not a cron", t0, at(3), 10)
+		require.ErrorContains(t, err, "parse cron")
+	})
+}
+
+// TestTickOnceAndSweepOnceLogErrors proves the maintenance-activity wrappers log a
+// failure and carry on rather than propagating it, so a transient fault does not
+// stop the scheduler loop.
+func TestTickOnceAndSweepOnceLogErrors(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	sched := newScheduler(t, db)
+	h := &captureHandler{}
+	sched.logger = slog.New(h)
+	closeDB(t, db)
+	ctx := context.Background()
+
+	sched.tickOnce(ctx)
+	assert.True(t, h.has("jobs: periodic tick failed"), "a failed tick is logged, not propagated")
+
+	sched.sweepOnce(ctx)
+	assert.True(t, h.has("jobs: lease sweep failed"), "a failed sweep is logged, not propagated")
 }

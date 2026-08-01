@@ -782,3 +782,33 @@ func TestFakeHTTPDoerStubDefaultBodyReadErrorFailsUnstubbedReads(t *testing.T) {
 	_, readBackErr := io.ReadAll(resp.Body)
 	require.ErrorIs(t, readBackErr, readErr, "the default body-read error applies to any unstubbed request")
 }
+
+// TestPollOnceSurfacesReserveError proves pollOnce returns the context error when
+// the pool cannot free a slot: the pool is filled and the context is already dead,
+// so reserve gives up rather than blocking forever.
+func TestPollOnceSurfacesReserveError(t *testing.T) {
+	t.Parallel()
+	r := newFakeRunner(t, &fakeDriver{}, 2)
+	r.pool.admit(2) // fill the pool so reserve must wait for a free slot
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := r.pollOnce(ctx)
+	require.ErrorIs(t, err, context.Canceled, "reserve surfaces the context error when no slot frees")
+}
+
+// TestPollOnceSurfacesWaitIdleError proves pollOnce surfaces a waitIdle failure:
+// a phantom held slot the pool never releases keeps it non-idle, so a dead context
+// makes waitIdle return rather than hang.
+func TestPollOnceSurfacesWaitIdleError(t *testing.T) {
+	t.Parallel()
+	r := newFakeRunner(t, &fakeDriver{}, 2)
+	r.pool.admit(1) // a held slot with no dispatch to release it: the pool never idles
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// reserve still gets the one free slot; the empty claim releases it; waitIdle
+	// then observes the dead context while the phantom slot keeps the pool busy.
+	_, err := r.pollOnce(ctx)
+	require.ErrorIs(t, err, context.Canceled, "waitIdle surfaces the context error while the pool is non-idle")
+}

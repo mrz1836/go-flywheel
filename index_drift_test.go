@@ -182,3 +182,16 @@ func TestInspectIndexesRejectsANilDB(t *testing.T) {
 	_, err := InspectIndexes(context.Background(), nil)
 	require.Error(t, err)
 }
+
+// TestInspectIndexesSurfacesReadError drives the catalog-read failure path shared
+// by InspectIndexes, inspectIndexes, and readInstalledIndexDefs: a closed DB makes
+// the sqlite_master scan fail, and the error is surfaced rather than reported as
+// an empty (parity) result.
+func TestInspectIndexesSurfacesReadError(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	closeDB(t, db)
+
+	_, err := InspectIndexes(context.Background(), db)
+	require.ErrorContains(t, err, "InspectIndexes", "a failed catalog read is surfaced, not swallowed as parity")
+}

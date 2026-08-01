@@ -118,3 +118,16 @@ func TestRenewLeaseUnknownJobIsNotAnError(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, held)
 }
+
+// TestRenewLeaseSurfacesDBError proves a renewal whose UPDATE fails outright is
+// surfaced as an error, distinct from the held=false a lost or missing claim
+// reports: a database fault is not a supersede.
+func TestRenewLeaseSurfacesDBError(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	d := NewSQLiteDriver(db)
+	closeDB(t, db)
+
+	_, err := d.RenewLease(context.Background(), "j", "tok", time.Now().Add(time.Hour))
+	require.ErrorContains(t, err, "renew lease", "a failed renewal UPDATE is an error, not a silent lost claim")
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -650,4 +651,29 @@ func TestConcurrencyOneDispatchesSequentially(t *testing.T) {
 	for i, limit := range d.claimLimits() {
 		assert.Equalf(t, 1, limit, "claim %d asked for %d; a single-slot pool claims one job", i, limit)
 	}
+}
+
+// TestDrainDispatchErrLogsForContinuousRun pins the continuous-Run arm of the
+// error drain: a per-job dispatch error is logged and swallowed (returns nil), so
+// a long-lived Run keeps looping rather than aborting on one job's failure — the
+// opposite of the RunUntilIdle arm, which returns the error to fail on.
+func TestDrainDispatchErrLogsForContinuousRun(t *testing.T) {
+	t.Parallel()
+	r := newFakeRunner(t, &fakeDriver{}, 1)
+	h := &captureHandler{}
+	r.cfg.Logger = slog.New(h)
+
+	// Deposit a dispatch error into the pool's collector (inline at concurrency 1).
+	r.pool.start(func() error { return errors.New("boom") })
+	require.NoError(t, r.pool.waitIdle(context.Background()))
+
+	require.NoError(t, r.drainDispatchErr(context.Background(), false),
+		"the continuous-run drain logs the error and returns nil")
+	assert.True(t, h.has("jobs: dispatch failed"), "the drained error is logged for a continuous Run")
+
+	// The RunUntilIdle arm, by contrast, returns the error — proven here so the two
+	// arms are not conflated.
+	r.pool.start(func() error { return errors.New("boom again") })
+	require.NoError(t, r.pool.waitIdle(context.Background()))
+	require.Error(t, r.drainDispatchErr(context.Background(), true), "the until-idle drain returns the error")
 }

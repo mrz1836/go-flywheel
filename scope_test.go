@@ -2,7 +2,9 @@ package flywheel
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -220,4 +222,60 @@ func TestCancelByParentDoesNotCountItsOwnCancellationsAsTerminal(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 10, res.Changed)
 	assert.EqualValues(t, 0, res.SkippedTerminal, "the rows this cancel just terminated are Changed, not SkippedTerminal")
+}
+
+// --- scopeByParent error branches -------------------------------------------
+
+// TestScopeByParentSurfacesErrors covers scopeByParent's four failure exits: a
+// nil db, a failed running count, a failed terminal count, and a failed batch
+// update. Each is surfaced with the operation named, so a shutdown log stays
+// legible.
+func TestScopeByParentSurfacesErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a nil db is rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := CancelByParent(context.Background(), nil, "P", ScopeOpts{})
+		require.ErrorContains(t, err, "db is nil")
+	})
+
+	t.Run("a failed running count is surfaced", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		closeDB(t, db)
+		_, err := CancelByParent(context.Background(), db, "P", ScopeOpts{})
+		require.ErrorContains(t, err, "count running")
+	})
+
+	t.Run("a failed terminal count is surfaced", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		// Fail the second query only: the running count (query 1) succeeds, the
+		// terminal count (query 2) fails.
+		var seen atomic.Int32
+		require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:fail_second_query",
+			func(tx *gorm.DB) {
+				if seen.Add(1) == 2 {
+					_ = tx.AddError(errors.New("terminal count failed"))
+				}
+			}))
+		_, err := CancelByParent(context.Background(), db, "P", ScopeOpts{})
+		require.ErrorContains(t, err, "count terminal")
+	})
+
+	t.Run("a failed batch update is surfaced", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		seedChildrenBulk(t, db, "P", 3, StateAvailable, time.Now())
+
+		// The counts are reads and succeed; the batch's UPDATE fails under a
+		// read-only pragma held on the single pinned connection.
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		sqlDB.SetMaxOpenConns(1)
+		require.NoError(t, db.Exec(`PRAGMA query_only = ON`).Error)
+
+		_, err = CancelByParent(context.Background(), db, "P", ScopeOpts{})
+		require.ErrorContains(t, err, "cancel by parent", "the batch UPDATE failure is surfaced")
+	})
 }

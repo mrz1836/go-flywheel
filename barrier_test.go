@@ -9,6 +9,7 @@ import (
 	"github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -303,4 +304,70 @@ func TestBarrierExactlyOnceDeterministic(t *testing.T) {
 		require.EqualValues(t, 1, countJobsOfKind(t, db, "finalize"),
 			"rep %d: the barrier fires exactly once regardless of outcome order", rep)
 	}
+}
+
+// --- barrier reconstruction error branches ----------------------------------
+
+// TestFollowUpFromBarrierSpecRejectsBadJSON proves a corrupt stored barrier_spec
+// surfaces the unmarshal error rather than silently reconstructing a garbage
+// continuation.
+func TestFollowUpFromBarrierSpecRejectsBadJSON(t *testing.T) {
+	t.Parallel()
+	_, err := followUpFromBarrierSpec("cont", datatypes.JSON("not json"), "parent-id")
+	require.ErrorContains(t, err, "unmarshal barrier spec")
+}
+
+// TestResolveBarrierColumnsSurfacesErrors covers the two failure gates of
+// declaring a barrier: the parent's routing row must be readable, and the
+// barrier's args must be marshalable.
+func TestResolveBarrierColumnsSurfacesErrors(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+
+	t.Run("a missing parent row is surfaced", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := resolveBarrierColumns(db, RawJob{ID: "ghost"}, &Barrier{Kind: "cont"})
+		require.ErrorContains(t, err, "read barrier parent routing")
+	})
+
+	t.Run("unmarshalable barrier args are surfaced", func(t *testing.T) {
+		t.Parallel()
+		seedJob(t, db, jobRow{
+			ID: "P-marshal", Kind: "coordinator", Queue: "default", ExecutorClass: "local",
+			Priority: 3, State: string(StateRunning), MaxAttempts: 5, ScheduledAt: time.Now(),
+		})
+		// A channel cannot be JSON-marshaled, so the args marshal fails after the
+		// parent read succeeds.
+		_, _, err := resolveBarrierColumns(db, RawJob{ID: "P-marshal", Queue: "default"},
+			&Barrier{Kind: "cont", Args: make(chan int)})
+		require.ErrorContains(t, err, "marshal barrier args")
+	})
+}
+
+// TestFireBarrierIfCompleteToleratesPrunedParent proves the completion check
+// treats a vanished parent as nothing to fire: a child whose parent_job_id points
+// at a row retention has already pruned finalizes cleanly, taking the gate's
+// record-not-found path rather than erroring.
+func TestFireBarrierIfCompleteToleratesPrunedParent(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	d := NewSQLiteDriver(db)
+	ctx := context.Background()
+
+	ghost := "pruned-parent"
+	seedJob(t, db, jobRow{
+		ID: "orphan", Kind: "child", Queue: "default", ExecutorClass: "local",
+		State: string(StateAvailable), MaxAttempts: 5, ScheduledAt: time.Now().Add(-time.Minute),
+		ParentJobID: &ghost, Args: datatypes.JSON("{}"),
+	})
+
+	raw := claimOne(t, d, ctx)
+	require.Equal(t, "orphan", raw.ID)
+	require.NotNil(t, raw.ParentJobID, "the claimed child carries its dangling parent id")
+
+	// The finalize invokes fireBarrierIfComplete against the missing parent; the
+	// gate read misses and returns nil, so the child still finalizes cleanly.
+	finalizeJob(t, d, ctx, raw, Result{}, nil)
+	assert.Equal(t, string(StateSucceeded), jobState(t, db, "orphan"),
+		"a child of a pruned parent still reaches its terminal state")
 }
