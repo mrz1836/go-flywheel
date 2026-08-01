@@ -79,9 +79,9 @@ var pgIsolatedSeq atomic.Uint64
 // index DDL. A test that wants a deliberately reduced schema builds it from
 // IndexSet through applyIndexKinds and says at the call site why.
 //
-// It is defined in an internal (package flywheel) test file so it can migrate
-// the unexported row structs; being exported lets the external
-// flywheel_test integration suite call it.
+// It lives in the core integration suite; the peeled packages (node, and any
+// later peel) reach an equivalent fixture through internal/flywheeltest, which
+// the test-import-cycle rule keeps core's own tests from sharing.
 func NewPostgresIsolatedDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
