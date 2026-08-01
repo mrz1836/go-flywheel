@@ -475,7 +475,7 @@ type Snapshot struct {
 // seriesKey(cell.Name, cell.Tags), so ordering by map key is exactly ordering by
 // (name, tags) — the deterministic order a Snapshot promises — with no per-type
 // comparator. The caller holds m.mu.
-func snapshotSeries[C any, S any](seriesMap map[string]*C, conv func(*C) S) []S {
+func snapshotSeries[C, S any](seriesMap map[string]*C, conv func(*C) S) []S {
 	keys := slices.Sorted(maps.Keys(seriesMap))
 	out := make([]S, 0, len(keys))
 	for _, k := range keys {
