@@ -236,3 +236,24 @@ func TestProgressEmptyInputs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, byKind)
 }
+
+// --- progress read error branches -------------------------------------------
+
+// TestProgressReadsSurfaceDBErrors covers the DB-error exit of each progress
+// entry point: a closed database makes every read return its wrapped error rather
+// than a partial (and misleading) rollup.
+func TestProgressReadsSurfaceDBErrors(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	closeDB(t, db)
+	ctx := context.Background()
+
+	_, err := Progress(ctx, db, "p")
+	require.Error(t, err, "Progress surfaces a read failure")
+	_, err = ProgressMany(ctx, db, []string{"p"})
+	require.Error(t, err, "ProgressMany surfaces a read failure")
+	_, err = ProgressByKind(ctx, db, []string{"k"})
+	require.Error(t, err, "ProgressByKind surfaces a read failure")
+	_, err = ChildOutputs(ctx, db, "p", ListRunsParams{})
+	require.Error(t, err, "ChildOutputs surfaces a read failure")
+}

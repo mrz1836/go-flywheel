@@ -522,3 +522,25 @@ func TestStarvationTrackerThresholdAndReset(t *testing.T) {
 	s.denied(ctx, r)
 	assert.Equal(t, 1, warnings(), "a fresh streak has not yet reached the threshold")
 }
+
+// TestStarvationIntervalResolvesArms pins the three arms of the starvation-warning
+// threshold: a negative value disables the heuristic, a positive one is taken as
+// given, and zero selects the default.
+func TestStarvationIntervalResolvesArms(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		configured time.Duration
+		want       time.Duration
+	}{
+		"negative disables":      {configured: -1, want: 0},
+		"explicit positive kept": {configured: 5 * time.Second, want: 5 * time.Second},
+		"zero selects default":   {configured: 0, want: defaultLimiterStarvationInterval},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			r := &Runner{cfg: RunnerConfig{LimiterStarvationInterval: tc.configured}}
+			assert.Equal(t, tc.want, r.starvationInterval())
+		})
+	}
+}

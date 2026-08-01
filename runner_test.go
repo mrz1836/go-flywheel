@@ -3,6 +3,7 @@ package flywheel
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -275,4 +276,22 @@ func TestRunnerSqliteDriverRejectsConcurrencyGreaterThanOne(t *testing.T) {
 		Concurrency:   2,
 	})
 	require.ErrorIs(t, err, ErrSQLiteConcurrency)
+}
+
+// TestExecutorIdentityFallsBackWhenHostnameFails covers the fallback arm of the
+// executor identity: when os.Hostname fails (or returns empty), the identity is
+// built from "unknown" rather than an empty host. It is not parallel because it
+// swaps the osHostname seam a package global; it runs in the serial phase, so no
+// concurrent NewRunner reads the seam mid-swap.
+func TestExecutorIdentityFallsBackWhenHostnameFails(t *testing.T) {
+	orig := osHostname
+	t.Cleanup(func() { osHostname = orig })
+
+	osHostname = func() (string, error) { return "", errors.New("no hostname") }
+	assert.True(t, strings.HasPrefix(executorIdentity(), "unknown:"),
+		"a hostname failure falls back to an unknown host")
+
+	osHostname = func() (string, error) { return "", nil }
+	assert.True(t, strings.HasPrefix(executorIdentity(), "unknown:"),
+		"an empty hostname also falls back to unknown")
 }

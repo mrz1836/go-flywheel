@@ -762,3 +762,28 @@ func TestNoopObserverMethodsAreInert(t *testing.T) {
 	o.OnFinish(ctx, FinishEvent{})
 	o.OnRetry(ctx, RetryEvent{})
 }
+
+// --- driver.go InsertChild single-row seam ----------------------------------
+
+// TestInsertChildInsertsAndDeduplicates exercises the single-row InsertChild seam
+// directly. Production now fans out through the chunk primitive, so this is the
+// only caller that pins InsertChild's success path and its
+// duplicate->ErrAlreadyEnqueued translation.
+func TestInsertChildInsertsAndDeduplicates(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	d := NewSQLiteDriver(db)
+	ctx := context.Background()
+
+	fu := FollowUp{Kind: "child", Args: map[string]int{"i": 1}, UniqueKey: "child-key"}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		return d.InsertChild(ctx, tx, fu, "parent")
+	}), "the first child inserts cleanly")
+
+	err := db.Transaction(func(tx *gorm.DB) error {
+		return d.InsertChild(ctx, tx, fu, "parent")
+	})
+	require.ErrorIs(t, err, ErrAlreadyEnqueued, "a unique_key collision reads as already-enqueued, not a raw db error")
+
+	assert.EqualValues(t, 1, countJobsOfKind(t, db, "child"), "the rolled-back duplicate left no second row")
+}

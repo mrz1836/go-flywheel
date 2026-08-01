@@ -134,3 +134,76 @@ func TestInstallIndexesWithOptionsRejectsANilDB(t *testing.T) {
 	t.Parallel()
 	require.Error(t, InstallIndexesWithOptions(context.Background(), nil, IndexOpts{Reconcile: true}))
 }
+
+// TestReconcileIndexSurfacesDropAndCreateErrors covers the two failure points of a
+// single in-place rebuild: the DROP must find its index, and the CREATE must
+// succeed. The transaction rolls back on either, so a correctness-bearing index is
+// never left absent.
+func TestReconcileIndexSurfacesDropAndCreateErrors(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("a failed drop is surfaced", func(t *testing.T) {
+		t.Parallel()
+		db := newBareSQLite(t)
+		require.NoError(t, db.AutoMigrate(Models()...))
+		// No index named "ghost" exists, so the unguarded DROP INDEX fails.
+		err := reconcileIndex(ctx, db, IndexDrift{Name: "ghost", Expected: `CREATE INDEX ghost ON jobs (state)`})
+		require.ErrorContains(t, err, "drop")
+	})
+
+	t.Run("a failed create is surfaced", func(t *testing.T) {
+		t.Parallel()
+		db := newBareSQLite(t)
+		require.NoError(t, db.AutoMigrate(Models()...))
+		require.NoError(t, db.Exec(`CREATE INDEX tmp_idx ON jobs (state)`).Error)
+		// The drop succeeds; the create fails on a table that does not exist.
+		err := reconcileIndex(ctx, db, IndexDrift{Name: "tmp_idx", Expected: `CREATE INDEX tmp_idx ON no_such_table (col)`})
+		require.ErrorContains(t, err, "create")
+	})
+}
+
+// TestApplyIndexesSurfacesErrors covers applyIndexes' three failure exits: the
+// initial inspection, the create of an absent index, and a propagated reconcile
+// failure.
+func TestApplyIndexesSurfacesErrors(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("a failed inspection aborts the install", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		closeDB(t, db)
+		require.Error(t, InstallIndexes(ctx, db), "a catalog read failure aborts before any create")
+	})
+
+	t.Run("a failed create of an absent index is surfaced", func(t *testing.T) {
+		t.Parallel()
+		db := newBareSQLite(t)
+		require.NoError(t, db.AutoMigrate(Models()...)) // tables, no indexes
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		sqlDB.SetMaxOpenConns(1)
+		require.NoError(t, db.Exec(`PRAGMA query_only = ON`).Error)
+
+		require.ErrorContains(t, InstallIndexes(ctx, db), "create index",
+			"an absent index whose CREATE fails aborts the install")
+	})
+
+	t.Run("a failed reconcile propagates", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t) // full schema: every runtime index present
+		// Re-create jobs_state non-partial so it is the single drifted index, with
+		// every other index already present, so applyIndexes reaches only the reconcile.
+		require.NoError(t, db.Exec(`DROP INDEX jobs_state`).Error)
+		require.NoError(t, db.Exec(`CREATE INDEX jobs_state ON jobs (state)`).Error)
+
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		sqlDB.SetMaxOpenConns(1)
+		require.NoError(t, db.Exec(`PRAGMA query_only = ON`).Error)
+
+		require.Error(t, InstallIndexesWithOptions(ctx, db, IndexOpts{Reconcile: true}),
+			"a reconcile that cannot rebuild the drifted index surfaces the failure")
+	})
+}

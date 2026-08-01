@@ -48,6 +48,7 @@ func TestMultiFansEveryEventToAllInOrder(t *testing.T) {
 	m.OnFinish(ctx, flywheel.FinishEvent{})
 	m.OnRetry(ctx, flywheel.RetryEvent{})
 	m.OnSupersede(ctx, flywheel.SupersedeEvent{})
+	m.OnSweep(ctx, flywheel.SweepEvent{})
 
 	assert.Equal(t, []string{
 		"a:claim", "b:claim",
@@ -55,6 +56,7 @@ func TestMultiFansEveryEventToAllInOrder(t *testing.T) {
 		"a:finish", "b:finish",
 		"a:retry", "b:retry",
 		"a:supersede", "b:supersede",
+		"a:sweep", "b:sweep",
 	}, sink, "each event reaches both children, parent order preserved")
 }
 
@@ -68,6 +70,7 @@ func TestMultiWithNoObserversIsANoOp(t *testing.T) {
 		m.OnFinish(ctx, flywheel.FinishEvent{})
 		m.OnRetry(ctx, flywheel.RetryEvent{})
 		m.OnSupersede(ctx, flywheel.SupersedeEvent{})
+		m.OnSweep(ctx, flywheel.SweepEvent{})
 	}, "an empty Multi swallows every event without panicking")
 }
 

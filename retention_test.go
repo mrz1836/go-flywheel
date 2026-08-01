@@ -2,6 +2,7 @@ package flywheel
 
 import (
 	"context"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -126,4 +127,57 @@ func TestSchedulerRunFiresRetentionOnCadence(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return !jobExists(t, db, "old-done")
 	}, 3*time.Second, 10*time.Millisecond, "the retention ticker prunes the old terminal job on cadence")
+}
+
+// --- pruneOnce: the scheduler activity around PruneRetention -----------------
+
+// TestPruneOnceLogsAndSuppresses drives the three arms of pruneOnce: a failed
+// pass is logged as a maintenance error, a pass that deletes nothing stays quiet,
+// and a pass that ends on its batch ceiling logs both the deletion and the
+// ceiling note so an operator can tell a working knob from one falling behind.
+func TestPruneOnceLogsAndSuppresses(t *testing.T) {
+	t.Parallel()
+	now := time.Now().UTC().Truncate(time.Second)
+	ctx := clockCtx(context.Background(), models.NewFixedClock(now))
+
+	t.Run("a failed pass is logged as a maintenance error", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		sched := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db), RetentionMaxAge: 14 * 24 * time.Hour})
+		h := &captureHandler{}
+		sched.logger = slog.New(h)
+		closeDB(t, db)
+
+		sched.pruneOnce(ctx)
+		assert.True(t, h.has("jobs: retention sweep failed"), "a real prune failure is surfaced")
+	})
+
+	t.Run("a pass that deletes nothing stays quiet", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		sched := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db), RetentionMaxAge: 14 * 24 * time.Hour})
+		h := &captureHandler{}
+		sched.logger = slog.New(h)
+		seedFinished(t, db, "recent", StateSucceeded, now.Add(-time.Hour)) // inside the window
+
+		sched.pruneOnce(ctx)
+		assert.False(t, h.has("jobs: retention sweep pruned finished jobs"), "a zero-delete pass logs nothing")
+	})
+
+	t.Run("a pass that ends on its ceiling says so", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		sched := newSchedulerCfg(t, SchedulerConfig{
+			DB: db, Client: NewClient(db), RetentionMaxAge: 14 * 24 * time.Hour,
+			RetentionBatchSize: 1, RetentionMaxBatches: 1,
+		})
+		h := &captureHandler{}
+		sched.logger = slog.New(h)
+		seedFinished(t, db, "old", StateSucceeded, now.Add(-30*24*time.Hour))
+
+		sched.pruneOnce(ctx)
+		assert.True(t, h.has("jobs: retention sweep pruned finished jobs"), "the deletion is logged")
+		assert.True(t, h.has("jobs: retention sweep stopped on its batch ceiling"),
+			"reaching MaxBatches*BatchSize is reported as a ceiling stop")
+	})
 }

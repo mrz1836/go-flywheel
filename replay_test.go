@@ -329,3 +329,37 @@ func TestStaggerZeroLeavesTheCohortImmediatelyClaimable(t *testing.T) {
 		assert.True(t, s.Equal(base), "every job is immediately claimable at base")
 	}
 }
+
+// --- replay error branches --------------------------------------------------
+
+// TestReplaySurfacesErrors covers replay's guard and count-read failure exits: a
+// nil db, a dead context on entry (no work, progress named), and a failed
+// running-count read. ReplayByParent is used because Replay's own unbounded guard
+// short-circuits before reaching the shared engine.
+func TestReplaySurfacesErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a nil db is rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := ReplayByParent(context.Background(), nil, "P", ReplayOpts{})
+		require.ErrorContains(t, err, "db is nil")
+	})
+
+	t.Run("a dead context does no work", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := ReplayByParent(ctx, db, "P", ReplayOpts{})
+		require.ErrorIs(t, err, context.Canceled)
+		require.ErrorContains(t, err, "cancelled after 0 changed", "the error names the progress made")
+	})
+
+	t.Run("a failed running-count read is surfaced", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		closeDB(t, db)
+		_, err := ReplayByParent(context.Background(), db, "P", ReplayOpts{})
+		require.ErrorContains(t, err, "count running")
+	})
+}

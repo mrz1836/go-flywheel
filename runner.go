@@ -1342,9 +1342,14 @@ func jittered(d time.Duration) time.Duration {
 	return time.Duration(float64(d) * spread)
 }
 
+// osHostname is os.Hostname, indirected so a test can force the failure fallback.
+//
+//nolint:gochecknoglobals // a test seam for executorIdentity's hostname-failure path
+var osHostname = os.Hostname
+
 // executorIdentity returns this process's executor identity (hostname:pid).
 func executorIdentity() string {
-	host, err := os.Hostname()
+	host, err := osHostname()
 	if err != nil || host == "" {
 		host = "unknown"
 	}

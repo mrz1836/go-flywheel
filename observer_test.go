@@ -194,5 +194,6 @@ func TestNoopObserverMethodsDoNotPanic(t *testing.T) {
 		o.OnFinish(ctx, FinishEvent{})
 		o.OnRetry(ctx, RetryEvent{})
 		o.OnSupersede(ctx, SupersedeEvent{})
+		o.OnSweep(ctx, SweepEvent{})
 	})
 }
