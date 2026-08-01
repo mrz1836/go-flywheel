@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	founddb "github.com/mrz1836/go-foundation/db"
 )
 
 // ErrValidation is the sentinel every lifecycle validation failure wraps, so a
@@ -129,7 +131,11 @@ var ErrSQLiteConcurrency = errors.New("jobs: sqlite driver requires concurrency 
 // safe synchronous level). NewSQLiteDriverWithOptions returns it;
 // NewSQLiteDriver logs it through slog.Default() and proceeds, so its
 // one-argument, error-free signature is preserved.
-var ErrSQLitePragma = errors.New("flywheel: sqlite connection is missing a required pragma")
+//
+// It aliases go-foundation/db.ErrSQLitePragma — the canonical sentinel the
+// shared pragma verifier wraps — so errors.Is(err, ErrSQLitePragma) matches
+// whether the failure came from flywheel or the foundation helper.
+var ErrSQLitePragma = founddb.ErrSQLitePragma
 
 // ErrRunnerStopped is returned by RunUntilIdle when Stop ended the dispatch loop
 // before the queue reached a terminal state. It promised a drained queue and did

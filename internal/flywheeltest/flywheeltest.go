@@ -8,9 +8,6 @@ package flywheeltest
 import (
 	"context"
 	"fmt"
-	"log/slog"
-	"net"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +15,7 @@ import (
 	"github.com/glebarez/sqlite"
 	core "github.com/mrz1836/go-flywheel/internal/core"
 	"github.com/mrz1836/go-foundation/models"
+	"github.com/mrz1836/go-foundation/testutil"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -87,14 +85,11 @@ func WaitForJobState(t testing.TB, db *gorm.DB, jobID, state string, timeout tim
 	t.Fatalf("job %s did not reach state %q within %s (last: %q)", jobID, state, timeout, JobState(t, db, jobID))
 }
 
-// FreeAddr reserves and releases an ephemeral loopback port for a server to bind.
+// FreeAddr reserves and releases an ephemeral loopback port for a server to
+// bind. It delegates to go-foundation/testutil so the internal test packages
+// keep their existing import path.
 func FreeAddr(t testing.TB) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
-	return addr
+	return testutil.FreeAddr(t)
 }
 
 // InstallPeriodic seeds a job_periodics row directly, bypassing the work-context
@@ -129,36 +124,6 @@ func (w *SuccessWorker) Work(_ context.Context, _ *core.Job[SuccessArgs]) (core.
 
 // RecordingHandler captures the structured attributes of every log record, so a
 // test can assert on the log's cadence and content rather than on its absence.
-type RecordingHandler struct {
-	mu   sync.Mutex
-	logs []map[string]any
-}
-
-// Enabled reports the handler is always enabled.
-func (*RecordingHandler) Enabled(context.Context, slog.Level) bool { return true }
-
-// Handle records one log record's message, level, and attributes.
-func (h *RecordingHandler) Handle(_ context.Context, rec slog.Record) error {
-	entry := map[string]any{"msg": rec.Message, "level": rec.Level.String()}
-	rec.Attrs(func(a slog.Attr) bool {
-		entry[a.Key] = a.Value.Any()
-		return true
-	})
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.logs = append(h.logs, entry)
-	return nil
-}
-
-// WithAttrs returns the handler unchanged.
-func (h *RecordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-
-// WithGroup returns the handler unchanged.
-func (h *RecordingHandler) WithGroup(string) slog.Handler { return h }
-
-// Records returns a copy of what has been logged so far.
-func (h *RecordingHandler) Records() []map[string]any {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return append([]map[string]any(nil), h.logs...)
-}
+// It aliases go-foundation/testutil.RecordingHandler so the internal test
+// packages keep their existing import path and the map[string]any record shape.
+type RecordingHandler = testutil.RecordingHandler

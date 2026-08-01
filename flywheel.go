@@ -16,6 +16,7 @@ import (
 
 	core "github.com/mrz1836/go-flywheel/internal/core"
 	node "github.com/mrz1836/go-flywheel/internal/node"
+	"github.com/mrz1836/go-foundation/testutil"
 	"gorm.io/gorm"
 )
 
@@ -49,7 +50,7 @@ type (
 	ErrorClass            = core.ErrorClass
 	ExecutorClass         = core.ExecutorClass
 	FailureView           = core.FailureView
-	FakeHTTPDoer          = core.FakeHTTPDoer
+	FakeHTTPDoer          = testutil.FakeHTTPDoer
 	FinalizeOutcome       = core.FinalizeOutcome
 	FinishEvent           = core.FinishEvent
 	FollowUp              = core.FollowUp
@@ -266,7 +267,7 @@ func NewDBLimiter(db *gorm.DB, cfg DBLimiterConfig) (*DBLimiter, error) {
 }
 
 func NewFakeHTTPDoer() *FakeHTTPDoer {
-	return core.NewFakeHTTPDoer()
+	return testutil.NewFakeHTTPDoer()
 }
 
 func NewNode(cfg NodeConfig) (*Node, error) {
