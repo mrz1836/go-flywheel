@@ -1,46 +1,21 @@
-package core
+package node
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	core "github.com/mrz1836/go-flywheel/internal/core"
+	ft "github.com/mrz1836/go-flywheel/internal/flywheeltest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
-
-// freeAddr reserves and releases an ephemeral loopback port, returning its
-// address for a server to bind. The brief reserve/release window is tolerated by
-// the callers' connect-retry loops.
-func freeAddr(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
-	return addr
-}
-
-// waitForJobState polls until jobID reaches state or the deadline elapses. It is
-// the deterministic way to observe a Node's infinite Run loop making progress.
-func waitForJobState(t *testing.T, db *gorm.DB, jobID, state string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if jobState(t, db, jobID) == state {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("job %s did not reach state %q within %s (last: %q)", jobID, state, timeout, jobState(t, db, jobID))
-}
 
 // requireEventually200 polls url until it returns 200 or the deadline elapses.
 func requireEventually200(t *testing.T, url string, timeout time.Duration) {
@@ -60,10 +35,10 @@ func requireEventually200(t *testing.T, url string, timeout time.Duration) {
 	t.Fatalf("GET %s did not return 200 within %s", url, timeout)
 }
 
-// sqliteRunner is a one-line RunnerConfig for a Node test over db.
-func sqliteRunner(db *gorm.DB, reg *Registry) RunnerConfig {
-	return RunnerConfig{
-		DB: db, Driver: NewSQLiteDriver(db), Registry: reg,
+// sqliteRunner is a one-line core.RunnerConfig for a Node test over db.
+func sqliteRunner(db *gorm.DB, reg *core.Registry) core.RunnerConfig {
+	return core.RunnerConfig{
+		DB: db, Driver: core.NewSQLiteDriver(db), Registry: reg,
 		Queues: []string{"default", "periodic"}, ClaimAnyClass: true,
 		PollInterval: 5 * time.Millisecond,
 	}
@@ -77,57 +52,57 @@ func TestNewNodeRequiresRunner(t *testing.T) {
 
 func TestNewNodeRejectsInvalidRunnerConfig(t *testing.T) {
 	t.Parallel()
-	_, err := NewNode(NodeConfig{Runners: []RunnerConfig{{ /* missing DB */ }}})
-	require.ErrorIs(t, err, errRunnerNeedsDB, "an invalid runner config surfaces through NewNode")
+	_, err := NewNode(NodeConfig{Runners: []core.RunnerConfig{{ /* missing DB */ }}})
+	require.ErrorContains(t, err, "runner config requires DB", "an invalid runner config surfaces through NewNode")
 }
 
 func TestNewNodeRejectsSchedulerWithoutDBAndClient(t *testing.T) {
 	t.Parallel()
-	db := newDB(t)
-	reg := NewRegistry()
+	db := ft.NewDB(t)
+	reg := core.NewRegistry()
 	_, err := NewNode(NodeConfig{
-		Runners:   []RunnerConfig{sqliteRunner(db, reg)},
-		Scheduler: &SchedulerConfig{}, // nil DB, Client, and Driver
+		Runners:   []core.RunnerConfig{sqliteRunner(db, reg)},
+		Scheduler: &core.SchedulerConfig{}, // nil DB, Client, and Driver
 	})
 	// The scheduler's own constructor is the authority, so the error names the
 	// first missing field rather than a generic "node scheduler config" verdict.
-	require.ErrorIs(t, err, errSchedulerNeedsDB)
+	require.ErrorContains(t, err, "scheduler config requires DB")
 }
 
 // TestNewNodePropagatesASchedulerConstructionError proves the propagation for a
 // config NewNode itself never inspected: DB and Client are present, and only the
 // Driver is missing. Before the scheduler owned its validation this reached
-// NewSchedulerWithConfig unchecked and a Node was built around a scheduler that
+// core.NewSchedulerWithConfig unchecked and a Node was built around a scheduler that
 // could not sweep.
 func TestNewNodePropagatesASchedulerConstructionError(t *testing.T) {
 	t.Parallel()
-	db := newDB(t)
-	reg := NewRegistry()
+	db := ft.NewDB(t)
+	reg := core.NewRegistry()
 	_, err := NewNode(NodeConfig{
-		Runners:   []RunnerConfig{sqliteRunner(db, reg)},
-		Scheduler: &SchedulerConfig{DB: db, Client: NewClient(db)}, // nil Driver
+		Runners:   []core.RunnerConfig{sqliteRunner(db, reg)},
+		Scheduler: &core.SchedulerConfig{DB: db, Client: core.NewClient(db)}, // nil Driver
 	})
-	require.ErrorIs(t, err, errSchedulerNeedsDriver)
+	require.ErrorContains(t, err, "scheduler config requires Driver")
 }
 
 func TestNodeRunDrainsRunnerOnContextCancel(t *testing.T) {
 	t.Parallel()
-	db := newWALFileDB(t)
-	reg := NewRegistry()
-	w := &successWorker{}
-	Register(reg, w)
+	db := ft.NewWALFileDB(t)
+	reg := core.NewRegistry()
+	w := &ft.SuccessWorker{}
+	core.Register(reg, w)
 
-	node, err := NewNode(NodeConfig{Runners: []RunnerConfig{sqliteRunner(db, reg)}})
+	node, err := NewNode(NodeConfig{Runners: []core.RunnerConfig{sqliteRunner(db, reg)}})
 	require.NoError(t, err)
 
-	id, err := Insert(context.Background(), NewClient(db), successArgs{V: "x"}, InsertOpts{})
+	id, err := core.Insert(context.Background(), core.NewClient(db), ft.SuccessArgs{V: "x"}, core.InsertOpts{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runErr := make(chan error, 1)
 	go func() { runErr <- node.Run(ctx) }()
 
-	waitForJobState(t, db, id, string(StateSucceeded), 3*time.Second)
+	ft.WaitForJobState(t, db, id, string(core.StateSucceeded), 3*time.Second)
 	cancel()
 
 	select {
@@ -136,20 +111,20 @@ func TestNodeRunDrainsRunnerOnContextCancel(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("node.Run did not return after cancel")
 	}
-	assert.EqualValues(t, 1, w.calls.Load())
+	assert.EqualValues(t, 1, w.Calls.Load())
 }
 
 func TestNodeProcessesEnqueuedBatch(t *testing.T) {
 	t.Parallel()
-	db := newWALFileDB(t)
-	reg := NewRegistry()
-	w := &successWorker{}
-	Register(reg, w)
+	db := ft.NewWALFileDB(t)
+	reg := core.NewRegistry()
+	w := &ft.SuccessWorker{}
+	core.Register(reg, w)
 
 	const jobs = 20
 	ids := make([]string, jobs)
 	for i := range ids {
-		id, err := Insert(context.Background(), NewClient(db), successArgs{V: fmt.Sprintf("v%d", i)}, InsertOpts{})
+		id, err := core.Insert(context.Background(), core.NewClient(db), ft.SuccessArgs{V: fmt.Sprintf("v%d", i)}, core.InsertOpts{})
 		require.NoError(t, err)
 		ids[i] = id
 	}
@@ -157,7 +132,7 @@ func TestNodeProcessesEnqueuedBatch(t *testing.T) {
 	// A single SQLite runner (SQLite serializes writers, so one is the supported
 	// shape) drains the whole batch. Multiple-runner concurrency is exercised on
 	// Postgres in the integration suite.
-	node, err := NewNode(NodeConfig{Runners: []RunnerConfig{sqliteRunner(db, reg)}})
+	node, err := NewNode(NodeConfig{Runners: []core.RunnerConfig{sqliteRunner(db, reg)}})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -165,28 +140,28 @@ func TestNodeProcessesEnqueuedBatch(t *testing.T) {
 	go func() { runErr <- node.Run(ctx) }()
 
 	for _, id := range ids {
-		waitForJobState(t, db, id, string(StateSucceeded), 5*time.Second)
+		ft.WaitForJobState(t, db, id, string(core.StateSucceeded), 5*time.Second)
 	}
 	cancel()
 	require.NoError(t, <-runErr)
-	assert.EqualValues(t, jobs, w.calls.Load(), "every job ran exactly once")
+	assert.EqualValues(t, jobs, w.Calls.Load(), "every job ran exactly once")
 }
 
 func TestNodeRunsSchedulerEnqueuesPeriodic(t *testing.T) {
 	t.Parallel()
-	db := newWALFileDB(t)
-	reg := NewRegistry()
-	w := &successWorker{}
-	Register(reg, w)
+	db := ft.NewWALFileDB(t)
+	reg := core.NewRegistry()
+	w := &ft.SuccessWorker{}
+	core.Register(reg, w)
 
 	// A periodic that was due a minute ago must fire immediately once the Node's
 	// scheduler ticks; the Node's runner then processes the enqueued job.
-	installPeriodic(t, db, "node-sched", "test.success", time.Now().Add(-time.Minute), true)
+	ft.InstallPeriodic(t, db, "node-sched", "test.success", time.Now().Add(-time.Minute), true)
 
 	node, err := NewNode(NodeConfig{
-		Runners: []RunnerConfig{sqliteRunner(db, reg)},
-		Scheduler: &SchedulerConfig{
-			DB: db, Client: NewClient(db), Driver: NewSQLiteDriver(db),
+		Runners: []core.RunnerConfig{sqliteRunner(db, reg)},
+		Scheduler: &core.SchedulerConfig{
+			DB: db, Client: core.NewClient(db), Driver: core.NewSQLiteDriver(db),
 			TickInterval: 5 * time.Millisecond, SweepInterval: 50 * time.Millisecond,
 		},
 	})
@@ -197,12 +172,12 @@ func TestNodeRunsSchedulerEnqueuesPeriodic(t *testing.T) {
 	go func() { runErr <- node.Run(ctx) }()
 
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && w.calls.Load() == 0 {
+	for time.Now().Before(deadline) && w.Calls.Load() == 0 {
 		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
 	require.NoError(t, <-runErr)
-	assert.Positive(t, w.calls.Load(), "the scheduler enqueued a periodic job that the runner processed")
+	assert.Positive(t, w.Calls.Load(), "the scheduler enqueued a periodic job that the runner processed")
 }
 
 // blockingArgs/blockingWorker park inside Work until released, modeling a worker
@@ -218,27 +193,27 @@ type blockingWorker struct {
 }
 
 func (*blockingWorker) Kind() string { return "test.blocking" }
-func (w *blockingWorker) Work(_ context.Context, _ *Job[blockingArgs]) (Result, error) {
+func (w *blockingWorker) Work(_ context.Context, _ *core.Job[blockingArgs]) (core.Result, error) {
 	close(w.started)
 	<-w.release
 	close(w.done)
-	return Result{}, nil
+	return core.Result{}, nil
 }
 
 func TestNodeRunHonorsDrainTimeout(t *testing.T) {
 	t.Parallel()
-	db := newWALFileDB(t)
-	reg := NewRegistry()
+	db := ft.NewWALFileDB(t)
+	reg := core.NewRegistry()
 	w := &blockingWorker{started: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
-	Register(reg, w)
+	core.Register(reg, w)
 
 	node, err := NewNode(NodeConfig{
-		Runners:      []RunnerConfig{sqliteRunner(db, reg)},
+		Runners:      []core.RunnerConfig{sqliteRunner(db, reg)},
 		DrainTimeout: 100 * time.Millisecond,
 	})
 	require.NoError(t, err)
 
-	_, err = Insert(context.Background(), NewClient(db), blockingArgs{}, InsertOpts{})
+	_, err = core.Insert(context.Background(), core.NewClient(db), blockingArgs{}, core.InsertOpts{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -326,13 +301,13 @@ func TestNodeHealthMuxMetricsIs404WhenHandlerNil(t *testing.T) {
 
 func TestNodeServeHealthEndToEnd(t *testing.T) {
 	t.Parallel()
-	db := newWALFileDB(t)
-	reg := NewRegistry()
-	Register(reg, &successWorker{})
-	addr := freeAddr(t)
+	db := ft.NewWALFileDB(t)
+	reg := core.NewRegistry()
+	core.Register(reg, &ft.SuccessWorker{})
+	addr := ft.FreeAddr(t)
 
 	node, err := NewNode(NodeConfig{
-		Runners: []RunnerConfig{sqliteRunner(db, reg)},
+		Runners: []core.RunnerConfig{sqliteRunner(db, reg)},
 		Health:  HealthConfig{Addr: addr},
 	})
 	require.NoError(t, err)
@@ -361,17 +336,17 @@ func TestNodeServeHealthEndToEnd(t *testing.T) {
 
 func TestNodeServeMetricsEndToEnd(t *testing.T) {
 	t.Parallel()
-	db := newWALFileDB(t)
-	reg := NewRegistry()
-	Register(reg, &successWorker{})
-	addr := freeAddr(t)
+	db := ft.NewWALFileDB(t)
+	reg := core.NewRegistry()
+	core.Register(reg, &ft.SuccessWorker{})
+	addr := ft.FreeAddr(t)
 
 	metrics := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("flywheel_queue_ready 0\n"))
 	})
 	node, err := NewNode(NodeConfig{
-		Runners: []RunnerConfig{sqliteRunner(db, reg)},
+		Runners: []core.RunnerConfig{sqliteRunner(db, reg)},
 		Health:  HealthConfig{Addr: addr, MetricsHandler: metrics},
 	})
 	require.NoError(t, err)
@@ -402,11 +377,37 @@ func TestDBPingerReadiness(t *testing.T) {
 	t.Parallel()
 	require.NoError(t, dbPinger(nil)(context.Background()), "a nil db is always ready")
 
-	db := newDB(t)
+	db := ft.NewDB(t)
 	require.NoError(t, dbPinger(db)(context.Background()), "an open db pings ready")
 
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	require.NoError(t, sqlDB.Close())
 	require.Error(t, dbPinger(db)(context.Background()), "a closed db fails readiness")
+}
+
+// TestNodeRunSurfacesHealthListenError proves a Node whose health server cannot
+// bind its address fails fast: serveHealth returns the listen error, the fail
+// closure records it and tears down the siblings, and Run returns that first
+// error through drainErrors.
+func TestNodeRunSurfacesHealthListenError(t *testing.T) {
+	t.Parallel()
+	db := ft.NewWALFileDB(t)
+	reg := core.NewRegistry()
+	core.Register(reg, &ft.SuccessWorker{})
+
+	node, err := NewNode(NodeConfig{
+		Runners: []core.RunnerConfig{{
+			DB: db, Driver: core.NewSQLiteDriver(db), Registry: reg,
+			Queues: []string{"default"}, ExecutorClass: "local", Concurrency: 1,
+			PollInterval: time.Hour, // keep the runner quiet so the health error is the first
+		}},
+		Health: HealthConfig{Addr: "256.256.256.256:99999"}, // an unbindable address
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err = node.Run(ctx)
+	require.ErrorContains(t, err, "health server", "the health listen failure is surfaced as the node's first error")
 }

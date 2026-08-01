@@ -721,34 +721,6 @@ func TestRunUntilIdleStopsWhenContextCancelledDuringWait(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled, "a cancel during the backoff wait stops the drain loop")
 }
 
-// --- node.go component-error / health-listen branches -----------------------
-
-// TestNodeRunSurfacesHealthListenError proves a Node whose health server cannot
-// bind its address fails fast: serveHealth returns the listen error, the fail
-// closure records it and tears down the siblings, and Run returns that first
-// error through drainErrors.
-func TestNodeRunSurfacesHealthListenError(t *testing.T) {
-	t.Parallel()
-	db := newWALFileDB(t)
-	reg := NewRegistry()
-	Register(reg, &successWorker{})
-
-	node, err := NewNode(NodeConfig{
-		Runners: []RunnerConfig{{
-			DB: db, Driver: NewSQLiteDriver(db), Registry: reg,
-			Queues: []string{"default"}, ExecutorClass: "local", Concurrency: 1,
-			PollInterval: time.Hour, // keep the runner quiet so the health error is the first
-		}},
-		Health: HealthConfig{Addr: "256.256.256.256:99999"}, // an unbindable address
-	})
-	require.NoError(t, err)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	err = node.Run(ctx)
-	require.ErrorContains(t, err, "health server", "the health listen failure is surfaced as the node's first error")
-}
-
 // --- observer.go default no-op methods --------------------------------------
 
 // TestNoopObserverMethodsAreInert proves the default Observer's methods run
