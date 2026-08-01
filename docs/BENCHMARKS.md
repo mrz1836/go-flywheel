@@ -202,7 +202,7 @@ report's `histogram` object. Count, min, max, and mean are exact.
 `ON CONFLICT DO NOTHING` — where `Enqueue` writes one row per call. At 100,000 jobs with nothing
 draining, the producer path is the whole measurement.
 
-| | Before (single-row `Enqueue`) | After (`InsertMany`, chunk 1,000) | |
+| | Before (single-row `Enqueue`) | After (`InsertMany`, chunk 1,000) | Delta |
 |---|---|---|---|
 | **Enqueue throughput** | 9,897 jobs/s | **52,230 jobs/s** | **5.3×** |
 | Statements | 100,000 | 100 | the chunk factor |
@@ -296,7 +296,7 @@ that drops the class from the key. `LIMIT` is 8, a runner's `Concurrency` at the
 
 Six claim shapes:
 
-| | Shape |
+| Cell | Shape |
 |---|---|
 | A | 1 queue, routed by `executor_class` |
 | B | 3 queues, routed |
@@ -380,7 +380,7 @@ empty poll a probe rather than a scan.
 [`claim-plans-1m-after.txt`](benchmarks/claim-plans-1m-after.txt) — same seed, same 1M rows, the index
 definition the only variable:
 
-| Shape | Before | After | |
+| Shape | Before | After | Delta |
 |---|---|---|---|
 | A — 1 queue, routed | 153.6 ms, Bitmap + Sort | **0.179 ms, Index Scan** | **858×** |
 | C — 1 queue, `ClaimAnyClass` | 219.6 ms, Bitmap + Sort | **0.135 ms, Index Scan** | **1,627×** |
@@ -391,7 +391,7 @@ definition the only variable:
 
 **End to end**, the 100k drain at `-runners 4 -workers 8`, run at the same commit before and after:
 
-| | Before | After | |
+| | Before | After | Delta |
 |---|---|---|---|
 | **Claim p50** | 38.75 ms | **0.96 ms** | **40× faster** |
 | **Claim p99** | 61.26 ms | **1.91 ms** | 32× faster |
@@ -484,7 +484,7 @@ indexes cost about 2.4 MB less than the figure above.
 Sampled once per second across the drain. The row *count* never changes — 100,000 jobs are seeded
 before the clock starts and none are added — so everything below is the cost of updating them.
 
-| | Start | End | Change |
+| | Start | End | Delta |
 |---|---|---|---|
 | `jobs` table | 61.7 MB | 89.3 MB | **+45 %** |
 | `jobs` indexes | 15.7 MB | 22.1 MB | +41 % |
@@ -713,7 +713,7 @@ pool claims far more often in smaller batches, so that direction is expected.
 is the shape `loadtest/workload.go` chose so that 1 − 0.9⁸ ≈ 57 % of eight-job batches contain a
 straggler:
 
-| | Before (barrier) | After (pool) | |
+| | Before (barrier) | After (pool) | Delta |
 |---|---|---|---|
 | **Slot utilization** | **24.4 %** | **95.4 %** | **3.9×** |
 | **Drain throughput** | 247 jobs/s | **1,036 jobs/s** | **4.2×** |
@@ -755,7 +755,7 @@ The harness gates every runner's driver for 60 seconds at 50 % drained and count
 refused — which is the only measurement available, because a gated call deliberately records no latency
 observation:
 
-| | Before | After | |
+| | Before | After | Delta |
 |---|---|---|---|
 | **Claims refused during the 60 s outage** | **42,676** | **56** | **762× fewer** |
 | Per runner | 10,669 | 14 | |
@@ -1052,10 +1052,10 @@ to reach for if the write volume matters more than how fast a crash is noticed.
 **The measurement.** A same-binary A/B over a 100,000-job drain at 25 ms per job against a one-second
 lease, `-count=5`, differing only in `Config.Heartbeat`:
 
-| | Median throughput | Median wall clock |
+| | Renewal disabled | Renewal enabled (default) |
 |---|---|---|
-| Renewal disabled | 486.6 jobs/s | 205.5 s |
-| Renewal enabled (default) | 481.3 jobs/s | 207.8 s |
+| Median throughput | 486.6 jobs/s | 481.3 jobs/s |
+| Median wall clock | 205.5 s | 207.8 s |
 
 **Read that as "no resolvable difference", not as "1 % slower".** The run-to-run spread within the
 disabled set alone is 421.5–492.6 jobs/s — 17 % — so a 1 % gap between the two medians is well inside

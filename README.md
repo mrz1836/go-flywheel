@@ -124,7 +124,7 @@ The runtime is built from focused, composable pieces:
 - **Typed workers** — generic `Worker[A]` interface, registered by `Kind()` ([registry.go](registry.go))
 - **One-call lifecycle** — `Node` runs N runners + the scheduler + an optional health/metrics server and drains cleanly on shutdown ([node.go](node.go))
 - **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `UpsertPeriodic` ([scheduler.go](scheduler.go), [schedule.go](schedule.go))
-- **Bounded worker pool** — `Concurrency` slots that refill independently, so one slow job never idles the rest; explicit `Stop`/`Drain` with an in-flight count ([runner.go](runner.go))
+- **Bounded concurrency** — a runner keeps up to `Concurrency` jobs in flight, each slot refilling independently so one slow job never idles the rest; explicit `Stop`/`Drain` with an in-flight count ([runner.go](runner.go))
 - **Pre-claim admission** — an optional `Limiter` gates a runner before it claims, keyed on an arbitrary downstream resource; a job that cannot run yet is never claimed, leased, or audited. Ships an in-process token bucket and a shared database-backed limiter ([limiter.go](limiter.go), [limiter_db.go](limiter_db.go))
 - **Retries with backoff** — exponential backoff with jitter, overridable per worker; consecutive poll failures climb their own ladder so a failing database is not hammered ([runner.go](runner.go))
 - **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](runner.go))
@@ -407,8 +407,8 @@ spawn a coordinator job rather than return N children from one attempt.
 <summary><strong><code>Batch progress, controls, and the fan-in barrier</code></strong></summary>
 <br>
 
-A worker spawns children by returning `FollowUp{Parent: true}`, and a producer sets a child's parent
-with `InsertOpts.Parent`. That lineage pointer is what the batch surface reads.
+A worker spawns children by returning `FollowUp{Parent: true}`, and the enqueuing caller sets a child's
+parent with `InsertOpts.Parent`. That lineage pointer is what the batch surface reads.
 
 **The rollup answers "how is this batch doing?" from one call.** `Progress` returns a `BatchProgress`:
 the per-state child counts, the totals, the parent's own state, and the age of the oldest pending child
@@ -1268,6 +1268,13 @@ magex help
 
 ## 🧪 Examples & Tests
 
+Four complete, runnable programs live under [`examples/`](examples), smallest first:
+
+- **[`sqlite-quickstart`](examples/sqlite-quickstart)** — the smallest "bolt flywheel onto an app": one worker, one enqueue, a runner + scheduler over a local SQLite file.
+- **[`exec-cron`](examples/exec-cron)** — flywheel as a cron replacement, the generic `ExecWorker` running a shell command on an interval with no job-specific Go.
+- **[`local-tasks`](examples/local-tasks)** — local developer tasks run durably: a shell script, a Python script, and a magex/mage target, each a typed worker with a captured audit trail.
+- **[`split-executors`](examples/split-executors)** — one registry across two executors, a long-running pool and a bounded invocation-scoped burst, routed by `ExecutorClass`.
+
 All unit tests run via [GitHub Actions](https://github.com/mrz1836/go-flywheel/actions) and use [Go version 1.25.x](https://go.dev/doc/go1.25). View the [configuration file](.github/workflows/fortress.yml).
 
 Run all tests (fast):
@@ -1319,7 +1326,10 @@ go test -tags=loadtest -run='^$' -bench='BenchmarkClaim100k|BenchmarkEnqueue100k
 <br/>
 
 ## 🛠️ Code Standards
-Read more about this Go project's [code standards](.github/CODE_STANDARDS.md).
+Read more about this Go project's [code standards](.github/CODE_STANDARDS.md). The library-specific
+conventions a contributor inherits — the `jobs:`/`flywheel:` prefix rule, sentinel naming, the
+`…WithOptions`/`…Opts` pairing, the Postgres test mirror, and the retained-seam pattern — are recorded in
+[`docs/CONVENTIONS.md`](docs/CONVENTIONS.md).
 
 <br/>
 
