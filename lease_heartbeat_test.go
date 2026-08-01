@@ -10,11 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // --- fixtures ---------------------------------------------------------------
@@ -390,22 +388,6 @@ func TestHeartbeatIntervalResolution(t *testing.T) {
 }
 
 // --- SQLite parity ------------------------------------------------------------
-
-// newSingleConnMemoryDB opens a bare `:memory:` SQLite database capped at one
-// connection, which is the shape an embedding host's test boundary uses: each
-// pooled connection to a bare `:memory:` DSN gets its own private empty
-// database, so the cap is not a tuning choice but a correctness requirement.
-func newSingleConnMemoryDB(t *testing.T) *gorm.DB {
-	t.Helper()
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	require.NoError(t, err)
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
-	t.Cleanup(func() { _ = sqlDB.Close() })
-	require.NoError(t, Migrate(db))
-	return db
-}
 
 // TestLeaseHeartbeatOnSingleConnectionSQLite is the SQLite-parity check the
 // heartbeat most needs, and it is a deadlock test rather than a feature test.

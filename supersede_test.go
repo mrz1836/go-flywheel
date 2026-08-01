@@ -86,7 +86,7 @@ func TestSupersedeIsNotEmittedForAHeldClaim(t *testing.T) {
 	reg := NewRegistry()
 	Register(reg, &successWorker{})
 	obs := &recordingObserver{}
-	r := newObservedRunner(t, db, reg, obs)
+	r := rwRunner(t, db, reg, func(c *RunnerConfig) { c.Observer = obs })
 	ctx := context.Background()
 
 	_, err := Insert(ctx, NewClient(db), successArgs{V: "x"}, InsertOpts{})
@@ -114,7 +114,7 @@ func TestSupersedeOnFinishReportsThePersistedOutcome(t *testing.T) {
 	reg := NewRegistry()
 	Register(reg, &retryWorker{failuresBefore: 1})
 	obs := &recordingObserver{}
-	r := newObservedRunner(t, db, reg, obs)
+	r := rwRunner(t, db, reg, func(c *RunnerConfig) { c.Observer = obs })
 	ctx := context.Background()
 
 	id, err := Insert(ctx, NewClient(db), retryArgs{V: "x"}, InsertOpts{})
