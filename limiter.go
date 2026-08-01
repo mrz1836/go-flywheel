@@ -96,6 +96,14 @@ type TokenBucketConfig struct {
 // only in memory, so a process death drops every reservation with the map, and
 // the Runner's release-on-every-path defer is what returns a permit in a live
 // process.
+//
+// The per-resource bucket map is intentionally unbounded, unlike the evict-on-cap
+// metrics recorder: a bucket cell holds live budget — the rate reservoir plus the
+// held/live concurrency permits — so evicting one would either over-admit (drop a
+// cell that still holds permits) or starve (discard a partly-drained reservoir).
+// The design mandates one resource per Runner, which keeps the resource set small
+// and fixed; a host that needs a bounded or shared gate across many resources uses
+// NewDBLimiter instead.
 type TokenBucket struct {
 	rate          int
 	interval      time.Duration

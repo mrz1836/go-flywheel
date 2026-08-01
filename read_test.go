@@ -129,7 +129,7 @@ func TestListRunsBeforeCursorAndLimit(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	base := time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		ts := base.Add(time.Duration(i) * time.Minute)
 		seedRun(t, db, jobRunRow{
 			ID: string(rune('a' + i)), JobID: "j", Attempt: i + 1,
