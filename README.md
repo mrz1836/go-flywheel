@@ -123,20 +123,20 @@ The runtime is built from focused, composable pieces:
 
 - **Typed workers** — generic `Worker[A]` interface, registered by `Kind()` ([registry.go](registry.go))
 - **One-call lifecycle** — `Node` runs N runners + the scheduler + an optional health/metrics server and drains cleanly on shutdown ([node.go](node.go))
-- **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `UpsertPeriodic` ([scheduler.go](scheduler.go), [schedule.go](schedule.go))
 - **Bounded concurrency** — a runner keeps up to `Concurrency` jobs in flight, each slot refilling independently so one slow job never idles the rest; explicit `Stop`/`Drain` with an in-flight count ([runner.go](runner.go))
-- **Pre-claim admission** — an optional `Limiter` gates a runner before it claims, keyed on an arbitrary downstream resource; a job that cannot run yet is never claimed, leased, or audited. Ships an in-process token bucket and a shared database-backed limiter ([limiter.go](limiter.go), [limiter_db.go](limiter_db.go))
+- **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `UpsertPeriodic` ([scheduler.go](scheduler.go), [schedule.go](schedule.go))
 - **Retries with backoff** — exponential backoff with jitter, overridable per worker; consecutive poll failures climb their own ladder so a failing database is not hammered ([runner.go](runner.go))
-- **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](runner.go))
 - **Lease-based recovery** — orphaned, crashed jobs reclaimed via `leased_until` sweeps ([scheduler.go](scheduler.go))
+- **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](runner.go))
 - **Per-run audit** — append-only `job_runs` table records every attempt, outcome, timing, and cost ([read.go](read.go))
+- **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work ([client.go](client.go))
+- **Outbox pattern** — enqueue on the caller's own `*gorm.DB` transaction for exactly-once side effects ([client.go](client.go))
+- **Follow-up jobs (DAG)** — workers return child jobs that are enqueued atomically ([types.go](types.go))
+- **Bulk enqueue** — `InsertMany` writes N jobs in bounded, dialect-aware chunks, honoring the outbox transaction and per-row idempotency ([batch.go](batch.go))
+- **Free-form routing** — a `ExecutorClass` label routes jobs to executor pools; empty is the wildcard ([types.go](types.go))
+- **Pre-claim admission** — an optional `Limiter` gates a runner before it claims, keyed on an arbitrary downstream resource; a job that cannot run yet is never claimed, leased, or audited. Ships an in-process token bucket and a shared database-backed limiter ([limiter.go](limiter.go), [limiter_db.go](limiter_db.go))
 - **Observability built in** — a dependency-free `Observer` seam with ready-made metrics, slog, and Prometheus adapters, queue-health/lag inspection, a `/metrics` endpoint, and `flywheel status` ([observer.go](observer.go), [observers/](observers), [health.go](health.go))
 - **Postgres + SQLite** — `FOR UPDATE SKIP LOCKED` and `BEGIN IMMEDIATE` drivers ([driver_postgres.go](driver_postgres.go), [driver_sqlite.go](driver_sqlite.go))
-- **Free-form routing** — a `ExecutorClass` label routes jobs to executor pools; empty is the wildcard ([types.go](types.go))
-- **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work ([client.go](client.go))
-- **Follow-up jobs (DAG)** — workers return child jobs that are enqueued atomically ([types.go](types.go))
-- **Outbox pattern** — enqueue on the caller's own `*gorm.DB` transaction for exactly-once side effects ([client.go](client.go))
-- **Bulk enqueue** — `InsertMany` writes N jobs in bounded, dialect-aware chunks, honoring the outbox transaction and per-row idempotency ([batch.go](batch.go))
 - **Generic workers** — ready-made `ExecWorker`, `ShellWorker`, `PythonWorker`, `MageWorker` (magex/mage), and `HTTPWorker` so local scripts and build tasks need no custom Go ([workers/](workers))
 
 <br/>
@@ -206,8 +206,8 @@ func (Summarizer) Work(ctx context.Context, job *flywheel.Job[SummarizeDoc]) (fl
 }
 
 func main() {
-	db, _ := gorm.Open(sqlite.Open("flywheel.db"), &gorm.Config{})
-	_ = flywheel.Migrate(db) // creates the jobs / job_runs / job_periodics tables
+	db, _ := gorm.Open(sqlite.Open("file:flywheel.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate"), &gorm.Config{})
+	_ = flywheel.Migrate(db) // creates flywheel's tables and indexes
 
 	reg := flywheel.NewRegistry()
 	flywheel.Register(reg, Summarizer{})
@@ -218,11 +218,12 @@ func main() {
 		SummarizeDoc{DocID: "42"}, flywheel.InsertOpts{})
 
 	// ③ Run a Node: it claims jobs, runs your worker, retries failures, and
-	//    drains cleanly on Ctrl+C. Concurrency: 4 → four summaries at once.
+	//    drains cleanly on Ctrl+C. (SQLite runs one job at a time; point it at
+	//    Postgres and raise Concurrency to run several at once.)
 	node, _ := flywheel.NewNode(flywheel.NodeConfig{
 		Runners: []flywheel.RunnerConfig{{
 			DB: db, Driver: flywheel.NewSQLiteDriver(db), Registry: reg,
-			Queues: []string{"default"}, Concurrency: 4, ClaimAnyClass: true,
+			Queues: []string{"default"}, Concurrency: 1, ClaimAnyClass: true,
 		}},
 	})
 
@@ -237,12 +238,12 @@ func callLLM(ctx context.Context, docID string) (summary string, costMicros int6
 }
 ```
 
-That's a durable AI pipeline: enqueue returns instantly, the `Node` summarizes four
-documents at a time, a failed model call retries itself with backoff, and every attempt —
+That's a durable AI pipeline: enqueue returns instantly, the `Node` summarizes documents
+in the background, a failed model call retries itself with backoff, and every attempt —
 including what it cost — lands in the `job_runs` audit table. Need periodic or cron-style
 runs too? Add a `Scheduler` to the `Node` (see [`examples/`](examples) for the full set).
 
-`Migrate` above is the right call when the database is the runtime's alone. If flywheel's three tables
+`Migrate` above is the right call when the database is the runtime's alone. If flywheel's tables
 will share a database with your own application schema, use the host-owned path instead — see
 **Schema setup** below, and pick exactly one of the two.
 
@@ -256,23 +257,24 @@ Each section below is self-contained; open the ones you need.
 <summary><strong><code>Schema setup — pick exactly one install path</code></strong></summary>
 <br>
 
-`go-flywheel` owns three tables — `jobs`, `job_runs`, `job_periodics` — and there are **two ways to
-install them. Pick exactly one.** They are not layers; running both means two migration authorities
-against one database.
+`go-flywheel` owns five tables — `jobs`, `job_runs`, and `job_periodics`, plus `limiter_buckets` and
+`limiter_holds` for the shared database-backed limiter (additive: empty unless you construct a
+`DBLimiter`) — and there are **two ways to install them. Pick exactly one.** They are not layers; running
+both means two migration authorities against one database.
 
 | Question | **Library-owned** | **Host-owned** |
 |---|---|---|
-| Who creates the three tables? | `Migrate(db)` | your loader, from `Models()` |
+| Who creates the five tables? | `Migrate(db)` | your loader, from `Models()` |
 | Who creates the indexes? | `Migrate(db)` | you, from `IndexSet(dialect)` / `InstallIndexes` |
 | Who sets the storage parameters? | `Migrate(db)` | you, from `InstallStorageParameters` |
 | Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
 | Does the runtime run DDL at startup? | yes, every start | no |
-| Is a co-located host schema safe? | only if the host's tooling excludes the three tables | yes — the tables are in your loader |
+| Is a co-located host schema safe? | only if the host's tooling excludes the five tables | yes — the tables are in your loader |
 | **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
 
 **The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
-same database, your migration tool must know about `jobs`, `job_runs`, and `job_periodics` — a tool that
-cannot see them will happily propose dropping them.
+same database, your migration tool must know about all five — a tool that cannot see them will happily
+propose dropping them.
 
 **Library-owned** — one call, no external tooling:
 
@@ -292,7 +294,7 @@ up-to-date schema — a re-run creates nothing and changes nothing — so it is 
 
 ```go
 // 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
-//    so your migration tool knows the three tables exist and never proposes dropping them.
+//    so your migration tool knows all five tables exist and never proposes dropping them.
 stmts, err := gormschema.New("postgres").Load(
     append(myapp.AllModels(), flywheel.Models()...)...,
 )
@@ -308,7 +310,7 @@ if err := flywheel.InstallStorageParameters(ctx, db); err != nil {
 
 Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
 it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
-GORM struct tag cannot express. Four of the nine are correctness-bearing — without `jobs_unique_key`
+GORM struct tag cannot express. Four of the eleven are correctness-bearing — without `jobs_unique_key`
 and `jobs_unique_active_key` the database accepts duplicate enqueues and **`ErrAlreadyEnqueued` is never
 returned.** Use `flywheel.IndexSet(dialect)` when you want them classified:
 
@@ -345,194 +347,6 @@ default leaves that lock to you. `InspectStorageParameters(ctx, db)` gives the s
 > Only PostgreSQL and SQLite are supported, because both express the partial indexes the runtime relies
 > on. Every entry point returns `flywheel.ErrUnsupportedDialect` for anything else rather than silently
 > dropping idempotency. The module takes **no** hard dependency on Atlas or any external migration tool.
-
-</details>
-
-<details>
-<summary><strong><code>Bulk enqueue and the follow-up ceiling</code></strong></summary>
-<br>
-
-Enqueuing one job is one `Insert`/`Enqueue` call and one row. Enqueuing many that way is one round trip
-per job — a 100k fan-out is 100k statements. `InsertMany` writes them in bounded, dialect-aware chunks
-instead: one multi-row `INSERT` per chunk, so the round trips drop by the chunk factor.
-
-```go
-items := make([]flywheel.BatchItem, len(subjects))
-for i, subject := range subjects {
-    args, err := json.Marshal(reportArgs{Subject: subject})
-    if err != nil {
-        return err
-    }
-    items[i] = flywheel.BatchItem{
-        Kind: "report",
-        Args: args,
-        Opts: flywheel.InsertOpts{Queue: "reports", UniqueKey: subject}, // per-row options
-    }
-}
-
-res, err := flywheel.InsertMany(ctx, client, items, flywheel.BatchOpts{})
-// res.Inserted + res.Skipped == len(items).
-// res.IDs stays aligned to the input — empty at any row a unique-key collision skipped.
-```
-
-Everything `Enqueue` guarantees for one row holds per row here: the same defaults, the same
-`unique_key`/`unique_active_key` idempotency, the same `ErrAlreadyEnqueued` meaning — a collision is a
-per-row skip, never a failed batch. `res.Skipped` counts the collisions; set `BatchOpts.SkipDuplicates`
-to drop them silently instead. `InsertManyTyped[A]` is the generic form: it reads each job's kind from
-the args value, exactly as `Insert` does.
-
-**The outbox guarantee carries over.** Set `BatchOpts.Tx` and every chunk writes on your transaction —
-the batch opens none of its own, so the rows land with your domain writes or not at all. Leave it unset
-and each chunk commits independently, so a mid-batch failure leaves the earlier chunks committed and the
-returned error names the failing chunk.
-
-`ChunkSize` defaults to a value chosen so a chunk stays well inside the driver's bind-parameter ceiling;
-a request above the dialect maximum is clamped down, not rejected.
-
-| Dialect | Bind-parameter ceiling | Rows per statement | Default `ChunkSize` |
-|---|---|---|---|
-| PostgreSQL | 65,535 | 2,978 | **1,000** |
-| SQLite | 32,766 | 1,489 | **500** |
-
-**The follow-up fan-out is bounded the same way.** A worker's `Result.FollowUps` is enqueued inside the
-finalize transaction, so an unbounded fan-out is an unbounded, lock-holding transaction. The children
-are inserted in chunks, and the total is capped: a fan-out past the limit fails the finalize with
-`ErrFollowUpLimit` rather than silently truncating. The bounds are `DriverOpts.FollowUpChunkSize`
-(default 500) and `DriverOpts.FollowUpLimit` (default 10,000) — a fan-out that large is a signal to
-spawn a coordinator job rather than return N children from one attempt.
-
-</details>
-
-<details>
-<summary><strong><code>Batch progress, controls, and the fan-in barrier</code></strong></summary>
-<br>
-
-A worker spawns children by returning `FollowUp{Parent: true}`, and the enqueuing caller sets a child's
-parent with `InsertOpts.Parent`. That lineage pointer is what the batch surface reads.
-
-**The rollup answers "how is this batch doing?" from one call.** `Progress` returns a `BatchProgress`:
-the per-state child counts, the totals, the parent's own state, and the age of the oldest pending child
-— served by a covering index, so it holds at a hundred thousand children.
-
-```go
-p, err := flywheel.Progress(ctx, db, parentID)
-// p.CountsByState["succeeded"], p.Total, p.Terminal, p.Pending
-// p.Pending == 0 means the batch is complete.
-```
-
-An unknown or already-pruned parent is a zero rollup with an empty `ParentState`, not an error: children
-outlive the parent row, so `Progress` reports them either way. `ProgressMany` rolls up several parents in
-a fixed two reads rather than one per parent — a childless or unknown parent still gets an entry, so a
-dashboard tells "no children" from "unknown id". `ProgressByKind` is the parentless form, for a host
-whose batches are defined by what the work is rather than by who spawned it.
-
-**`paused` is a real, operator-visible state, not a `scheduled_at` trick.** A far-future `scheduled_at`
-would be free, but it is indistinguishable from a legitimately deferred job and invisible to every
-rollup and health sample — the exact class of "a condition encoded as a side effect of another field"
-the runtime avoids. `paused` is the one state that is neither claimable nor terminal: a runner never
-picks it up, and it stays held until a resume returns it to `available`. It is unfinished work, so it
-keeps `RunUntilIdle` polling and stays counted as non-terminal.
-
-**Pause, resume, and cancel scope to a whole generation.** Each operates in bounded, per-transaction
-batches — the lease sweep's shape — and reports what it did by reason, so a running attempt is never
-interrupted and a succeeded child is never clobbered:
-
-```go
-res, err := flywheel.CancelByParent(ctx, db, parentID, flywheel.ScopeOpts{})
-// res.Changed cancelled; res.SkippedRunning left in flight; res.SkippedTerminal left as they were.
-```
-
-`PauseByParent` holds every claimable child; `ResumeByParent` returns the paused ones to `available`,
-preserving a deferred child's schedule. The per-id `CancelJob` and `RetryJob` are guarded to the same
-standard: a job that has already reached a terminal state is left exactly as it is and `ErrJobTerminal`
-is returned, so an operator action can never overwrite a recorded outcome. Re-running a finished job is
-deliberate — `RetryJobWithOptions` with `Force` — and replaying a whole cohort of failures, with a
-restored retry budget, is its own guide: **Replaying work** below.
-
-**The fan-in barrier runs a continuation once a generation completes.** A worker returns `Result.Barrier`
-alongside its children, and the runtime enqueues the continuation exactly once, after the last child
-reaches *any* terminal state — a half-failed generation still gets its finalizer. It is keyed so a
-retried, discarded, or superseded child can never enqueue it twice, and it fires inside that last child's
-finalize transaction, so no host writes a retry-unsafe counter.
-
-```go
-return flywheel.Result{
-    FollowUps: children,                                  // each with Parent: true
-    Barrier:   &flywheel.Barrier{Kind: "finalize_batch"}, // runs once, when they are all terminal
-}, nil
-```
-
-The continuation reads what the generation produced through `ChildOutputs` — one entry per terminal
-child, its final state paired with its last attempt's recorded output. A barrier-bearing generation is
-bounded by `DriverOpts.BarrierMaxChildren` (default 10,000): the barrier costs an index-only completion
-count per child finalize, so a wider fan-out is refused with `ErrBarrierTooWide`, directing you to a tree
-of bounded generations rather than one that costs `O(children²)`.
-
-**No barrier timeout ships, by design — anchor your own deadline to progress.** A deadline measured from
-when a batch was *spawned* kills a healthy batch that is merely behind a deep backlog, which is precisely
-when a batch most needs to survive. `BatchProgress.OldestPendingAge` is the signal instead: it measures
-from the least-recently-scheduled *pending* child, so a host that wants a deadline anchors it to how long
-real work has actually been stalled, not to wall-clock age.
-
-</details>
-
-<details>
-<summary><strong><code>Replaying work — retry vs. re-enqueue</code></strong></summary>
-<br>
-
-**Replaying the failures is the common recovery after an incident, and it is a retry, not a re-enqueue.**
-`ReplayByParent` returns the failed children of a parent to `available` in bounded, per-transaction
-batches; `Replay` does the same for a whole kind or an incident window, unscoped by lineage. Both report
-what they did through the same `ScopeResult` the batch controls use:
-
-```go
-res, err := flywheel.ReplayByParent(ctx, db, parentID, flywheel.ReplayOpts{
-    RetryOpts: flywheel.RetryOpts{ResetAttempts: true}, // restore the retry budget
-    Stagger:   5 * time.Minute,                         // spread arrivals over five minutes
-})
-// res.Changed replayed; res.SkippedTerminal left as they were; res.SkippedRunning left in flight.
-```
-
-**A replay restores the retry budget as headroom, not by rewinding the counter.** A job discarded at
-`attempt == max_attempts` has no budget left, so a plain retry gives it exactly one more attempt before
-it discards again. `ResetAttempts` raises `max_attempts` — to `attempt + Budget`, or the job's original
-budget when `Budget` is zero — so the job gets a real second life. `attempt` is never lowered: it is the
-`job_runs(job_id, attempt)` audit key, so the replay's runs continue the sequence rather than colliding
-with the recorded failures. It is the same mechanism a snooze uses to stay free.
-
-**A replay is bounded by construction.** Empty `States` replays discarded jobs only — never succeeded
-work; naming `StateSucceeded` additionally requires `Force`. An unscoped `Replay` with neither `Kinds`
-nor `FailedSince` is refused with `ErrReplayUnbounded` rather than replaying every discarded job in the
-database by accident.
-
-```go
-// The incident-shaped recovery: one kind, bounded to the outage window, budget of three.
-res, err := flywheel.Replay(ctx, db, flywheel.ReplayOpts{
-    RetryOpts:   flywheel.RetryOpts{ResetAttempts: true, Budget: 3},
-    Kinds:       []string{"fetch_report"},
-    FailedSince: outageStart,
-})
-```
-
-**`Stagger` shapes when the cohort arrives; it is not a rate ceiling.** With `Stagger` set, job *i* of
-*n* becomes claimable at `now + Stagger*i/n`, so 30,000 replayed jobs do not all hit a just-recovered
-dependency at once. The placement is deterministic, so you can predict when the last job lands. It does
-not cap how fast the cohort is claimed once each job is due — an actual claim-rate ceiling is a separate
-capability.
-
-**Retry an existing row; do not re-enqueue it under the same key.** Which mechanism recovers a unit of
-work depends on the intent:
-
-| Intent | Mechanism | Key |
-|---|---|---|
-| Re-run *this job row*, keeping its id, history, and audit trail | `RetryJobWithOptions` / `Replay*` | — |
-| Enqueue a *new* job for the same logical unit, at most once ever | new `Insert` | `UniqueKey` — collides forever, terminal or not |
-| Enqueue a *new* job for a subject that may run again later | new `Insert` | `UniqueActiveKey` — frees on a terminal state |
-
-> A job enqueued with `UniqueKey` can never be re-enqueued: the key collides with the original row
-> forever, terminal or not. That is the guarantee `UniqueKey` exists to provide. To run that unit of work
-> again, retry the original job — its id, lineage, and audit trail are preserved. If the unit is expected
-> to run again later, `UniqueActiveKey` is the key you want.
 
 </details>
 
@@ -637,120 +451,6 @@ names how many jobs were still in flight, and only then is the scheduler and hea
 A zero `DrainTimeout` waits for in-flight work however long it takes — genuinely unbounded, since the
 heartbeat renews a running job's lease indefinitely. Size it to the longest drain your deployment will
 tolerate.
-
-</details>
-
-<details>
-<summary><strong><code>Fairness across parents — priority banding</code></strong></summary>
-<br>
-
-**The claim is `ORDER BY priority, scheduled_at`, so equal-priority work is strict FIFO.** A lower
-priority number is claimed first; ties break by schedule time. That is the right default — it is one
-index seek to the front of the queue, `O(batch)` regardless of how deep the backlog is — but it means a
-large batch enqueued first fully drains before a small batch enqueued a minute later gets a single
-claim. When the two batches belong to different parents (or tenants, or customers), that is
-head-of-line blocking, and bulk enqueue makes the starving batch cheap to create.
-
-**Fairness is expressed through the priority column, at enqueue time — not by reordering the claim.** A
-runtime policy that interleaved parents in the claim would rank the whole ready set with a window
-function before applying the `LIMIT`, which is `O(ready)`: measured against a 166,667-row ready set at
-one million rows, that claim runs in **216 ms** where the shipped claim runs in **0.06 ms**, and a
-priority-band pre-filter still costs 102 ms because computing the band scans the ready set too (see
-[BENCHMARKS](docs/BENCHMARKS.md)). A runner claims on every poll, so paying that on every claim against
-a deep queue is not an option. So the ranking is moved to enqueue time, where it is paid once per job
-and the claim stays `O(batch)`: give each parent's *n*-th child the same priority band, so the claim's
-existing `(priority, scheduled_at)` order interleaves the parents for free.
-
-```go
-// Round-robin two parents by banding their children's priorities. Child i of every
-// parent shares band base+i, so the claim takes one child from each parent per band
-// instead of draining parent A before parent B is seen.
-for i, item := range parentAChildren {
-    item.Opts.Priority = priorityBase + i
-}
-for i, item := range parentBChildren {
-    item.Opts.Priority = priorityBase + i
-}
-```
-
-**Priority still dominates.** Banding interleaves work *of equal urgency*; it does not let a low-priority
-parent jump ahead of a high-priority one. Reserve a range of priority numbers for the band offset (say,
-`base + (i % window)`) so a genuinely more urgent job at a lower base is still claimed first, and the
-banding only decides the order *within* a base.
-
-**A parentless job is its own group of one.** Fairness is keyed on the parent, so a job with no parent
-does not share a band with anyone — id 1000 and id 1001, both parentless and both enqueued at the
-default priority, are claimed in schedule order exactly as they are today. Banding changes nothing for
-work that was never part of a batch; it is a tool for the case where one lineage would otherwise starve
-another.
-
-</details>
-
-<details>
-<summary><strong><code>Admission control — gating a runner before it claims</code></strong></summary>
-<br>
-
-**A `Limiter` is consulted before every claim, so work that cannot run yet is never claimed.** Without
-one, the only backpressure is *claim-then-snooze*: a worker is dispatched, discovers the downstream is
-at budget, and returns `Result{Snooze}`. A snooze spends no retry attempt, but it does spend a poll, a
-claim, a `job_runs` audit row, and a finalize — so under sustained backpressure the queue's dominant
-work becomes jobs re-scheduling themselves and `job_runs` grows at the snooze rate. A pre-claim gate
-removes all of that: at a 50/s budget it claims 50 jobs a second and writes 50 audit rows a second,
-where the same workload under claim-then-snooze wrote 221× the rows (see [BENCHMARKS](docs/BENCHMARKS.md)).
-
-**The gate is keyed on an arbitrary resource string, not on the queue or executor class.** The thing
-that needs protecting is a *downstream dependency* — a provider, an API tenant, an external account —
-and its budget has nothing to do with which pool runs the job. `Resource` names it:
-
-```go
-limiter := flywheel.NewTokenBucket(flywheel.TokenBucketConfig{
-    Rate: 50, Interval: time.Second, // 50 operations/second to this downstream
-    Burst:         50,               // bucket capacity; defaults to Rate
-    MaxConcurrent: 5,                // optional: at most 5 in flight at once
-})
-
-flywheel.RunnerConfig{
-    Queues:   []string{"provider-x"},
-    Limiter:  limiter,
-    Resource: "provider:x", // required when Limiter is set
-}
-```
-
-**A `Runner` is the unit of resource scoping.** The gate runs *before* the claim, so the resource must
-be knowable without inspecting a job — which makes it a property of the runner, not the work. A host
-protecting several downstreams runs one runner per downstream, each over its own queue, rather than one
-runner sorting jobs by destination after claiming them (`NodeConfig.Runners` is a slice, so N gated
-runners live in one process). This is the concrete answer to **queue-per-destination**: per-destination
-limiting requires per-destination queues, the same conclusion the claim path reaches from the other
-direction — a multi-queue claim cannot be indexed, so a queue is best served by its own runner (see
-[BENCHMARKS](docs/BENCHMARKS.md)).
-
-**Work that spawns work runs ungated, or on a distinct resource.** A coordinator whose only job is to
-dispatch children must not consume the capacity those children need: put it on an ungated runner, or
-one whose resource differs from the resource its children consume. Because resource is a runner
-property, a coordinator on its own runner already has a different resource by construction — the
-deadlock is only reachable by placing coordinators and their children on one gated runner sharing a
-resource, and a runner in that shape logs a starvation warning (`LimiterStarvationInterval`).
-
-**Pick the limiter by process count.** `NewTokenBucket` is in-process and correct for one process — a
-deployment running N processes against one downstream gets N times the budget. `NewDBLimiter` shares
-one budget across every process on the database; it is a round trip per claim, so it suits budgets in
-the tens-to-hundreds per second. Its concurrency reservations carry a `HoldTTL` so a crashed holder's
-capacity self-heals — set it **above the longest expected job**, since a TTL shorter than the work
-reclaims capacity from a healthy holder and over-admits.
-
-```go
-limiter, err := flywheel.NewDBLimiter(db, flywheel.DBLimiterConfig{
-    MaxConcurrent: 10,
-    HoldTTL:       5 * time.Minute, // longer than any job this resource runs
-})
-// Optional: reclaim expired holds proactively. Acquire also reclaims inline, so
-// correctness never depends on the sweeper running.
-go limiter.RunSweeper(ctx)
-```
-
-**A limiter outage is not a work outage.** When the limiter returns an error the runner claims anyway
-and logs, by default. A host guarding a hard external quota sets `LimiterFailClosed` to defer instead.
 
 </details>
 
@@ -888,6 +588,308 @@ runID, err := flywheel.SeedRun(ctx, db, flywheel.RunSeed{
 </details>
 
 <details>
+<summary><strong><code>Bulk enqueue and the follow-up ceiling</code></strong></summary>
+<br>
+
+Enqueuing one job is one `Insert`/`Enqueue` call and one row. Enqueuing many that way is one round trip
+per job — a 100k fan-out is 100k statements. `InsertMany` writes them in bounded, dialect-aware chunks
+instead: one multi-row `INSERT` per chunk, so the round trips drop by the chunk factor.
+
+```go
+items := make([]flywheel.BatchItem, len(subjects))
+for i, subject := range subjects {
+    args, err := json.Marshal(reportArgs{Subject: subject})
+    if err != nil {
+        return err
+    }
+    items[i] = flywheel.BatchItem{
+        Kind: "report",
+        Args: args,
+        Opts: flywheel.InsertOpts{Queue: "reports", UniqueKey: subject}, // per-row options
+    }
+}
+
+res, err := flywheel.InsertMany(ctx, client, items, flywheel.BatchOpts{})
+// res.Inserted + res.Skipped == len(items).
+// res.IDs stays aligned to the input — empty at any row a unique-key collision skipped.
+```
+
+Everything `Enqueue` guarantees for one row holds per row here: the same defaults, the same
+`unique_key`/`unique_active_key` idempotency, the same `ErrAlreadyEnqueued` meaning — a collision is a
+per-row skip, never a failed batch. `res.Skipped` counts the collisions; set `BatchOpts.SkipDuplicates`
+to drop them silently instead. `InsertManyTyped[A]` is the generic form: it reads each job's kind from
+the args value, exactly as `Insert` does.
+
+**The outbox guarantee carries over.** Set `BatchOpts.Tx` and every chunk writes on your transaction —
+the batch opens none of its own, so the rows land with your domain writes or not at all. Leave it unset
+and each chunk commits independently, so a mid-batch failure leaves the earlier chunks committed and the
+returned error names the failing chunk.
+
+`ChunkSize` defaults to a value chosen so a chunk stays well inside the driver's bind-parameter ceiling;
+a request above the dialect maximum is clamped down, not rejected.
+
+| Dialect | Bind-parameter ceiling | Rows per statement | Default `ChunkSize` |
+|---|---|---|---|
+| PostgreSQL | 65,535 | 2,730 | **1,000** |
+| SQLite | 32,766 | 1,365 | **500** |
+
+**The follow-up fan-out is bounded the same way.** A worker's `Result.FollowUps` is enqueued inside the
+finalize transaction, so an unbounded fan-out is an unbounded, lock-holding transaction. The children
+are inserted in chunks, and the total is capped: a fan-out past the limit fails the finalize with
+`ErrFollowUpLimit` rather than silently truncating. The bounds are `DriverOpts.FollowUpChunkSize`
+(default 500) and `DriverOpts.FollowUpLimit` (default 10,000) — a fan-out that large is a signal to
+spawn a coordinator job rather than return N children from one attempt.
+
+</details>
+
+<details>
+<summary><strong><code>Batch progress, controls, and the fan-in barrier</code></strong></summary>
+<br>
+
+A worker spawns children by returning `FollowUp{Parent: true}`, and the enqueuing caller sets a child's
+parent with `InsertOpts.Parent`. That lineage pointer is what the batch surface reads.
+
+**The rollup answers "how is this batch doing?" from one call.** `Progress` returns a `BatchProgress`:
+the per-state child counts, the totals, the parent's own state, and the age of the oldest pending child
+— served by a covering index, so it holds at a hundred thousand children.
+
+```go
+p, err := flywheel.Progress(ctx, db, parentID)
+// p.CountsByState["succeeded"], p.Total, p.Terminal, p.Pending
+// p.Pending == 0 means the batch is complete.
+```
+
+An unknown or already-pruned parent is a zero rollup with an empty `ParentState`, not an error: children
+outlive the parent row, so `Progress` reports them either way. `ProgressMany` rolls up several parents in
+a fixed two reads rather than one per parent — a childless or unknown parent still gets an entry, so a
+dashboard tells "no children" from "unknown id". `ProgressByKind` is the parentless form, for a host
+whose batches are defined by what the work is rather than by who spawned it.
+
+**`paused` is a real, operator-visible state, not a `scheduled_at` trick.** A far-future `scheduled_at`
+would be free, but it is indistinguishable from a legitimately deferred job and invisible to every
+rollup and health sample — the exact class of "a condition encoded as a side effect of another field"
+the runtime avoids. `paused` is the one state that is neither claimable nor terminal: a runner never
+picks it up, and it stays held until a resume returns it to `available`. It is unfinished work, so it
+keeps `RunUntilIdle` polling and stays counted as non-terminal.
+
+**Pause, resume, and cancel scope to a whole generation.** Each operates in bounded, per-transaction
+batches — the lease sweep's shape — and reports what it did by reason, so a running attempt is never
+interrupted and a succeeded child is never clobbered:
+
+```go
+res, err := flywheel.CancelByParent(ctx, db, parentID, flywheel.ScopeOpts{})
+// res.Changed cancelled; res.SkippedRunning left in flight; res.SkippedTerminal left as they were.
+```
+
+`PauseByParent` holds every claimable child; `ResumeByParent` returns the paused ones to `available`,
+preserving a deferred child's schedule. The per-id `CancelJob` and `RetryJob` are guarded to the same
+standard: a job that has already reached a terminal state is left exactly as it is and `ErrJobTerminal`
+is returned, so an operator action can never overwrite a recorded outcome. Re-running a finished job is
+deliberate — `RetryJobWithOptions` with `Force` — and replaying a whole cohort of failures, with a
+restored retry budget, is its own guide: **Replaying work** below.
+
+**The fan-in barrier runs a continuation once a generation completes.** A worker returns `Result.Barrier`
+alongside its children, and the runtime enqueues the continuation exactly once, after the last child
+reaches *any* terminal state — a half-failed generation still gets its finalizer. It is keyed so a
+retried, discarded, or superseded child can never enqueue it twice, and it fires inside that last child's
+finalize transaction, so no host writes a retry-unsafe counter.
+
+```go
+return flywheel.Result{
+    FollowUps: children,                                  // each with Parent: true
+    Barrier:   &flywheel.Barrier{Kind: "finalize_batch"}, // runs once, when they are all terminal
+}, nil
+```
+
+The continuation reads what the generation produced through `ChildOutputs` — one entry per terminal
+child, its final state paired with its last attempt's recorded output. A barrier-bearing generation is
+bounded by `DriverOpts.BarrierMaxChildren` (default 10,000): the barrier costs an index-only completion
+count per child finalize, so a wider fan-out is refused with `ErrBarrierTooWide`, directing you to a tree
+of bounded generations rather than one that costs `O(children²)`.
+
+**No barrier timeout ships, by design — anchor your own deadline to progress.** A deadline measured from
+when a batch was *spawned* kills a healthy batch that is merely behind a deep backlog, which is precisely
+when a batch most needs to survive. `BatchProgress.OldestPendingAge` is the signal instead: it measures
+from the least-recently-scheduled *pending* child, so a host that wants a deadline anchors it to how long
+real work has actually been stalled, not to wall-clock age.
+
+</details>
+
+<details>
+<summary><strong><code>Fairness across parents — priority banding</code></strong></summary>
+<br>
+
+**The claim is `ORDER BY priority, scheduled_at`, so equal-priority work is strict FIFO.** A lower
+priority number is claimed first; ties break by schedule time. That is the right default — it is one
+index seek to the front of the queue, `O(batch)` regardless of how deep the backlog is — but it means a
+large batch enqueued first fully drains before a small batch enqueued a minute later gets a single
+claim. When the two batches belong to different parents (or tenants, or customers), that is
+head-of-line blocking, and bulk enqueue makes the starving batch cheap to create.
+
+**Fairness is expressed through the priority column, at enqueue time — not by reordering the claim.** A
+runtime policy that interleaved parents in the claim would rank the whole ready set with a window
+function before applying the `LIMIT`, which is `O(ready)`: measured against a 166,667-row ready set at
+one million rows, that claim runs in **216 ms** where the shipped claim runs in **0.06 ms**, and a
+priority-band pre-filter still costs 102 ms because computing the band scans the ready set too (see
+[BENCHMARKS](docs/BENCHMARKS.md)). A runner claims on every poll, so paying that on every claim against
+a deep queue is not an option. So the ranking is moved to enqueue time, where it is paid once per job
+and the claim stays `O(batch)`: give each parent's *n*-th child the same priority band, so the claim's
+existing `(priority, scheduled_at)` order interleaves the parents for free.
+
+```go
+// Round-robin two parents by banding their children's priorities. Child i of every
+// parent shares band base+i, so the claim takes one child from each parent per band
+// instead of draining parent A before parent B is seen.
+for i, item := range parentAChildren {
+    item.Opts.Priority = priorityBase + i
+}
+for i, item := range parentBChildren {
+    item.Opts.Priority = priorityBase + i
+}
+```
+
+**Priority still dominates.** Banding interleaves work *of equal urgency*; it does not let a low-priority
+parent jump ahead of a high-priority one. Reserve a range of priority numbers for the band offset (say,
+`base + (i % window)`) so a genuinely more urgent job at a lower base is still claimed first, and the
+banding only decides the order *within* a base.
+
+**A parentless job is its own group of one.** Fairness is keyed on the parent, so a job with no parent
+does not share a band with anyone — id 1000 and id 1001, both parentless and both enqueued at the
+default priority, are claimed in schedule order exactly as they are today. Banding changes nothing for
+work that was never part of a batch; it is a tool for the case where one lineage would otherwise starve
+another.
+
+</details>
+
+<details>
+<summary><strong><code>Replaying work — retry vs. re-enqueue</code></strong></summary>
+<br>
+
+**Replaying the failures is the common recovery after an incident, and it is a retry, not a re-enqueue.**
+`ReplayByParent` returns the failed children of a parent to `available` in bounded, per-transaction
+batches; `Replay` does the same for a whole kind or an incident window, unscoped by lineage. Both report
+what they did through the same `ScopeResult` the batch controls use:
+
+```go
+res, err := flywheel.ReplayByParent(ctx, db, parentID, flywheel.ReplayOpts{
+    RetryOpts: flywheel.RetryOpts{ResetAttempts: true}, // restore the retry budget
+    Stagger:   5 * time.Minute,                         // spread arrivals over five minutes
+})
+// res.Changed replayed; res.SkippedTerminal left as they were; res.SkippedRunning left in flight.
+```
+
+**A replay restores the retry budget as headroom, not by rewinding the counter.** A job discarded at
+`attempt == max_attempts` has no budget left, so a plain retry gives it exactly one more attempt before
+it discards again. `ResetAttempts` raises `max_attempts` — to `attempt + Budget`, or the job's original
+budget when `Budget` is zero — so the job gets a real second life. `attempt` is never lowered: it is the
+`job_runs(job_id, attempt)` audit key, so the replay's runs continue the sequence rather than colliding
+with the recorded failures. It is the same mechanism a snooze uses to stay free.
+
+**A replay is bounded by construction.** Empty `States` replays discarded jobs only — never succeeded
+work; naming `StateSucceeded` additionally requires `Force`. An unscoped `Replay` with neither `Kinds`
+nor `FailedSince` is refused with `ErrReplayUnbounded` rather than replaying every discarded job in the
+database by accident.
+
+```go
+// The incident-shaped recovery: one kind, bounded to the outage window, budget of three.
+res, err := flywheel.Replay(ctx, db, flywheel.ReplayOpts{
+    RetryOpts:   flywheel.RetryOpts{ResetAttempts: true, Budget: 3},
+    Kinds:       []string{"fetch_report"},
+    FailedSince: outageStart,
+})
+```
+
+**`Stagger` shapes when the cohort arrives; it is not a rate ceiling.** With `Stagger` set, job *i* of
+*n* becomes claimable at `now + Stagger*i/n`, so 30,000 replayed jobs do not all hit a just-recovered
+dependency at once. The placement is deterministic, so you can predict when the last job lands. It does
+not cap how fast the cohort is claimed once each job is due — an actual claim-rate ceiling is a separate
+capability.
+
+**Retry an existing row; do not re-enqueue it under the same key.** Which mechanism recovers a unit of
+work depends on the intent:
+
+| Intent | Mechanism | Key |
+|---|---|---|
+| Re-run *this job row*, keeping its id, history, and audit trail | `RetryJobWithOptions` / `Replay*` | — |
+| Enqueue a *new* job for the same logical unit, at most once ever | new `Insert` | `UniqueKey` — collides forever, terminal or not |
+| Enqueue a *new* job for a subject that may run again later | new `Insert` | `UniqueActiveKey` — frees on a terminal state |
+
+> A job enqueued with `UniqueKey` can never be re-enqueued: the key collides with the original row
+> forever, terminal or not. That is the guarantee `UniqueKey` exists to provide. To run that unit of work
+> again, retry the original job — its id, lineage, and audit trail are preserved. If the unit is expected
+> to run again later, `UniqueActiveKey` is the key you want.
+
+</details>
+
+<details>
+<summary><strong><code>Admission control — gating a runner before it claims</code></strong></summary>
+<br>
+
+**A `Limiter` is consulted before every claim, so work that cannot run yet is never claimed.** Without
+one, the only backpressure is *claim-then-snooze*: a worker is dispatched, discovers the downstream is
+at budget, and returns `Result{Snooze}`. A snooze spends no retry attempt, but it does spend a poll, a
+claim, a `job_runs` audit row, and a finalize — so under sustained backpressure the queue's dominant
+work becomes jobs re-scheduling themselves and `job_runs` grows at the snooze rate. A pre-claim gate
+removes all of that: at a 50/s budget it claims 50 jobs a second and writes 50 audit rows a second,
+where the same workload under claim-then-snooze wrote 221× the rows (see [BENCHMARKS](docs/BENCHMARKS.md)).
+
+**The gate is keyed on an arbitrary resource string, not on the queue or executor class.** The thing
+that needs protecting is a *downstream dependency* — a provider, an API tenant, an external account —
+and its budget has nothing to do with which pool runs the job. `Resource` names it:
+
+```go
+limiter := flywheel.NewTokenBucket(flywheel.TokenBucketConfig{
+    Rate: 50, Interval: time.Second, // 50 operations/second to this downstream
+    Burst:         50,               // bucket capacity; defaults to Rate
+    MaxConcurrent: 5,                // optional: at most 5 in flight at once
+})
+
+flywheel.RunnerConfig{
+    Queues:   []string{"provider-x"},
+    Limiter:  limiter,
+    Resource: "provider:x", // required when Limiter is set
+}
+```
+
+**A `Runner` is the unit of resource scoping.** The gate runs *before* the claim, so the resource must
+be knowable without inspecting a job — which makes it a property of the runner, not the work. A host
+protecting several downstreams runs one runner per downstream, each over its own queue, rather than one
+runner sorting jobs by destination after claiming them (`NodeConfig.Runners` is a slice, so N gated
+runners live in one process). This is the concrete answer to **queue-per-destination**: per-destination
+limiting requires per-destination queues, the same conclusion the claim path reaches from the other
+direction — a multi-queue claim cannot be indexed, so a queue is best served by its own runner (see
+[BENCHMARKS](docs/BENCHMARKS.md)).
+
+**Work that spawns work runs ungated, or on a distinct resource.** A coordinator whose only job is to
+dispatch children must not consume the capacity those children need: put it on an ungated runner, or
+one whose resource differs from the resource its children consume. Because resource is a runner
+property, a coordinator on its own runner already has a different resource by construction — the
+deadlock is only reachable by placing coordinators and their children on one gated runner sharing a
+resource, and a runner in that shape logs a starvation warning (`LimiterStarvationInterval`).
+
+**Pick the limiter by process count.** `NewTokenBucket` is in-process and correct for one process — a
+deployment running N processes against one downstream gets N times the budget. `NewDBLimiter` shares
+one budget across every process on the database; it is a round trip per claim, so it suits budgets in
+the tens-to-hundreds per second. Its concurrency reservations carry a `HoldTTL` so a crashed holder's
+capacity self-heals — set it **above the longest expected job**, since a TTL shorter than the work
+reclaims capacity from a healthy holder and over-admits.
+
+```go
+limiter, err := flywheel.NewDBLimiter(db, flywheel.DBLimiterConfig{
+    MaxConcurrent: 10,
+    HoldTTL:       5 * time.Minute, // longer than any job this resource runs
+})
+// Optional: reclaim expired holds proactively. Acquire also reclaims inline, so
+// correctness never depends on the sweeper running.
+go limiter.RunSweeper(ctx)
+```
+
+**A limiter outage is not a work outage.** When the limiter returns an error the runner claims anyway
+and logs, by default. A host guarding a hard external quota sets `LimiterFailClosed` to defer instead.
+
+</details>
+
+<details>
 <summary><strong><code>Running one registry across two executors</code></strong></summary>
 <br>
 
@@ -973,65 +975,6 @@ A complete, runnable version of this is [`examples/split-executors`](examples/sp
 </details>
 
 <details>
-<summary><strong><code>Local daemon & cron replacement</code></strong></summary>
-<br>
-
-The [`flywheel` CLI](cmd/flywheel/README.md) runs the runtime as a local daemon over a SQLite file
-(zero-ops) or Postgres, and replaces cron with durable scheduled jobs — no custom Go required:
-
-```bash
-go install github.com/mrz1836/go-flywheel/cmd/flywheel@latest
-
-flywheel migrate   # stand up the schema
-flywheel serve     # run runner + scheduler until Ctrl+C
-flywheel jobs ls   # inspect the queue
-```
-
-Declare your jobs in `flywheel.yaml` — each run is retried, audited, and overlap-protected,
-strictly better than a crontab line. Pick the worker that matches what you run locally: `shell`
-(a `.sh` file or inline snippet), `python` (a script, `-m` module, or `-c` snippet), `mage`
-(magex/mage build targets), `exec` (any binary), or `http` (call a URL):
-
-```yaml
-schedules:
-  - slug: nightly-maintenance      # a shell script — file or inline, no +x needed
-    every: 24h
-    worker: shell
-    shell:
-      script: /usr/local/bin/maintenance.sh
-      args: ["--verbose"]
-      timeout_seconds: 600
-
-  - slug: hourly-sync              # a Python script — resolves python3, then python
-    cron: "0 * * * *"
-    worker: python
-    python:
-      script: /opt/hermes/sync.py
-      args: ["--since=1h"]
-
-  - slug: repo-deps-update         # magex/mage targets — the Go-native task runner
-    every: 24h
-    worker: mage
-    mage:
-      targets: ["deps:update"]     # e.g. ["test"], ["lint"], ["version:bump", "push=true"]
-      dir: /Users/me/projects/my-repo
-
-  - slug: gateway-healthcheck      # call a URL
-    cron: "*/5 * * * *"
-    worker: http
-    http:
-      url: https://gateway.internal/healthz
-```
-
-Every run's stdout, stderr, and exit code are captured to the `job_runs` audit trail — inspect
-them with `flywheel jobs inspect <id>`. Prefer to wire it from Go? The
-[examples/local-tasks](examples/local-tasks) program registers the shell, python, and mage
-workers and schedules one of each. See the [CLI README](cmd/flywheel/README.md) for every
-command, the config reference, and the macOS launchd setup.
-
-</details>
-
-<details>
 <summary><strong><code>Observability, health, and metrics</code></strong></summary>
 <br>
 
@@ -1039,7 +982,7 @@ The runtime is self-diagnosing. The `Observer` seam ([observer.go](observer.go))
 attempt's lifecycle — claim, start, finish, retry, supersede — with no metrics dependency in the core,
 and the [`observers/`](observers) package ships ready adapters that plug straight in:
 
-- `observers.NewMetrics(rec)` translates events into a `MetricsRecorder` — a one-method sink you back
+- `observers.NewMetrics(rec)` translates events into a `MetricsRecorder` — a small four-method sink you back
   with Prometheus, OpenTelemetry, statsd, or CloudWatch (the core imports none of them).
 - `observers.NewSlog(logger)` logs each event at debug level; `observers.NewMulti(...)` fans events
   out to several observers at once.
@@ -1165,6 +1108,65 @@ the cutoff. Pending and running work is never touched, whatever its age.
 
 </details>
 
+<details>
+<summary><strong><code>Local daemon & cron replacement</code></strong></summary>
+<br>
+
+The [`flywheel` CLI](cmd/flywheel/README.md) runs the runtime as a local daemon over a SQLite file
+(zero-ops) or Postgres, and replaces cron with durable scheduled jobs — no custom Go required:
+
+```bash
+go install github.com/mrz1836/go-flywheel/cmd/flywheel@latest
+
+flywheel migrate   # stand up the schema
+flywheel serve     # run runner + scheduler until Ctrl+C
+flywheel jobs ls   # inspect the queue
+```
+
+Declare your jobs in `flywheel.yaml` — each run is retried, audited, and overlap-protected,
+strictly better than a crontab line. Pick the worker that matches what you run locally: `shell`
+(a `.sh` file or inline snippet), `python` (a script, `-m` module, or `-c` snippet), `mage`
+(magex/mage build targets), `exec` (any binary), or `http` (call a URL):
+
+```yaml
+schedules:
+  - slug: nightly-maintenance      # a shell script — file or inline, no +x needed
+    every: 24h
+    worker: shell
+    shell:
+      script: /usr/local/bin/maintenance.sh
+      args: ["--verbose"]
+      timeout_seconds: 600
+
+  - slug: hourly-sync              # a Python script — resolves python3, then python
+    cron: "0 * * * *"
+    worker: python
+    python:
+      script: /opt/hermes/sync.py
+      args: ["--since=1h"]
+
+  - slug: repo-deps-update         # magex/mage targets — the Go-native task runner
+    every: 24h
+    worker: mage
+    mage:
+      targets: ["deps:update"]     # e.g. ["test"], ["lint"], ["version:bump", "push=true"]
+      dir: /Users/me/projects/my-repo
+
+  - slug: gateway-healthcheck      # call a URL
+    cron: "*/5 * * * *"
+    worker: http
+    http:
+      url: https://gateway.internal/healthz
+```
+
+Every run's stdout, stderr, and exit code are captured to the `job_runs` audit trail — inspect
+them with `flywheel jobs inspect <id>`. Prefer to wire it from Go? The
+[examples/local-tasks](examples/local-tasks) program registers the shell, python, and mage
+workers and schedules one of each. See the [CLI README](cmd/flywheel/README.md) for every
+command, the config reference, and the macOS launchd setup.
+
+</details>
+
 <br/>
 
 ## 📚 Documentation
@@ -1176,7 +1178,7 @@ the cutoff. Pending and running work is never touched, whatever its age.
 - **Tuning** – Sizing the knobs from measured numbers in [`docs/TUNING.md`](docs/TUNING.md)
 - **Dashboards** – An importable Grafana dashboard over the metrics in [`docs/dashboards/`](docs/dashboards/)
 - **Benchmarks** – The measured 100k baseline, environment, and index comparison in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
-- **Test Suite** – Review both the [unit tests](integration_test.go) (powered by [`testify`](https://github.com/stretchr/testify))
+- **Test Suite** – Review the [test suite](integration_test.go) (powered by [`testify`](https://github.com/stretchr/testify))
 
 <br/>
 
@@ -1184,7 +1186,7 @@ the cutoff. Pending and running work is never touched, whatever its age.
 <summary><strong><code>Repository Features</code></strong></summary>
 <br/>
 
-This repository includes 25+ built-in features covering CI/CD, security, code quality, developer experience, and community tooling.
+This repository includes 24 built-in features covering CI/CD, security, code quality, developer experience, and community tooling.
 
 **[View the full Repository Features list →](.github/docs/repository-features.md)**
 
@@ -1309,7 +1311,7 @@ cores with the database — so treat them as floors:
 | | |
 |---|---|
 | **Claim p50 / p99** | 0.96 ms / 1.91 ms — served by an ordered index scan, not a scan-and-sort |
-| **Drain throughput** | ~9,900 jobs/s at `-runners 4 -workers 8` with no simulated work |
+| **Drain throughput** | ~9,500 jobs/s at `-runners 4 -workers 8` with no simulated work |
 | **Slot utilization** | 95 % at `Concurrency: 8` on a workload where 10 % of jobs run 20× longer |
 
 That last one is the property to design against: throughput on a real workload is bounded by the work
