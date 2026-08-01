@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	founddb "github.com/mrz1836/go-foundation/db"
 	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/gorm"
 )
@@ -75,51 +76,24 @@ func NewSQLiteDriverWithOptions(db *gorm.DB, opts SQLiteOpts) (Driver, error) {
 }
 
 // checkSQLitePragmas verifies the connection pragmas the serialized claim relies
-// on, returning ErrSQLitePragma (naming the pragma) on a hard failure. A file
-// database must be in WAL so readers do not block the claim's writer; an
-// in-memory database — which cannot use WAL — is exempt from that one requirement
-// but, like any database, still needs a positive busy_timeout to absorb the brief
-// claim lock and a safe synchronous level so a committed outcome survives a crash.
-// foreign_keys and _txlock are warned about (file databases only), never fatal.
+// on, returning ErrSQLitePragma (naming the pragma) on a hard failure. The fatal
+// checks — WAL for a file database (an in-memory database, which cannot use WAL,
+// is exempt), a positive busy_timeout, and a safe synchronous level — are the
+// shared verifier in go-foundation/db; on success this adds flywheel's own
+// non-fatal warnings for a file database. foreign_keys and _txlock are warned
+// about (file databases only), never fatal.
 func checkSQLitePragmas(db *gorm.DB) error {
-	journalMode, err := scanPragmaString(db, "journal_mode")
+	if err := founddb.VerifySQLitePragmas(db); err != nil {
+		return err
+	}
+	// The fatal checks passed, so journal_mode is either wal or memory; re-read
+	// it to decide whether to add the file-only warnings. An in-memory database
+	// is exempt — a single writer makes foreign_keys and _txlock moot.
+	journalMode, err := founddb.SQLitePragmaString(db, "journal_mode")
 	if err != nil {
 		return fmt.Errorf("%w: reading journal_mode: %w", ErrSQLitePragma, err)
 	}
-	inMemory := strings.EqualFold(journalMode, "memory")
-	if !inMemory && !strings.EqualFold(journalMode, "wal") {
-		return fmt.Errorf(
-			"%w: journal_mode is %q, want wal — open with the _pragma=journal_mode(WAL) DSN parameter",
-			ErrSQLitePragma, journalMode,
-		)
-	}
-
-	busyTimeout, err := scanPragmaInt(db, "busy_timeout")
-	if err != nil {
-		return fmt.Errorf("%w: reading busy_timeout: %w", ErrSQLitePragma, err)
-	}
-	if busyTimeout <= 0 {
-		return fmt.Errorf(
-			"%w: busy_timeout is %d, want > 0 — open with the _pragma=busy_timeout(5000) DSN parameter",
-			ErrSQLitePragma, busyTimeout,
-		)
-	}
-
-	synchronous, err := scanPragmaInt(db, "synchronous")
-	if err != nil {
-		return fmt.Errorf("%w: reading synchronous: %w", ErrSQLitePragma, err)
-	}
-	// 1 = NORMAL, 2 = FULL are safe; 0 = OFF risks losing a committed outcome on
-	// power loss, which for a durable job runtime is exactly the failure it exists
-	// to prevent.
-	if synchronous != 1 && synchronous != 2 {
-		return fmt.Errorf(
-			"%w: synchronous is %d, want NORMAL(1) or FULL(2), not OFF(0)",
-			ErrSQLitePragma, synchronous,
-		)
-	}
-
-	if !inMemory {
+	if !strings.EqualFold(journalMode, "memory") {
 		warnSQLitePragmas(db)
 	}
 	return nil
@@ -133,7 +107,7 @@ func checkSQLitePragmas(db *gorm.DB) error {
 // failure than a documented requirement — and neither fires for an in-memory
 // database, where a single writer makes both moot.
 func warnSQLitePragmas(db *gorm.DB) {
-	if foreignKeys, err := scanPragmaInt(db, "foreign_keys"); err == nil && foreignKeys == 0 {
+	if foreignKeys, err := founddb.SQLitePragmaInt(db, "foreign_keys"); err == nil && foreignKeys == 0 {
 		slog.Default().Warn(
 			"flywheel: sqlite foreign_keys is off; a host FK onto job_runs will be unenforced (the runtime declares none)",
 		)
@@ -149,20 +123,6 @@ func warnSQLitePragmas(db *gorm.DB) {
 			)
 		}
 	}
-}
-
-// scanPragmaString reads a text-valued PRAGMA from db.
-func scanPragmaString(db *gorm.DB, pragma string) (string, error) {
-	var v string
-	err := db.Raw("PRAGMA " + pragma).Row().Scan(&v)
-	return v, err
-}
-
-// scanPragmaInt reads an integer-valued PRAGMA from db.
-func scanPragmaInt(db *gorm.DB, pragma string) (int, error) {
-	var v int
-	err := db.Raw("PRAGMA " + pragma).Row().Scan(&v)
-	return v, err
 }
 
 // Sweep reclaims expired leases in bounded batches.

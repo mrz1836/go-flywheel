@@ -8,6 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mrz1836/go-foundation/backoff"
 	"github.com/mrz1836/go-foundation/ctxutil"
 	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/datatypes"
@@ -310,19 +311,11 @@ func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time
 
 // expBackoff is the exponential retry ladder shared by the Runner's
 // configurable backoff and the driver's fallback: base, doubling once per
-// attempt past the first, capped at maxDelay.
+// attempt past the first, capped at maxDelay. The canonical implementation lives
+// in go-foundation/backoff; this thin wrapper keeps the call sites and their
+// tests unchanged.
 func expBackoff(base, maxDelay time.Duration, attempt int) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
-	delay := base
-	for range attempt - 1 {
-		delay *= 2
-		if delay >= maxDelay {
-			return maxDelay
-		}
-	}
-	return delay
+	return backoff.Exponential(base, maxDelay, attempt)
 }
 
 // defaultBackoff is the fallback retry delay when the Runner supplied none.

@@ -13,6 +13,7 @@ import (
 
 	"github.com/mrz1836/go-foundation/ctxutil"
 	"github.com/mrz1836/go-foundation/models"
+	"github.com/mrz1836/go-foundation/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
@@ -769,7 +770,7 @@ func TestDefaultHTTPDoerPerformsRealRequest(t *testing.T) {
 func TestFakeHTTPDoerStubDefaultBodyReadErrorFailsUnstubbedReads(t *testing.T) {
 	t.Parallel()
 	readErr := errors.New("truncated stream")
-	doer := NewFakeHTTPDoer().StubDefaultBodyReadError(http.StatusOK, readErr)
+	doer := testutil.NewFakeHTTPDoer().StubDefaultBodyReadError(http.StatusOK, readErr)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.test/x", nil)
 	require.NoError(t, err)
