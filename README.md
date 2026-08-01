@@ -1326,7 +1326,10 @@ go test -tags=loadtest -run='^$' -bench='BenchmarkClaim100k|BenchmarkEnqueue100k
 <br/>
 
 ## 🛠️ Code Standards
-Read more about this Go project's [code standards](.github/CODE_STANDARDS.md).
+Read more about this Go project's [code standards](.github/CODE_STANDARDS.md). The library-specific
+conventions a contributor inherits — the `jobs:`/`flywheel:` prefix rule, sentinel naming, the
+`…WithOptions`/`…Opts` pairing, the Postgres test mirror, and the retained-seam pattern — are recorded in
+[`docs/CONVENTIONS.md`](docs/CONVENTIONS.md).
 
 <br/>
 
