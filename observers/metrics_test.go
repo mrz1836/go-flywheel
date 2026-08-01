@@ -380,7 +380,7 @@ func counterFor(snap Snapshot, k, v string) CounterSeries {
 func TestMemRecorderBoundDropsNewKeepsEstablished(t *testing.T) {
 	t.Parallel()
 	m := NewMemRecorderWithConfig(HistogramConfig{MaxSeries: 100})
-	for i := 0; i < 10_000; i++ {
+	for i := range 10_000 {
 		m.Count("c", 1, map[string]string{"id": strconv.Itoa(i)})
 	}
 
@@ -426,11 +426,11 @@ func TestMemRecorderBoundIsRaceFree(t *testing.T) {
 	const goroutines, perG = 8, 500
 
 	var wg sync.WaitGroup
-	for g := 0; g < goroutines; g++ {
+	for g := range goroutines {
 		wg.Add(1)
 		go func(base int) {
 			defer wg.Done()
-			for i := 0; i < perG; i++ {
+			for i := range perG {
 				m.Count("c", 1, map[string]string{"id": strconv.Itoa(base*perG + i)})
 			}
 		}(g)
@@ -449,11 +449,11 @@ func TestMemRecorderConcurrentRecordingIsRaceFree(t *testing.T) {
 	const goroutines, perG = 8, 1000
 
 	var wg sync.WaitGroup
-	for g := 0; g < goroutines; g++ {
+	for range goroutines {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < perG; i++ {
+			for i := range perG {
 				m.Count("c", 1, map[string]string{"shard": "x"})
 				m.Gauge("g", float64(i), nil)
 				m.Observe("o", 2.0, nil)

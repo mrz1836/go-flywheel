@@ -555,38 +555,72 @@ func (s *Scheduler) enqueueBucket(ctx context.Context, def jobPeriodicRow, bucke
 // intervalBuckets returns the missed fire times of a fixed-interval schedule
 // from start through now (capped at the most recent limit), and the first fire
 // time strictly after now.
+//
+// A fixed interval has a closed form, so the most recent limit fires are found
+// by arithmetic rather than by materializing the whole missed-fire history: a
+// stale next_run_at with a tight interval (a definition reactivated after a
+// pause, clock skew) could otherwise allocate millions of time.Time in one
+// fire(). Allocation here is bounded by limit (or by the fire count when limit
+// is unbounded).
 func intervalBuckets(start time.Time, intervalSeconds int, now time.Time, limit int) ([]time.Time, time.Time) {
 	interval := time.Duration(intervalSeconds) * time.Second
-	var all []time.Time
-	t := start
-	for !t.After(now) {
-		all = append(all, t)
-		t = t.Add(interval)
+	// A non-positive interval has no valid schedule; guarding it also forecloses a
+	// zero-interval infinite loop. start after now means no fire is yet due, so the
+	// first (and next) fire is start itself with no missed buckets.
+	if interval <= 0 || start.After(now) {
+		return nil, start
 	}
-	return capBuckets(all, limit), t
+	// t == start + k*interval. n is the largest k with t <= now, so the missed
+	// fires are k in [0, n] and nextRun is k == n+1. Skip directly to the most
+	// recent limit of them.
+	n := int(now.Sub(start) / interval)
+	first := 0
+	if limit > 0 && n+1 > limit {
+		first = n + 1 - limit
+	}
+	buckets := make([]time.Time, 0, n-first+1)
+	for k := first; k <= n; k++ {
+		buckets = append(buckets, start.Add(time.Duration(k)*interval))
+	}
+	return buckets, start.Add(time.Duration(n+1) * interval)
 }
 
 // cronBuckets returns the missed fire times of a cron schedule from start
 // through now (capped at the most recent limit), and the first fire time
 // strictly after now. start is treated as a valid fire time.
+//
+// Cron has no closed form, so iteration stays O(missed fires); a ring buffer of
+// size limit keeps allocation at O(limit) rather than building the whole history
+// (the same stale-next_run_at unbounded-allocation risk intervalBuckets guards
+// against). A non-positive limit keeps the original unbounded collection.
 func cronBuckets(expr string, start, now time.Time, limit int) ([]time.Time, time.Time, error) {
 	schedule, err := cron.ParseStandard(expr)
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("jobs: parse cron %q: %w", expr, err)
 	}
-	var all []time.Time
+	if limit <= 0 {
+		var all []time.Time
+		t := start
+		for !t.After(now) {
+			all = append(all, t)
+			t = schedule.Next(t)
+		}
+		return all, t, nil
+	}
+	ring := make([]time.Time, limit)
+	n := 0 // total missed fires seen
 	t := start
 	for !t.After(now) {
-		all = append(all, t)
+		ring[n%limit] = t
+		n++
 		t = schedule.Next(t)
 	}
-	return capBuckets(all, limit), t, nil
-}
-
-// capBuckets keeps only the most recent limit entries.
-func capBuckets(all []time.Time, limit int) []time.Time {
-	if limit > 0 && len(all) > limit {
-		return all[len(all)-limit:]
+	// The most recent min(n, limit) fires, oldest first. The oldest retained fire
+	// is overall index n-count, which lives at ring[(n-count) % limit].
+	count := min(n, limit)
+	buckets := make([]time.Time, count)
+	for i := range count {
+		buckets[i] = ring[(n-count+i)%limit]
 	}
-	return all
+	return buckets, t, nil
 }

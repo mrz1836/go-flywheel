@@ -1,7 +1,6 @@
 package observers
 
 import (
-	"cmp"
 	"context"
 	"maps"
 	"slices"
@@ -336,36 +335,45 @@ func (m *MemRecorder) atSeriesCap() bool {
 	return len(m.counters)+len(m.gauges)+len(m.observed)+len(m.histograms) >= m.maxSeries
 }
 
-// Count adds delta to the named counter series.
-func (m *MemRecorder) Count(name string, delta int64, tags map[string]string) {
-	key := seriesKey(name, tags)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	cell, ok := m.counters[key]
+// upsertCell returns the cell keyed by key in seriesMap, minting one via newCell
+// when absent. It returns nil — after counting one dropped series — when a new
+// cell would push the recorder past its combined series cap, so a runaway tag
+// cannot grow a map without limit. The caller holds m.mu.
+func upsertCell[C any](m *MemRecorder, seriesMap map[string]*C, key string, newCell func() *C) *C {
+	cell, ok := seriesMap[key]
 	if !ok {
 		if m.atSeriesCap() {
 			m.droppedSeries++
-			return
+			return nil
 		}
-		cell = &counterCell{name: name, tags: copyTags(tags)}
-		m.counters[key] = cell
+		cell = newCell()
+		seriesMap[key] = cell
+	}
+	return cell
+}
+
+// Count adds delta to the named counter series.
+func (m *MemRecorder) Count(name string, delta int64, tags map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cell := upsertCell(m, m.counters, seriesKey(name, tags), func() *counterCell {
+		return &counterCell{name: name, tags: copyTags(tags)}
+	})
+	if cell == nil {
+		return
 	}
 	cell.value += delta
 }
 
 // Gauge sets the named gauge series to value (last write wins).
 func (m *MemRecorder) Gauge(name string, value float64, tags map[string]string) {
-	key := seriesKey(name, tags)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cell, ok := m.gauges[key]
-	if !ok {
-		if m.atSeriesCap() {
-			m.droppedSeries++
-			return
-		}
-		cell = &gaugeCell{name: name, tags: copyTags(tags)}
-		m.gauges[key] = cell
+	cell := upsertCell(m, m.gauges, seriesKey(name, tags), func() *gaugeCell {
+		return &gaugeCell{name: name, tags: copyTags(tags)}
+	})
+	if cell == nil {
+		return
 	}
 	cell.value = value
 }
@@ -373,17 +381,13 @@ func (m *MemRecorder) Gauge(name string, value float64, tags map[string]string) 
 // Observe folds value into the named distribution series as a running sum and
 // count, so an average is sum/count.
 func (m *MemRecorder) Observe(name string, value float64, tags map[string]string) {
-	key := seriesKey(name, tags)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cell, ok := m.observed[key]
-	if !ok {
-		if m.atSeriesCap() {
-			m.droppedSeries++
-			return
-		}
-		cell = &observedCell{name: name, tags: copyTags(tags)}
-		m.observed[key] = cell
+	cell := upsertCell(m, m.observed, seriesKey(name, tags), func() *observedCell {
+		return &observedCell{name: name, tags: copyTags(tags)}
+	})
+	if cell == nil {
+		return
 	}
 	cell.sum += value
 	cell.count++
@@ -395,22 +399,18 @@ func (m *MemRecorder) Observe(name string, value float64, tags map[string]string
 // bucket but still lifts sum and count, so the +Inf bucket the renderer derives
 // equals count.
 func (m *MemRecorder) Histogram(name string, value float64, tags map[string]string) {
-	key := seriesKey(name, tags)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cell, ok := m.histograms[key]
-	if !ok {
-		if m.atSeriesCap() {
-			m.droppedSeries++
-			return
-		}
-		cell = &histogramCell{
+	cell := upsertCell(m, m.histograms, seriesKey(name, tags), func() *histogramCell {
+		return &histogramCell{
 			name:    name,
 			tags:    copyTags(tags),
 			buckets: m.buckets,
 			counts:  make([]uint64, len(m.buckets)),
 		}
-		m.histograms[key] = cell
+	})
+	if cell == nil {
+		return
 	}
 	// buckets is ascending, so the first bound >= value is the bucket value falls
 	// in (le semantics: a value exactly on a boundary counts into that bucket).
@@ -470,52 +470,48 @@ type Snapshot struct {
 	DroppedSeries int64
 }
 
+// snapshotSeries converts every cell in seriesMap to an output series via conv,
+// in ascending map-key order. Invariant: every map key is
+// seriesKey(cell.Name, cell.Tags), so ordering by map key is exactly ordering by
+// (name, tags) — the deterministic order a Snapshot promises — with no per-type
+// comparator. The caller holds m.mu.
+func snapshotSeries[C any, S any](seriesMap map[string]*C, conv func(*C) S) []S {
+	keys := slices.Sorted(maps.Keys(seriesMap))
+	out := make([]S, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, conv(seriesMap[k]))
+	}
+	return out
+}
+
 // Snapshot copies every series out under the lock. The returned maps are private
 // copies the caller may read freely without racing concurrent recording.
 func (m *MemRecorder) Snapshot() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	snap := Snapshot{
-		Counters:      make([]CounterSeries, 0, len(m.counters)),
-		Gauges:        make([]GaugeSeries, 0, len(m.gauges)),
-		Observations:  make([]ObservationSeries, 0, len(m.observed)),
-		Histograms:    make([]HistogramSeries, 0, len(m.histograms)),
+	return Snapshot{
+		Counters: snapshotSeries(m.counters, func(c *counterCell) CounterSeries {
+			return CounterSeries{Name: c.name, Tags: copyTags(c.tags), Value: c.value}
+		}),
+		Gauges: snapshotSeries(m.gauges, func(g *gaugeCell) GaugeSeries {
+			return GaugeSeries{Name: g.name, Tags: copyTags(g.tags), Value: g.value}
+		}),
+		Observations: snapshotSeries(m.observed, func(o *observedCell) ObservationSeries {
+			return ObservationSeries{Name: o.name, Tags: copyTags(o.tags), Sum: o.sum, Count: o.count}
+		}),
+		Histograms: snapshotSeries(m.histograms, func(h *histogramCell) HistogramSeries {
+			return HistogramSeries{
+				Name:    h.name,
+				Tags:    copyTags(h.tags),
+				Buckets: slices.Clone(h.buckets),
+				Counts:  slices.Clone(h.counts),
+				Sum:     h.sum,
+				Count:   h.count,
+			}
+		}),
 		DroppedSeries: m.droppedSeries,
 	}
-	for _, c := range m.counters {
-		snap.Counters = append(snap.Counters, CounterSeries{Name: c.name, Tags: copyTags(c.tags), Value: c.value})
-	}
-	for _, g := range m.gauges {
-		snap.Gauges = append(snap.Gauges, GaugeSeries{Name: g.name, Tags: copyTags(g.tags), Value: g.value})
-	}
-	for _, o := range m.observed {
-		snap.Observations = append(snap.Observations, ObservationSeries{Name: o.name, Tags: copyTags(o.tags), Sum: o.sum, Count: o.count})
-	}
-	for _, h := range m.histograms {
-		snap.Histograms = append(snap.Histograms, HistogramSeries{
-			Name:    h.name,
-			Tags:    copyTags(h.tags),
-			Buckets: slices.Clone(h.buckets),
-			Counts:  slices.Clone(h.counts),
-			Sum:     h.sum,
-			Count:   h.count,
-		})
-	}
-
-	slices.SortFunc(snap.Counters, func(a, b CounterSeries) int {
-		return cmp.Compare(seriesKey(a.Name, a.Tags), seriesKey(b.Name, b.Tags))
-	})
-	slices.SortFunc(snap.Gauges, func(a, b GaugeSeries) int {
-		return cmp.Compare(seriesKey(a.Name, a.Tags), seriesKey(b.Name, b.Tags))
-	})
-	slices.SortFunc(snap.Observations, func(a, b ObservationSeries) int {
-		return cmp.Compare(seriesKey(a.Name, a.Tags), seriesKey(b.Name, b.Tags))
-	})
-	slices.SortFunc(snap.Histograms, func(a, b HistogramSeries) int {
-		return cmp.Compare(seriesKey(a.Name, a.Tags), seriesKey(b.Name, b.Tags))
-	})
-	return snap
 }
 
 // seriesKey builds a canonical identity for a metric series: its name plus its
@@ -544,8 +540,6 @@ func copyTags(tags map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(tags))
-	for k, v := range tags {
-		out[k] = v
-	}
+	maps.Copy(out, tags)
 	return out
 }

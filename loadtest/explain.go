@@ -3,11 +3,12 @@
 package loadtest
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -952,14 +953,14 @@ func captureStatements(
 // sortCells orders the matrix by condition, then predicate, then variant, so the
 // artifact reads as a table rather than as the order the loop happened to visit.
 func sortCells(cells []ExplainCell) {
-	sort.SliceStable(cells, func(i, j int) bool {
-		if cells[i].Condition != cells[j].Condition {
-			return cells[i].Condition < cells[j].Condition
+	slices.SortStableFunc(cells, func(a, b ExplainCell) int {
+		if a.Condition != b.Condition {
+			return cmp.Compare(a.Condition, b.Condition)
 		}
-		if cells[i].Predicate != cells[j].Predicate {
-			return cells[i].Predicate < cells[j].Predicate
+		if a.Predicate != b.Predicate {
+			return cmp.Compare(a.Predicate, b.Predicate)
 		}
-		return cells[i].Variant < cells[j].Variant
+		return cmp.Compare(a.Variant, b.Variant)
 	})
 }
 
