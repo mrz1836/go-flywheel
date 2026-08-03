@@ -77,8 +77,10 @@ func newStatusCmd(configPath *string) *cobra.Command {
 }
 
 // runStatusWatch clears and redraws the text status every interval until the
-// command's context is cancelled (Ctrl-C). A render error during cancellation is
-// treated as a clean stop rather than a failure.
+// command's context is cancelled (Ctrl-C). Each frame renders with a context
+// detached from cancellation so an in-flight redraw always completes — a Ctrl-C
+// that races the first frame still leaves a full snapshot on screen rather than a
+// blank cleared one. Interruption is honored between frames by the select below.
 func runStatusWatch(cmd *cobra.Command, db *gorm.DB, cfg *Config, interval time.Duration) error {
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
@@ -87,10 +89,7 @@ func runStatusWatch(cmd *cobra.Command, db *gorm.DB, cfg *Config, interval time.
 	for {
 		// ANSI clear-screen + cursor-home so each redraw replaces the last frame.
 		_, _ = fmt.Fprint(out, "\033[2J\033[H")
-		if err := renderStatusOnce(ctx, out, db, cfg, false); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
+		if err := renderStatusOnce(context.WithoutCancel(ctx), out, db, cfg, false); err != nil {
 			return err
 		}
 		select {
