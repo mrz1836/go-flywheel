@@ -244,7 +244,14 @@ func closedChan() chan struct{} {
 // it kept ticking.
 func TestLeaseHeartbeatStopsOnClaimLoss(t *testing.T) {
 	t.Parallel()
-	db := newDB(t)
+	// A WAL file DB (busy_timeout, _txlock=immediate — the production daemon's
+	// own config) rather than the shared-cache in-memory fixture: the heartbeat
+	// renews on one connection while the steal below writes on another, and
+	// shared-cache without a busy_timeout turns that overlap into an intermittent
+	// "database is locked" error on RetryJob/Dequeue. WAL + busy_timeout serializes
+	// the same writers instead of failing them, removing the flake without weakening
+	// what the test exercises.
+	db := newWALFileDB(t)
 	driver := &countingRenewDriver{Driver: NewSQLiteDriver(db)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
