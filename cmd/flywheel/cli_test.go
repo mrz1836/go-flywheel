@@ -14,10 +14,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// runRoot executes the root command with args, capturing combined output. A nil
-// update nudge keeps the command tree network-free in tests.
+// runRoot executes the root command with args, capturing combined output. The
+// passive update check wired by cobracmd is a no-op under a dev build (the
+// version tests resolve to in the test binary), so the command tree stays
+// network-free in tests.
 func runRoot(ctx context.Context, args ...string) (string, error) {
-	root := newRootCmd(nil)
+	root := newRootCmd()
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)

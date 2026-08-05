@@ -5,7 +5,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/mrz1836/go-flywheel/cmd/flywheel/internal/update"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,7 +15,7 @@ func TestRunReturnsZeroOnSuccess(t *testing.T) {
 	// cache; pin it to a temp dir so the check is hermetic.
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("FLYWHEEL_DISABLE_UPDATE_CHECK", "1")
+	t.Setenv("FLYWHEEL_NO_UPDATE_CHECK", "1")
 
 	var stderr bytes.Buffer
 	code := run(context.Background(), []string{"version"}, &stderr)
@@ -27,7 +26,7 @@ func TestRunReturnsZeroOnSuccess(t *testing.T) {
 func TestRunReturnsOneAndWritesErrorOnFailure(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("FLYWHEEL_DISABLE_UPDATE_CHECK", "1")
+	t.Setenv("FLYWHEEL_NO_UPDATE_CHECK", "1")
 
 	var stderr bytes.Buffer
 	// An unknown command makes Execute return an error, so run reports exit code 1.
@@ -36,34 +35,26 @@ func TestRunReturnsOneAndWritesErrorOnFailure(t *testing.T) {
 	assert.Contains(t, stderr.String(), "flywheel:", "the error is prefixed and written to stderr")
 }
 
-func TestShowUpdateBannerDrainsAvailableResult(t *testing.T) {
+// TestUpdateCommandWiring locks the seam between newRootCmd and the go-selfupdate
+// cobracmd package: the update command is registered with the upgrade alias and
+// the check/force/verbose boolean flags. The command's behavior itself is covered
+// by the library's own suites, so this asserts only the wiring.
+func TestUpdateCommandWiring(t *testing.T) {
 	t.Parallel()
-	// A non-nil channel carrying an available update is drained without blocking; the
-	// banner itself writes to os.Stderr, so here we just prove the drain path runs.
-	ch := make(chan *update.Result, 1)
-	ch <- &update.Result{CurrentVersion: "v1.0.0", LatestVersion: "v2.0.0", UpdateAvailable: true}
 
-	cmd := &cobra.Command{Use: "status"}
-	assert.NotPanics(t, func() { showUpdateBanner(cmd, ch) }, "draining an available result runs the banner path")
-}
+	var updateCmd *cobra.Command
+	for _, c := range newRootCmd().Commands() {
+		if c.Name() == "update" {
+			updateCmd = c
+			break
+		}
+	}
+	require.NotNil(t, updateCmd, "newRootCmd registers an update command")
+	assert.Contains(t, updateCmd.Aliases, "upgrade", "the update command carries the upgrade alias")
 
-func TestShowUpdateBannerTimesOutWhenChannelSilent(t *testing.T) {
-	t.Parallel()
-	// An open, empty channel forces the drain-timeout branch (bounded, never hangs).
-	ch := make(chan *update.Result)
-	cmd := &cobra.Command{Use: "status"}
-	assert.NotPanics(t, func() { showUpdateBanner(cmd, ch) }, "a silent channel falls through the bounded timeout")
-}
-
-func TestShowUpdateBannerSkippedForNilAndUpdateCommand(t *testing.T) {
-	t.Parallel()
-	// A nil channel is a no-op (banner disabled, e.g. in tests).
-	assert.NotPanics(t, func() { showUpdateBanner(&cobra.Command{Use: "status"}, nil) })
-
-	// The update command speaks for itself, so the banner is suppressed even with a
-	// ready result on the channel.
-	ch := make(chan *update.Result, 1)
-	ch <- &update.Result{UpdateAvailable: true}
-	require.NotNil(t, ch)
-	assert.NotPanics(t, func() { showUpdateBanner(&cobra.Command{Use: "update"}, ch) })
+	for _, name := range []string{"check", "force", "verbose"} {
+		flag := updateCmd.Flags().Lookup(name)
+		require.NotNilf(t, flag, "the update command registers --%s", name)
+		assert.Equalf(t, "bool", flag.Value.Type(), "--%s is a boolean flag", name)
+	}
 }

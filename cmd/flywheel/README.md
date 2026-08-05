@@ -5,8 +5,8 @@
 SQLite or PostgreSQL from a `flywheel.yaml` file, turns declarative schedules into
 durable cron replacements, and inspects and operates the queue.
 
-It is a **nested Go module** (its own `go.mod`) so the heavier CLI dependencies
-(cobra, yaml) never reach consumers of the root library.
+It lives in the single Go module rooted at the repository — there is no separate
+`go.mod` here; the command and the library ship together.
 
 ## Install
 
@@ -16,7 +16,31 @@ go install github.com/mrz1836/go-flywheel/cmd/flywheel@latest
 
 No CGO or C toolchain required — SQLite is the pure-Go `modernc` driver, so the
 binary cross-compiles to every platform. You can also grab a prebuilt binary
-from the releases page, or self-update an existing install with `flywheel update`.
+from the releases page, or self-update an existing install with `flywheel update`
+(see [Updating](#updating)).
+
+## Updating
+
+Self-update is provided by [go-selfupdate](https://github.com/mrz1836/go-selfupdate).
+`flywheel update` (alias `flywheel upgrade`) downloads the latest release, verifies its
+SHA-256 checksum against the published `go-flywheel_<ver>_checksums.txt`, and atomically
+replaces the running binary — nothing is written until the download has been verified.
+
+| Flag | Effect |
+|---|---|
+| `--check` | Report whether a newer release is available without installing |
+| `--force` | Reinstall the latest release even when it is not newer than the running build |
+| `--verbose`, `-v` | Narrate each step (and print the release notes with `--check`) |
+
+A binary owned by another installer is **refused rather than overwritten**: a Homebrew
+or `go install` build declines the in-place update and points at the right reinstall
+path. A plain binary on your `PATH` (prebuilt or locally built) updates in place.
+
+Every other command runs a passive, cached (24h) background check and prints a one-line
+"a new version is available" notice — it never blocks or fails a command. The check is
+skipped for a development build and can be silenced with `FLYWHEEL_NO_UPDATE_CHECK=1`
+(or the shared `NO_UPDATE_CHECK` / `CI`). When a GitHub token is needed for rate limits
+it is read from `FLYWHEEL_GITHUB_TOKEN`, then `GITHUB_TOKEN`, then `GH_TOKEN`.
 
 ## Quick start
 

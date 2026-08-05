@@ -12,15 +12,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"github.com/mrz1836/go-flywheel/cmd/flywheel/internal/update"
+	selfupdate "github.com/mrz1836/go-selfupdate"
+	"github.com/mrz1836/go-selfupdate/cobracmd"
 	"github.com/spf13/cobra"
 )
-
-// nudgeDrainTimeout bounds how long the root command waits for the background
-// update check before giving up and exiting without a banner.
-const nudgeDrainTimeout = 500 * time.Millisecond
 
 // Build-time metadata, injected by goreleaser ldflags
 // (-X main.version=… -X main.commit=… -X main.buildDate=…). For a `go install`
@@ -46,13 +42,7 @@ func main() {
 // error to stderr, and returns the process exit code. It is the testable core of
 // main: main only wires signal handling and os.Exit around it.
 func run(ctx context.Context, args []string, stderr io.Writer) int {
-	// Kick off a non-blocking "is a newer version available?" check. It is a no-op
-	// under CI / FLYWHEEL_DISABLE_UPDATE_CHECK / a dev build, and the root command
-	// drains it with a short timeout so a slow network never delays the CLI.
-	current := resolveVersion()
-	nudge := update.StartBackgroundCheck(ctx, current, update.NewGitHubFetcher(current))
-
-	root := newRootCmd(nudge)
+	root := newRootCmd()
 	root.SetArgs(args)
 	if err := root.ExecuteContext(ctx); err != nil {
 		_, _ = fmt.Fprintln(stderr, "flywheel:", err)
@@ -61,20 +51,19 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 	return 0
 }
 
-// newRootCmd assembles the command tree. nudge carries the background update
-// check; the root drains it after a successful command and prints a banner when
-// an update is available. A nil channel disables the banner (used by tests).
-func newRootCmd(nudge <-chan *update.Result) *cobra.Command {
+// newRootCmd assembles the command tree. The self-update command and the passive
+// "a new version is available" banner are wired from a single selfupdate.Config
+// by cobracmd.Attach, which derives the cache slug and the FLYWHEEL_ env prefix
+// from BinaryName. The banner check is a no-op under CI / NO_UPDATE_CHECK /
+// FLYWHEEL_NO_UPDATE_CHECK / a dev build, and never blocks the CLI on a slow
+// network.
+func newRootCmd() *cobra.Command {
 	var configPath string
 	root := &cobra.Command{
 		Use:           "flywheel",
 		Short:         "Durable local job runtime: a cron replacement and queue operator CLI",
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		PersistentPostRunE: func(cmd *cobra.Command, _ []string) error {
-			showUpdateBanner(cmd, nudge)
-			return nil
-		},
 	}
 	root.PersistentFlags().StringVar(&configPath, "config", defaultConfigPath(), "path to flywheel.yaml")
 	root.AddCommand(
@@ -87,22 +76,16 @@ func newRootCmd(nudge <-chan *update.Result) *cobra.Command {
 		newStatusCmd(&configPath),
 		newDoctorCmd(&configPath),
 		newVersionCmd(),
-		newUpdateCmd(),
 	)
-	return root
-}
 
-// showUpdateBanner drains the background update check (bounded by
-// nudgeDrainTimeout) and prints the banner when an update is available. It is a
-// no-op for a nil channel and for the update command itself (which speaks for
-// itself), and never blocks the CLI on a slow check.
-func showUpdateBanner(cmd *cobra.Command, nudge <-chan *update.Result) {
-	if nudge == nil || cmd.Name() == "update" {
-		return
-	}
-	select {
-	case result := <-nudge:
-		update.ShowBanner(result)
-	case <-time.After(nudgeDrainTimeout):
-	}
+	current := resolveVersion()
+	cobracmd.Attach(root, selfupdate.Config{
+		Owner:          "mrz1836",
+		Repo:           "go-flywheel",
+		BinaryName:     "flywheel",
+		CurrentVersion: current,
+		TokenEnvVar:    "FLYWHEEL_GITHUB_TOKEN",
+	})
+
+	return root
 }
