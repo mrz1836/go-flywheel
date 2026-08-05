@@ -10,14 +10,33 @@ It lives in the single Go module rooted at the repository — there is no separa
 
 ## Install
 
+Download the prebuilt binary for your platform from the [releases page][releases]. This is
+the recommended install — and the one `flywheel update` can keep current for you.
+
+Install it into a **user-writable directory on your `PATH`**. `~/.local/bin` is the
+recommended target: no `sudo`, and self-update works from there.
+
 ```bash
-go install github.com/mrz1836/go-flywheel/cmd/flywheel@latest
+# macOS arm64 shown; match the asset to `uname -sm`
+tar -xzf go-flywheel_<ver>_darwin_arm64.tar.gz
+mkdir -p ~/.local/bin
+mv flywheel ~/.local/bin/flywheel
+# make sure ~/.local/bin is on PATH, ahead of ~/go/bin
 ```
 
-No CGO or C toolchain required — SQLite is the pure-Go `modernc` driver, so the
-binary cross-compiles to every platform. You can also grab a prebuilt binary
-from the releases page, or self-update an existing install with `flywheel update`
-(see [Updating](#updating)).
+Each release also ships `go-flywheel_<ver>_checksums.txt` so you can verify the archive's
+SHA-256 before installing. From here on, `flywheel update` keeps the binary current on its
+own (see [Updating](#updating)).
+
+No CGO or C toolchain required — SQLite is the pure-Go `modernc` driver, so the binary
+cross-compiles to every platform.
+
+> **Skip `go install` for everyday use.** It lands the binary in `~/go/bin`, where the Go
+> toolchain owns it, so `flywheel update` will refuse to replace it and you're back to
+> updating by hand. Use the release binary above. (`go build ./cmd/flywheel` from a
+> checkout is fine for development.)
+
+[releases]: https://github.com/mrz1836/go-flywheel/releases
 
 ## Updating
 
@@ -32,9 +51,19 @@ replaces the running binary — nothing is written until the download has been v
 | `--force` | Reinstall the latest release even when it is not newer than the running build |
 | `--verbose`, `-v` | Narrate each step (and print the release notes with `--check`) |
 
-A binary owned by another installer is **refused rather than overwritten**: a Homebrew
-or `go install` build declines the in-place update and points at the right reinstall
-path. A plain binary on your `PATH` (prebuilt or locally built) updates in place.
+`flywheel update` replaces the binary **in place**, so where it lives matters. Two
+conditions have to hold, and both fail loudly with a message that names the fix:
+
+- **The install directory must be writable by you.** A binary in a root-owned location
+  like `/usr/local/bin` fails with `install dir not writable` — updating it would need
+  `sudo`. Install into a user-writable dir such as `~/.local/bin` instead.
+- **The binary must not be owned by another installer.** A `go install` build (in the Go
+  bin directory) or a Homebrew binary is **refused rather than overwritten** — replacing
+  a file another tool believes it owns would break both. Update those the way they were
+  installed: `go install …@latest`, or `brew upgrade flywheel`.
+
+A plain binary in a user-writable `PATH` directory — the [Option B](#install) install —
+updates cleanly, no `sudo`.
 
 Every other command runs a passive, cached (24h) background check and prints a one-line
 "a new version is available" notice — it never blocks or fails a command. The check is

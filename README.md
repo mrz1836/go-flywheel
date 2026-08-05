@@ -1113,11 +1113,12 @@ the cutoff. Pending and running work is never touched, whatever its age.
 <br>
 
 The [`flywheel` CLI](cmd/flywheel/README.md) runs the runtime as a local daemon over a SQLite file
-(zero-ops) or Postgres, and replaces cron with durable scheduled jobs — no custom Go required:
+(zero-ops) or Postgres, and replaces cron with durable scheduled jobs — no custom Go required.
+Grab the prebuilt binary for your platform from the
+[releases page](https://github.com/mrz1836/go-flywheel/releases) and install it to `~/.local/bin`
+so `flywheel update` can keep it current (see [Install](cmd/flywheel/README.md#install)):
 
 ```bash
-go install github.com/mrz1836/go-flywheel/cmd/flywheel@latest
-
 flywheel migrate   # stand up the schema
 flywheel serve     # run runner + scheduler until Ctrl+C
 flywheel jobs ls   # inspect the queue
