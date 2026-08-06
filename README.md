@@ -1278,6 +1278,8 @@ Four complete, runnable programs live under [`examples/`](examples), smallest fi
 - **[`local-tasks`](examples/local-tasks)** — local developer tasks run durably: a shell script, a Python script, and a magex/mage target, each a typed worker with a captured audit trail.
 - **[`split-executors`](examples/split-executors)** — one registry across two executors, a long-running pool and a bounded invocation-scoped burst, routed by `ExecutorClass`.
 
+Testing your own integration? The [`flywheeltest`](flywheeltest) package ships ready-made fixtures — an in-memory or file-backed SQLite database (or an isolated PostgreSQL schema) with the runtime schema migrated in, plus `WaitForJobState` and a trivial success worker — so your tests can enqueue and assert without a bespoke harness.
+
 All unit tests run via [GitHub Actions](https://github.com/mrz1836/go-flywheel/actions) and use [Go version 1.25.x](https://go.dev/doc/go1.25). View the [configuration file](.github/workflows/fortress.yml).
 
 Run all tests (fast):
