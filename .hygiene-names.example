@@ -1,0 +1,12 @@
+# Hygiene codename list for scripts/cohesion-check.sh.
+#
+# Copy this file to ".hygiene-names" (which is gitignored) and fill in the real
+# internal consumer names / codenames the hygiene gate should catch. One name
+# per line; blank lines and lines starting with '#' are ignored. Alternatively,
+# set HYGIENE_NAMES to a pipe-separated list.
+#
+# These names must NEVER be committed to this public repo — keeping them out of
+# version control is the entire point of the gate.
+#
+# example-codename
+# another-internal-name

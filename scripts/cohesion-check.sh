@@ -124,12 +124,29 @@ fi
 
 # ---------------------------------------------------------------------------
 # 3. Hygiene: no consumer name or planning id in any committed artifact.
-#    The unambiguous proper nouns and id shapes are the automated gate; the
-#    internal codenames that collide with English ("reach", "control") are left
-#    to human review, since a word grep on them can never be empty.
+#    Planning-id shapes are generic and leak nothing, so they are the always-on
+#    automated gate. The consumer/codename list is deliberately NOT committed —
+#    hardcoding the names here would itself be the leak — so it is read from the
+#    local, gitignored .hygiene-names (one name per line; blank lines and '#'
+#    comments ignored) or the HYGIENE_NAMES env var (pipe-separated). With no
+#    list supplied, only the id-shape gate runs. Internal codenames that collide
+#    with English ("reach", "control") are still left to human review, since a
+#    word grep on them can never be empty.
 # ---------------------------------------------------------------------------
 section "hygiene grep (consumer names + planning ids)"
-if grep -rniE '\b(redacted|redacted|redacted|redacted|redacted)\b|\b(FR|SC|WS)-[0-9]' \
+pattern='\b(FR|SC|WS)-[0-9]'
+names=''
+if [ -n "${HYGIENE_NAMES:-}" ]; then
+    names="$HYGIENE_NAMES"
+elif [ -f .hygiene-names ]; then
+    names=$(grep -vE '^[[:space:]]*(#|$)' .hygiene-names | paste -sd '|' -)
+fi
+if [ -n "$names" ]; then
+    pattern="\\b($names)\\b|$pattern"
+else
+    echo "  note: no codename list (.hygiene-names / HYGIENE_NAMES); id-shape gate only"
+fi
+if grep -rniE "$pattern" \
         --include='*.go' --include='*.md' --include='*.yml' . | grep -v '^\./plans/'; then
     echo "  FAIL: hygiene hits above"; fail=1
 else

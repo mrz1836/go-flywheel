@@ -33,6 +33,9 @@ todo.md
 # Working plans (temporary, local-only)
 /plans/
 
+# Hygiene codename list for scripts/cohesion-check.sh (local-only; never commit)
+.hygiene-names
+
 # Distribution
 dist
 
