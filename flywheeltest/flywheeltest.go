@@ -1,8 +1,3 @@
-// Package flywheeltest provides shared test fixtures for the internal packages
-// that split out of core (node, and any later peel). Everything here is built on
-// core's exported API, so a package's white-box tests get the same in-memory
-// database, worker double, and polling helpers without reaching into core's
-// unexported internals.
 package flywheeltest
 
 import (

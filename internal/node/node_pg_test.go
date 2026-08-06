@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	ft "github.com/mrz1836/go-flywheel/flywheeltest"
 	core "github.com/mrz1836/go-flywheel/internal/core"
-	ft "github.com/mrz1836/go-flywheel/internal/flywheeltest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
