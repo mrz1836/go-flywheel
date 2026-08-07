@@ -10,23 +10,29 @@ It lives in the single Go module rooted at the repository — there is no separa
 
 ## Install
 
-Download the prebuilt binary for your platform from the [releases page][releases]. This is
-the recommended install — and the one `flywheel update` can keep current for you.
+Install the latest prebuilt release into `~/.local/bin` — a user-writable directory, so no
+`sudo`, and `flywheel update` can self-update in place afterward.
 
-Install it into a **user-writable directory on your `PATH`**. `~/.local/bin` is the
-recommended target: no `sudo`, and self-update works from there.
+No `curl … | sudo bash` here — we don't ask you to pipe a mystery script into your shell
+and hope for the best. Every line below is in the open, and the download is checked against
+the release's published SHA-256 checksums before anything lands on your `PATH`:
 
 ```bash
-# macOS arm64 shown; match the asset to `uname -sm`
-tar -xzf go-flywheel_<ver>_darwin_arm64.tar.gz
-mkdir -p ~/.local/bin
-mv flywheel ~/.local/bin/flywheel
-# make sure ~/.local/bin is on PATH, ahead of ~/go/bin
+# Install the latest flywheel release into ~/.local/bin, verified against checksums.txt
+VER=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/mrz1836/go-flywheel/releases/latest | sed 's#.*/v##')
+OS=$(uname -s | tr '[:upper:]' '[:lower:]'); ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+F="go-flywheel_${VER}_${OS}_${ARCH}.tar.gz"; U="https://github.com/mrz1836/go-flywheel/releases/download/v${VER}"
+mkdir -p ~/.local/bin && cd "$(mktemp -d)" && curl -fsSLO "$U/$F" \
+  && WANT=$(curl -fsSL "$U/go-flywheel_${VER}_checksums.txt" | awk -v f="$F" '$2==f{print $1}') \
+  && GOT=$( { command -v sha256sum >/dev/null && sha256sum "$F" || shasum -a 256 "$F"; } | awk '{print $1}') \
+  && [ -n "$WANT" ] && [ "$WANT" = "$GOT" ] \
+  && tar -xzf "$F" -C ~/.local/bin flywheel
+flywheel version
 ```
 
-Each release also ships `go-flywheel_<ver>_checksums.txt` so you can verify the archive's
-SHA-256 before installing. From here on, `flywheel update` keeps the binary current on its
-own (see [Updating](#updating)).
+Prefer to grab a specific build yourself? Every release on the [releases page][releases]
+ships `go-flywheel_<ver>_checksums.txt`, so you can verify it by hand with `shasum -a 256 -c`.
+From here on, `flywheel update` keeps the binary current on its own (see [Updating](#updating)).
 
 No CGO or C toolchain required — SQLite is the pure-Go `modernc` driver, so the binary
 cross-compiles to every platform.
