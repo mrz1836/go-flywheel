@@ -51,6 +51,12 @@ const (
 	// their claim was lost. It is the double-execution signal: every increment is
 	// work that ran and did not count.
 	MetricJobsSuperseded = "flywheel_jobs_superseded_total"
+	// MetricSweepReclaimed counts the expired leases a sweep pass returned to
+	// available — work a crashed executor left behind that the sweep, not clean
+	// finalization, recovered. It is the crash-recovery signal: a steadily nonzero
+	// rate means executors are dying mid-attempt often enough that recovery leans
+	// on the sweep rather than on jobs finalizing themselves.
+	MetricSweepReclaimed = "flywheel_sweep_reclaimed_total"
 )
 
 // Duration histogram names. Unlike MetricJobDuration's historical summary form,
@@ -122,6 +128,7 @@ type HistogramConfig struct {
 //	OnRetry  -> Count(flywheel_jobs_retried_total, 1, {kind, error_class})
 //	OnSupersede -> Count(flywheel_jobs_superseded_total, 1, {kind, queue})
 //	OnSweep  -> Histogram(flywheel_sweep_duration_seconds, secs, {})
+//	            Count(flywheel_sweep_reclaimed_total, reclaimed, {})
 //
 // The duration series are histograms, not summaries, so p50/p99 are derivable:
 // flywheel_job_duration_seconds was upgraded from the summary Observe form. A
@@ -214,11 +221,15 @@ func (m *MetricsObserver) OnSupersede(_ context.Context, ev flywheel.SupersedeEv
 	})
 }
 
-// OnSweep records the stuck-lease reclaim pass duration. It carries no tags: a
-// deployment runs one scheduler, so the sweep is a single series whose slow tail
-// is the database-load signal to watch.
+// OnSweep records the stuck-lease reclaim pass: its duration and the count of
+// expired leases it returned to available. Both carry no tags — a deployment runs
+// one scheduler, so each is a single series. The duration's slow tail is the
+// database-load signal; the reclaimed count is the crash-recovery signal, and it
+// is emitted even when zero so the counter series always exists and rate() alerts
+// have a baseline.
 func (m *MetricsObserver) OnSweep(_ context.Context, ev flywheel.SweepEvent) {
 	m.rec.Histogram(MetricSweepDuration, ev.Duration.Seconds(), nil)
+	m.rec.Count(MetricSweepReclaimed, int64(ev.Reclaimed), nil)
 }
 
 // MemRecorder is a concurrent-safe, in-memory MetricsRecorder. It is three things

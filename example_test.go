@@ -79,7 +79,9 @@ func ExampleNewNode() {
 			Concurrency:   1,
 			ClaimAnyClass: true,
 		}},
-		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db)},
+		// The scheduler needs its own Driver (the dialect + observability seam);
+		// SchedulerConfig requires it explicitly, unlike the NewScheduler shorthand.
+		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db), Driver: flywheel.NewSQLiteDriver(db)},
 		Health:    flywheel.HealthConfig{Addr: ":8080"},
 		Logger:    slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 	})
