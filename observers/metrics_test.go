@@ -228,10 +228,28 @@ func TestMetricsObserverOnSweepTimesTheSweep(t *testing.T) {
 		Duration: 12 * time.Millisecond, Reclaimed: 4,
 	})
 
-	require.Len(t, rec.calls, 1, "a sweep records one untagged duration histogram")
+	require.Len(t, rec.calls, 2, "a sweep records one duration histogram and one reclaimed count")
 	h := rec.only(t, "histogram", MetricSweepDuration)
 	assert.InDelta(t, 0.012, h.value, 1e-9)
-	assert.Nil(t, h.tags, "the sweep is a single series with no tags")
+	assert.Nil(t, h.tags, "the sweep duration is a single series with no tags")
+
+	c := rec.only(t, "count", MetricSweepReclaimed)
+	assert.EqualValues(t, 4, c.delta, "the reclaimed count carries the leases the pass recovered")
+	assert.Nil(t, c.tags, "the reclaimed count is a single series with no tags")
+}
+
+// TestMetricsObserverOnSweepEmitsReclaimedEvenWhenZero pins that the reclaimed
+// counter series is always created, so a rate() alert has a baseline before the
+// first crash rather than a series that only appears once work is already lost.
+func TestMetricsObserverOnSweepEmitsReclaimedEvenWhenZero(t *testing.T) {
+	t.Parallel()
+	rec := &fakeRecorder{}
+	NewMetrics(rec).OnSweep(context.Background(), flywheel.SweepEvent{
+		Duration: 3 * time.Millisecond, Reclaimed: 0,
+	})
+
+	c := rec.only(t, "count", MetricSweepReclaimed)
+	assert.EqualValues(t, 0, c.delta, "an empty sweep still records a zero reclaimed count")
 }
 
 func TestMetricsObserverImplementsObserver(t *testing.T) {
