@@ -1280,7 +1280,7 @@ Four complete, runnable programs live under [`examples/`](examples), smallest fi
 
 Testing your own integration? The [`flywheeltest`](flywheeltest) package ships ready-made fixtures — an in-memory or file-backed SQLite database (or an isolated PostgreSQL schema) with the runtime schema migrated in, plus `WaitForJobState` and a trivial success worker — so your tests can enqueue and assert without a bespoke harness.
 
-All unit tests run via [GitHub Actions](https://github.com/mrz1836/go-flywheel/actions) and use [Go version 1.25.x](https://go.dev/doc/go1.25). View the [configuration file](.github/workflows/fortress.yml).
+All unit tests run via [GitHub Actions](https://github.com/mrz1836/go-flywheel/actions) and use [Go version 1.26.x](https://go.dev/doc/go1.26). View the [configuration file](.github/workflows/fortress.yml).
 
 Run all tests (fast):
 
