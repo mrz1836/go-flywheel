@@ -153,7 +153,7 @@ func ListJobs(ctx context.Context, db *gorm.DB, p ListJobsParams) ([]JobView, er
 // ErrJobNotFound so the caller can map it to a 404.
 func FindJob(ctx context.Context, db *gorm.DB, id string) (JobView, error) {
 	var row jobRow
-	err := db.WithContext(ctx).Where("id = ?", id).First(&row).Error
+	err := quietMissing(db).WithContext(ctx).Where("id = ?", id).First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return JobView{}, ErrJobNotFound
 	}

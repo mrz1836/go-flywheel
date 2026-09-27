@@ -97,7 +97,7 @@ func UpsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) error {
 	}
 
 	var existing jobPeriodicRow
-	err := db.WithContext(ctx).Where("slug = ?", spec.Slug).First(&existing).Error
+	err := quietMissing(db).WithContext(ctx).Where("slug = ?", spec.Slug).First(&existing).Error
 	switch {
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		return insertPeriodic(ctx, db, spec, queue, args, now)
