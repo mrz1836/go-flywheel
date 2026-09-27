@@ -67,7 +67,7 @@ func Progress(ctx context.Context, db *gorm.DB, parentJobID string) (BatchProgre
 	// soft-deleted leaves its children pointing at an id no live row has, and that
 	// is a reportable state (empty ParentState), not a failure.
 	var parent jobRow
-	switch err := db.WithContext(ctx).Select("state").Where("id = ?", parentJobID).First(&parent).Error; {
+	switch err := quietMissing(db).WithContext(ctx).Select("state").Where("id = ?", parentJobID).First(&parent).Error; {
 	case err == nil:
 		bp.ParentState = JobState(parent.State)
 	case errors.Is(err, gorm.ErrRecordNotFound):

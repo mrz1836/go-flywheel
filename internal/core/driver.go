@@ -579,7 +579,7 @@ func (d *baseDriver) Finalize(
 			// lost — cancelled underneath the attempt, or reclaimed and re-running.
 			// It is one extra SELECT on a path that should be rare.
 			var current jobRow
-			switch err := tx.Model(&jobRow{}).
+			switch err := quietMissing(tx).Model(&jobRow{}).
 				Select("state").Where("id = ?", raw.ID).First(&current).Error; {
 			case err == nil:
 				out.State = JobState(current.State)
@@ -928,7 +928,7 @@ func (d *baseDriver) fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, par
 	// with no barrier — every parent that did not declare one — returns here, having
 	// touched nothing else.
 	var gate jobRow
-	switch err := tx.WithContext(ctx).Model(&jobRow{}).
+	switch err := quietMissing(tx).WithContext(ctx).Model(&jobRow{}).
 		Select("barrier_kind").Where("id = ?", parentID).First(&gate).Error; {
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		return nil // the parent row is gone (pruned); nothing to fire
@@ -943,7 +943,7 @@ func (d *baseDriver) fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, par
 	// serialize on it, then re-read under the lock: a concurrent finalize may have
 	// fired and cleared the barrier between the gate read and the lock.
 	var parent jobRow
-	locked := tx.WithContext(ctx).Model(&jobRow{}).
+	locked := quietMissing(tx).WithContext(ctx).Model(&jobRow{}).
 		Select("barrier_kind, barrier_spec").Where("id = ?", parentID)
 	if tx.Name() == "postgres" {
 		locked = locked.Clauses(clause.Locking{Strength: "UPDATE"})
