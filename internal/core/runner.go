@@ -1181,7 +1181,7 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 		Attempt:     raw.Attempt,
 		MaxAttempts: raw.MaxAttempts,
 		ParentJobID: raw.ParentJobID,
-		EnqueuedAt:  raw.ScheduledAt,
+		EnqueuedAt:  raw.CreatedAt,
 		Tags:        raw.Tags,
 		Logger:      logger,
 		RunID:       runID,
