@@ -354,6 +354,7 @@ func rawFromRow(r jobRow, attempt int, leaseToken string) (RawJob, error) {
 		LeaseToken:  leaseToken,
 		ParentJobID: r.ParentJobID,
 		Tags:        tags,
+		CreatedAt:   r.CreatedAt,
 		ScheduledAt: r.ScheduledAt,
 		Metadata:    []byte(r.Metadata),
 	}, nil

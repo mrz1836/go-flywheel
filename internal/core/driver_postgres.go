@@ -118,7 +118,7 @@ SET state = 'running', attempt = attempt + 1, leased_until = ?, lease_token = ?,
 FROM claimed
 WHERE jobs.id = claimed.id
 RETURNING jobs.id, jobs.kind, jobs.queue, jobs.args, jobs.attempt, jobs.max_attempts,
-    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.scheduled_at, jobs.metadata`, classFilter)
+    jobs.timeout_ms, jobs.parent_job_id, jobs.tags, jobs.created_at, jobs.scheduled_at, jobs.metadata`, classFilter)
 
 	var rows []jobRow
 	if err := d.db.WithContext(ctx).Raw(sql, args...).Scan(&rows).Error; err != nil {

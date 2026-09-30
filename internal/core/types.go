@@ -167,9 +167,12 @@ type Job[A Args] struct {
 	Attempt     int
 	MaxAttempts int
 	ParentJobID *string
-	EnqueuedAt  time.Time
-	Tags        []string
-	Logger      *slog.Logger
+	// EnqueuedAt is when the job was inserted (jobs.created_at), the same instant
+	// JobView.EnqueuedAt reports. It is fixed for the job's lifetime: a retry, a
+	// snooze, or an InsertOpts.ScheduleAt moves when the job runs, not this.
+	EnqueuedAt time.Time
+	Tags       []string
+	Logger     *slog.Logger
 	// RunID is the pre-allocated job_runs.id for this attempt. A side-effect
 	// row may set its job_run_id to RunID safely — the run row already exists.
 	RunID string
@@ -202,6 +205,11 @@ type RawJob struct {
 	LeaseToken  string
 	ParentJobID *string
 	Tags        []string
+	// CreatedAt is when the job was inserted; the Runner hands it to the worker
+	// as Job.EnqueuedAt.
+	CreatedAt time.Time
+	// ScheduledAt is when this attempt became claimable. A retry or a snooze
+	// moves it forward, so it is not the enqueue time.
 	ScheduledAt time.Time
 	// Metadata is the raw jobs.metadata JSON blob. The Runner uses it to
 	// thread request_id through to the worker's ctx and slog attrs; workers
