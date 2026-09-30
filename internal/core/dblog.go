@@ -36,11 +36,15 @@ func quietMissing(db *gorm.DB) *gorm.DB {
 // ignoreNotFoundLogger wraps a gorm logger.Interface and drops the
 // gorm.ErrRecordNotFound signal before tracing, delegating every other call — Info,
 // Warn, Error, and the slow-query and successful-statement traces — to the wrapped
-// logger unchanged. It backs quietMissing and carries no state, so the zero value is
+// logger unchanged. It also honors the wrapped logger's parameter filter, so a host
+// logger that withholds bound values from the traced SQL keeps withholding them on
+// these lookups. It backs quietMissing and carries no state, so the zero value is
 // unusable: the embedded Interface must be set.
 type ignoreNotFoundLogger struct {
 	logger.Interface
 }
+
+var _ gorm.ParamsFilter = ignoreNotFoundLogger{}
 
 // LogMode returns a logger at the requested level that still ignores the not-found
 // signal, so the wrapper survives GORM cloning the logger for a sub-scope rather than
@@ -61,4 +65,17 @@ func (l ignoreNotFoundLogger) Trace(
 		err = nil
 	}
 	l.Interface.Trace(ctx, begin, fc, err)
+}
+
+// ParamsFilter forwards to the wrapped logger's gorm.ParamsFilter when it has one, and
+// otherwise returns sql and params unchanged, which is what GORM does for a logger
+// without a filter. GORM finds the filter by a type assertion on the session logger,
+// and the embedded Interface does not carry the method, so without this forward a
+// host logger configured with ParameterizedQueries would have its bound values
+// inlined into every statement traced through quietMissing.
+func (l ignoreNotFoundLogger) ParamsFilter(ctx context.Context, sql string, params ...any) (string, []any) {
+	if filter, ok := l.Interface.(gorm.ParamsFilter); ok {
+		return filter.ParamsFilter(ctx, sql, params...)
+	}
+	return sql, params
 }

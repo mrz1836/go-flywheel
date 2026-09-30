@@ -1,9 +1,13 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -194,4 +198,64 @@ func TestQuietMissingStillLogsRealError(t *testing.T) {
 	require.True(t, ok)
 	require.Error(t, last, "a real error must still be logged")
 	assert.False(t, errors.Is(last, gorm.ErrRecordNotFound))
+}
+
+// TestIgnoreNotFoundLoggerParamsFilter verifies the wrapper forwards to the wrapped
+// logger's parameter filter when it has one, and returns the params unchanged when it
+// does not, matching what GORM does for a logger without a filter.
+func TestIgnoreNotFoundLoggerParamsFilter(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	const sql = "SELECT * FROM jobs WHERE id = ?"
+
+	t.Run("parameterized host logger withholds params", func(t *testing.T) {
+		t.Parallel()
+		host := logger.NewSlogLogger(slog.New(slog.DiscardHandler), logger.Config{ParameterizedQueries: true})
+
+		gotSQL, gotVars := ignoreNotFoundLogger{host}.ParamsFilter(ctx, sql, "secret")
+
+		assert.Equal(t, sql, gotSQL)
+		assert.Nil(t, gotVars, "the host's filter must be honored through the wrapper")
+	})
+
+	t.Run("host logger without a filter keeps params", func(t *testing.T) {
+		t.Parallel()
+
+		gotSQL, gotVars := ignoreNotFoundLogger{newCaptureLogger()}.ParamsFilter(ctx, sql, "kept")
+
+		assert.Equal(t, sql, gotSQL)
+		assert.Equal(t, []any{"kept"}, gotVars)
+	})
+}
+
+// TestQuietMissingHonorsParameterizedQueries verifies a lookup traced through
+// quietMissing keeps its placeholder and never writes the bound value, when the host
+// logger is configured with ParameterizedQueries. GORM finds the filter by a type
+// assertion on the session logger, so this fails if the wrapper hides it.
+func TestQuietMissingHonorsParameterizedQueries(t *testing.T) {
+	t.Parallel()
+	const sentinel = "quiet-missing-sentinel-6f1d"
+	var buf bytes.Buffer
+	db := newDB(t)
+	db.Logger = logger.NewSlogLogger(
+		slog.New(slog.NewJSONHandler(&buf, nil)),
+		logger.Config{LogLevel: logger.Info, ParameterizedQueries: true},
+	)
+
+	var row jobRow
+	err := quietMissing(db).WithContext(context.Background()).Where("id = ?", sentinel).First(&row).Error
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	require.Len(t, lines, 1, "the lookup must be traced exactly once: %q", buf.String())
+	var record struct {
+		Msg   string `json:"msg"`
+		Trace struct {
+			SQL string `json:"sql"`
+		} `json:"trace"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &record))
+	assert.Equal(t, "SQL executed", record.Msg)
+	assert.Contains(t, record.Trace.SQL, "id = ?", "the traced statement must keep its placeholder")
+	assert.NotContains(t, buf.String(), sentinel, "the bound value must never reach the log")
 }
