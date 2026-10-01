@@ -1,7 +1,9 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"sync"
 	"testing"
@@ -132,6 +134,50 @@ func TestSchedulerLogHealthLogsSampleError(t *testing.T) {
 	// A failing sample is logged and swallowed — it must not panic or stop the loop.
 	assert.NotPanics(t, func() { sched.logHealth(context.Background()) })
 	assert.True(t, handler.has("jobs: queue health sample failed"), "a sample failure is logged, not silently dropped")
+}
+
+// TestSchedulerLogHealthLogsLagAsNumber pins the pulse's numeric lag field as a
+// JSON number on the wire, because a log-metric pipeline extracts a value only
+// from a number. The duration string stays alongside it for people.
+func TestSchedulerLogHealthLogsLagAsNumber(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		seedReady   bool
+		wantSeconds float64
+		wantString  string
+	}{
+		{name: "ready job reports its age", seedReady: true, wantSeconds: 90.5, wantString: "1m30.5s"},
+		{name: "empty queue reports zero", seedReady: false, wantSeconds: 0, wantString: "0s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
+			ctx := clockCtx(context.Background(), models.NewFixedClock(healthAnchor))
+			if tt.seedReady {
+				seedJob(t, db, jobRow{
+					ID: "lag1", Kind: "k", State: string(StateAvailable),
+					ScheduledAt: healthAnchor.Add(-90500 * time.Millisecond),
+				})
+			}
+
+			var buf bytes.Buffer
+			sched := newSchedulerCfg(t, SchedulerConfig{
+				DB: db, Client: NewClient(db),
+				Logger: slog.New(slog.NewJSONHandler(&buf, nil)),
+			})
+			sched.logHealth(ctx)
+
+			var line map[string]any
+			require.NoError(t, json.Unmarshal(buf.Bytes(), &line), "the pulse is one JSON line")
+			assert.Equal(t, "jobs: queue health", line["msg"])
+			require.IsType(t, float64(0), line["oldest_ready_seconds"], "the lag is a JSON number, not a string")
+			assert.InDelta(t, tt.wantSeconds, line["oldest_ready_seconds"], 1e-9)
+			assert.Equal(t, tt.wantString, line["oldest_ready"], "the duration string stays for people reading the log")
+		})
+	}
 }
 
 func TestSchedulerRunNoHeartbeatWhenIntervalZero(t *testing.T) {

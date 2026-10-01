@@ -1106,6 +1106,18 @@ silently.
 Only terminal jobs are ever removed — succeeded, cancelled, discarded, and only those finalized before
 the cutoff. Pending and running work is never touched, whatever its age.
 
+### The queue-health heartbeat
+
+The heartbeat is **off by default**. Set `HealthSampleInterval` and the scheduler samples queue health
+on that cadence and logs one `jobs: queue health` line: `ready`, `inflight`, `scheduled_ahead`,
+`discarded`, and the lag twice — `oldest_ready` as a duration string for people, and
+`oldest_ready_seconds` as a number.
+
+The number is for a deployment that derives metrics from its logs instead of scraping `/metrics`. It
+is the same value the `flywheel_queue_oldest_ready_seconds` gauge reports, and it is on every pulse,
+zero when nothing is ready, so a log-metric filter gets a datapoint each interval and can alarm on lag
+directly.
+
 </details>
 
 <details>
