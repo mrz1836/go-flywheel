@@ -98,9 +98,11 @@ type SchedulerConfig struct {
 	RetentionMaxBatches int
 	// HealthSampleInterval enables the queue-health heartbeat: when > 0 the
 	// Scheduler samples QueueHealth on this cadence and logs a one-line pulse
-	// (ready, in-flight, oldest-ready lag, discarded). Zero (the default) disables
-	// it — no surprise log output for an embedded consumer that never asked for a
-	// heartbeat; a `/metrics` scrape samples fresh regardless.
+	// (ready, inflight, scheduled_ahead, the oldest-ready lag as both the
+	// oldest_ready string and the numeric oldest_ready_seconds, discarded). Zero
+	// (the default) disables it — no surprise log output for an embedded
+	// consumer that never asked for a heartbeat; a `/metrics` scrape samples
+	// fresh regardless.
 	HealthSampleInterval time.Duration
 }
 
@@ -388,6 +390,13 @@ func (s *Scheduler) SampleHealth(ctx context.Context) (QueueHealth, error) {
 
 // logHealth samples queue health and logs a one-line pulse. A sample failure is
 // logged and swallowed: a transient read error must not stop the scheduler loop.
+//
+// The lag is logged twice: oldest_ready is a duration string for a person
+// reading the log, and oldest_ready_seconds is the same value as a number, for
+// a pipeline that derives metrics from log fields (a log-only deployment can
+// alarm on it). It is the value the flywheel_queue_oldest_ready_seconds gauge
+// reports, and it is always present, zero when nothing is ready, so every pulse
+// yields a datapoint.
 func (s *Scheduler) logHealth(ctx context.Context) {
 	qh, err := s.SampleHealth(ctx)
 	if err != nil {
@@ -400,6 +409,7 @@ func (s *Scheduler) logHealth(ctx context.Context) {
 		"inflight", qh.InFlight,
 		"scheduled_ahead", qh.ScheduledAhead,
 		"oldest_ready", qh.OldestReadyAge.String(),
+		"oldest_ready_seconds", qh.OldestReadyAge.Seconds(),
 		"discarded", qh.CountsByState[string(StateDiscarded)],
 	)
 }

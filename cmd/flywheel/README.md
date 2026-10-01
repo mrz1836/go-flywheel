@@ -182,6 +182,12 @@ runtime:
 curl localhost:9090/metrics      # flywheel_jobs_* counters + flywheel_queue_* gauges
 ```
 
+Each heartbeat is one `jobs: queue health` log line with `ready`, `inflight`,
+`scheduled_ahead`, `oldest_ready` (the lag as a duration string, e.g. `1m30.5s`),
+`oldest_ready_seconds` (the same lag as a number, `0` when nothing is ready), and
+`discarded`. Alarm on `oldest_ready_seconds` when you derive metrics from logs
+rather than scraping `/metrics`.
+
 ## Run as a background daemon (macOS, launchd)
 
 A per-user LaunchAgent template lives in [`dist/com.mrz1836.flywheel.plist`](dist/com.mrz1836.flywheel.plist):

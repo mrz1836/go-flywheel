@@ -31,6 +31,12 @@ The gauges are sampled fresh on every scrape from `SampleQueueHealth`; the histo
 accumulate over the process lifetime. Percentiles come from the `_bucket` series via
 `histogram_quantile`, so their accuracy is bounded by the recorder's buckets (`DefaultLatencyBuckets`).
 
+**Without a scrape.** A deployment that ships logs rather than scraping can still watch the lag. With
+`SchedulerConfig.HealthSampleInterval` set, every `jobs: queue health` line carries
+`oldest_ready_seconds`, the same value as `flywheel_queue_oldest_ready_seconds`, as a number (zero when
+nothing is ready). Point a log-metric filter at that field and you have the lag signal the symptoms
+below read, ready to alarm on.
+
 <br>
 
 ## Symptom: the queue is deep
