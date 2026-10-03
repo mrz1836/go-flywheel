@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os/signal"
 	"syscall"
+	"time"
 
 	flywheel "github.com/mrz1836/go-flywheel"
 	"github.com/mrz1836/go-flywheel/observers"
@@ -47,7 +49,32 @@ func runServe(ctx context.Context, cfg *Config, db *gorm.DB, driver flywheel.Dri
 	if err := reconcileSchedules(ctx, db, cfg); err != nil {
 		return err
 	}
+	node, err := newServeNode(cfg, db, driver, logger, statsRollup)
+	if err != nil {
+		return err
+	}
 
+	sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	logger.Info("flywheel serve: started",
+		"version", resolveVersion(),
+		"db", dbLabel(cfg),
+		"queues", cfg.Runtime.Queues,
+		"concurrency", cfg.Runtime.Concurrency,
+		"schedules", len(cfg.Schedules),
+		"retention", cfg.Runtime.Retention.Std().String(),
+		"stats_rollup", statsRollup.String(),
+		"metrics_addr", cfg.Runtime.MetricsAddr)
+	return node.Run(sigCtx)
+}
+
+// newServeNode builds the daemon's Node from cfg: one runner over the
+// configured queues and the scheduler, with the stats rollup at statsRollup.
+// Construction is where an invalid combination of settings is refused, so it is
+// separate from runServe's migrate and run to be checked on its own.
+func newServeNode(
+	cfg *Config, db *gorm.DB, driver flywheel.Driver, logger *slog.Logger, statsRollup time.Duration,
+) (*flywheel.Node, error) {
 	// Wire telemetry by default: a process-lifetime metrics recorder behind a
 	// fan-out observer (structured debug logs + counters), so every consumer
 	// gets telemetry for free without hand-rolling and wiring an adapter.
@@ -64,7 +91,7 @@ func runServe(ctx context.Context, cfg *Config, db *gorm.DB, driver flywheel.Dri
 		})
 	}
 
-	node, err := flywheel.NewNode(flywheel.NodeConfig{
+	return flywheel.NewNode(flywheel.NodeConfig{
 		Runners: []flywheel.RunnerConfig{{
 			DB:               db,
 			Driver:           driver,
@@ -99,20 +126,4 @@ func runServe(ctx context.Context, cfg *Config, db *gorm.DB, driver flywheel.Dri
 		Health: health,
 		Logger: logger,
 	})
-	if err != nil {
-		return err
-	}
-
-	sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	logger.Info("flywheel serve: started",
-		"version", resolveVersion(),
-		"db", dbLabel(cfg),
-		"queues", cfg.Runtime.Queues,
-		"concurrency", cfg.Runtime.Concurrency,
-		"schedules", len(cfg.Schedules),
-		"retention", cfg.Runtime.Retention.Std().String(),
-		"stats_rollup", statsRollup.String(),
-		"metrics_addr", cfg.Runtime.MetricsAddr)
-	return node.Run(sigCtx)
 }

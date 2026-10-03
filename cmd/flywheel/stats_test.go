@@ -448,13 +448,15 @@ func TestRunServeKeepsAShortRetentionConfigStarting(t *testing.T) {
 	assert.Zero(t, interval)
 	assert.Contains(t, reason, "runtime.retention")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	require.NoError(t, runServe(ctx, cfg, db, flywheel.NewSQLiteDriver(db)),
-		"an existing short-retention config keeps working after the upgrade")
+	// Building the Node is where a refused combination of settings fails; it is
+	// checked directly rather than by running serve against a deadline, which a
+	// slow machine can spend entirely on migrating.
+	node, err := newServeNode(cfg, db, flywheel.NewSQLiteDriver(db), newLogger(cfg), interval)
+	require.NoError(t, err, "an existing short-retention config keeps working after the upgrade")
+	require.NotNil(t, node)
 
 	cfg.Runtime.StatsRollup = Duration(time.Minute)
-	err := runServe(context.Background(), cfg, db, flywheel.NewSQLiteDriver(db))
+	err = runServe(context.Background(), cfg, db, flywheel.NewSQLiteDriver(db))
 	require.ErrorIs(t, err, flywheel.ErrValidation,
 		"asking for the rollup explicitly with a retention that would delete runs before they are rolled up is refused")
 }
