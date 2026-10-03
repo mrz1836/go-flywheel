@@ -152,6 +152,99 @@ func TestListRunsBeforeCursorAndLimit(t *testing.T) {
 	assert.Equal(t, "c", limited[0].ID)
 }
 
+// TestListRunsPagesLegacyLocalZoneRows pages, on SQLite, a job whose attempts
+// span the upgrade: two rows an older release stamped in the clock's local zone
+// — either side of a DST change, so their offsets differ — and one stamped in
+// UTC, with fractional seconds throughout. Text order puts them in the wrong
+// order and a UTC text cursor skips the older rows; both cursors must return
+// every attempt exactly once, newest first.
+func TestListRunsPagesLegacyLocalZoneRows(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	// Europe/Berlin moved from +01:00 to +02:00 at 2026-03-29 01:00 UTC.
+	legacy := []struct {
+		id      string
+		attempt int
+		at      time.Time
+		text    string
+	}{
+		{"r1", 1, time.Date(2026, 3, 29, 0, 30, 0, 250_000_000, time.UTC), "2026-03-29 01:30:00.25+01:00"},
+		{"r2", 2, time.Date(2026, 3, 29, 1, 15, 0, 500_000_000, time.UTC), "2026-03-29 03:15:00.5+02:00"},
+	}
+	for _, l := range legacy {
+		seedRun(t, db, jobRunRow{
+			ID: l.id, JobID: "j", Attempt: l.attempt, ExecutorID: "e",
+			Outcome: string(OutcomeError), StartedAt: l.at, CreatedAt: l.at,
+		})
+		require.NoError(t, db.Exec(`UPDATE job_runs SET started_at = ?, created_at = ? WHERE id = ?`,
+			l.text, l.text, l.id).Error)
+	}
+	newest := time.Date(2026, 3, 29, 1, 45, 0, 123_456_789, time.UTC)
+	seedRun(t, db, jobRunRow{
+		ID: "r3", JobID: "j", Attempt: 3, ExecutorID: "e",
+		Outcome: string(OutcomeSuccess), StartedAt: newest, CreatedAt: newest,
+	})
+
+	all, err := ListRuns(ctx, db, "j", ListRunsParams{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"r3", "r2", "r1"}, runIDs(all), "newest attempt first, whatever zone each row is in")
+	assert.True(t, all[1].StartedAt.Equal(legacy[1].at), "the legacy text reads back as its instant")
+
+	t.Run("by attempt", func(t *testing.T) {
+		t.Parallel()
+		var got []string
+		p := ListRunsParams{Limit: 1}
+		for range 4 {
+			page, err := ListRuns(ctx, db, "j", p)
+			require.NoError(t, err)
+			if len(page) == 0 {
+				break
+			}
+			got = append(got, page[0].ID)
+			p.BeforeAttempt = page[0].Attempt
+		}
+		assert.Equal(t, []string{"r3", "r2", "r1"}, got)
+	})
+
+	t.Run("by created_at", func(t *testing.T) {
+		t.Parallel()
+		var got []string
+		p := ListRunsParams{Limit: 1}
+		for range 4 {
+			page, err := ListRuns(ctx, db, "j", p)
+			require.NoError(t, err)
+			if len(page) == 0 {
+				break
+			}
+			got = append(got, page[0].ID)
+			// The row's own instant, in the zone it read back in: the cursor excludes
+			// exactly that row, so equality must hold through the fractional seconds.
+			p.Before = page[0].StartedAt
+		}
+		assert.Equal(t, []string{"r3", "r2", "r1"}, got)
+	})
+
+	t.Run("a cursor between two legacy rows", func(t *testing.T) {
+		t.Parallel()
+		// A millisecond after r1, in a third zone: r1 is older, r2 is not.
+		page, err := ListRuns(ctx, db, "j", ListRunsParams{
+			Before: legacy[0].at.Add(time.Millisecond).In(time.FixedZone("x", -5*3600)),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"r1"}, runIDs(page))
+	})
+}
+
+// runIDs extracts ids from a page of run views.
+func runIDs(runs []JobRunView) []string {
+	out := make([]string, len(runs))
+	for i, r := range runs {
+		out[i] = r.ID
+	}
+	return out
+}
+
 func TestOverviewGroupsByStateWithTotal(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)

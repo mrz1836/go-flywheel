@@ -145,6 +145,24 @@ func inspectSuite(t *testing.T, open dbOpener) {
 		require.NoError(t, err)
 		assert.Equal(t, []string{"fin-h", "fin-e", "fin-b"}, viewIDs(failed))
 
+		// A repeated state is read once: it must not list a job twice or spend
+		// half the page on duplicates.
+		repeated, err := ListFinished(context.Background(), db, ListFinishedParams{
+			States: []JobState{StateDiscarded, StateDiscarded}, Limit: 10,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, viewIDs(failed), viewIDs(repeated))
+		pair, err := ListFinished(context.Background(), db, ListFinishedParams{
+			States: []JobState{StateDiscarded, StateSucceeded}, Limit: 4,
+		})
+		require.NoError(t, err)
+		mixed, err := ListFinished(context.Background(), db, ListFinishedParams{
+			States: []JobState{StateDiscarded, StateSucceeded, StateDiscarded}, Limit: 4,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, viewIDs(pair), viewIDs(mixed))
+		assert.Equal(t, []string{"fin-h", "fin-g", "fin-e", "fin-d"}, viewIDs(mixed))
+
 		since, err := ListFinished(context.Background(), db, ListFinishedParams{
 			Kind: "y", Since: inspectT0.Add(4 * time.Minute),
 		})
@@ -253,6 +271,14 @@ func inspectSuite(t *testing.T, open dbOpener) {
 		require.NoError(t, err)
 		require.Len(t, older, 1, "a cursor in any zone compares as the instant it is")
 		assert.Equal(t, "j-run-1", older[0].ID)
+
+		byAttempt, err := ListRuns(context.Background(), db, "j", ListRunsParams{BeforeAttempt: runs[0].Attempt})
+		require.NoError(t, err)
+		require.Len(t, byAttempt, 1, "the attempt cursor continues after the previous page's last attempt")
+		assert.Equal(t, "j-run-1", byAttempt[0].ID)
+		none, err := ListRuns(context.Background(), db, "j", ListRunsParams{BeforeAttempt: 1})
+		require.NoError(t, err)
+		assert.Empty(t, none)
 	})
 }
 

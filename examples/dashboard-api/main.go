@@ -8,7 +8,12 @@
 //	GET /stats              per-kind stats (?since=24h&kind=…&queue=…)
 //	GET /series             a trend series (?since=720h&interval=hour|day&kind=…&tz=America/New_York)
 //	GET /anomalies          the latest rolled hour's anomalies
-//	GET /jobs/{id}/runs     one job's attempts
+//	GET /jobs/{id}/runs     one job's attempts (?before_attempt=<attempt>)
+//
+// A /finished cursor is the previous page's last job: its finalized_at exactly
+// as the JSON carried it, a comma, and its id. URL-encode it — an RFC3339 offset
+// such as +02:00 carries a '+', which a query string otherwise reads as a space
+// (the handler restores one left unencoded, but a client should not rely on it).
 //
 // It writes nothing and runs no runtime: the database's own flywheel deployment
 // (a Node with a Scheduler whose StatsRollupInterval is set, or `flywheel serve`)
@@ -31,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -105,12 +111,11 @@ func NewHandler(db *gorm.DB) http.Handler {
 				p.States = []flywheel.JobState{flywheel.JobState(s)}
 			}
 			if before := r.URL.Query().Get("before"); before != "" {
-				at, id, ok := strings.Cut(before, ",")
-				t, err := time.Parse(time.RFC3339Nano, at)
-				if !ok || err != nil {
-					return nil, badRequest("before must be <RFC3339 finalized_at>,<id>")
+				cursor, err := finishedCursor(before)
+				if err != nil {
+					return nil, err
 				}
-				p.Before = &flywheel.FinishedCursor{FinalizedAt: t, ID: id}
+				p.Before = cursor
 			}
 			return flywheel.ListFinished(ctx, db, p)
 		})
@@ -153,10 +158,35 @@ func NewHandler(db *gorm.DB) http.Handler {
 	})
 	mux.HandleFunc("GET /jobs/{id}/runs", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, r, func(ctx context.Context) (any, error) {
-			return flywheel.ListRuns(ctx, db, r.PathValue("id"), flywheel.ListRunsParams{Limit: 50})
+			p := flywheel.ListRunsParams{Limit: 50}
+			if raw := r.URL.Query().Get("before_attempt"); raw != "" {
+				attempt, err := strconv.Atoi(raw)
+				if err != nil || attempt <= 0 {
+					return nil, badRequest("before_attempt must be a positive attempt number")
+				}
+				p.BeforeAttempt = attempt
+			}
+			return flywheel.ListRuns(ctx, db, r.PathValue("id"), p)
 		})
 	})
 	return mux
+}
+
+// finishedCursor parses a /finished cursor, <RFC3339 finalized_at>,<id>.
+//
+// A '+' a client left unencoded reaches the handler as a space, and RFC3339
+// never contains one, so turning spaces back into '+' is lossless — and it keeps
+// paging working for every database whose timestamps carry a positive offset.
+func finishedCursor(raw string) (*flywheel.FinishedCursor, error) {
+	at, id, ok := strings.Cut(raw, ",")
+	if !ok || id == "" {
+		return nil, badRequest("before must be <RFC3339 finalized_at>,<id>")
+	}
+	t, err := time.Parse(time.RFC3339Nano, strings.ReplaceAll(at, " ", "+"))
+	if err != nil {
+		return nil, badRequest("before must be <RFC3339 finalized_at>,<id>: " + err.Error())
+	}
+	return &flywheel.FinishedCursor{FinalizedAt: t, ID: id}, nil
 }
 
 // errBadRequest marks a caller error, answered with 400 rather than 500.

@@ -213,7 +213,8 @@ type FinishedCursor struct {
 // most recently finished jobs in every terminal state.
 type ListFinishedParams struct {
 	// States restricts the page to some terminal states; empty means all three.
-	// A non-terminal state is rejected with ErrValidation.
+	// A non-terminal state is rejected with ErrValidation; a repeated one counts
+	// once.
 	States []JobState
 	// Kind and Queue, when set, are exact-match filters.
 	Kind  string
@@ -247,11 +248,20 @@ func ListFinished(ctx context.Context, db *gorm.DB, p ListFinishedParams) ([]Job
 	if len(states) == 0 {
 		states = TerminalStates()
 	}
+	// Each state is read once: a repeated one would fetch the same page twice and
+	// list every job on it twice.
+	seen := make(map[JobState]bool, len(states))
+	unique := make([]JobState, 0, len(states))
 	for _, s := range states {
 		if !isTerminalStateString(string(s)) {
 			return nil, newValidationError("states", fmt.Sprintf("%q is not a terminal state", s))
 		}
+		if !seen[s] {
+			seen[s] = true
+			unique = append(unique, s)
+		}
 	}
+	states = unique
 	limit := p.Limit
 	if limit <= 0 {
 		limit = defaultListFinishedLimit

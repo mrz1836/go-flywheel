@@ -149,12 +149,19 @@ func stateStrings(states []JobState) []string {
 	return out
 }
 
-// ListRunsParams configures a ListRuns page. Before is a created_at cursor (zero
-// means newest); Limit caps the rows returned. A host that wants a has-more
-// sentinel passes Limit+1 and trims the extra row itself.
+// ListRunsParams configures a ListRuns (or ChildOutputs) page. Limit caps the
+// rows returned; a host that wants a has-more sentinel passes Limit+1 and trims
+// the extra row itself. The zero value is the newest page, uncapped.
 type ListRunsParams struct {
+	// Before is a created_at cursor: only rows created strictly before it are
+	// returned. Zero means newest.
 	Before time.Time
-	Limit  int
+	// BeforeAttempt is ListRuns' attempt cursor: when positive, only attempts
+	// numbered below it are returned. Pass the Attempt of the previous page's
+	// last run. It is exact on every dialect and is the cursor to prefer;
+	// ChildOutputs, which pages jobs rather than attempts, ignores it.
+	BeforeAttempt int
+	Limit         int
 }
 
 // OverviewParams configures an Overview query. Kind, when non-empty, scopes the
@@ -240,21 +247,39 @@ func FindJob(ctx context.Context, db *gorm.DB, id string) (JobView, error) {
 	return jobViewFromRow(row), nil
 }
 
-// ListRuns returns a job's runs newest-first (created_at desc, id desc), reading
-// through db. When p.Before is non-zero only rows strictly older than the cursor
-// are returned; a positive p.Limit caps the page.
+// ListRuns returns a job's runs newest-first by attempt (attempt desc, id desc),
+// reading through db; the job_runs_job_attempt unique index serves the order. A
+// positive p.BeforeAttempt returns only earlier attempts, a non-zero p.Before only
+// runs created strictly before it, and a positive p.Limit caps the page.
+//
+// # Zone-proof on SQLite
+//
+// The page is ordered by attempt rather than created_at because a job's attempt
+// numbers only grow, while SQLite compares its text timestamps as text: a run an
+// older release wrote carries the clock's local zone until NormalizeRunTimestamps
+// re-stamps it in UTC, and the stats rollup — the only caller of that — may never
+// run. So BeforeAttempt is exact everywhere, and Before is compared as text only
+// against a row stamped in UTC (exact to the nanosecond) and through julianday —
+// which reads the zone suffix, to the millisecond — against any other.
 func ListRuns(ctx context.Context, db *gorm.DB, jobID string, p ListRunsParams) ([]JobRunView, error) {
 	query := db.WithContext(ctx).Model(&jobRunRow{}).Where("job_id = ?", jobID)
+	if p.BeforeAttempt > 0 {
+		query = query.Where("attempt < ?", p.BeforeAttempt)
+	}
 	if !p.Before.IsZero() {
-		// UTC, because job_runs timestamps are stamped in UTC: on SQLite the
-		// comparison is textual, and a cursor in another zone would compare wrong.
-		query = query.Where("created_at < ?", p.Before.UTC())
+		before := p.Before.UTC()
+		if db.Name() == "sqlite" {
+			query = query.Where(`CASE WHEN substr(created_at, -6) = '+00:00' THEN created_at < ? `+
+				`ELSE julianday(created_at) < julianday(?) END`, before, before)
+		} else {
+			query = query.Where("created_at < ?", before)
+		}
 	}
 	if p.Limit > 0 {
 		query = query.Limit(p.Limit)
 	}
 	var rows []jobRunRow
-	if err := query.Order("created_at desc, id desc").Find(&rows).Error; err != nil {
+	if err := query.Order("attempt desc, id desc").Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("flywheel: list runs: %w", err)
 	}
 	views := make([]JobRunView, len(rows))
