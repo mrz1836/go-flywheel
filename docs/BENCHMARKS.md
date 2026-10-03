@@ -717,23 +717,25 @@ explains it with `EXPLAIN (ANALYZE, BUFFERS)`, and times the whole call — medi
 
 | Read | Median | Target |
 |---|---|---|
-| `Stats`, 24 h, every kind | **12.3 ms** | < 50 ms |
-| `Stats`, 24 h, one kind | 9.4 ms | |
-| `Stats`, 30 d, every kind | 79.4 ms | |
-| `StatsSeries`, 30 d hourly | **20.5 ms** | < 50 ms |
+| `Stats`, 24 h, every kind | **12.5 ms** | < 50 ms |
+| `Stats`, 24 h, one kind | 9.3 ms | |
+| `Stats`, 30 d, every kind | 78.5 ms | |
+| `StatsSeries`, 30 d hourly | **21.1 ms** | < 50 ms |
 | `StatsSeries`, 30 d daily | 19.0 ms | |
-| `Baselines`, 7 d (memoized) | 0.08 ms | |
-| `Anomalies`, latest hour | 21.1 ms | |
-| `ListRunning` with baselines | **2.5 ms** | < 5 ms |
+| `Baselines`, 7 d (memoized) | 0.05 ms | |
+| `Anomalies`, latest hour | 20.8 ms | |
+| `ListRunning` with baselines | **2.4 ms** | < 5 ms |
 | `ListFinished` | **2.5 ms** | < 5 ms |
-| `RecentFailures` | 1.0 ms | |
-| `SlowRuns`, 24 h | 69.1 ms | |
-| `QueueDepths` | 2.2 ms | |
-| `CountActiveByKind` | 2.1 ms | |
+| `RecentFailures` | 1.1 ms | |
+| `SlowRuns`, 24 h | 71.2 ms | |
+| `QueueDepths` | 2.4 ms | |
+| `CountActiveByKind` | 1.8 ms | |
 | `ListJobs` | 1.2 ms | |
-| Roll up one hour of ~1.4k runs | 15.2 ms | |
-| Roll up one hour of 100,000 runs | **263 ms** | < 2 s |
-| Roll up all 720 hours from scratch | 8.8 s | |
+| Rollup pass, caught up (every `StatsRollupInterval`) | **0.25 ms** | |
+| `BackfillRunFinishes`, nothing to log (each Scheduler start) | 40 ms | |
+| Roll up one hour of ~1.4k runs | 16.3 ms | |
+| Roll up one hour of 100,000 runs | **262 ms** | < 2 s |
+| Roll up all 719 closed hours from scratch | 7.3 s | |
 
 Three changes got the reads there; the first characterization had `Stats` 30 d at 612 ms, the 100k-run hour
 at 2.9 s, and `ListRunning` with baselines at 147 ms:
@@ -749,10 +751,24 @@ at 2.9 s, and `ListRunning` with baselines at 147 ms:
   memoized by the rollup's progress** — its covered range and a version every rollup write moves — which
   changes hourly.
 
+The rollup's own upkeep is two rows of the table. A caught-up pass — what the Scheduler runs every minute
+between hours — is two primary-key reads of `job_stats_progress` and a range delete that finds nothing,
+and writes no row. The backfill check every Scheduler start runs (twice: at start and ten minutes later)
+is one statement that reads `job_runs` once and stops at the first unlogged run; with none, as on every
+start after an upgrade, it reads the whole table — a parallel sequential scan, 37 ms of the 40 at a
+million runs, and linear in `job_runs`.
+
 On SQLite, a 100k-run month (`go test -run '^$' -bench SQLite ./internal/core`): `Stats` 24 h **0.98 ms**
-(target < 100 ms), 30 d 14.0 ms, `StatsSeries` 30 d hourly 6.7 ms, one rollup hour 2.5 ms, `ListRunning`
-0.41 ms. The same reads against PostgreSQL at 100k (`-tags=integration -bench StatsReadsPostgres`): 3.5,
-13.0, 7.7, 2.5, and 0.31 ms.
+(target < 100 ms), 30 d 14.4 ms, `StatsSeries` 30 d hourly 7.0 ms, one rollup hour 0.77 ms, `ListRunning`
+0.24 ms. The same reads against PostgreSQL at 100k (`-tags=integration -bench StatsReadsPostgres`): 2.1,
+13.1, 7.8, 2.5, and 0.11 ms.
+
+**The coverage rework, measured.** Recording the rollup's covered range in `job_stats_progress`, rather than
+inferring it from the rows, was benchmarked against the release before it (`44e66f6`) on the same machine,
+interleaved, six runs each (benchstat): no read changed significantly (p ≥ 0.13 on every one), and rolling
+up one hour got faster — **−70% on SQLite** (2.59 → 0.77 ms) and **−27% on PostgreSQL** (3.41 → 2.50 ms) —
+because the empty-hour marker rows, and the delete that cleared stale ones by scanning every older rollup
+row, are gone. The finalize path is unchanged by it, so the write-cost numbers above stand.
 
 ### The retention prune, with `jobs_finished` in place
 

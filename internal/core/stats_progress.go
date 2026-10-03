@@ -118,20 +118,34 @@ func markCovered(ctx context.Context, db *gorm.DB, step coverageStep, now time.T
 // covered no longer — and RetainFromUnix becomes earliest. A database idle for
 // longer than the retention restarts its range at the boundary. It returns the
 // progress as it stands after.
+//
+// The boundary moves once an hour and the rollup passes once a minute, so it
+// reads first and writes only when something changes: a pass with nothing to
+// do leaves the row, and its version, alone.
 func advanceStatsFloor(ctx context.Context, db *gorm.DB, earliest, now time.Time) (statsProgress, error) {
-	if err := ensureStatsProgress(ctx, db, earliest, now); err != nil {
+	p, ok, err := readStatsProgress(ctx, db)
+	if err != nil {
 		return statsProgress{}, err
+	}
+	if ok && !p.From.Before(earliest) && !p.To.Before(earliest) && p.RetainFrom.Equal(earliest) {
+		return p, nil
+	}
+	if !ok {
+		if err := ensureStatsProgress(ctx, db, earliest, now); err != nil {
+			return statsProgress{}, err
+		}
 	}
 	e := earliest.Unix()
 	if err := db.WithContext(ctx).Exec(`UPDATE job_stats_progress SET `+
 		`version = version + CASE WHEN covered_from_unix < ? OR covered_to_unix < ? THEN 1 ELSE 0 END, `+
 		`covered_from_unix = CASE WHEN covered_from_unix < ? THEN ? ELSE covered_from_unix END, `+
 		`covered_to_unix = CASE WHEN covered_to_unix < ? THEN ? ELSE covered_to_unix END, `+
-		`retain_from_unix = ?, updated_at = ? WHERE id = ?`,
-		e, e, e, e, e, e, e, now.UTC(), statsProgressID).Error; err != nil {
+		`retain_from_unix = ?, updated_at = ? `+
+		`WHERE id = ? AND (covered_from_unix < ? OR covered_to_unix < ? OR retain_from_unix <> ?)`,
+		e, e, e, e, e, e, e, now.UTC(), statsProgressID, e, e, e).Error; err != nil {
 		return statsProgress{}, fmt.Errorf("record stats retention: %w", err)
 	}
-	p, _, err := readStatsProgress(ctx, db)
+	p, _, err = readStatsProgress(ctx, db)
 	return p, err
 }
 

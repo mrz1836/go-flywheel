@@ -130,7 +130,8 @@ type SchedulerConfig struct {
 	// last few hours and what keeps trends after retention prunes the raw runs.
 	// Zero (the default) disables it, the same opt-in convention as
 	// HealthSampleInterval; `flywheel serve` enables it. A minute is a sensible
-	// cadence — a pass with nothing to roll is two indexed reads.
+	// cadence — a pass with nothing to roll is two primary-key reads and a range
+	// delete that finds nothing, and writes no row.
 	//
 	// Run it on one Scheduler per database, as CONTRACT.md already asks of the
 	// Scheduler. A duplicate is harmless — every pass replaces whole hours,

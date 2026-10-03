@@ -33,16 +33,16 @@ until it is done.
 
 | Question | API | Served by | Median at 1M runs |
 |---|---|---|---|
-| What is running now, for how long, is it stuck? | `ListRunning` | `jobs_running_leased` + `job_runs` PK | 2.5 ms |
-| How deep is each queue, how far behind? | `QueueDepths` | `jobs_ready`, `jobs_state` | 2.2 ms |
-| What is in flight, per kind? | `CountActiveByKind` | `jobs_state` | 2.1 ms |
+| What is running now, for how long, is it stuck? | `ListRunning` | `jobs_running_leased` + `job_runs` PK | 2.4 ms |
+| How deep is each queue, how far behind? | `QueueDepths` | `jobs_ready`, `jobs_state` | 2.4 ms |
+| What is in flight, per kind? | `CountActiveByKind` | `jobs_state` | 1.8 ms |
 | What just finished, and how? | `ListFinished`, `RecentFailures` | `jobs_finished` | 1–2.5 ms |
-| How did each kind do today? | `Stats` (24 h) | `job_stats_hourly` + the raw tail | 12 ms |
-| How did each kind do this month? | `Stats` (30 d) | `job_stats_hourly` + the raw tail | 79 ms |
-| How is it trending over weeks? | `StatsSeries` (30 d, hourly or daily) | `job_stats_hourly` | 20 ms |
+| How did each kind do today? | `Stats` (24 h) | `job_stats_hourly` + the raw tail | 12.5 ms |
+| How did each kind do this month? | `Stats` (30 d) | `job_stats_hourly` + the raw tail | 78 ms |
+| How is it trending over weeks? | `StatsSeries` (30 d, hourly or daily) | `job_stats_hourly` | 19–21 ms |
 | What is normal for kind X? | `Baselines` | `job_stats_hourly` | sub-ms, memoized |
 | Is anything regressing? | `Anomalies` | `job_stats_hourly` | 21 ms |
-| What were the slowest runs today? | `SlowRuns` | `job_run_finishes` + `job_runs` PK | 69 ms |
+| What were the slowest runs today? | `SlowRuns` | `job_run_finishes` + `job_runs` PK | 71 ms |
 | One job's attempts | `ListRuns` | `job_runs_job_attempt` | sub-ms |
 
 The [measured latencies](#measured-cost) are at the end. Everything above is bounded — by a window, a
@@ -331,7 +331,7 @@ node, err := flywheel.NewNode(flywheel.NodeConfig{
 
 | Field | Default | What it does |
 |---|---|---|
-| `StatsRollupInterval` | 0 (off) | cadence of the rollup; a pass with nothing to do is two indexed reads |
+| `StatsRollupInterval` | 0 (off) | cadence of the rollup; a pass with nothing to do is two primary-key reads and an empty range delete, and writes nothing |
 | `StatsRollupGrace` | 5m | how long past an hour's end before it is closed — absorbs clock skew between nodes |
 | `StatsMaxHoursPerPass` | 24 | bounds one pass's work during a catch-up |
 | `StatsRetention` | 400 days | how long rollup rows are kept |
@@ -748,23 +748,25 @@ whole API call; the plans behind them are in
 <!-- measured-reads -->
 | Read | Median |
 |---|---|
-| `Stats`, last 24 h, every kind | 12.3 ms |
-| `Stats`, last 24 h, one kind | 9.4 ms |
-| `Stats`, last 30 d, every kind | 79.4 ms |
-| `StatsSeries`, 30 d hourly | 20.5 ms |
+| `Stats`, last 24 h, every kind | 12.5 ms |
+| `Stats`, last 24 h, one kind | 9.3 ms |
+| `Stats`, last 30 d, every kind | 78.5 ms |
+| `StatsSeries`, 30 d hourly | 21.1 ms |
 | `StatsSeries`, 30 d daily | 19.0 ms |
-| `Baselines`, 7 d (memoized; first call ~20 ms) | 0.08 ms |
-| `Anomalies`, latest hour | 21.1 ms |
-| `ListRunning` with baselines | 2.5 ms |
+| `Baselines`, 7 d (memoized; first call ~20 ms) | 0.05 ms |
+| `Anomalies`, latest hour | 20.8 ms |
+| `ListRunning` with baselines | 2.4 ms |
 | `ListFinished` | 2.5 ms |
-| `RecentFailures` | 1.0 ms |
-| `SlowRuns`, 24 h | 69.1 ms |
-| `QueueDepths` | 2.2 ms |
-| `CountActiveByKind` | 2.1 ms |
+| `RecentFailures` | 1.1 ms |
+| `SlowRuns`, 24 h | 71.2 ms |
+| `QueueDepths` | 2.4 ms |
+| `CountActiveByKind` | 1.8 ms |
 | `ListJobs` | 1.2 ms |
-| Rolling up one hour of ~1.4k runs | 15.2 ms |
-| Rolling up one hour of 100k runs | 263 ms |
-| Rolling up all 30 days from scratch (720 hours, 58k rollup rows) | 8.8 s |
+| A caught-up rollup pass (each `StatsRollupInterval`) | 0.25 ms |
+| The backfill check (each Scheduler start, twice) | 40 ms |
+| Rolling up one hour of ~1.4k runs | 16.3 ms |
+| Rolling up one hour of 100k runs | 262 ms |
+| Rolling up all 30 days from scratch (719 closed hours, 58k rollup rows) | 7.3 s |
 
 On SQLite, the same reads over a 100k-run month (`go test -bench SQLite ./internal/core`) are all under
 15 ms; `Stats` for the last day is about 1 ms.

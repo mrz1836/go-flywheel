@@ -250,6 +250,32 @@ func coverageSuite(t *testing.T, open dbOpener) {
 		assert.EqualValues(t, 32, got.Total.Attempts, "the rollups outlive the runs retention took")
 	})
 
+	t.Run("a pass with nothing to roll writes nothing", func(t *testing.T) {
+		t.Parallel()
+		db := open(t)
+		seedHistory(t, db, []histRun{okRun("a", hourAt(rollupBase, 0).Add(time.Minute), 100)})
+		now := hourAt(rollupBase, 3).Add(10 * time.Minute)
+		rollupAll(t, db, now)
+		before, _, err := readStatsProgress(context.Background(), db)
+		require.NoError(t, err)
+
+		// The rollup's next tick, a minute later: no hour has closed since.
+		sqls, counted := countStatements(db)
+		later := now.Add(time.Minute)
+		res, err := rollupPass(fixedClockCtx(later), counted, later, rollupConfig{
+			grace: defaultStatsRollupGrace, maxHours: 24, retention: defaultStatsRetention,
+		})
+		require.NoError(t, err)
+		assert.True(t, res.CaughtUp)
+		for _, q := range *sqls {
+			assert.NotContains(t, q, "UPDATE", "an idle pass rewrites nothing: %s", q)
+			assert.NotContains(t, q, "INSERT", "an idle pass inserts nothing: %s", q)
+		}
+		after, _, err := readStatsProgress(context.Background(), db)
+		require.NoError(t, err)
+		assert.Equal(t, before, after, "so the baselines memo stays valid across idle passes")
+	})
+
 	t.Run("a rollup write moves the version the baselines memo keys on", func(t *testing.T) {
 		t.Parallel()
 		db := open(t)

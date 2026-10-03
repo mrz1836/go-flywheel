@@ -141,9 +141,23 @@ func ExplainStats(ctx context.Context, cfg ExplainConfig) (StatsExplainReport, e
 	report.StatsRows = scalarInt(ctx, db, `SELECT count(*) FROM job_stats_hourly`)
 	report.StatsBytes = scalarInt(ctx, db, `SELECT pg_total_relation_size('job_stats_hourly')`)
 
+	// The Scheduler the rollup-pass row times has made its start-up pass — the
+	// backfill check and the retention boundary — so what it times is the pass
+	// a caught-up rollup runs every StatsRollupInterval.
+	sched, err := flywheel.NewSchedulerWithConfig(flywheel.SchedulerConfig{
+		DB: db, Client: flywheel.NewClient(db), Driver: flywheel.NewPostgresDriver(db),
+		StatsRollupInterval: time.Minute,
+	})
+	if err != nil {
+		return report, fmt.Errorf("loadtest: rollup scheduler: %w", err)
+	}
+	if _, err = sched.RollupStats(clockCtx); err != nil {
+		return report, fmt.Errorf("loadtest: start-up rollup pass: %w", err)
+	}
+
 	denseHour := seedEpoch.Add(15*24*time.Hour + 12*time.Hour)
 	typicalHour := seedEpoch.Add(20*24*time.Hour + 9*time.Hour)
-	for _, r := range statsReads(end, typicalHour, denseHour) {
+	for _, r := range statsReads(end, typicalHour, denseHour, sched) {
 		read, readErr := measureStatsRead(clockCtx, db, r)
 		if readErr != nil {
 			return report, readErr
@@ -154,8 +168,10 @@ func ExplainStats(ctx context.Context, cfg ExplainConfig) (StatsExplainReport, e
 }
 
 // statsReads lists every read the characterization measures, as the APIs a
-// dashboard calls — nothing here retypes their SQL.
-func statsReads(now, typicalHour, denseHour time.Time) []statsRead {
+// dashboard calls — nothing here retypes their SQL — and the two maintenance
+// calls a running Scheduler makes unprompted: its rollup pass, through sched,
+// and the backfill check every Scheduler start runs.
+func statsReads(now, typicalHour, denseHour time.Time, sched *flywheel.Scheduler) []statsRead {
 	day := 24 * time.Hour
 	return []statsRead{
 		{"Stats 24h", func(ctx context.Context, db *gorm.DB) error {
@@ -214,6 +230,14 @@ func statsReads(now, typicalHour, denseHour time.Time) []statsRead {
 		}},
 		{"ListJobs", func(ctx context.Context, db *gorm.DB) error {
 			_, err := flywheel.ListJobs(ctx, db, flywheel.ListJobsParams{})
+			return err
+		}},
+		{"Rollup pass, caught up", func(ctx context.Context, _ *gorm.DB) error {
+			_, err := sched.RollupStats(ctx)
+			return err
+		}},
+		{"BackfillRunFinishes, none to log", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.BackfillRunFinishes(ctx, db)
 			return err
 		}},
 		{"Roll up one hour (~1.4k runs)", func(ctx context.Context, db *gorm.DB) error {
@@ -397,7 +421,9 @@ func (r StatsExplainReport) Text() string {
 			"logger and explained verbatim with EXPLAIN (ANALYZE, BUFFERS), after VACUUM (ANALYZE). The clock is\n" +
 			"fixed at the end of the seeded range: the rollups cover every closed hour, and the hour in\n" +
 			"progress is read raw. Latency is the wall time of the whole API call — every statement plus the\n" +
-			"Go-side merge — as the median of 7 calls after a warm-up.\n\n",
+			"Go-side merge — as the median of 7 calls after a warm-up. The rollup pass runs through a Scheduler\n" +
+			"that has made its start-up pass, on its own handle, so its statements (primary-key reads of\n" +
+			"job_stats_progress and an empty range delete) are not captured.\n\n",
 	)
 	fmt.Fprintf(&b, "%-36s %10s %10s %10s %6s\n", "read", "median", "min", "max", "stmts")
 	for _, read := range r.Reads {

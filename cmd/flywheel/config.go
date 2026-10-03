@@ -101,8 +101,9 @@ type RuntimeConfig struct {
 }
 
 // defaultStatsRollup is the stats rollup cadence `serve` uses when
-// runtime.stats_rollup is unset. A pass with nothing to roll is two indexed
-// reads, so a minute keeps the rollup current at negligible cost.
+// runtime.stats_rollup is unset. A pass with nothing to roll is two primary-key
+// reads and a range delete that finds nothing, so a minute keeps the rollup
+// current at negligible cost.
 const defaultStatsRollup = time.Minute
 
 // rollupMinRetention is the shortest runtime.retention the stats rollup can
