@@ -35,6 +35,15 @@ type RetentionOpts struct {
 	// sweep has no equivalent ceiling, deliberately — an unpruned row is only
 	// storage, while an unreclaimed lease is stalled work.
 	MaxBatches int
+	// HoldForStatsRollup holds the cutoff back for the hourly stats rollup, so
+	// retention never deletes a run the rollup has yet to count: the cutoff is
+	// capped at the end of the hours the rollups cover (the watermark), and —
+	// while the rollup is still working back through history toward
+	// StatsRetention — at the oldest hour it keeps. Nothing is deleted while
+	// nothing has been rolled up. A Scheduler with StatsRollupInterval set holds
+	// on its own; set this for any other pass against a database the rollup runs
+	// on, such as `flywheel prune`'s.
+	HoldForStatsRollup bool
 }
 
 // batchSize resolves the configured batch size, applying the default for a
@@ -103,6 +112,20 @@ func DeleteFinishedJobs(ctx context.Context, db *gorm.DB, olderThan time.Time) (
 func DeleteFinishedJobsWithOptions(
 	ctx context.Context, db *gorm.DB, olderThan time.Time, opts RetentionOpts,
 ) (int64, error) {
+	if opts.HoldForStatsRollup {
+		held, ok, err := statsRetentionCap(ctx, db)
+		if err != nil {
+			return 0, fmt.Errorf("flywheel: delete finished jobs: %w", err)
+		}
+		if !ok {
+			return 0, nil
+		}
+		if held.Before(olderThan) {
+			// In the caller's zone: jobs timestamps are compared in it, which on
+			// SQLite is the zone their text was written in.
+			olderThan = held.In(olderThan.Location())
+		}
+	}
 	batchSize := opts.batchSize()
 	var (
 		deleted int64

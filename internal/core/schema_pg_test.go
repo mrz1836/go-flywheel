@@ -54,6 +54,7 @@ func TestInspectSchemaReportsWhatAnOlderSchemaLacksPostgres(t *testing.T) {
 	assert.ElementsMatch(t, []string{
 		"job_runs.kind", "job_runs.queue", "job_runs.queue_wait_ms", "job_runs.job_state",
 		"job_runs.superseded", "job_run_finishes (table)", "job_stats_hourly (table)",
+		"job_stats_progress (table)",
 	}, schemaDriftNames(drift))
 
 	current, err := InspectSchema(context.Background(), NewPostgresIsolatedDB(t))

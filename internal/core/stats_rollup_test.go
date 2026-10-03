@@ -27,10 +27,10 @@ func rollupSuite(t *testing.T, open dbOpener) {
 			discardRun("a", h.Add(30*time.Minute)), okRun("b", h.Add(40*time.Minute), 30),
 		})
 		ctx := fixedClockCtx(h.Add(2 * time.Hour))
-		_, err := rollupHour(ctx, db, h, h.Add(2*time.Hour), false)
+		_, err := rollupHour(ctx, db, h, h.Add(2*time.Hour), false, coverageStep{})
 		require.NoError(t, err)
 		first := statsRows(t, db)
-		_, err = rollupHour(ctx, db, h, h.Add(3*time.Hour), false)
+		_, err = rollupHour(ctx, db, h, h.Add(3*time.Hour), false, coverageStep{})
 		require.NoError(t, err)
 		assert.Equal(t, first, statsRows(t, db), "a re-roll is a replace with the same values")
 		require.Len(t, first, 5, "two groups, their two per-kind totals, and the hour's total")
@@ -56,12 +56,12 @@ func rollupSuite(t *testing.T, open dbOpener) {
 		gone.ID = "run-gone"
 		seedHistory(t, db, []histRun{okRun("kept", h.Add(5*time.Minute), 100), gone})
 		ctx := fixedClockCtx(h.Add(2 * time.Hour))
-		_, err := rollupHour(ctx, db, h, h, false)
+		_, err := rollupHour(ctx, db, h, h, false, coverageStep{})
 		require.NoError(t, err)
 		require.Len(t, groupStatsRows(t, db), 2)
 
 		require.NoError(t, db.Where("id = ?", "run-gone").Delete(&jobRunRow{}).Error)
-		_, err = rollupHour(ctx, db, h, h, false)
+		_, err = rollupHour(ctx, db, h, h, false, coverageStep{})
 		require.NoError(t, err)
 		rows := groupStatsRows(t, db)
 		require.Len(t, rows, 1, "replace semantics: a group the recompute no longer produces disappears")
@@ -80,10 +80,7 @@ func rollupSuite(t *testing.T, open dbOpener) {
 		res := rollupAll(t, db, h.Add(time.Hour+4*time.Minute))
 		assert.Zero(t, res.Hours, "the hour ended four minutes ago, inside the five-minute grace")
 		assert.Equal(t, h, res.Watermark, "only the empty hours before it are recorded as processed")
-		for _, r := range statsRows(t, db) {
-			assert.Equal(t, statsTotalKey, r.Kind, "nothing but a marker is written")
-			assert.Zero(t, r.Attempts)
-		}
+		assert.Empty(t, statsRows(t, db), "an empty hour stores no rows; the progress row records it")
 
 		res = rollupAll(t, db, h.Add(time.Hour+5*time.Minute))
 		assert.Equal(t, 1, res.Hours, "past the grace the hour closes")
@@ -105,18 +102,13 @@ func rollupSuite(t *testing.T, open dbOpener) {
 		assert.Equal(t, hourAt(rollupBase, 20), res.Watermark,
 			"the quiet stretch after the last run is recorded, so the watermark reaches the last closed hour")
 
-		markers := func() int64 {
-			var n int64
-			require.NoError(t, db.Model(&jobStatsHourlyRow{}).
-				Where("kind = ? AND queue = ? AND attempts = 0", statsTotalKey, statsTotalKey).Count(&n).Error)
-			return n
-		}
-		assert.EqualValues(t, 1, markers(), "one marker records the quiet stretch")
-
 		res = rollupAll(t, db, now.Add(5*time.Hour))
 		assert.Empty(t, res.Rolled)
 		assert.Equal(t, hourAt(rollupBase, 25), res.Watermark)
-		assert.EqualValues(t, 1, markers(), "an older marker is replaced, never accumulated")
+		for _, r := range statsRows(t, db) {
+			assert.NotZero(t, r.Attempts, "a quiet hour stores no row, so nothing accumulates")
+		}
+		assert.Len(t, statsRows(t, db), 6, "two rolled hours, each a group, a per-kind total, and a total")
 	})
 
 	t.Run("a pass stops at its ceiling and the next one resumes", func(t *testing.T) {

@@ -147,9 +147,21 @@ func TestCLIStatsWithoutRollupsReadsRawAndCapsTheWindow(t *testing.T) {
 	assert.Contains(t, out, "no hourly rollups yet", "an unrolled database says the window was read raw")
 	assert.Regexp(t, `TOTAL\s+0\s+0\s+0\s+0\s+-`, out, "an empty window renders zeros and dashes")
 
+	out, err = runRoot(statusClockCtx(), "--config", cfg, "stats", "--since", "30d")
+	require.NoError(t, err, "a month with no runs in it costs nothing to read raw")
+	assert.Contains(t, out, "raw runs")
+
+	// History spread over three weeks: reading it raw is the scan the cap refuses.
+	db, _ := openCLIConfigDB(t, cfg)
+	for i, at := range []time.Time{statusAnchor.Add(-21 * 24 * time.Hour), statusAnchor.Add(-time.Hour)} {
+		id := fmt.Sprintf("spread-%d", i)
+		insertStatsJob(t, db, id, "exec", "default", "succeeded", at, nil)
+		fin := at.Add(time.Second)
+		insertStatsRun(t, db, id+"-r", id, "exec", "default", "success", "succeeded", at, &fin, 1000)
+	}
 	_, err = runRoot(statusClockCtx(), "--config", cfg, "stats", "--since", "30d")
 	require.ErrorIs(t, err, flywheel.ErrStatsNotRolledUp,
-		"a month of raw runs is refused rather than scanned")
+		"three weeks of raw runs is refused rather than scanned")
 	assert.Contains(t, err.Error(), "stats_rollup", "the error names the daemon setting that fixes it")
 }
 
@@ -175,6 +187,7 @@ func TestCLIStatsRebuildRecomputesAndRefusesPrunedHours(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out, "rebuilt 1 hour(s), 1 group row(s)", "every closed hour in range is recomputed")
 	assert.Contains(t, out, "→ 2026-06-22T11:00:00Z", "the range is clamped to the last closed hour")
+	assert.Regexp(t, `rollups now cover \S+ → 2026-06-22T11:00:00Z`, out, "and the covered range is reported")
 
 	// Delete the raw history the rollup counted: a rebuild without --force must
 	// refuse to replace the complete rollup with a partial one.

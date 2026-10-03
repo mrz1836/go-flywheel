@@ -59,7 +59,7 @@ func BenchmarkStatsReadsPostgres(b *testing.B) {
 	})
 	b.Run("RollupHour", func(b *testing.B) {
 		for b.Loop() {
-			if _, err := rollupHour(ctx, db, hour, now, false); err != nil {
+			if _, err := rollupHour(ctx, db, hour, now, false, coverageStep{}); err != nil {
 				b.Fatal(err)
 			}
 		}

@@ -150,7 +150,8 @@ not keep pace (two passes in two minutes).
   month at a million runs rolls from scratch in under ten seconds in one `RebuildStats`, so raise it (or
   rebuild once) if you would rather catch up at once.
 - **Retention must outlive the grace.** With the rollup on, `RetentionMaxAge` below one hour plus the
-  grace is refused, and retention never prunes past the rollup watermark. Keep raw runs as long as you
+  grace is refused, and retention never prunes a run the rollup has not counted yet (the watermark, or
+  the oldest hour it keeps while it works back through history). Keep raw runs as long as you
   want per-run drill-down (`ListRuns`, `SlowRuns`); keep rollups (`StatsRetention`, 400 days) as long as you
   want trends.
 - **The write cost is fixed per job, not per read.** The analytics add about 0.4–0.65 KB of WAL per job —

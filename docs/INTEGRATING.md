@@ -58,9 +58,9 @@ column that is nullable or carries a default, so:
 - **a database migrated for this release keeps working with the previous release's binaries**, which never
   read or write the new columns — the safe direction of a rolling deploy;
 - **this release's binaries refuse to start against a database that has not been migrated.** A Runner,
-  a Node, and a Scheduler with the stats rollup on each stop at startup with `ErrSchemaOutdated`, naming
-  every missing column and table and the fix — rather than claiming work whose audit row they cannot
-  write.
+  a Scheduler, and a Node each stop at startup with `ErrSchemaOutdated`, naming every missing column and
+  table and the fix — rather than claiming work whose audit row they cannot write, or sweeping into a
+  finish log that is not there.
 
 **So the order is always: migrate the database, then deploy the binaries.**
 
@@ -74,6 +74,7 @@ column that is nullable or carries a default, so:
 | `job_runs.superseded` | column, `boolean NOT NULL DEFAULT false` | a durable record that an attempt finished after its claim was gone |
 | `job_run_finishes` | table | the finish log: `(finished_at, run_id)`, which makes runs searchable by finish time |
 | `job_stats_hourly` | table | the hourly rollups trends and baselines read |
+| `job_stats_progress` | table | one row: the hours the rollups cover, so a missing hour is known to be empty |
 | `jobs_finished` | index on `jobs` | "recently finished", newest first, per terminal state |
 
 None of it is backfilled at migration time: old rows keep the column defaults, and the read path resolves
@@ -97,9 +98,16 @@ err := flywheel.MigrateWithOptions(db, flywheel.MigrateOpts{
 })
 ```
 
-`flywheel migrate` prints what it added (`added: job_runs.kind, …, job_stats_hourly (table)`), and a
-re-run prints nothing new. Both options are no-ops on SQLite. If the lock timeout fires — a long
-transaction held `job_runs` — the migration fails cleanly; run it again at a quieter moment.
+`flywheel migrate` prints what it added (`added: job_runs.kind, …, job_stats_progress (table)`), and a
+re-run prints nothing new — an up-to-date schema issues no DDL at all. Both options are no-ops on
+SQLite. Each step commits on its own, so a lock timeout fails only the statement that could not get its
+lock: everything before it is applied, and a re-run completes the rest. Two migrations of one schema run
+one after the other.
+
+`flywheel serve` and `flywheel doctor` migrate too, with concurrent index builds, so either can be the
+first thing to touch a live database without blocking the queue's writers; both also repair an index an
+interrupted `migrate --concurrently` left invalid. Running `flywheel migrate --concurrently --lock-timeout
+5s` first is still the better order: it is the step you can watch and retry.
 
 ### Host-owned install (your migration tool)
 
@@ -158,6 +166,15 @@ CREATE TABLE IF NOT EXISTS job_stats_hourly (
   rolled_at         timestamptz NOT NULL,
   PRIMARY KEY (bucket_start_unix, kind, queue)
 );
+CREATE TABLE IF NOT EXISTS job_stats_progress (
+  id                bigint      NOT NULL,
+  covered_from_unix bigint      NOT NULL,
+  covered_to_unix   bigint      NOT NULL,
+  retain_from_unix  bigint      NOT NULL,
+  version           bigint      NOT NULL,
+  updated_at        timestamptz NOT NULL,
+  PRIMARY KEY (id)
+);
 ```
 
 If your schema declares `job_runs.id` as `uuid` rather than `text`, declare `job_run_finishes.run_id` as
@@ -208,6 +225,15 @@ CREATE TABLE IF NOT EXISTS job_stats_hourly (
   rolled_at         datetime NOT NULL,
   PRIMARY KEY (bucket_start_unix, kind, queue)
 );
+CREATE TABLE IF NOT EXISTS job_stats_progress (
+  id                integer  NOT NULL,
+  covered_from_unix integer  NOT NULL,
+  covered_to_unix   integer  NOT NULL,
+  retain_from_unix  integer  NOT NULL,
+  version           integer  NOT NULL,
+  updated_at        datetime NOT NULL,
+  PRIMARY KEY (id)
+);
 ```
 
 **2. Install the index at deploy, the way you already install the others.** The one new index,
@@ -241,13 +267,17 @@ The deploy itself needs nothing more. What remains, the runtime does on its own 
 1. **Its first rollup pass backfills the finish log** for every run the previous release finalized
    (`BackfillRunFinishes`) — one pass over `job_runs` in primary-key batches, writing an entry only for the
    pre-upgrade rows. On SQLite it first re-stamps those rows' timestamps in UTC
-   (`NormalizeRunTimestamps`), because the previous release wrote them in the clock's local zone.
+   (`NormalizeRunTimestamps`), because the previous release wrote them in the clock's local zone. Every
+   later backfill starts with one statement that asks whether any run still lacks its entry, and stops
+   there when none does — so once the upgrade is done, a restart does not walk `job_runs` again.
 2. **The rollup then works through history** a bounded number of hours per pass (`StatsMaxHoursPerPass`,
    24 by default), from the oldest finished run — but no further back than `StatsRetention` (400 days).
    While it catches up it logs `jobs: stats rollup catching up`, and a long `Stats` window answers
    `ErrStatsNotRolledUp`. To catch up at once instead, run `flywheel stats rebuild --from <oldest> --to
    <now>` (it backfills, then rebuilds), or `BackfillRunFinishes` followed by `RebuildStats`. A month at
-   a million runs rolls up from scratch in under ten seconds.
+   a million runs rolls up from scratch in under ten seconds. A rebuild of only the recent hours is safe
+   too: the rollups never cover a range with a gap in it, so it rolls the hours between the rollup's
+   progress and the ones you asked for as well (only those with runs cost a recompute).
 3. **Old rows are read through `jobs`.** A run the previous release wrote has `kind = ''`; the stats
    resolve its kind, queue, and — for a failed attempt — whether it discarded its job, through the job row.
    Nothing rewrites history.
@@ -257,8 +287,14 @@ The deploy itself needs nothing more. What remains, the runtime does on its own 
 During a rolling deploy both releases run against the migrated database. The previous release's runners
 write runs without the new columns and without finish-log entries; this release's Scheduler backfills
 those on its first pass and once more ten minutes later, which covers a deploy that overlaps for minutes.
-If yours overlaps for longer, run `flywheel stats rebuild` over the deploy window afterwards — a rebuild
-backfills before it recomputes.
+A backfilled run whose hour the rollup already closed is counted by re-rolling that hour. If your deploy
+overlaps for longer, run `flywheel stats rebuild` over the deploy window afterwards — a rebuild backfills
+before it recomputes.
+
+Right after the migration, a previous-release process on PostgreSQL may fail one statement on `job_runs`
+with `cached plan must not change result type` (SQLSTATE `0A000`): its driver cached a `SELECT *` plan
+before the columns were added. The driver drops the plan and the retry succeeds; the error is a one-off
+per connection, not a sign the migration went wrong.
 
 ### Verifying
 
@@ -270,9 +306,9 @@ flywheel stats     # per-kind stats for the last 24 hours, and how they were ser
 ### Rolling back
 
 Deploy the previous release's binaries: they run unchanged against the migrated schema. Nothing needs to
-be dropped. If you want the schema back as it was, drop `job_stats_hourly`, `job_run_finishes`, the
-`jobs_finished` index, and the five `job_runs` columns — but only after no binary of this release is
-running, since it refuses to start without them.
+be dropped. If you want the schema back as it was, drop `job_stats_progress`, `job_stats_hourly`,
+`job_run_finishes`, the `jobs_finished` index, and the five `job_runs` columns — but only after no binary
+of this release is running, since it refuses to start without them.
 
 <br>
 
@@ -317,7 +353,8 @@ maintenance loop can call `Scheduler.RollupStats(ctx)` instead of the activity.
 2. **The columns documented below are stable for direct SQL.** Their names, types, and meaning will not
    change without a major version.
 3. **Everything else is internal**: other columns, index names and shapes, the histogram encoding beyond
-   what `HistogramBounds` documents, and the watermark marker rows in `job_stats_hourly`.
+   what `HistogramBounds` documents, and `job_stats_progress` — read the hours the rollups cover through
+   `StatsCoverage` (or `RebuildResult`) instead.
 
 ### Tables and columns
 
@@ -338,8 +375,8 @@ once when it ends (by its finalize, or by the lease sweep if its process died).
 | `started_at`, `finished_at` | in UTC; `finished_at` is NULL while running and written once |
 | `duration_ms` | start to finalize; NULL while running and for `crashed` |
 | `queue_wait_ms` | claimable to started; NULL on older rows |
-| `job_state` | the state the finalize applied (`succeeded`, `retryable`, `discarded`, `scheduled`, `cancelled`, or `available` for a crash); NULL while running and when superseded |
-| `superseded` | true when the attempt finished after its claim was gone — its outcome was recorded but never applied, so the work may have run twice |
+| `job_state` | the state the finalize applied (`succeeded`, `retryable`, `discarded`, `scheduled`, `cancelled`, or `available` for a crash the lease sweep reclaimed); NULL while running, when superseded, and on a row an older release or `SeedRun` wrote |
+| `superseded` | true when the attempt finished after its claim was gone — its outcome was recorded but never applied, so the work may have run twice. An attempt the lease sweep crashed that then finished late keeps `job_state = 'available'` and its sweep-time `finished_at` beside the late outcome |
 | `error_class`, `error_message` | for a failed attempt |
 | `cost_micros`, `enqueued_children`, `output` | what the worker reported |
 
@@ -359,15 +396,15 @@ Join it to `job_runs` on `run_id = id` to find runs by finish time.
 
 **Read exactly one class**, or you count every run two or three times. A per-kind chart reads
 `queue = ''`; an overview reads `kind = '' AND queue = ''`; only a per-queue view needs the groups
-(`kind <> '' AND queue <> ''`). An hour total with zero counts is also how the rollup marks a stretch of
-hours with no runs. Runs whose kind or queue cannot be resolved — an old row whose job is gone — group under
-`(unknown)`.
+(`kind <> '' AND queue <> ''`). An hour with no runs has no rows: within the hours the rollups cover, a
+missing hour means nothing ran (which hours those are, `Stats` reports in its `Coverage`). Runs whose kind
+or queue cannot be resolved — an old row whose job is gone — group under `(unknown)`.
 
 | Column | Meaning |
 |---|---|
 | `attempts` | finished, non-superseded attempts |
 | `success`, `error`, `timeout`, `snooze`, `cancelled`, `crashed` | attempts by outcome (superseded excluded) |
-| `superseded` | attempts that finished after losing their claim |
+| `superseded` | attempts that finished after losing their claim — to a cancel; an attempt the lease sweep reclaimed counts as `crashed`, even if it finished late |
 | `discarded` | attempts that discarded their job — job-level failures |
 | `dur_count`, `dur_sum_ms`, `dur_max_ms` | exact, over **successful** attempts only |
 | `dur_p50_ms`, `dur_p95_ms`, `dur_p99_ms` | estimated within a few percent, never above the max |
@@ -377,7 +414,9 @@ hours with no runs. Runs whose kind or queue cannot be resolved — an old row w
 | `dur_hist`, `wait_hist`, `hist_version` | sparse `[[bucket, count], …]` histograms; `HistogramBounds(hist_version)` gives the bounds |
 
 Derived numbers: jobs **succeeded** = `success`; jobs **failed** = `discarded`; **retries** =
-`error + timeout − discarded + crashed`; **success rate** = `success / (success + discarded)`.
+`error + timeout − discarded + crashed`; **success rate** = `success / (success + discarded)`. A failed
+attempt that does not record the state it applied — one an older release wrote, or one `SeedRun`
+imported — counts as the discard when its job is discarded at that attempt, and as a retry otherwise.
 
 ### Time and zones
 
@@ -418,7 +457,7 @@ job's age (the lag). The same access paths as `SampleQueueHealth`.
 **`ListFinished(ctx, db, ListFinishedParams{States, Kind, Queue, Since, Before, Limit})`** — the most
 recently finished jobs, newest first by `(finalized_at, id)`. One `LIMIT n` range scan per requested
 terminal state on `jobs_finished`, merged in Go. Page with `Before: &FinishedCursor{FinalizedAt, ID}` from
-the previous page's last job.
+the previous page's last job. A state listed twice is read once.
 
 **`RecentFailures(ctx, db, RecentFailuresParams{Since, Limit})`** — discarded jobs with the error of the
 attempt that discarded them; also on `jobs_finished`.
@@ -426,7 +465,9 @@ attempt that discarded them; also on `jobs_finished`.
 **`ListJobs(ctx, db, ListJobsParams{State, Kind, Queue, BeforeID, Limit})`** — jobs newest first *by id*.
 Ids are UUIDv7, so id order is insertion order and the primary key serves the page; `BeforeID` pages it.
 
-**`ListRuns(ctx, db, jobID, params)`** — one job's attempts with every column above.
+**`ListRuns(ctx, db, jobID, ListRunsParams{BeforeAttempt, Before, Limit})`** — one job's attempts with
+every column above, newest attempt first. Page with `BeforeAttempt` set to the previous page's last
+`Attempt`; `Before` (a `created_at` cursor) also works, and is zone-proof on SQLite.
 
 **`SlowRuns(ctx, db, SlowRunsParams{Kind, Since, MinDuration, Limit})`** — the slowest finished runs in a
 short window (24 hours by default), any outcome — a timeout is a slow run. A range of `job_run_finishes`;
@@ -439,18 +480,24 @@ attempts by outcome, jobs succeeded and discarded, retries, superseded attempts,
 `Duration` (successful attempts) and `QueueWait` as `{Count, Avg, P50, P95, P99, Max}`, cost, and the
 slowest run — plus a `Total` and a `Coverage` saying how it was served.
 
-It is a hybrid read. Whole hours the rollup has closed come from `job_stats_hourly`; the rest — the hours
-past the rollup's watermark, and a partial hour at either edge — is aggregated from raw runs by the same
-function the rollup runs. Both halves count with the same histograms, so the answer is identical whether
-an hour came from a rollup or from raw runs; a randomized oracle test holds this to equality. With the
-rollup off the whole window is read raw — correct, only slower — and a window that would read more than
-`MaxRawSpan` (7 days by default) of raw runs fails with `ErrStatsNotRolledUp`, naming the fix.
+It is a hybrid read. Whole hours the rollups cover — `[Coverage.RolledFrom, Coverage.RolledThrough)`, the
+range `job_stats_progress` records — come from `job_stats_hourly`; the rest — the hours past the rollup's
+watermark, a partial hour at either edge, and any hours older than the rollups reach (`StatsRetention`)
+— is aggregated from raw runs by the same function the rollup runs. Both halves count with the same
+histograms, so the answer is identical whether an hour came from a rollup or from raw runs; a randomized
+oracle test holds this to equality. With the rollup off the whole window is read raw — correct, only
+slower — and a window that would read more than `MaxRawSpan` (7 days by default) of raw runs fails with
+`ErrStatsNotRolledUp`, naming the fix. The cap counts raw *runs*, not the clock: each raw part is measured
+from the first run in it, so a "last 90 days" window on a database with two weeks of history, or one
+reaching back past the rollups into hours retention has emptied, is served.
 
 **`StatsSeries(ctx, db, SeriesParams{From, To, Kind, Queue, Interval, Location})`** — one point per hour or
 per local day, empty buckets included, each a `KindStats` for the bucket. Served exactly like `Stats`.
 
 **`Baselines(ctx, db, window)`** — each kind's p50/p95/p99 success duration, sample count, and discard
-rate over the window of rolled hours ending at the watermark (7 days by default).
+rate over the window of rolled hours ending at the watermark (7 days by default). It is memoized per
+database and window until the rollup next writes — in any process — so polling it costs one primary-key
+read.
 
 **`Anomalies(ctx, db, AnomalyParams{Hour, BaselineWindow, Thresholds})`** — the kinds behaving unlike
 their own baseline at an hour; see [What the anomaly detector catches](#what-the-anomaly-detector-catches).
@@ -459,8 +506,8 @@ their own baseline at an hour; see [What the anomaly detector catches](#what-the
 
 | Function | Use |
 |---|---|
-| `RebuildStats(ctx, db, RebuildOpts{From, To, Force})` | recompute closed hours from raw runs — after a `SeedRun` import, or clock skew beyond the grace; refuses to shrink an hour whose raw runs retention already pruned unless `Force` |
-| `BackfillRunFinishes(ctx, db)` | write finish-log entries for runs an older release finalized; the rollup runs it for you, and `flywheel stats rebuild` runs it before rebuilding — call it yourself before a `RebuildStats` that should see such runs |
+| `RebuildStats(ctx, db, RebuildOpts{From, To, Force})` | recompute closed hours from raw runs — after a `SeedRun` import, clock skew beyond the grace, or to catch up at once; extends the covered range without leaving a gap (it rolls the hours between too); refuses to shrink an hour whose raw runs retention already pruned unless `Force` |
+| `BackfillRunFinishes(ctx, db)` | write finish-log entries for runs an older release finalized, and re-roll any covered hour they land in; the rollup runs it for you, and `flywheel stats rebuild` runs it before rebuilding |
 | `NormalizeRunTimestamps(ctx, db)` | SQLite only: re-stamp pre-upgrade `job_runs` timestamps in UTC; the backfill runs it for you |
 | `HistogramBounds(version)` | the bucket bounds behind a stored histogram |
 | `InspectSchema`, `InspectIndexes` | the CI parity checks |
@@ -645,6 +692,10 @@ rollup never loses data:
 
 - **Retention waits for the rollup.** With the rollup on, the retention cutoff is the earlier of
   `now − RetentionMaxAge` and the rollup watermark, and nothing is pruned until the rollup has run once.
+  While the rollup is still working back through history it holds at the oldest hour the rollup keeps, so
+  nothing it has yet to count is taken. `flywheel prune` holds the same way whenever its config has the
+  rollup on (`--ignore-stats-rollup` prunes past it); any other caller sets
+  `RetentionOpts.HoldForStatsRollup`.
 - **A retention window shorter than one hour plus the grace is refused** (`ErrValidation`) when the rollup
   is on: no run would live long enough to be counted. `flywheel serve` instead turns its default rollup
   off, with a warning, so a config written before this release keeps starting.

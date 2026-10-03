@@ -26,15 +26,15 @@ func Models() []any {
 	return []any{
 		&jobRow{}, &jobRunRow{}, &jobPeriodicRow{},
 		&limiterBucketRow{}, &limiterHoldRow{},
-		&jobRunFinishRow{}, &jobStatsHourlyRow{},
+		&jobRunFinishRow{}, &jobStatsHourlyRow{}, &jobStatsProgressRow{},
 	}
 }
 
 // Migrate is the library-owned install: it brings up the runtime's tables — the
 // three job tables (jobs, job_runs, job_periodics), the two limiter tables
-// (limiter_buckets, limiter_holds) the DBLimiter uses, and the two stats tables
-// (job_run_finishes, the finish log every finalize writes, and job_stats_hourly,
-// the rollup) — with their NOT-NULL constraints, column defaults, and the jobs
+// (limiter_buckets, limiter_holds) the DBLimiter uses, and the three stats tables
+// (job_run_finishes, the finish log every finalize writes; job_stats_hourly, the
+// rollup; and job_stats_progress, the hours the rollup covers) — with their NOT-NULL constraints, column defaults, and the jobs
 // soft-delete column, plus the partial/unique indexes GORM AutoMigrate cannot
 // express. A host in this mode calls Migrate(db) and nothing else. The limiter
 // tables are additive: a host that never constructs a DBLimiter simply leaves
@@ -42,7 +42,7 @@ func Models() []any {
 //
 // # Choosing an install mode
 //
-// The runtime owns seven tables and there are two ways to install them. They are
+// The runtime owns eight tables and there are two ways to install them. They are
 // not layers. A host picks exactly one; running both means two migration
 // authorities against one database.
 //

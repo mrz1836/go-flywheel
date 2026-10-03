@@ -769,16 +769,18 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 }
 
 // checkSchema runs the startup schema probe over the tables the run path writes,
-// once per Runner. A database missing a column the stub insert or the finalize
-// update names fails the run before anything is claimed: claiming first would
-// lease a job, fail its stub insert, and leave the lease sweep to reclaim the
-// same jobs forever. A probe that cannot reach the database is not a verdict and
-// is retried on the next run — see probeSchema.
+// once per Runner: jobs and job_runs, which the claim, the stub insert, and the
+// finalize update write, and job_run_finishes, which every finalize logs to in
+// the same transaction. A database missing any of them fails the run before
+// anything is claimed: claiming first would lease a job, fail its stub insert or
+// its finalize, and leave the lease sweep to reclaim the same jobs forever. A
+// probe that cannot reach the database is not a verdict and is retried on the
+// next run — see probeSchema.
 func (r *Runner) checkSchema(ctx context.Context) error {
 	if r.schemaChecked.Load() {
 		return nil
 	}
-	checked, err := probeSchema(ctx, r.cfg.DB, &jobRow{}, &jobRunRow{})
+	checked, err := probeSchema(ctx, r.cfg.DB, runPathModels()...)
 	if err != nil {
 		return fmt.Errorf("jobs: runner schema check: %w", err)
 	}

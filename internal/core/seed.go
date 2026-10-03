@@ -71,8 +71,10 @@ type RunSeed struct {
 // finalize path uses, the same kind and queue copied from its job, and the same
 // UTC timestamps, and — for a finished run — the same job_run_finishes entry a
 // finalize writes, in the same transaction. What a seed cannot know it leaves
-// NULL — the queue wait and the job state the attempt applied — so a seeded run
-// is counted by outcome and duration, never as a retry or a discard.
+// NULL — the queue wait and the job state the attempt applied. The stats
+// resolve a seeded failed attempt's effect on its job the way they resolve a
+// run an older release wrote, through the job: it counts as the discard when
+// its job is discarded at that attempt, and as a retry otherwise.
 //
 // A seeded run that finishes in an hour the stats rollup has already closed is
 // not in that hour's rollup until RebuildStats covers it.

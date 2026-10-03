@@ -125,12 +125,13 @@ func TestStatsCoverageDescribesTheSplit(t *testing.T) {
 }
 
 // TestStatsRefusesAnUnrolledLongWindow proves the raw cap: with no rollup, a
-// window longer than MaxRawSpan fails with ErrStatsNotRolledUp naming the fix,
-// a shorter one is served raw, and a negative cap removes the limit.
+// window that would read more than MaxRawSpan of raw runs fails with
+// ErrStatsNotRolledUp naming the fix, a shorter one is served raw, and a
+// negative cap removes the limit.
 func TestStatsRefusesAnUnrolledLongWindow(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	seedHistory(t, db, []histRun{okRun("a", rollupBase, 100)})
+	seedHistory(t, db, []histRun{okRun("a", rollupBase.Add(-20*24*time.Hour), 100), okRun("a", rollupBase, 100)})
 	ctx := context.Background()
 
 	_, err := Stats(ctx, db, StatsParams{From: rollupBase.Add(-30 * 24 * time.Hour), To: rollupBase.Add(time.Hour)})
@@ -150,7 +151,29 @@ func TestStatsRefusesAnUnrolledLongWindow(t *testing.T) {
 		From: rollupBase.Add(-30 * 24 * time.Hour), To: rollupBase.Add(time.Hour), MaxRawSpan: -1,
 	})
 	require.NoError(t, err)
+	assert.EqualValues(t, 2, got.Total.Attempts)
+
+	// The cap measures raw runs, not the clock: a window reaching back past the
+	// oldest run reads only from that run on.
+	got, err = Stats(ctx, db, StatsParams{From: rollupBase.Add(-10 * 24 * time.Hour), To: rollupBase.Add(time.Hour)})
+	require.NoError(t, err, "ten days back, but the only run in the window is an hour old")
 	assert.EqualValues(t, 1, got.Total.Attempts)
+	assert.Equal(t, time.Hour, got.Coverage.RawSpan, "measured from the first run in the window")
+	points, err := StatsSeries(ctx, db, SeriesParams{
+		From: rollupBase.Add(-10 * 24 * time.Hour), To: rollupBase.Add(time.Hour), Interval: IntervalDay,
+	})
+	require.NoError(t, err, "and so does a series")
+	var total int64
+	for _, p := range points {
+		total += p.Stats.Attempts
+	}
+	assert.EqualValues(t, 1, total)
+	got, err = Stats(ctx, db, StatsParams{
+		From: rollupBase.Add(-60 * 24 * time.Hour), To: rollupBase.Add(-30 * 24 * time.Hour),
+	})
+	require.NoError(t, err, "a window with no runs at all reads nothing")
+	assert.Zero(t, got.Total.Attempts)
+	assert.Zero(t, got.Coverage.RawSpan)
 }
 
 // TestStatsValidatesItsWindow covers the argument checks.

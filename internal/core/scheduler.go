@@ -91,7 +91,9 @@ type SchedulerConfig struct {
 	//
 	// With the stats rollup enabled, retention never deletes a run the rollup has
 	// not counted yet: the cutoff is the earlier of now minus RetentionMaxAge and
-	// the rollup watermark, and nothing is pruned until the rollup has run once.
+	// the rollup watermark (or, while the rollup is still working back through
+	// history, the oldest hour it keeps), and nothing is pruned until the rollup
+	// has run once. See RetentionOpts.HoldForStatsRollup.
 	// A RetentionMaxAge shorter than one hour plus StatsRollupGrace is rejected,
 	// because no run would live long enough to be rolled up.
 	RetentionMaxAge time.Duration
@@ -338,8 +340,13 @@ func (a *activity) tick(ctx context.Context, logger *slog.Logger) {
 // before returning. That wait is bounded by one batch rather than one backlog —
 // which is true only because the sweep and the retention prune are batched, and
 // is what makes a Node's DrainTimeout a meaningful bound on shutdown.
+//
+// The one early return is a schema older than the binary: before starting any
+// activity, Run checks that the tables its sweep writes (and, with the stats
+// rollup on, the rollup's tables) carry every column, and returns
+// ErrSchemaOutdated naming what is missing.
 func (s *Scheduler) Run(ctx context.Context) error {
-	if err := s.checkStatsSchema(ctx); err != nil {
+	if err := s.checkSchema(ctx); err != nil {
 		return err
 	}
 	s.runActivities(ctx, s.activities())
@@ -539,30 +546,17 @@ func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
 // The returned count is meaningful alongside a non-nil error: committed batches
 // are not rolled back by a later batch's failure.
 //
-// With the stats rollup enabled the cutoff is held at the rollup watermark when
-// that is earlier, so retention never deletes a run before the rollup has
-// counted it — and nothing is pruned until the rollup has run once.
+// With the stats rollup enabled the pass holds for it, as
+// RetentionOpts.HoldForStatsRollup does: retention never deletes a run before
+// the rollup has counted it, and nothing is pruned until the rollup has run.
 func (s *Scheduler) PruneRetention(ctx context.Context) (int64, error) {
 	if s.retentionMaxAge <= 0 {
 		return 0, nil
 	}
-	now := models.ClockFrom(ctx).Now(ctx)
-	cutoff := now.Add(-s.retentionMaxAge)
-	if s.statsInterval > 0 {
-		watermark, rolled, err := readStatsWatermark(ctx, s.db)
-		if err != nil {
-			return 0, fmt.Errorf("jobs: retention: %w", err)
-		}
-		if !rolled {
-			return 0, nil
-		}
-		if watermark.Before(cutoff) {
-			// In the clock's zone: jobs timestamps are compared in it, which on
-			// SQLite is the zone their text was written in.
-			cutoff = watermark.In(now.Location())
-		}
-	}
-	return DeleteFinishedJobsWithOptions(ctx, s.db, cutoff, s.retentionOpts)
+	opts := s.retentionOpts
+	opts.HoldForStatsRollup = opts.HoldForStatsRollup || s.statsInterval > 0
+	cutoff := models.ClockFrom(ctx).Now(ctx).Add(-s.retentionMaxAge)
+	return DeleteFinishedJobsWithOptions(ctx, s.db, cutoff, opts)
 }
 
 // prunedOnItsCeiling reports whether a pass that deleted n rows used every

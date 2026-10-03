@@ -93,7 +93,7 @@ flywheel serve                        # run the runtime until Ctrl+C
 
 | Command | Purpose |
 |---|---|
-| `flywheel serve` | Run the runner + scheduler until SIGINT/SIGTERM (drains in-flight work) |
+| `flywheel serve` | Migrate (concurrent index builds on PostgreSQL; an up-to-date schema issues no DDL), then run the runner + scheduler until SIGINT/SIGTERM (drains in-flight work) |
 | `flywheel migrate` | Create or upgrade the schema, reporting what it added (`--concurrently --lock-timeout 5s` for a live PostgreSQL database) |
 | `flywheel enqueue <kind> <json>` | Enqueue one job (`--queue --unique --priority --at`) |
 | `flywheel jobs ls` | List recent jobs, newest first (`--state --kind --queue --before <id> --limit --json`) |
@@ -103,10 +103,11 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel jobs cancel <id>` | Move a job to cancelled (refused once a job is terminal) |
 | `flywheel schedule ls` | List periodic schedules |
 | `flywheel schedule add <slug> <kind>` | Add/update a schedule (`--cron \| --every`, `--args`) |
+| `flywheel prune` | Delete finished jobs and their runs older than a cutoff, holding for the stats rollup when it is on (`--older-than 14d --ignore-stats-rollup`) |
 | `flywheel status` | Show queue health, schedules, and recent failures (`--json --watch`) |
 | `flywheel stats` | Per-kind outcomes, success rate, duration percentiles, and queue wait (`--since 24h --kind --queue --json`) |
-| `flywheel stats rebuild` | Backfill the finish log for runs an older release finalized, then recompute the hourly stats rollups for a range (`--from --to [--force]`) |
-| `flywheel doctor` | Validate config, migrate (reporting what the upgrade added), print effective settings and the stats rollup's lag |
+| `flywheel stats rebuild` | Backfill the finish log for runs an older release finalized, then recompute the hourly stats rollups for a range, rolling any hours between it and the rollup's progress too (`--from --to [--force]`) |
+| `flywheel doctor` | Validate config, migrate (as `serve` does), print effective settings and the stats rollup's lag |
 
 All commands take `--config <path>` (default `./flywheel.yaml`, else
 `$XDG_CONFIG_HOME/flywheel/flywheel.yaml`).

@@ -186,9 +186,9 @@ func (jobRunFinishRow) TableName() string { return "job_run_finishes" }
 // from the INSERT, and a counter that is legitimately zero must be written as
 // zero, not left to whatever the column default happens to be.
 //
-// A row with an empty kind and queue is a watermark marker: it records that the
-// rollup has processed an hour that had no runs, carries all-zero counters, and is
-// skipped by every read.
+// An hour with no runs has no rows. Which hours the table speaks for — so that a
+// missing hour means "nothing ran" rather than "not rolled up yet" — is recorded
+// apart from the rows, in job_stats_progress (see jobStatsProgressRow).
 type jobStatsHourlyRow struct {
 	BucketStartUnix int64  `gorm:"column:bucket_start_unix;primaryKey;autoIncrement:false"`
 	Kind            string `gorm:"column:kind;primaryKey"`
@@ -238,6 +238,46 @@ type jobStatsHourlyRow struct {
 
 // TableName binds jobStatsHourlyRow to the job_stats_hourly table.
 func (jobStatsHourlyRow) TableName() string { return "job_stats_hourly" }
+
+// statsProgressID is the key of job_stats_progress's one row.
+const statsProgressID = 1
+
+// jobStatsProgressRow is the one row of job_stats_progress: the range of UTC
+// hours job_stats_hourly is complete for, and a version that moves whenever a
+// rolled hour or the range changes.
+//
+// Every hour in [CoveredFromUnix, CoveredToUnix) has been rolled up: its rows in
+// job_stats_hourly count every run that finished in it, and an hour with no rows
+// had none. The stats reads serve those hours from the rollup and everything
+// outside them from raw runs; retention never deletes a run the range has not
+// reached (see statsRetentionCap).
+//
+// The range is recorded rather than inferred from the rows because the rows
+// cannot say it. An empty hour has no rows, so the first and last stored hours
+// are not where coverage starts and ends; and a RebuildStats of hours the rollup
+// has not reached yet stores rows past a gap of hours nothing has rolled. Every
+// writer extends the range only across hours it has itself just rolled or proven
+// empty, in the same transaction, so the range never spans an unrolled hour.
+//
+// RetainFromUnix is the oldest hour the rollup keeps — now minus StatsRetention
+// as of its latest pass. While CoveredFromUnix is above it the rollup is still
+// working back through history, and retention holds off the runs it has yet to
+// count.
+//
+// Version increases with every write that changes a rolled hour or the range.
+// Baselines memoizes on it, so a rebuild in any process invalidates every
+// process's memo on its next read.
+type jobStatsProgressRow struct {
+	ID              int       `gorm:"column:id;primaryKey;autoIncrement:false"`
+	CoveredFromUnix int64     `gorm:"column:covered_from_unix;not null"`
+	CoveredToUnix   int64     `gorm:"column:covered_to_unix;not null"`
+	RetainFromUnix  int64     `gorm:"column:retain_from_unix;not null"`
+	Version         int64     `gorm:"column:version;not null"`
+	UpdatedAt       time.Time `gorm:"column:updated_at;not null"`
+}
+
+// TableName binds jobStatsProgressRow to the job_stats_progress table.
+func (jobStatsProgressRow) TableName() string { return "job_stats_progress" }
 
 // limiterBucketRow is the DBLimiter's per-resource rate reservoir. The resource
 // string is the primary key — one bucket per protected dependency — and the row

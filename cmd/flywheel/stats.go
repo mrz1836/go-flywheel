@@ -103,15 +103,16 @@ func writeStatsRow(w io.Writer, label string, k flywheel.KindStats) {
 		summaryDuration(k.QueueWait, k.QueueWait.P95))
 }
 
-// describeCoverage renders how the window was served: from rollups up to the
-// watermark and raw after it, or raw throughout when nothing is rolled up yet.
+// describeCoverage renders how the window was served: from the rollups over
+// the hours they cover and raw elsewhere, or raw throughout when nothing is
+// rolled up yet.
 func describeCoverage(c flywheel.StatsCoverage) string {
 	if c.RolledThrough.IsZero() {
 		return fmt.Sprintf("coverage: no hourly rollups yet; read %s of raw runs "+
 			"(the rollup runs in `flywheel serve`, see runtime.stats_rollup)", formatSpan(c.RawSpan))
 	}
-	return fmt.Sprintf("coverage: rollups through %s; %s of raw runs",
-		c.RolledThrough.Format(time.RFC3339), formatSpan(c.RawSpan))
+	return fmt.Sprintf("coverage: rollups through %s (from %s); %s of raw runs",
+		c.RolledThrough.Format(time.RFC3339), c.RolledFrom.Format(time.RFC3339), formatSpan(c.RawSpan))
 }
 
 // formatSuccessRate renders the job success rate as a percentage, or "-" when
@@ -167,6 +168,8 @@ func newStatsRebuildCmd(configPath *string) *cobra.Command {
 		Long: "Recompute the hourly stats rollups for every closed hour in [--from, --to) from the raw\n" +
 			"job_runs, replacing what the rollup stored. Use it to backfill history without waiting for the\n" +
 			"daemon's per-pass ceiling, or to repair hours whose runs landed after the rollup closed them.\n" +
+			"The hours the rollups cover never have a gap: when the range does not touch them, the hours\n" +
+			"in between are rolled too (an empty stretch costs one probe).\n" +
 			"It first backfills the finish log for runs an older release finalized, so a rolling deploy's\n" +
 			"stragglers are counted.\n" +
 			"An hour whose raw runs retention has already pruned is refused unless --force is set.",
@@ -226,6 +229,8 @@ func runStatsRebuild(ctx context.Context, w io.Writer, db *gorm.DB, opts flywhee
 	}
 	_, _ = fmt.Fprintf(w, "rebuilt %d hour(s), %d group row(s), %s → %s\n",
 		res.Hours, res.Groups, res.From.Format(time.RFC3339), res.To.Format(time.RFC3339))
+	_, _ = fmt.Fprintf(w, "rollups now cover %s → %s\n",
+		res.RolledFrom.Format(time.RFC3339), res.RolledThrough.Format(time.RFC3339))
 	return nil
 }
 

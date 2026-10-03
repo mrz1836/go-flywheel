@@ -1104,7 +1104,9 @@ deleted, err := flywheel.DeleteFinishedJobsWithOptions(ctx, db, cutoff,
     flywheel.RetentionOpts{BatchSize: 100, MaxBatches: 1})
 ```
 
-`flywheel prune --older-than 720h` does the same from the CLI.
+`flywheel prune --older-than 720h` does the same from the CLI. With the stats rollup on, both hold for
+it — set `HoldForStatsRollup` in `RetentionOpts` for a pass of your own — so no run is deleted before the
+rollup has counted it.
 
 **If your schema references `job_runs`.** The library declares no foreign key between `jobs` and
 `job_runs`, but your schema may. A row of yours pointing at `job_runs.id` must be `ON DELETE SET NULL`

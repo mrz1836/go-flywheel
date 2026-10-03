@@ -36,9 +36,6 @@ const (
 // rather than one per group. Real groups never carry the empty key — a run's kind
 // is required, its queue defaults to "default", and a run whose kind or queue
 // cannot be resolved groups as unknownStatsKey.
-//
-// A ("", "") row with zero counts is also how the rollup records a stretch of
-// hours with no runs, so its watermark advances through them.
 const statsTotalKey = ""
 
 // unknownStatsKey is the kind and queue a run is grouped under when they cannot
@@ -159,11 +156,13 @@ const (
 	resolvedQueueExpr = `CASE WHEN r.queue = '' THEN COALESCE((SELECT j.queue FROM jobs j WHERE j.id = r.job_id), '` +
 		unknownStatsKey + `') ELSE r.queue END`
 	// resolvedJobStateExpr is the job state a run applied. A row this release
-	// finalized carries it. A failed attempt an older binary wrote does not, and
-	// whether it discarded its job is recovered the same way the kind is: it did
-	// when its job is discarded and this was the job's last attempt.
+	// finalized carries it. A failed attempt that does not — one an older binary
+	// wrote, or one SeedRun imported, which cannot know the state its attempt
+	// applied — has whether it discarded its job recovered through the job: it did
+	// when its job is discarded and this was the job's last attempt. A superseded
+	// attempt applied nothing, and is not looked up.
 	resolvedJobStateExpr = `CASE WHEN r.job_state IS NOT NULL THEN r.job_state ` +
-		`WHEN r.kind = '' AND r.outcome IN ('error', 'timeout') THEN ` +
+		`WHEN NOT r.superseded AND r.outcome IN ('error', 'timeout') THEN ` +
 		`(SELECT CASE WHEN j.state = 'discarded' AND j.attempt = r.attempt THEN 'discarded' END ` +
 		`FROM jobs j WHERE j.id = r.job_id) END`
 )
@@ -260,9 +259,21 @@ func aggregateRuns(ctx context.Context, db *gorm.DB, from, to time.Time, f stats
 // superseded: its outcome was never applied to the job, so it is in no outcome
 // counter and no duration or wait distribution. Durations are successful runs
 // only.
+//
+// A run the lease sweep reclaimed is counted as the crash it was when it
+// finished — job state available, which only the sweep writes — whatever its
+// row says now. The attempt may still finish after the reclaim, and its late,
+// superseded finalize then records its real outcome, duration, and cost on the
+// row; but it keeps the row's finished_at, job state, and queue wait. Counting
+// by those keeps the run where the sweep put it — one crashed attempt, one
+// retry, its wait, and nothing else — so an hour rolled up before the late
+// finalize equals the same hour aggregated after it.
 func (a *runAgg) observe(
 	id string, outcome RunOutcome, superseded bool, jobState *string, duration, wait, cost *int64,
 ) {
+	if jobState != nil && *jobState == string(StateAvailable) {
+		outcome, superseded, duration, cost = OutcomeCrashed, false, nil, nil
+	}
 	if superseded {
 		a.Superseded++
 		return
@@ -314,9 +325,12 @@ type statsGroup struct {
 // hourRows renders one hour's aggregates as the rows the rollup stores: one per
 // (kind, queue) group, one per-kind total, and the hour's total (see
 // statsTotalKey), each with the percentile columns a direct-SQL trend chart reads.
-// An hour with no aggregates renders as a lone zero ("", "") row — the marker
-// that records a quiet stretch.
+// An hour with no aggregates renders as no rows: job_stats_progress, not a row,
+// records that it was rolled.
 func hourRows(bucket time.Time, aggs map[statsGroup]*runAgg, rolledAt time.Time) []jobStatsHourlyRow {
+	if len(aggs) == 0 {
+		return nil
+	}
 	out := make([]jobStatsHourlyRow, 0, len(aggs)*2+1)
 	kinds := map[string]*runAgg{}
 	total := newRunAgg(statsTotalKey, statsTotalKey)
@@ -398,15 +412,21 @@ var errRollupWouldShrink = errors.New("recompute counts fewer runs than the stor
 //
 // guard refuses a recompute that would count fewer runs than the stored rows,
 // returning errRollupWouldShrink and leaving the hour untouched. RebuildStats
-// sets it; the rollup activity, which only ever rolls hours past the watermark,
-// does not need it.
+// sets it, and so does the re-roll after a backfill; the rollup activity, which
+// rolls hours no rollup has covered yet, does not need it.
 //
-// An hour with no runs writes only its zero total row — the marker that records
-// the rollup's progress through a quiet stretch. Older markers are deleted in the
-// same transaction: only the latest one carries information.
+// step extends the covered range across the hour, in the same transaction, when
+// the hour is one the range has not reached; a zero step leaves the range alone.
+// Either way the transaction bumps job_stats_progress's version, which is what
+// tells every process's Baselines memo that a rolled hour changed.
 //
-// It reports the number of (kind, queue) groups written, zero for a marker.
-func rollupHour(ctx context.Context, db *gorm.DB, hour, rolledAt time.Time, guard bool) (int, error) {
+// An hour with no runs writes no rows; it is still recorded as rolled, by the
+// step.
+//
+// It reports the number of (kind, queue) groups written.
+func rollupHour(
+	ctx context.Context, db *gorm.DB, hour, rolledAt time.Time, guard bool, step coverageStep,
+) (int, error) {
 	aggs, err := aggregateRuns(ctx, db, hour, hour.Add(time.Hour), statsFilter{})
 	if err != nil {
 		return 0, err
@@ -424,15 +444,12 @@ func rollupHour(ctx context.Context, db *gorm.DB, hour, rolledAt time.Time, guar
 		if err := tx.Where("bucket_start_unix = ?", hour.Unix()).Delete(&jobStatsHourlyRow{}).Error; err != nil {
 			return fmt.Errorf("clear hour: %w", err)
 		}
-		// A quiet stretch's marker is only needed until a later hour is written.
-		if err := tx.Where("kind = ? AND queue = ? AND attempts = 0 AND superseded = 0 AND bucket_start_unix < ?",
-			statsTotalKey, statsTotalKey, hour.Unix()).Delete(&jobStatsHourlyRow{}).Error; err != nil {
-			return fmt.Errorf("clear stale markers: %w", err)
+		if len(rows) > 0 {
+			if err := tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(&rows).Error; err != nil {
+				return fmt.Errorf("write hour: %w", err)
+			}
 		}
-		if err := tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(&rows).Error; err != nil {
-			return fmt.Errorf("write hour: %w", err)
-		}
-		return nil
+		return applyCoverageStep(tx, step, rolledAt)
 	})
 	if err != nil {
 		return 0, fmt.Errorf("roll up hour %s: %w", hour.UTC().Format(time.RFC3339), err)
@@ -489,19 +506,30 @@ func floorHour(t time.Time) time.Time {
 	return t.UTC().Truncate(time.Hour)
 }
 
-// readStatsWatermark returns the instant the rollups cover up to: the end of the
-// latest rolled hour, marker rows included. ok is false when nothing has been
-// rolled up yet. It is a single descending primary-key probe.
-func readStatsWatermark(ctx context.Context, db *gorm.DB) (time.Time, bool, error) {
-	var buckets []int64
-	if err := db.WithContext(ctx).Model(&jobStatsHourlyRow{}).
-		Order("bucket_start_unix DESC").Limit(1).Pluck("bucket_start_unix", &buckets).Error; err != nil {
-		return time.Time{}, false, fmt.Errorf("read stats watermark: %w", err)
+// ceilHour rounds t up to the start of the next UTC hour, or returns it when it
+// starts one.
+func ceilHour(t time.Time) time.Time {
+	h := floorHour(t)
+	if h.Before(t.UTC()) {
+		return h.Add(time.Hour)
 	}
-	if len(buckets) == 0 {
+	return h
+}
+
+// prevFinishedAt returns the latest finish in [lo, hi), or ok false when there
+// is none: nextFinishedAt's mirror, one descending probe of job_run_finishes'
+// primary key.
+func prevFinishedAt(ctx context.Context, db *gorm.DB, lo, hi time.Time) (time.Time, bool, error) {
+	var at []time.Time
+	if err := db.WithContext(ctx).Model(&jobRunFinishRow{}).
+		Where("finished_at >= ? AND finished_at < ?", lo.UTC(), hi.UTC()).
+		Order("finished_at DESC").Limit(1).Pluck("finished_at", &at).Error; err != nil {
+		return time.Time{}, false, fmt.Errorf("probe previous finished run: %w", err)
+	}
+	if len(at) == 0 {
 		return time.Time{}, false, nil
 	}
-	return time.Unix(buckets[0], 0).UTC().Add(time.Hour), true, nil
+	return at[0].UTC(), true, nil
 }
 
 // nextFinishedAt returns the earliest finish at or after from, or ok false when
@@ -532,79 +560,73 @@ type rollupConfig struct {
 // RollupResult reports what one stats rollup pass did.
 type RollupResult struct {
 	// Hours is the closed hours rolled up with runs in them. Empty hours, skipped
-	// in one probe, are not counted.
+	// in one probe per quiet stretch, are not counted.
 	Hours int `json:"hours"`
-	// Rolled lists the start of each hour written, in order.
+	// Rolled lists the start of each hour written, in hour order.
 	Rolled []time.Time `json:"rolled"`
-	// Watermark is where the rollups cover up to after the pass.
-	Watermark time.Time `json:"watermark"`
-	// CaughtUp is true when the pass reached the last closed hour, false when it
-	// stopped on its per-pass ceiling with closed hours still to roll.
+	// RolledFrom and Watermark bound the hours the rollups cover after the pass:
+	// every hour in [RolledFrom, Watermark) is rolled up.
+	RolledFrom time.Time `json:"rolled_from"`
+	Watermark  time.Time `json:"watermark"`
+	// CaughtUp is true when the pass reached the last closed hour and the
+	// covered range reaches back to the retention; false when it stopped on its
+	// per-pass ceiling with hours still to roll.
 	CaughtUp bool `json:"caught_up"`
 	// Pruned is the rollup rows deleted for being older than the retention.
 	Pruned int64 `json:"pruned"`
 }
 
-// rollupPass rolls up every closed hour from the watermark forward, at most
-// cfg.maxHours of them, then prunes rollup rows older than the retention.
+// rollupPass rolls up closed hours into job_stats_hourly, at most cfg.maxHours
+// of them, extending the covered range recorded in job_stats_progress, then
+// prunes rollup rows older than the retention.
 //
-// An hour is closed once its end plus the grace is in the past. With no
-// watermark yet the pass starts at the oldest finished run's hour, but never
-// further back than the retention, so enabling the rollup on a long-lived
-// database backfills its history a bounded pass at a time. Empty stretches are
-// skipped with one indexed probe each, and the last hour of a quiet stretch is
-// recorded with a marker so the watermark advances through it.
-//
-//nolint:gocognit // one walk over the closed hours with the empty-stretch skip
+// An hour is closed once its end plus the grace is in the past. The pass first
+// raises the range to the retention boundary (now minus cfg.retention), creating
+// it there on the first pass. It then works forward from the range's upper edge
+// to the last closed hour — the new hours dashboards want first — and, with
+// whatever budget is left, backward from the range's lower edge toward the
+// retention boundary, which matters only when the range starts above it (a
+// RebuildStats created it, or the retention grew). So enabling the rollup on a
+// long-lived database backfills its history a bounded pass at a time, and a
+// stretch with no runs costs one indexed probe, however long.
 func rollupPass(ctx context.Context, db *gorm.DB, now time.Time, cfg rollupConfig) (RollupResult, error) {
 	var res RollupResult
 	closedBefore := floorHour(now.Add(-cfg.grace))
 	earliest := floorHour(now.Add(-cfg.retention))
+	if closedBefore.Before(earliest) {
+		earliest = closedBefore
+	}
 
-	start, ok, err := readStatsWatermark(ctx, db)
+	p, err := advanceStatsFloor(ctx, db, earliest, now)
 	if err != nil {
 		return res, err
 	}
-	if !ok || start.Before(earliest) {
-		start = earliest
-	}
-
-	hour := start
-	for hour.Before(closedBefore) && res.Hours < cfg.maxHours {
-		if err := ctx.Err(); err != nil {
-			return res, fmt.Errorf("stats rollup cancelled after %d hours: %w", res.Hours, err)
-		}
-		next, found, err := nextFinishedAt(ctx, db, hour)
-		if err != nil {
-			return res, err
-		}
-		if !found || !floorHour(next).Before(closedBefore) {
-			// Nothing finished in [hour, closedBefore): record the stretch as
-			// processed with one marker on its last hour and stop.
-			if _, err := rollupHour(ctx, db, closedBefore.Add(-time.Hour), now, false); err != nil {
-				return res, err
-			}
-			hour = closedBefore
-			break
-		}
-		hour = floorHour(next)
-		if _, err := rollupHour(ctx, db, hour, now, false); err != nil {
-			return res, err
-		}
-		res.Hours++
-		res.Rolled = append(res.Rolled, hour)
-		hour = hour.Add(time.Hour)
-	}
-	res.CaughtUp = !hour.Before(closedBefore)
-	res.Watermark, _, err = readStatsWatermark(ctx, db)
+	fwd, err := rollForward(ctx, db, p.To, closedBefore, now, false, cfg.maxHours)
 	if err != nil {
+		return res, fmt.Errorf("stats rollup: %w", err)
+	}
+	back := rollWalk{done: true}
+	if left := cfg.maxHours - len(fwd.rolled); fwd.done && left > 0 {
+		if back, err = rollBackward(ctx, db, earliest, p.From, now, false, left); err != nil {
+			return res, fmt.Errorf("stats rollup: %w", err)
+		}
+	} else if earliest.Before(p.From) {
+		back.done = false
+	}
+	for i := len(back.rolled) - 1; i >= 0; i-- {
+		res.Rolled = append(res.Rolled, back.rolled[i])
+	}
+	res.Rolled = append(res.Rolled, fwd.rolled...)
+	res.Hours = len(res.Rolled)
+	res.CaughtUp = fwd.done && back.done
+
+	if p, _, err = readStatsProgress(ctx, db); err != nil {
 		return res, err
 	}
+	res.RolledFrom, res.Watermark = p.From, p.To
 
-	// Prune by primary-key range. The latest row is never older than the
-	// retention unless the whole history is, so the watermark survives the prune
-	// except on a database idle for longer than the retention — where restarting
-	// from the retention boundary is exactly right.
+	// Prune by primary-key range: the hours below the retention boundary, which
+	// the range was raised past above.
 	pruned := db.WithContext(ctx).Where("bucket_start_unix < ?", earliest.Unix()).Delete(&jobStatsHourlyRow{})
 	if pruned.Error != nil {
 		return res, fmt.Errorf("prune stats rollups: %w", pruned.Error)
@@ -633,36 +655,53 @@ type RebuildOpts struct {
 
 // RebuildResult reports what a RebuildStats call did.
 type RebuildResult struct {
-	// From and To are the hour range rebuilt, after flooring and clamping.
+	// From and To are the hour range requested, after flooring and clamping.
 	From time.Time `json:"from"`
 	To   time.Time `json:"to"`
-	// Hours is the number of hours recomputed; Groups the (kind, queue) rollup
-	// rows written across them.
+	// Hours is the number of hours recomputed — the requested range's, and any
+	// with runs in a gap rolled to keep the covered range contiguous; Groups the
+	// (kind, queue) rollup rows written across them.
 	Hours  int `json:"hours"`
 	Groups int `json:"groups"`
+	// RolledFrom and RolledThrough bound the hours the rollups cover after the
+	// rebuild — the range Stats serves from them.
+	RolledFrom    time.Time `json:"rolled_from"`
+	RolledThrough time.Time `json:"rolled_through"`
 }
 
 // RebuildStats recomputes the hourly rollups for a range of closed hours from
 // the raw job_runs, replacing whatever the rollup stored. It is the repair for
 // runs that landed in an hour after the rollup closed it — clock skew beyond the
-// grace, a SeedRun import of history — and the fast way to backfill a range
+// grace, a SeedRun import of history — and the fast way to roll up a range
 // without waiting out the rollup activity's per-pass ceiling.
 //
 // Each hour is replaced in its own transaction, exactly as the rollup activity
 // replaces it, so a rebuild and a running rollup can overlap safely, and a
 // cancelled rebuild leaves every hour it finished rebuilt.
 //
+// # The covered range
+//
+// The rollups serve exactly the hours job_stats_progress records as covered,
+// and that range never has a gap. A rebuild extends it: hours past its upper
+// edge are rebuilt oldest first, each extending the range up as it commits, and
+// hours below its lower edge newest first, extending it down. When the requested
+// range does not touch the covered one, the hours between are rolled too — only
+// those with runs cost a recompute; an empty stretch is one probe — so a
+// rebuild of recent hours while the rollup is still catching up on older ones
+// rolls everything in between rather than leaving it uncounted. On a database
+// no rollup has run on, the rebuilt range becomes the covered range; a rollup
+// enabled later extends it both ways.
+//
 // It sees the runs the finish log holds. Runs an older release finalized —
-// before an upgrade, or during a rolling deploy — are visible only once
+// before an upgrade, or during a rolling deploy — are visible once
 // BackfillRunFinishes has written their entries; the rollup activity does that
-// on its own, and `flywheel stats rebuild` runs it before rebuilding. It is not
-// run here because it reads all of job_runs, which a targeted rebuild of a few
-// hours should not have to pay for.
+// on its own, `flywheel stats rebuild` runs it first, and the backfill re-rolls
+// any covered hour it adds runs to, so the order of the two does not matter.
 //
 // Without Force it refuses to shrink an hour: when the recompute counts fewer
 // runs than the stored rollup, the rebuild stops at that hour with an error
-// wrapping ErrValidation, leaving it and every later hour as they were. Raw
-// history is what retention prunes; the rollup is what outlives it.
+// wrapping ErrValidation, leaving it and every hour not yet reached as they
+// were. Raw history is what retention prunes; the rollup is what outlives it.
 func RebuildStats(ctx context.Context, db *gorm.DB, opts RebuildOpts) (RebuildResult, error) {
 	if db == nil {
 		return RebuildResult{}, fmt.Errorf("flywheel: RebuildStats: db is nil")
@@ -681,33 +720,119 @@ func RebuildStats(ctx context.Context, db *gorm.DB, opts RebuildOpts) (RebuildRe
 		to = closed
 	}
 	res := RebuildResult{From: from, To: to}
-	// A rebuild rewrites hours the baseline memo may hold without moving the
-	// watermark it is keyed by.
-	defer baselineMemo.clear()
-	for hour := from; hour.Before(to); hour = hour.Add(time.Hour) {
-		if err := ctx.Err(); err != nil {
-			return res, fmt.Errorf("flywheel: RebuildStats: cancelled after %d hours: %w", res.Hours, err)
-		}
-		n, err := rollupHour(ctx, db, hour, now, !opts.Force)
-		if errors.Is(err, errRollupWouldShrink) {
-			return res, fmt.Errorf("flywheel: RebuildStats: %w", &ValidationError{
-				Field: "rebuild range",
-				Message: fmt.Sprintf("hour %s: %v; its raw runs were pruned after it was rolled up "+
-					"(set Force to rebuild it anyway)", hour.Format(time.RFC3339), err),
-			})
-		}
-		if err != nil {
+	if end := ceilHour(to); from.Before(end) {
+		if err := rebuildRange(ctx, db, from, end, now, !opts.Force, &res); err != nil {
+			if errors.Is(err, errRollupWouldShrink) {
+				return res, fmt.Errorf("flywheel: RebuildStats: %w", &ValidationError{
+					Field: "rebuild range",
+					Message: fmt.Sprintf("%v; its raw runs were pruned after it was rolled up "+
+						"(set Force to rebuild it anyway)", err),
+				})
+			}
 			return res, fmt.Errorf("flywheel: RebuildStats: %w", err)
+		}
+	}
+	p, _, err := readStatsProgress(ctx, db)
+	if err != nil {
+		return res, fmt.Errorf("flywheel: RebuildStats: %w", err)
+	}
+	res.RolledFrom, res.RolledThrough = p.From, p.To
+	return res, nil
+}
+
+// rebuildRange rebuilds every hour in [from, end) relative to the covered
+// range: the hours inside it in place, then the hours above it — after rolling
+// any gap below them — oldest first, then the hours below it — after any gap
+// above them — newest first, so every hour that extends the range is adjacent to
+// it when it commits.
+func rebuildRange(
+	ctx context.Context, db *gorm.DB, from, end, now time.Time, guard bool, res *RebuildResult,
+) error {
+	if err := ensureStatsProgress(ctx, db, from, now); err != nil {
+		return err
+	}
+	p, _, err := readStatsProgress(ctx, db)
+	if err != nil {
+		return err
+	}
+	rebuild := func(hour time.Time, step coverageStep) error {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("cancelled after %d hours: %w", res.Hours, err)
+		}
+		n, err := rollupHour(ctx, db, hour, now, guard, step)
+		if err != nil {
+			return err
 		}
 		res.Hours++
 		res.Groups += n
+		return nil
 	}
-	return res, nil
+	walked := func(w rollWalk) {
+		res.Hours += len(w.rolled)
+		res.Groups += w.groups
+	}
+
+	for hour := maxTime(from, p.From); hour.Before(minTime(end, p.To)); hour = hour.Add(time.Hour) {
+		if err := rebuild(hour, coverageStep{}); err != nil {
+			return err
+		}
+	}
+	if p.To.Before(end) {
+		start := maxTime(from, p.To)
+		gap, err := rollForward(ctx, db, p.To, start, now, guard, 0)
+		walked(gap)
+		if err != nil {
+			return err
+		}
+		for hour := start; hour.Before(end); hour = hour.Add(time.Hour) {
+			if err := rebuild(hour, stepUp(hour, hour.Add(time.Hour))); err != nil {
+				return err
+			}
+		}
+	}
+	if from.Before(p.From) {
+		top := minTime(end, p.From)
+		gap, err := rollBackward(ctx, db, top, p.From, now, guard, 0)
+		walked(gap)
+		if err != nil {
+			return err
+		}
+		for hour := top.Add(-time.Hour); !hour.Before(from); hour = hour.Add(-time.Hour) {
+			if err := rebuild(hour, stepDown(hour, hour.Add(time.Hour))); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// minTime and maxTime are min and max for times.
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 // backfillBatchSize is the number of job_runs rows BackfillRunFinishes examines
 // per statement.
 const backfillBatchSize = 1000
+
+// unloggedLegacyRunPredicate selects, over job_runs r, the finished runs an
+// older binary wrote that have no finish-log entry yet. An older binary leaves
+// kind at its column default and writes no entry; this release stamps every
+// run's kind. A run SeedRun imported against a job that no longer exists also
+// has an empty kind, but SeedRun logs its finish, so the entry check excludes
+// it.
+const unloggedLegacyRunPredicate = `r.kind = '' AND r.finished_at IS NOT NULL AND NOT EXISTS ` +
+	`(SELECT 1 FROM job_run_finishes f WHERE f.finished_at = r.finished_at AND f.run_id = r.id)`
 
 // BackfillRunFinishes writes the job_run_finishes entry of every finished run
 // that lacks one, and reports how many it wrote. It exists for the upgrade: a run
@@ -717,16 +842,21 @@ const backfillBatchSize = 1000
 // The stats rollup runs it on its own: on a Scheduler's first pass, and once
 // more ten minutes later, which covers the runs an older binary still finalizes
 // while a rolling deploy overlaps the two; `flywheel stats rebuild` runs it
-// before rebuilding. A host calls it directly to make older runs visible before
-// a RebuildStats, or without running the rollup at all.
+// before rebuilding. A host calls it directly to make older runs visible without
+// running the rollup at all.
 //
-// Only runs an older binary wrote need an entry, and they are recognizable: this
-// release stamps every run's kind, and an older one left it at the column
-// default, the empty string. So the work is one pass over job_runs in
-// primary-key batches, each an INSERT … SELECT that touches only those rows and
-// skips any entry already present. On SQLite the pass first re-stamps legacy
-// timestamps in UTC (NormalizeRunTimestamps), so every entry is written in the
-// zone the log is compared in. It is idempotent.
+// It first asks whether there is anything to do — one statement that reads
+// job_runs once and stops at the first unlogged run — and returns at once when
+// there is not, which after the upgrade is always. When there is, it walks
+// job_runs in primary-key batches and logs exactly the unlogged runs each batch
+// holds. On SQLite it first re-stamps legacy timestamps in UTC
+// (NormalizeRunTimestamps), so every entry is written in the zone the log is
+// compared in. It is idempotent.
+//
+// A backfilled run whose hour the rollups already cover — an older binary
+// finalized it after the rollup closed its hour — is counted by re-rolling that
+// hour, guarded like a RebuildStats: an hour whose recompute would count fewer
+// runs than its stored rollup is left as it was.
 func BackfillRunFinishes(ctx context.Context, db *gorm.DB) (int64, error) {
 	if db == nil {
 		return 0, fmt.Errorf("flywheel: BackfillRunFinishes: db is nil")
@@ -734,13 +864,39 @@ func BackfillRunFinishes(ctx context.Context, db *gorm.DB) (int64, error) {
 	if _, err := NormalizeRunTimestamps(ctx, db); err != nil {
 		return 0, fmt.Errorf("flywheel: BackfillRunFinishes: %w", err)
 	}
+	var probe []string
+	if err := db.WithContext(ctx).Raw(`SELECT r.id FROM job_runs r WHERE ` + unloggedLegacyRunPredicate +
+		` LIMIT 1`).Scan(&probe).Error; err != nil {
+		return 0, fmt.Errorf("flywheel: BackfillRunFinishes: probe: %w", err)
+	}
+	if len(probe) == 0 {
+		return 0, nil
+	}
+	written, hours, err := backfillWalk(ctx, db)
+	if err != nil {
+		return written, fmt.Errorf("flywheel: BackfillRunFinishes: %w", err)
+	}
+	if err := rerollCoveredHours(ctx, db, hours); err != nil {
+		return written, fmt.Errorf("flywheel: BackfillRunFinishes: %w", err)
+	}
+	return written, nil
+}
+
+// backfillWalk logs every unlogged legacy run, one primary-key batch of job_runs
+// at a time, and returns how many entries it wrote and the hours they fell in.
+// A batch's unlogged runs are read, then exactly those are logged, so the hours
+// returned are the hours of the entries written: a run an older binary
+// finalizes between the read and the write is not logged now, and the next
+// backfill finds it.
+func backfillWalk(ctx context.Context, db *gorm.DB) (int64, map[int64]struct{}, error) {
 	var (
 		written int64
 		cursor  string
 	)
+	hours := map[int64]struct{}{}
 	for {
 		if err := ctx.Err(); err != nil {
-			return written, fmt.Errorf("flywheel: BackfillRunFinishes: cancelled after %d entries: %w", written, err)
+			return written, hours, fmt.Errorf("cancelled after %d entries: %w", written, err)
 		}
 		query := db.WithContext(ctx).Model(&jobRunRow{})
 		if cursor != "" {
@@ -748,19 +904,65 @@ func BackfillRunFinishes(ctx context.Context, db *gorm.DB) (int64, error) {
 		}
 		var ids []string
 		if err := query.Order("id").Limit(backfillBatchSize).Pluck("id", &ids).Error; err != nil {
-			return written, fmt.Errorf("flywheel: BackfillRunFinishes: read batch: %w", err)
+			return written, hours, fmt.Errorf("read batch: %w", err)
 		}
 		if len(ids) == 0 {
-			return written, nil
+			return written, hours, nil
 		}
-		res := db.WithContext(ctx).Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND kind = '' AND id >= ? AND id <= ?"),
-			ids[0], ids[len(ids)-1])
-		if res.Error != nil {
-			return written, fmt.Errorf("flywheel: BackfillRunFinishes: write batch: %w", res.Error)
+		var found []struct {
+			ID         string
+			FinishedAt time.Time
 		}
-		written += res.RowsAffected
+		if err := db.WithContext(ctx).Raw(`SELECT r.id, r.finished_at FROM job_runs r WHERE r.id >= ? AND r.id <= ? AND `+
+			unloggedLegacyRunPredicate, ids[0], ids[len(ids)-1]).Scan(&found).Error; err != nil {
+			return written, hours, fmt.Errorf("read unlogged runs: %w", err)
+		}
+		if len(found) > 0 {
+			logged := make([]string, len(found))
+			for i := range found {
+				logged[i] = found[i].ID
+				hours[floorHour(found[i].FinishedAt).Unix()] = struct{}{}
+			}
+			res := db.WithContext(ctx).Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND id IN ?"), logged)
+			if res.Error != nil {
+				return written, hours, fmt.Errorf("write batch: %w", res.Error)
+			}
+			written += res.RowsAffected
+		}
 		cursor = ids[len(ids)-1]
 	}
+}
+
+// rerollCoveredHours re-rolls each hour in hours that the rollups already
+// cover, oldest first, so the runs a backfill just logged are counted. An hour
+// whose recompute would shrink its stored rollup — retention pruned some of its
+// runs after it was rolled — keeps its rollup: it counted more than a recompute
+// can.
+func rerollCoveredHours(ctx context.Context, db *gorm.DB, hours map[int64]struct{}) error {
+	if len(hours) == 0 {
+		return nil
+	}
+	p, ok, err := readStatsProgress(ctx, db)
+	if err != nil || !ok || !p.covered() {
+		return err
+	}
+	sorted := make([]int64, 0, len(hours))
+	for h := range hours {
+		sorted = append(sorted, h)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	now := models.ClockFrom(ctx).Now(ctx)
+	for _, sec := range sorted {
+		hour := unixHour(sec)
+		if !p.covers(hour) {
+			continue
+		}
+		if _, err := rollupHour(ctx, db, hour, now, true, coverageStep{}); err != nil &&
+			!errors.Is(err, errRollupWouldShrink) {
+			return err
+		}
+	}
+	return nil
 }
 
 // normalizeBatchSize is the number of job_runs rows NormalizeRunTimestamps

@@ -104,7 +104,7 @@ func BenchmarkRollupHourSQLite(b *testing.B) {
 	ctx := context.Background()
 	hour := floorHour(now.Add(-48 * time.Hour))
 	for b.Loop() {
-		if _, err := rollupHour(ctx, db, hour, now, false); err != nil {
+		if _, err := rollupHour(ctx, db, hour, now, false, coverageStep{}); err != nil {
 			b.Fatal(err)
 		}
 	}

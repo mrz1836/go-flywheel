@@ -475,7 +475,10 @@ func jobFinalizeUpdate(plan finalizePlan, finishedAt time.Time) map[string]any {
 // job_state is the state the finalize applied, so it is written only when the
 // finalize was not superseded — a superseded finalize applied nothing. Leaving
 // the column out rather than writing NULL keeps the available the sweep may have
-// recorded when it reclaimed the job from this attempt.
+// recorded when it reclaimed the job from this attempt. The stats count a run
+// carrying that available as the crash the sweep recorded, whatever outcome the
+// late finalize writes beside it (see runAgg.observe), so the late finalize
+// changes no hour the rollup has already counted.
 func runFinalizeUpdate(
 	plan finalizePlan, result Result, workErr error, finishedAt time.Time, durationMs, enqueued int, superseded bool,
 ) (map[string]any, error) {

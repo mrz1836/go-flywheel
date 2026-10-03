@@ -80,30 +80,45 @@ func (s *Scheduler) configureStats(cfg SchedulerConfig) error {
 	return nil
 }
 
-// checkStatsSchema is the stats rollup's startup schema probe: with the rollup
-// enabled, the rollup table and the job_runs columns it aggregates must exist,
-// or Run fails before its first pass rather than logging the same failure every
-// tick. See probeSchema for why an unreachable database is not a failure here.
-func (s *Scheduler) checkStatsSchema(ctx context.Context) error {
-	if s.statsInterval <= 0 {
-		return nil
+// runPathModels are the tables the run path writes: a claim and a finalize
+// write jobs, the stub insert and the finalize job_runs, and the finalize logs
+// to job_run_finishes in the same transaction. The lease sweep writes the same
+// three when it crashes a stub.
+func runPathModels() []any {
+	return []any{&jobRow{}, &jobRunRow{}, &jobRunFinishRow{}}
+}
+
+// checkSchema is the Scheduler's startup schema probe. Its lease sweep writes
+// the run path's tables, so they must carry every column it names, or each
+// sweep would fail and a crashed worker's jobs would stay running for good;
+// with the rollup enabled, so must the two rollup tables. A gap fails Run before
+// any activity starts, rather than logging the same failure every tick. See
+// probeSchema for why an unreachable database is not a failure here.
+func (s *Scheduler) checkSchema(ctx context.Context) error {
+	models := runPathModels()
+	if s.statsInterval > 0 {
+		models = append(models, &jobStatsHourlyRow{}, &jobStatsProgressRow{})
 	}
-	if _, err := probeSchema(ctx, s.db, &jobRunRow{}, &jobStatsHourlyRow{}); err != nil {
+	if _, err := probeSchema(ctx, s.db, models...); err != nil {
 		return fmt.Errorf("jobs: scheduler schema check: %w", err)
 	}
 	return nil
 }
 
-// RollupStats runs one stats rollup pass: it rolls up every closed hour of
-// job_runs since the watermark into job_stats_hourly, at most
-// StatsMaxHoursPerPass of them, and prunes rollup rows older than
-// StatsRetention.
+// RollupStats runs one stats rollup pass: it rolls up the closed hours of
+// job_runs past the watermark into job_stats_hourly — and, when the hours the
+// rollups cover start later than StatsRetention reaches, the hours before them —
+// at most StatsMaxHoursPerPass of them, then prunes rollup rows older than
+// StatsRetention. Which hours are covered is recorded in job_stats_progress.
 //
 // It also completes an upgrade on its own. Its first call backfills the finish
 // log for runs an older release finalized (BackfillRunFinishes, which on SQLite
 // first re-stamps their timestamps in UTC), and a call ten minutes later does it
 // once more, for runs an older binary finalized while a rolling deploy kept both
-// running. After that it never scans job_runs again.
+// running; a backfilled run in an hour already rolled up is counted by
+// re-rolling the hour. Each backfill first checks, in one statement, whether any
+// run lacks its entry, and stops there when none does — after the upgrade,
+// always.
 //
 // It parallels Tick, Sweep, and PruneRetention: the stats activity calls it on
 // every StatsRollupInterval tick, and a host that drives its own maintenance

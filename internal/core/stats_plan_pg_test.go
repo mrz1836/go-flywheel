@@ -33,8 +33,15 @@ func TestStatsIndexesHaveTheirShapePostgres(t *testing.T) {
 	assert.Contains(t, log, "unique")
 
 	var onRuns int64
-	require.NoError(t, db.Raw(`SELECT count(*) FROM pg_indexes
-		WHERE schemaname = current_schema() AND tablename = 'job_runs' AND indexdef ILIKE '%finished_at%'`).Scan(&onRuns).Error)
+	// The schema and table filters run first, in a materialized CTE: an indexdef
+	// predicate beside them may be evaluated on another schema's index while a
+	// parallel test drops it ("could not open relation with OID").
+	require.NoError(t, db.Raw(`WITH idx AS MATERIALIZED (
+			SELECT x.indexrelid FROM pg_index x
+			JOIN pg_class t ON t.oid = x.indrelid
+			JOIN pg_namespace n ON n.oid = t.relnamespace
+			WHERE n.nspname = current_schema() AND t.relname = 'job_runs')
+		SELECT count(*) FROM idx WHERE pg_get_indexdef(indexrelid) ILIKE '%finished_at%'`).Scan(&onRuns).Error)
 	assert.Zero(t, onRuns, "nothing on job_runs indexes finished_at: the finalize UPDATE must stay HOT-eligible")
 
 	jobs := def("jobs_finished")

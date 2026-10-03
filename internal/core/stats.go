@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -77,16 +78,23 @@ type KindStats struct {
 
 // StatsCoverage reports how a stats read was served.
 type StatsCoverage struct {
-	// RolledThrough is the rollup watermark when the read ran: whole hours before
-	// it were served from job_stats_hourly. Zero when nothing has been rolled up.
+	// RolledFrom and RolledThrough bound the hours the rollups covered when the
+	// read ran: whole hours in [RolledFrom, RolledThrough) were served from
+	// job_stats_hourly. RolledThrough is the rollup watermark. Both are zero when
+	// nothing has been rolled up.
+	RolledFrom    time.Time `json:"rolled_from"`
 	RolledThrough time.Time `json:"rolled_through"`
 	// RawFrom and RawTo bound the tail of the window aggregated from raw job_runs
 	// — the part past the watermark, or the whole window when no rollup covers
 	// it. They are equal when no tail was read.
 	RawFrom time.Time `json:"raw_from"`
 	RawTo   time.Time `json:"raw_to"`
-	// RawSpan is the total raw span aggregated: the tail, plus the partial hour
-	// at the window's start when From is not on an hour boundary.
+	// RawSpan is the total raw span aggregated: the tail, the partial hour at the
+	// window's start when From is not on an hour boundary, and any part of the
+	// window older than RolledFrom. When that would exceed MaxRawSpan, each raw
+	// part is first trimmed to start at the first run that finished in it — a
+	// stretch with no runs costs nothing to read — and RawSpan is the trimmed
+	// total.
 	RawSpan time.Duration `json:"raw_span"`
 }
 
@@ -100,6 +108,8 @@ type StatsParams struct {
 	// MaxRawSpan caps the raw job_runs history one read aggregates. Zero selects
 	// 7 days; a negative value removes the cap. A window that would exceed it
 	// fails with ErrStatsNotRolledUp rather than scanning a month of raw runs.
+	// A stretch with no runs does not count against it (see
+	// StatsCoverage.RawSpan).
 	MaxRawSpan time.Duration
 }
 
@@ -121,10 +131,12 @@ type StatsResult struct {
 //
 // # A hybrid read
 //
-// Whole hours the rollup has closed are read from job_stats_hourly — one row per
+// Whole hours the rollups cover are read from job_stats_hourly — one row per
 // (hour, kind, queue), merged in Go. The rest — the hours past the rollup
-// watermark, and a partial hour at either edge — is aggregated from job_runs by
-// the same function the rollup itself runs, through the job_run_finishes log.
+// watermark, a partial hour at either edge, and any hours older than the
+// rollups reach (the rollup keeps StatsRetention of them) — is aggregated from
+// job_runs by the same function the rollup itself runs, through the
+// job_run_finishes log.
 // Both halves count with the same histogram, so a window served half from rollups
 // equals the same window served entirely raw, percentiles included.
 //
@@ -135,6 +147,8 @@ type StatsResult struct {
 //
 // Counts reflect raw history only as far back as retention keeps it; rolled-up
 // hours outlive retention, which is what makes month-over-month trends possible.
+// A window older than the rollups is read raw, so it answers with what
+// retention left, or ErrStatsNotRolledUp when that is more than MaxRawSpan.
 func Stats(ctx context.Context, db *gorm.DB, p StatsParams) (StatsResult, error) {
 	if db == nil {
 		return StatsResult{}, fmt.Errorf("flywheel: Stats: db is nil")
@@ -174,12 +188,12 @@ func Stats(ctx context.Context, db *gorm.DB, p StatsParams) (StatsResult, error)
 func windowAggs(
 	ctx context.Context, db *gorm.DB, from, to time.Time, f statsFilter, class rollupRows, maxRaw time.Duration,
 ) (map[statsGroup]*runAgg, StatsCoverage, error) {
-	watermark, rolled, err := readStatsWatermark(ctx, db)
+	p, _, err := readStatsProgress(ctx, db)
 	if err != nil {
 		return nil, StatsCoverage{}, err
 	}
-	plan := planWindow(from, to, watermark, rolled)
-	if err := checkRawSpan(plan.rawSpan(), maxRaw); err != nil {
+	plan := planWindow(from, to, p)
+	if err := fitRawSpan(ctx, db, []*windowPlan{&plan}, p, maxRaw); err != nil {
 		return nil, StatsCoverage{}, err
 	}
 
@@ -202,8 +216,8 @@ func windowAggs(
 	}
 
 	cov := StatsCoverage{RawSpan: plan.rawSpan()}
-	if rolled {
-		cov.RolledThrough = watermark
+	if p.covered() {
+		cov.RolledFrom, cov.RolledThrough = p.From, p.To
 	}
 	cov.RawFrom, cov.RawTo = plan.tail[0], plan.tail[1]
 	return merged, cov, nil
@@ -229,25 +243,22 @@ func (p windowPlan) rawSpan() time.Duration {
 }
 
 // planWindow decides which part of [from, to) the rollups serve: the whole hours
-// at or after from's next hour boundary that end at or before both to and the
-// watermark. Everything else is raw. With no rollup, or no whole rolled hour
-// inside the window, the whole window is raw.
-func planWindow(from, to, watermark time.Time, rolled bool) windowPlan {
+// of the window inside the covered range [p.From, p.To). Everything else is raw:
+// a head before them — a partial first hour, and any hours older than the
+// covered range — and a tail after them. With nothing covered, or no whole
+// covered hour inside the window, the whole window is raw.
+func planWindow(from, to time.Time, p statsProgress) windowPlan {
 	from, to = from.UTC(), to.UTC()
-	alignedFrom := floorHour(from)
-	if alignedFrom.Before(from) {
-		alignedFrom = alignedFrom.Add(time.Hour)
+	rolledFrom, rolledTo := ceilHour(from), floorHour(to)
+	if p.covered() {
+		rolledFrom, rolledTo = maxTime(rolledFrom, p.From), minTime(rolledTo, p.To)
 	}
-	rolledTo := floorHour(to)
-	if rolled && watermark.Before(rolledTo) {
-		rolledTo = watermark
-	}
-	if !rolled || !alignedFrom.Before(rolledTo) {
+	if !p.covered() || !rolledFrom.Before(rolledTo) {
 		return windowPlan{raw: [][2]time.Time{{from, to}}, tail: [2]time.Time{from, to}}
 	}
-	plan := windowPlan{rolledFrom: alignedFrom, rolledTo: rolledTo, tail: [2]time.Time{rolledTo, to}}
-	if from.Before(alignedFrom) {
-		plan.raw = append(plan.raw, [2]time.Time{from, alignedFrom})
+	plan := windowPlan{rolledFrom: rolledFrom, rolledTo: rolledTo, tail: [2]time.Time{rolledTo, to}}
+	if from.Before(rolledFrom) {
+		plan.raw = append(plan.raw, [2]time.Time{from, rolledFrom})
 	}
 	if rolledTo.Before(to) {
 		plan.raw = append(plan.raw, [2]time.Time{rolledTo, to})
@@ -255,20 +266,63 @@ func planWindow(from, to, watermark time.Time, rolled bool) windowPlan {
 	return plan
 }
 
-// checkRawSpan enforces the raw-history cap.
-func checkRawSpan(span, maxRaw time.Duration) error {
+// fitRawSpan enforces the raw-history cap on plans, which together serve one
+// read.
+//
+// The cap bounds work, and a raw stretch before the first run in it is no work:
+// the aggregate is a range of job_run_finishes, and an empty range reads
+// nothing. So when the planned raw spans exceed the cap, every raw segment is
+// first trimmed to start at the first run finished at or after it, and a
+// segment with no run in it is dropped — one probe of the finish log, paid only
+// by a read that would otherwise be refused. A window reaching back past the
+// oldest run, or past the rollups' coverage into hours with no runs, is then
+// served; one that would really read more than the cap of raw runs fails with
+// ErrStatsNotRolledUp.
+func fitRawSpan(ctx context.Context, db *gorm.DB, plans []*windowPlan, p statsProgress, maxRaw time.Duration) error {
 	if maxRaw == 0 {
 		maxRaw = defaultMaxRawSpan
 	}
-	if maxRaw > 0 && span > maxRaw {
-		return fmt.Errorf(
-			"%w: serving it would aggregate %s of raw job_runs, over the %s cap; enable the hourly rollup "+
-				"(SchedulerConfig.StatsRollupInterval, or runtime.stats_rollup for `flywheel serve`) and let it catch up, "+
-				"backfill with RebuildStats, or raise MaxRawSpan",
-			ErrStatsNotRolledUp, span.Round(time.Minute), maxRaw,
-		)
+	span, start := time.Duration(0), time.Time{}
+	for _, plan := range plans {
+		span += plan.rawSpan()
+		for _, seg := range plan.raw {
+			if start.IsZero() || seg[0].Before(start) {
+				start = seg[0]
+			}
+		}
 	}
-	return nil
+	if maxRaw < 0 || span <= maxRaw {
+		return nil
+	}
+	first, found, err := nextFinishedAt(ctx, db, start)
+	if err != nil {
+		return err
+	}
+	span, preCoverage := 0, false
+	for _, plan := range plans {
+		kept := plan.raw[:0]
+		for _, seg := range plan.raw {
+			if !found || !first.Before(seg[1]) {
+				continue
+			}
+			seg[0] = maxTime(seg[0], first)
+			kept = append(kept, seg)
+			span += seg[1].Sub(seg[0])
+			preCoverage = preCoverage || (p.covered() && seg[0].Before(p.From))
+		}
+		plan.raw = kept
+	}
+	if span <= maxRaw {
+		return nil
+	}
+	hint := "enable the hourly rollup (SchedulerConfig.StatsRollupInterval, or runtime.stats_rollup for " +
+		"`flywheel serve`) and let it catch up, roll the range up with RebuildStats, or raise MaxRawSpan"
+	if preCoverage {
+		hint = "the window reaches back past " + p.From.Format(time.RFC3339) + ", the oldest hour the rollups " +
+			"keep (SchedulerConfig.StatsRetention); narrow it, keep rollups longer, or raise MaxRawSpan"
+	}
+	return fmt.Errorf("%w: serving it would aggregate %s of raw job_runs, over the %s cap; %s",
+		ErrStatsNotRolledUp, span.Round(time.Minute), maxRaw, hint)
 }
 
 // mergeInto merges every aggregate in src into dst by group.
@@ -468,7 +522,7 @@ const maxSeriesPoints = 400 * 24
 //
 // A raw bucket costs one indexed aggregate, so a series reaching past the
 // watermark costs one query per raw hour (or per raw day part) on top of the one
-// rollup read for everything before it.
+// rollup read for everything the rollups cover.
 func StatsSeries(ctx context.Context, db *gorm.DB, p SeriesParams) ([]StatsPoint, error) {
 	if db == nil {
 		return nil, fmt.Errorf("flywheel: StatsSeries: db is nil")
@@ -485,38 +539,40 @@ func StatsSeries(ctx context.Context, db *gorm.DB, p SeriesParams) ([]StatsPoint
 		return nil, err
 	}
 
-	watermark, rolled, err := readStatsWatermark(ctx, db)
+	progress, _, err := readStatsProgress(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("flywheel: StatsSeries: %w", err)
 	}
-	var rawSpan time.Duration
-	for _, b := range buckets {
-		rawSpan += planWindow(b[0], b[1], watermark, rolled).rawSpan()
+	plans := make([]windowPlan, len(buckets))
+	fit := make([]*windowPlan, len(buckets))
+	for i, b := range buckets {
+		plans[i] = planWindow(b[0], b[1], progress)
+		fit[i] = &plans[i]
 	}
-	if err := checkRawSpan(rawSpan, p.MaxRawSpan); err != nil {
+	if err := fitRawSpan(ctx, db, fit, progress, p.MaxRawSpan); err != nil {
 		return nil, fmt.Errorf("flywheel: StatsSeries: %w", err)
 	}
 
 	f := statsFilter{Kind: p.Kind, Queue: p.Queue}
 	byHour := map[int64]map[statsGroup]*runAgg{}
-	if rolled {
-		end := buckets[len(buckets)-1][1]
-		if watermark.Before(end) {
-			end = watermark
-		}
-		hours, err := loadRolledHours(ctx, db, buckets[0][0], end, f, rowsFor(f, false))
-		if err != nil {
-			return nil, fmt.Errorf("flywheel: StatsSeries: %w", err)
-		}
-		for _, h := range hours {
-			byHour[h.start.Unix()] = h.aggs
+	if progress.covered() {
+		start := maxTime(buckets[0][0], progress.From)
+		end := minTime(buckets[len(buckets)-1][1], progress.To)
+		if start.Before(end) {
+			hours, err := loadRolledHours(ctx, db, start, end, f, rowsFor(f, false))
+			if err != nil {
+				return nil, fmt.Errorf("flywheel: StatsSeries: %w", err)
+			}
+			for _, h := range hours {
+				byHour[h.start.Unix()] = h.aggs
+			}
 		}
 	}
 
 	points := make([]StatsPoint, len(buckets))
 	for i, b := range buckets {
 		total := newRunAgg(p.Kind, "")
-		plan := planWindow(b[0], b[1], watermark, rolled)
+		plan := plans[i]
 		for h := plan.rolledFrom; h.Before(plan.rolledTo); h = h.Add(time.Hour) {
 			for _, a := range byHour[h.Unix()] {
 				total.merge(a)
@@ -599,12 +655,14 @@ type Baseline struct {
 // it returns an empty slice until the rollup has run. A non-positive window
 // selects 7 days.
 //
-// The result is memoized per database and window, keyed by the watermark: the
-// rows a baseline reads change only when the rollup closes another hour, so a
+// The window is clipped to the hours the rollups cover, so a young deployment's
+// baseline is drawn from what it has (From and To say which hours).
+//
+// The result is memoized per database and window, keyed by the rollup's
+// progress — its covered range and the version every rollup write moves — so a
 // dashboard polling ListRunning(WithBaseline) every few seconds pays one
-// primary-key probe per call rather than a week of rollup rows. A RebuildStats
-// in the same process clears the memo; one run from another process is picked
-// up when the watermark next moves, within the hour.
+// primary-key read per call rather than a week of rollup rows, and a rollup pass
+// or a RebuildStats in any process invalidates the memo on the next call.
 func Baselines(ctx context.Context, db *gorm.DB, window time.Duration) ([]Baseline, error) {
 	if db == nil {
 		return nil, fmt.Errorf("flywheel: Baselines: db is nil")
@@ -612,43 +670,68 @@ func Baselines(ctx context.Context, db *gorm.DB, window time.Duration) ([]Baseli
 	if window <= 0 {
 		window = 7 * 24 * time.Hour
 	}
-	watermark, rolled, err := readStatsWatermark(ctx, db)
+	p, _, err := readStatsProgress(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("flywheel: Baselines: %w", err)
 	}
-	if !rolled {
+	if !p.covered() {
 		return []Baseline{}, nil
 	}
-	key := baselineKey{config: db.Config, window: window}
-	if cached, ok := baselineMemo.get(key, watermark); ok {
-		return cached, nil
+	key, memoize := newBaselineKey(db, window)
+	if memoize {
+		if cached, ok := baselineMemo.get(key, p); ok {
+			return cached, nil
+		}
 	}
-	from := floorHour(watermark.Add(-window))
-	hours, err := loadRolledHours(ctx, db, from, watermark, statsFilter{}, kindRows)
+	from := maxTime(floorHour(p.To.Add(-window)), p.From)
+	hours, err := loadRolledHours(ctx, db, from, p.To, statsFilter{}, kindRows)
 	if err != nil {
 		return nil, fmt.Errorf("flywheel: Baselines: %w", err)
 	}
-	out := baselinesFrom(hours, from, watermark)
-	baselineMemo.put(key, watermark, out)
+	out := baselinesFrom(hours, from, p.To)
+	if memoize {
+		baselineMemo.put(key, p, out)
+	}
 	return append([]Baseline(nil), out...), nil
 }
 
-// baselineKey identifies a memoized baseline: the database — by its GORM
-// configuration, which every session opened from one connection pool shares —
-// and the window.
+// baselineKey identifies a memoized baseline: the database and the window.
+//
+// The database is identified by its connection pool, which every handle opened
+// from one gorm.Open shares — sessions, WithContext copies, and transactions
+// alike (a transaction runs on a connection from the pool, but its Config still
+// names the pool). The *gorm.Config is no key: Session, and so WithContext,
+// copies it, so a caller passing db.WithContext(r.Context()) would miss on every
+// call.
 type baselineKey struct {
-	config *gorm.Config
+	pool   gorm.ConnPool
 	window time.Duration
+}
+
+// newBaselineKey builds db's memo key, unwrapping a prepared-statement
+// session's pool to the pool it wraps. memoize is false for a pool that cannot
+// be a map key — a host's own ConnPool implementation that is not comparable —
+// and such a read is simply not memoized.
+func newBaselineKey(db *gorm.DB, window time.Duration) (baselineKey, bool) {
+	pool := db.ConnPool
+	if prepared, ok := pool.(*gorm.PreparedStmtDB); ok {
+		pool = prepared.ConnPool
+	}
+	if pool == nil || !reflect.TypeOf(pool).Comparable() {
+		return baselineKey{}, false
+	}
+	return baselineKey{pool: pool, window: window}, true
 }
 
 // baselineMemoLimit bounds the memo. A process reads baselines from one or two
 // databases; the bound only keeps a test binary that opens hundreds from
-// holding every one.
+// holding every one. Replacing an existing key's entry never counts against it.
 const baselineMemoLimit = 16
 
-// baselineMemoEntry is one memoized result and the watermark it is valid at.
+// baselineMemoEntry is one memoized result and the rollup progress it is valid
+// at.
 type baselineMemoEntry struct {
-	watermark time.Time
+	progress  statsProgress
 	baselines []Baseline
 }
 
@@ -660,35 +743,31 @@ type baselineCache struct {
 
 // baselineMemo is the process's memo.
 //
-//nolint:gochecknoglobals // process-wide memo of immutable-per-watermark data
+//nolint:gochecknoglobals // process-wide memo of data immutable per rollup version
 var baselineMemo = &baselineCache{}
 
-// get returns a copy of the memoized baselines for key at watermark.
-func (c *baselineCache) get(key baselineKey, watermark time.Time) ([]Baseline, bool) {
+// get returns a copy of the memoized baselines for key at progress p.
+func (c *baselineCache) get(key baselineKey, p statsProgress) ([]Baseline, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[key]
-	if !ok || !e.watermark.Equal(watermark) {
+	if !ok || e.progress != p {
 		return nil, false
 	}
 	return append([]Baseline(nil), e.baselines...), true
 }
 
-// put memoizes baselines for key at watermark.
-func (c *baselineCache) put(key baselineKey, watermark time.Time, baselines []Baseline) {
+// put memoizes baselines for key at progress p.
+func (c *baselineCache) put(key baselineKey, p statsProgress, baselines []Baseline) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.entries == nil || len(c.entries) >= baselineMemoLimit {
+	if _, ok := c.entries[key]; !ok && len(c.entries) >= baselineMemoLimit {
+		c.entries = nil
+	}
+	if c.entries == nil {
 		c.entries = map[baselineKey]baselineMemoEntry{}
 	}
-	c.entries[key] = baselineMemoEntry{watermark: watermark, baselines: append([]Baseline(nil), baselines...)}
-}
-
-// clear drops every memoized baseline.
-func (c *baselineCache) clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.entries = nil
+	c.entries[key] = baselineMemoEntry{progress: p, baselines: append([]Baseline(nil), baselines...)}
 }
 
 // baselinesFrom merges hours per kind into baselines.

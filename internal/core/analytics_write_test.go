@@ -171,10 +171,26 @@ func writePathSuite(t *testing.T, open writePathOpener) {
 		assert.Nil(t, crashed.DurationMs, "a crash reports no finish of its own")
 		require.Len(t, finishEntries(t, db, runID), 1, "the sweep logs the crash as the run's finish")
 
+		// The sweep's hour closes and is rolled up before the attempt finishes.
+		hour := floorHour(sweptAt)
 		late := writePathT0.Add(2 * time.Hour)
-		out, err := d.Finalize(context.Background(), raw, runID, Result{}, nil, late)
+		rollupAll(t, db, late)
+		rolled, err := Stats(context.Background(), db, StatsParams{From: hour, To: hour.Add(time.Hour)})
+		require.NoError(t, err)
+		require.Zero(t, rolled.Coverage.RawSpan, "the hour is served from its rollup")
+
+		out, err := d.Finalize(context.Background(), raw, runID, Result{CostMicros: 7}, nil, late)
 		require.NoError(t, err)
 		require.True(t, out.Superseded)
+
+		_, rawTotal := rawKindStats(t, db, hour, hour.Add(time.Hour), statsFilter{})
+		assert.Equal(t, rolled.Total, rawTotal,
+			"the late finalize rewrites outcome, duration, and cost, but the run still counts as the crash it was")
+		assert.EqualValues(t, 1, rawTotal.Outcomes.Crashed)
+		assert.EqualValues(t, 1, rawTotal.Retries)
+		assert.Zero(t, rawTotal.Superseded)
+		assert.Zero(t, rawTotal.Duration.Count)
+		assert.Zero(t, rawTotal.CostMicros)
 
 		row := loadRun(t, db, runID)
 		require.NotNil(t, row.FinishedAt)

@@ -746,7 +746,8 @@ at 2.9 s, and `ListRunning` with baselines at 147 ms:
   A 30-day all-kinds trend reads 720 rows instead of 43,200, and a per-kind breakdown a third as many.
   With PostgreSQL's execution at ~12 ms, the rest of the old 600 ms was moving and decoding those rows.
 - **Rollup rows are scanned by hand and their histograms parsed without `encoding/json`, and baselines are
-  memoized by the rollup watermark**, which only moves hourly.
+  memoized by the rollup's progress** — its covered range and a version every rollup write moves — which
+  changes hourly.
 
 On SQLite, a 100k-run month (`go test -run '^$' -bench SQLite ./internal/core`): `Stats` 24 h **0.98 ms**
 (target < 100 ms), 30 d 14.0 ms, `StatsSeries` 30 d hourly 6.7 ms, one rollup hour 2.5 ms, `ListRunning`

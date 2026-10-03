@@ -121,3 +121,51 @@ func TestNormalizeRunTimestampsIsANoOpOnPostgres(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, n)
 }
+
+// TestCoverageSuitePostgres is the PostgreSQL half of the coverage suite.
+func TestCoverageSuitePostgres(t *testing.T) {
+	t.Parallel()
+	coverageSuite(t, postgresOpener)
+}
+
+// TestRacingWritersKeepTheCoveredRangeExactPostgres races everything that
+// extends the covered range — bounded rollup passes and rebuilds of ranges above,
+// inside, and below it — and asserts the range they leave has no gap: every hour
+// in it holds exactly a fresh recompute of the hour.
+func TestRacingWritersKeepTheCoveredRangeExactPostgres(t *testing.T) {
+	t.Parallel()
+	rng := rand.New(rand.NewPCG(7, 3)) //nolint:gosec // deterministic test data
+	db := NewPostgresIsolatedDB(t)
+	seedHistory(t, db, randomHistory(rng, 900, rollupBase, 48*time.Hour))
+	now := rollupBase.Add(50 * time.Hour)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 12)
+	for i := range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx := fixedClockCtx(now)
+			if i%2 == 0 {
+				_, err := rollupPass(ctx, db, now, rollupConfig{
+					grace: defaultStatsRollupGrace, maxHours: 2 + i, retention: defaultStatsRetention,
+				})
+				errs <- err
+				return
+			}
+			from := hourAt(rollupBase, (i*7)%40)
+			_, err := RebuildStats(ctx, db, RebuildOpts{From: from, To: from.Add(time.Duration(3+i) * time.Hour)})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	assertCoveredHoursExact(t, db)
+	got, err := Stats(context.Background(), db, StatsParams{From: rollupBase, To: now, MaxRawSpan: -1})
+	require.NoError(t, err)
+	_, want := rawKindStats(t, db, rollupBase, now, statsFilter{})
+	assert.Equal(t, want, got.Total)
+}

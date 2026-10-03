@@ -46,8 +46,24 @@ type histRun struct {
 
 // seedHistory writes each run and a terminal job for it, in batches. The job
 // carries the run's kind and queue, and is discarded at the run's attempt when
-// the run discarded it, so a legacy row's discard is resolvable.
+// the run discarded it, so a legacy row's discard is resolvable. A legacy run's
+// finish-log entry is written the way an upgraded database gets it: by
+// BackfillRunFinishes.
 func seedHistory(t testing.TB, db *gorm.DB, runs []histRun) {
+	t.Helper()
+	writeHistory(t, db, runs)
+	for i := range runs {
+		if runs[i].Legacy {
+			_, err := BackfillRunFinishes(context.Background(), db)
+			require.NoError(t, err)
+			break
+		}
+	}
+}
+
+// writeHistory is seedHistory without the backfill: a legacy run is left as an
+// older binary left it, with no finish-log entry.
+func writeHistory(t testing.TB, db *gorm.DB, runs []histRun) {
 	t.Helper()
 	jobs := make([]jobRow, 0, len(runs))
 	rows := make([]jobRunRow, 0, len(runs))
@@ -102,16 +118,8 @@ func seedHistory(t testing.TB, db *gorm.DB, runs []histRun) {
 	require.NoError(t, db.CreateInBatches(jobs, 200).Error)
 	require.NoError(t, db.CreateInBatches(rows, 200).Error)
 	// The finish log, written the way the runtime writes it — read back off the
-	// run rows — for every run this release would have finalized. A legacy row
-	// gets its entry the way an upgraded database does: from the backfill.
+	// run rows — for every run this release would have finalized.
 	require.NoError(t, db.Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND kind <> ''")).Error)
-	for i := range runs {
-		if runs[i].Legacy {
-			_, err := BackfillRunFinishes(context.Background(), db)
-			require.NoError(t, err)
-			break
-		}
-	}
 }
 
 // finishEntries reads every job_run_finishes entry for a run.

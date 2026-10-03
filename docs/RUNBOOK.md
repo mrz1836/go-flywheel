@@ -200,7 +200,7 @@ schema, so the rollback is a redeploy.
 lag:
 
 ```
-  schema:       upgraded (added job_runs.kind, …, job_stats_hourly (table))
+  schema:       upgraded (added job_runs.kind, …, job_stats_progress (table))
   indexes:      in sync
   stats:        rolled up through 2026-10-03T14:00:00Z (lag 1h2m)
 ```
@@ -220,12 +220,21 @@ negative) or is catching up.
 
 **`ErrStatsNotRolledUp`** from `Stats`/`StatsSeries` means the window would aggregate more than
 `MaxRawSpan` (7 days) of raw runs: the rollup is off, or still catching up. Turn it on, wait, or
-`flywheel stats rebuild --from … --to …` to catch up at once.
+`flywheel stats rebuild --from … --to …` to catch up at once — a rebuild of only the recent hours also
+rolls the ones between the rollup's progress and them, so it never leaves a gap. When the message names
+`StatsRetention` instead, the window reaches back past the oldest hour the rollups keep: narrow it, or keep
+rollups longer.
 
 **Stats look short after an import or a skewed clock.** A run that finished in an hour after the rollup
 closed it — a `SeedRun` import of history, or a node whose clock ran more than `StatsRollupGrace` behind —
 is in the raw data but not that hour's rollup. `flywheel stats rebuild` over the affected range recounts
-it; it refuses to shrink an hour retention has pruned (`--force` overrides).
+it; it refuses to shrink an hour retention has pruned (`--force` overrides). Runs an older release
+finalized during a rolling deploy need nothing: the backfill that logs them re-rolls their hours.
+
+**`flywheel prune` deleted fewer jobs than expected.** With the stats rollup on in its config it holds,
+like the daemon's retention, for runs the rollup has not counted yet, and says so (`held for the stats
+rollup`). Let the rollup catch up, or pass `--ignore-stats-rollup` if those hours' history does not
+matter.
 
 <br>
 

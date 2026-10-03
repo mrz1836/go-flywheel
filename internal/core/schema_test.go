@@ -115,6 +115,7 @@ func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	assert.ElementsMatch(t, []string{
 		"job_runs.kind", "job_runs.queue", "job_runs.queue_wait_ms", "job_runs.job_state",
 		"job_runs.superseded", "job_run_finishes (table)", "job_stats_hourly (table)",
+		"job_stats_progress (table)",
 	}, schemaDriftNames(drift))
 
 	current, err := InspectSchema(ctx, newDB(t))
@@ -145,23 +146,28 @@ func TestRunnerFailsFastOnAnOutdatedSchema(t *testing.T) {
 }
 
 // TestSchedulerWithStatsFailsFastOnAnOutdatedSchema is the same guard for the
-// rollup: with stats enabled and no job_stats_hourly table, Run stops before its
-// first pass rather than logging the failure on every tick.
+// Scheduler: its lease sweep writes the run tables, so against a schema missing
+// their new columns Run stops before starting any activity rather than logging
+// the failure on every tick — and with stats enabled it also names the rollup
+// tables.
 func TestSchedulerWithStatsFailsFastOnAnOutdatedSchema(t *testing.T) {
 	t.Parallel()
 	db := newBareSQLite(t)
 	installLegacySchema(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	s := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db), StatsRollupInterval: time.Minute})
-	err := s.Run(context.Background())
+	err := s.Run(ctx)
 	require.ErrorIs(t, err, ErrSchemaOutdated)
 	assert.Contains(t, err.Error(), "job_stats_hourly")
+	assert.Contains(t, err.Error(), "job_stats_progress")
 
-	// Without stats the scheduler needs none of it, and runs as it always did.
 	plain := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db)})
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	require.ErrorIs(t, plain.Run(ctx), context.Canceled)
+	err = plain.Run(ctx)
+	require.ErrorIs(t, err, ErrSchemaOutdated, "the sweep alone writes the new job_runs columns")
+	assert.Contains(t, err.Error(), "job_runs.job_state")
+	assert.NotContains(t, err.Error(), "job_stats_hourly", "a Scheduler without stats does not need the rollup tables")
 }
 
 // TestSchemaProbeIsNotAVerdictOnAnUnreachableDatabase proves a database that is

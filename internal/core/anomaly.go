@@ -173,14 +173,14 @@ func Anomalies(ctx context.Context, db *gorm.DB, p AnomalyParams) ([]Anomaly, er
 	}
 	hour := floorHour(p.Hour)
 	if p.Hour.IsZero() {
-		watermark, rolled, err := readStatsWatermark(ctx, db)
+		progress, _, err := readStatsProgress(ctx, db)
 		if err != nil {
 			return nil, fmt.Errorf("flywheel: Anomalies: %w", err)
 		}
-		if !rolled {
+		if !progress.covered() {
 			return []Anomaly{}, nil
 		}
-		hour = watermark.Add(-time.Hour)
+		hour = progress.To.Add(-time.Hour)
 	}
 
 	// One read covers both evaluations (this hour and the one before, for Onset):

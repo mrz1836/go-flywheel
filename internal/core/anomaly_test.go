@@ -107,6 +107,10 @@ func synthesizeRollups(t testing.TB, db *gorm.DB, rng *rand.Rand, base time.Time
 		rows = append(rows, hourRows(hour, aggs, hour)...)
 	}
 	require.NoError(t, db.CreateInBatches(rows, 500).Error)
+	// Record the synthesized hours as covered, as the rollup that wrote them would.
+	end := base.Add(noiseHours * time.Hour)
+	require.NoError(t, ensureStatsProgress(context.Background(), db, base, end))
+	require.NoError(t, markCovered(context.Background(), db, stepUp(base, end), end))
 }
 
 // evaluateWeek runs Anomalies for every hour of the evaluated (second) week and
