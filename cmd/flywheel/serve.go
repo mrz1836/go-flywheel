@@ -41,7 +41,7 @@ func runServe(ctx context.Context, cfg *Config, db *gorm.DB, driver flywheel.Dri
 	if rollupOff != "" {
 		logger.Warn("flywheel serve: stats rollup disabled", "reason", rollupOff)
 	}
-	if err := flywheel.Migrate(db); err != nil {
+	if err := migrateOnStart(db); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	if err := reconcileSchedules(ctx, db, cfg); err != nil {

@@ -50,7 +50,7 @@ func runDoctor(ctx context.Context, out io.Writer, configPath string, cfg *Confi
 	if err != nil {
 		return fmt.Errorf("schema inspection failed: %w", err)
 	}
-	if err := flywheel.Migrate(db); err != nil {
+	if err := migrateOnStart(db); err != nil {
 		return fmt.Errorf("schema check failed: %w", err)
 	}
 	indexDrift, err := flywheel.InspectIndexes(ctx, db)

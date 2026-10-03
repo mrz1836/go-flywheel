@@ -104,18 +104,55 @@ type IndexDriftError struct {
 
 // Error names each drifted index, what is installed, and what was expected, so a
 // host can act without reading library source.
+//
+// An invalid index is described as what it is — the leftover of a concurrent
+// build that failed part-way — with its own fix, because its definition usually
+// matches exactly: printing two identical definitions under "drifted" and
+// advising reconciliation, which takes an ACCESS EXCLUSIVE lock, would send an
+// operator after the wrong problem. A performance index is repaired, without
+// blocking writers, by re-running the install with Concurrently; a correctness
+// index only through Reconcile, since dropping a unique index is a guarantee the
+// host gives up on purpose.
 func (e *IndexDriftError) Error() string {
 	var b strings.Builder
-	fmt.Fprintf(
-		&b,
-		"flywheel: %d installed index definition(s) have drifted from the runtime's; "+
-			"enable reconciliation (IndexOpts.Reconcile) or correct by hand:",
-		len(e.Drift),
-	)
+	fmt.Fprintf(&b, "flywheel: %d installed index(es) do not match the runtime's:", len(e.Drift))
+	drifted := false
 	for _, d := range e.Drift {
-		fmt.Fprintf(&b, "\n  %s:\n    installed: %s\n    expected:  %s", d.Name, d.Installed, d.Expected)
+		if !d.Invalid {
+			drifted = true
+			fmt.Fprintf(&b, "\n  %s: definition has drifted\n    installed: %s\n    expected:  %s",
+				d.Name, d.Installed, d.Expected)
+			continue
+		}
+		fmt.Fprintf(&b, "\n  %s: invalid — a CREATE INDEX CONCURRENTLY that failed part-way left it unused by "+
+			"every query and maintained by every write; ", d.Name)
+		if indexKindOf(d.Name) == IndexCorrectness {
+			b.WriteString("it is correctness-bearing, so rebuild it with reconciliation " +
+				"(IndexOpts.Reconcile or MigrateOpts.Reconcile, which locks the table for the rebuild)")
+		} else {
+			b.WriteString("re-run `flywheel migrate --concurrently` (IndexOpts.Concurrently or " +
+				"MigrateOpts.Concurrently) to rebuild it without blocking writers")
+		}
+		if d.Installed != d.Expected {
+			fmt.Fprintf(&b, "\n    installed: %s\n    expected:  %s", d.Installed, d.Expected)
+		}
+	}
+	if drifted {
+		b.WriteString("\nenable reconciliation (IndexOpts.Reconcile or MigrateOpts.Reconcile) to rebuild drifted " +
+			"definitions, or correct them by hand")
 	}
 	return b.String()
+}
+
+// indexKindOf returns the kind the runtime declares for the named index, or
+// IndexPerformance for a name it does not declare.
+func indexKindOf(name string) IndexKind {
+	for _, idx := range runtimeIndexes() {
+		if idx.Name == name {
+			return idx.Kind
+		}
+	}
+	return IndexPerformance
 }
 
 // Unwrap exposes ErrIndexDrift for errors.Is.

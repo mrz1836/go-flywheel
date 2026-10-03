@@ -7,6 +7,7 @@ import (
 
 	flywheel "github.com/mrz1836/go-flywheel"
 	"github.com/spf13/cobra"
+	"gorm.io/gorm"
 )
 
 // newMigrateCmd builds `flywheel migrate`: stand up or update the schema.
@@ -58,6 +59,27 @@ func newMigrateCmd(configPath *string) *cobra.Command {
 	cmd.Flags().DurationVar(&lockTimeout, "lock-timeout", 0,
 		"PostgreSQL: fail a schema statement that waits longer than this for its table lock (0 waits indefinitely)")
 	return cmd
+}
+
+// migrateOnStart brings the schema up to date for the commands that migrate as
+// a side effect of doing something else — `flywheel serve` at startup and
+// `flywheel doctor` — where the operator passed no migration flags and the
+// database may be live, with older binaries still claiming and finalizing jobs.
+//
+// It builds any missing index concurrently: a plain CREATE INDEX holds a SHARE
+// lock on its table for the whole build, and the first new-release `serve`
+// against a loaded jobs table would stall every claim and finalize until the
+// build finished. Concurrently is a no-op on SQLite, harmless on an empty
+// database, and also repairs an invalid performance index an interrupted
+// `flywheel migrate --concurrently` left behind — which a plain Migrate reports as
+// drift, failing the start until someone re-ran the migration by hand.
+//
+// It sets no LockTimeout: a daemon that failed its start whenever a long
+// transaction held a table for a few seconds would crash-loop at exactly the
+// moments a database is busiest. An operator who wants the bound runs `flywheel
+// migrate --lock-timeout` before the deploy, as the upgrade runbook says.
+func migrateOnStart(db *gorm.DB) error {
+	return flywheel.MigrateWithOptions(db, flywheel.MigrateOpts{Concurrently: true})
 }
 
 // describeAdded lists the tables and columns a migration brought, or the empty

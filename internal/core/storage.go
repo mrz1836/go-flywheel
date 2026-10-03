@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -101,7 +102,7 @@ func InstallStorageParameters(ctx context.Context, db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("flywheel: InstallStorageParameters: db is nil")
 	}
-	if err := applyStorageParameters(ctx, db); err != nil {
+	if err := applyStorageParameters(ctx, db, 0); err != nil {
 		return fmt.Errorf("flywheel: InstallStorageParameters: %w", err)
 	}
 	return nil
@@ -126,9 +127,9 @@ type StorageParameterDrift struct {
 // and writes nothing.
 //
 // Unlike an index, a storage parameter does not silently drift through a
-// re-install. InstallStorageParameters emits ALTER TABLE ... SET (...), which
-// converges the reloptions to the declared value unconditionally, so a re-install
-// — or the next Migrate — heals any difference on its own. There is no fail-loud
+// re-install. InstallStorageParameters emits ALTER TABLE ... SET (...) for every
+// table whose values differ, which converges the reloptions to the declared
+// value, so a re-install — or the next Migrate — heals any difference on its own. There is no fail-loud
 // default here for that reason: forcing one would regress the current convergent
 // behavior for a defect that does not exist.
 //
@@ -175,6 +176,21 @@ func InspectStorageParameters(ctx context.Context, db *gorm.DB) ([]StorageParame
 		}
 	}
 	return drift, nil
+}
+
+// storageParameterCurrent reports whether every setting p declares already holds
+// on its table, by one read of pg_class.
+func storageParameterCurrent(ctx context.Context, db *gorm.DB, p StorageParameter) (bool, error) {
+	installed, err := readReloptions(ctx, db, p.Table)
+	if err != nil {
+		return false, err
+	}
+	for _, exp := range storageParameterExpectations([]StorageParameter{p}) {
+		if normalizeStorageValue(installed[exp.param]) != normalizeStorageValue(exp.expected) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // storageParamExpectation is one flattened (table, parameter, value) the runtime
@@ -249,13 +265,32 @@ func normalizeStorageValue(v string) string {
 // InstallStorageParameters and Migrate so both set the same parameters in the
 // same order. It leaves the caller's name off the error so each entry point can
 // prefix its own.
-func applyStorageParameters(ctx context.Context, db *gorm.DB) error {
+//
+// Each statement runs on its own — under SET LOCAL lock_timeout in its own
+// transaction when lockTimeout is positive on PostgreSQL — so an ALTER TABLE
+// that waits on autovacuum holds no lock taken by the statements before it.
+//
+// A statement whose settings already hold is skipped. ALTER TABLE ... SET takes a
+// SHARE UPDATE EXCLUSIVE lock even when it changes nothing, which waits on a
+// running vacuum, and Migrate runs on every `flywheel serve` start: re-applying
+// current values there would queue the start behind autovacuum for no effect.
+// Skipping is still convergent — a drifted value is set, as before.
+func applyStorageParameters(ctx context.Context, db *gorm.DB, lockTimeout time.Duration) error {
 	set, err := StorageParameterSet(db.Name())
 	if err != nil {
 		return err
 	}
 	for _, p := range set {
-		if err := db.WithContext(ctx).Exec(p.DDL).Error; err != nil {
+		current, err := storageParameterCurrent(ctx, db, p)
+		if err != nil {
+			return err
+		}
+		if current {
+			continue
+		}
+		if err := withLockTimeout(db.WithContext(ctx), lockTimeout, func(tx *gorm.DB) error {
+			return tx.Exec(p.DDL).Error
+		}); err != nil {
 			return fmt.Errorf("set storage parameters on %s: %w", p.Table, err)
 		}
 	}
