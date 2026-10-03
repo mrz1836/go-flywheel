@@ -68,20 +68,25 @@ func DeleteFinishedJobs(ctx context.Context, db *gorm.DB, olderThan time.Time) (
 //
 // # Delete order is contractual
 //
-// Within each batch the job_runs rows are deleted before their jobs rows. The
-// library declares no foreign key between the two tables, so on its own schema
-// the order is unobservable — but a host may declare one, and under an
-// ON DELETE CASCADE the order is visible in the reported counts: reversed, the
-// runs delete would match nothing and the cascade would do the work silently.
-// It is part of the contract rather than an implementation detail.
+// Within each batch the job_runs rows are deleted before their jobs rows, and
+// each run's job_run_finishes entry before the run. The library declares no
+// foreign key between the tables, so on its own schema the order is
+// unobservable — but a host may declare one, and under an ON DELETE CASCADE the
+// order is visible in the reported counts: reversed, the runs delete would match
+// nothing and the cascade would do the work silently. It is part of the contract
+// rather than an implementation detail.
 //
 // # Batching is keyset pagination, not an ordering by age
 //
 // Batches advance a cursor over the primary key rather than ordering by
-// finalized_at. There is no index on finalized_at, so ordering by it cannot
-// terminate early under a LIMIT and every batch would be a full scan plus a
-// top-N sort — measured at 500k rows and batch 1000, that spelling touches 4.7×
-// the heap blocks this one does.
+// finalized_at. When this was written no index carried finalized_at, so ordering
+// by it could not terminate early under a LIMIT and every batch was a full scan
+// plus a top-N sort — measured at 500k rows and batch 1000, that spelling touched
+// 4.7× the heap blocks this one does. jobs_finished now carries finalized_at, but
+// behind state: ordering by it across the three terminal states is a merge of
+// three ranges, and the primary-key walk is still the cheaper plan — at 1M
+// terminal jobs the planner picks it for a first batch, a mid-pass batch, and a
+// steady-state batch alike, at about 20 buffers each (docs/BENCHMARKS.md).
 //
 // The practical consequence: because job ids are UUIDv7, whose leading bits are
 // a millisecond timestamp, batches proceed in approximately oldest-created
@@ -165,7 +170,11 @@ func deleteFinishedBatch(
 		if len(ids) == 0 {
 			return nil
 		}
-		// Runs before jobs, per the contract in the exported doc comment.
+		// The runs' finish-log entries go first, then runs before jobs, per the
+		// contract in the exported doc comment.
+		if err := deleteRunFinishes(tx, ids); err != nil {
+			return err
+		}
 		if err := tx.Where("job_id IN ?", ids).Delete(&jobRunRow{}).Error; err != nil {
 			return fmt.Errorf("flywheel: delete finished job runs: %w", err)
 		}
@@ -183,3 +192,41 @@ func deleteFinishedBatch(
 	}
 	return deleted, last, nil
 }
+
+// deleteRunFinishes deletes the job_run_finishes entries of the given jobs'
+// runs, keyed exactly by the log's own primary key, so the log never holds an
+// entry for a run that no longer exists.
+//
+// The keys are read off the runs and bound back as values rather than compared
+// column to column in one statement. A host is free to declare job_runs.id as
+// uuid, and PostgreSQL has no uuid = text operator for a log whose run_id came
+// from the runtime's text-typed model; a bound value takes whichever type the
+// column it is compared to has.
+func deleteRunFinishes(tx *gorm.DB, jobIDs []string) error {
+	var keys []struct {
+		FinishedAt time.Time
+		ID         string
+	}
+	if err := tx.Model(&jobRunRow{}).Select("finished_at, id").
+		Where("job_id IN ? AND finished_at IS NOT NULL", jobIDs).Scan(&keys).Error; err != nil {
+		return fmt.Errorf("flywheel: read finished job run finishes: %w", err)
+	}
+	// Chunked, because a batch bounds jobs, not runs: a job snoozed or retried
+	// many times has as many runs, and two binds per run must stay under the
+	// bind-parameter ceiling however many runs a batch's jobs carry.
+	for start := 0; start < len(keys); start += finishDeleteChunk {
+		chunk := keys[start:min(start+finishDeleteChunk, len(keys))]
+		tuples := make([][]any, len(chunk))
+		for i, k := range chunk {
+			tuples[i] = []any{k.FinishedAt, k.ID}
+		}
+		if err := tx.Where("(finished_at, run_id) IN ?", tuples).Delete(&jobRunFinishRow{}).Error; err != nil {
+			return fmt.Errorf("flywheel: delete finished job run finishes: %w", err)
+		}
+	}
+	return nil
+}
+
+// finishDeleteChunk is the number of finish-log keys deleted per statement:
+// 2,000 binds, far below PostgreSQL's 65,535 and SQLite's 32,766.
+const finishDeleteChunk = 1000

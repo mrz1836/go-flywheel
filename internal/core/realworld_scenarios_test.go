@@ -340,7 +340,7 @@ func TestRealWorldTransientBackoff(t *testing.T) {
 
 	assert.Equal(t, string(StateSucceeded), jobState(t, db, id))
 	assert.EqualValues(t, failures+1, w.calls.Load(), "failures then one success")
-	assert.EqualValues(t, failures+1, runCount(t, db, id), "one job_runs row per attempt — append-only audit")
+	assert.EqualValues(t, failures+1, runCount(t, db, id), "one job_runs row per attempt")
 
 	// Attempts are strictly monotonic 1..failures+1 across the audit rows.
 	var attempts []int

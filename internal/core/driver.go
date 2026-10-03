@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -394,6 +396,11 @@ type baseDriver struct {
 // a side-effect row the worker writes during the attempt can reference it, and
 // the reference survives a crash — the sweep marks the stub crashed rather than
 // deleting it.
+//
+// It also records what the stats need to read job_runs without joining jobs —
+// the kind, the queue, and how long this attempt waited for a worker — all of
+// which raw already carries, so they ride on the insert the runtime makes
+// anyway rather than costing a statement.
 func (d *baseDriver) InsertRunStub(
 	ctx context.Context, runID string, raw RawJob, startedAt time.Time, class ExecutorClass, execID string,
 ) error {
@@ -401,16 +408,33 @@ func (d *baseDriver) InsertRunStub(
 		ID:            runID,
 		JobID:         raw.ID,
 		Attempt:       raw.Attempt,
+		Kind:          raw.Kind,
+		Queue:         raw.Queue,
 		ExecutorClass: string(class),
 		ExecutorID:    execID,
 		StartedAt:     startedAt,
 		Outcome:       string(OutcomeStarted),
+		QueueWaitMs:   queueWaitMs(raw.ScheduledAt, startedAt),
 		CreatedAt:     startedAt,
 	}
 	if err := d.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return fmt.Errorf("jobs: insert run stub: %w", models.WrapDBError(err))
 	}
 	return nil
+}
+
+// queueWaitMs is how long an attempt waited for a worker: from the instant it
+// became claimable to the instant it started, in whole milliseconds. It is nil
+// when the claimable instant is unknown (a RawJob a custom Driver built without
+// ScheduledAt), and clamped at zero, because clock skew between the node that
+// scheduled the job and the node that ran it can put the start a hair before the
+// schedule, and a negative wait is not a wait.
+func queueWaitMs(scheduledAt, startedAt time.Time) *int {
+	if scheduledAt.IsZero() {
+		return nil
+	}
+	wait := max(int(startedAt.Sub(scheduledAt).Milliseconds()), 0)
+	return &wait
 }
 
 // jobFinalizeUpdate is the jobs-row column set for a finalization.
@@ -439,15 +463,32 @@ func jobFinalizeUpdate(plan finalizePlan, finishedAt time.Time) map[string]any {
 }
 
 // runFinalizeUpdate is the job_runs-row column set for a finalization.
+//
+// finished_at is write-once: COALESCE keeps a value already there. The only
+// writer that can get there first is the lease sweep, which stamps a crashed stub
+// with the reclaim instant — and an attempt that finishes after its lease was
+// reclaimed finalizes superseded, late. Moving finished_at then would move the
+// run into a different hour after the stats rollup may already have counted the
+// hour it was in. The late finalize still records the attempt's real outcome and
+// duration, which is what SupersedeEvent promises.
+//
+// job_state is the state the finalize applied, so it is written only when the
+// finalize was not superseded — a superseded finalize applied nothing. Leaving
+// the column out rather than writing NULL keeps the available the sweep may have
+// recorded when it reclaimed the job from this attempt.
 func runFinalizeUpdate(
-	plan finalizePlan, result Result, workErr error, finishedAt time.Time, durationMs, enqueued int,
+	plan finalizePlan, result Result, workErr error, finishedAt time.Time, durationMs, enqueued int, superseded bool,
 ) (map[string]any, error) {
 	upd := map[string]any{
 		"outcome":           string(plan.runOutcome),
-		"finished_at":       finishedAt,
+		"finished_at":       gorm.Expr("COALESCE(finished_at, ?)", finishedAt.UTC()),
 		"duration_ms":       durationMs,
 		"cost_micros":       result.CostMicros,
 		"enqueued_children": enqueued,
+		"superseded":        superseded,
+	}
+	if !superseded {
+		upd["job_state"] = string(plan.jobState)
 	}
 	if plan.errorClass != nil {
 		upd["error_class"] = string(*plan.errorClass)
@@ -613,11 +654,11 @@ func (d *baseDriver) Finalize(
 			}
 		}
 
-		runUpd, err := runFinalizeUpdate(plan, result, workErr, finishedAt, durationMs, enqueued)
+		runUpd, err := runFinalizeUpdate(plan, result, workErr, finishedAt, durationMs, enqueued, out.Superseded)
 		if err != nil {
 			return err
 		}
-		if err := tx.Model(&jobRunRow{}).Where("id = ?", runID).Updates(runUpd).Error; err != nil {
+		if err := finalizeRunRow(tx, runID, runUpd); err != nil {
 			return fmt.Errorf("jobs: update run row: %w", err)
 		}
 		return nil
@@ -772,12 +813,7 @@ func (d *baseDriver) sweepBatch(
 		if len(ids) == 0 {
 			return nil
 		}
-		if err := tx.Model(&jobRunRow{}).
-			Where("job_id IN ? AND outcome = ?", ids, string(OutcomeStarted)).
-			Updates(map[string]any{
-				"outcome":     string(OutcomeCrashed),
-				"finished_at": now,
-			}).Error; err != nil {
+		if err := crashStaleStubs(tx, ids, now); err != nil {
 			return fmt.Errorf("jobs: crash stale stubs: %w", err)
 		}
 		reclaimed = len(ids)
@@ -787,6 +823,87 @@ func (d *baseDriver) sweepBatch(
 		return 0, fmt.Errorf("jobs: sweep: %w", err)
 	}
 	return reclaimed, nil
+}
+
+// finishLogInsert is the statement that records a run's finish in
+// job_run_finishes, as a suffix over a row source exposing id and finished_at.
+// The finish time is read back from the run row rather than passed in: the row
+// holds the effective value, which for a late finalize of a stub the sweep
+// already crashed is the sweep's (finished_at is write-once), so the log can
+// never carry a second, different finish for one run. ON CONFLICT DO NOTHING is
+// what absorbs that late finalize's repeat of the same entry.
+const finishLogInsert = `INSERT INTO job_run_finishes (finished_at, run_id) SELECT finished_at, id FROM %s ` +
+	`WHERE finished_at IS NOT NULL%s ON CONFLICT DO NOTHING`
+
+// finalizeRunRow applies a finalize's job_runs column set to one run and logs
+// the run's finish, in the caller's transaction.
+//
+// On PostgreSQL the two are one statement — the UPDATE as a data-modifying CTE
+// whose RETURNING feeds the log INSERT — so logging costs the finalize no extra
+// round trip, and the UPDATE stays HOT-eligible because it still writes no
+// indexed column. SQLite has no data-modifying CTE; it runs the two statements
+// back to back, which in-process costs nothing worth folding away.
+func finalizeRunRow(tx *gorm.DB, runID string, upd map[string]any) error {
+	if tx.Name() == "postgres" {
+		set, args := updateSetClause(upd)
+		return tx.Exec(`WITH u AS (UPDATE job_runs SET `+set+` WHERE id = ? RETURNING id, finished_at) `+
+			fmt.Sprintf(finishLogInsert, "u", ""), append(args, runID)...).Error
+	}
+	if err := tx.Model(&jobRunRow{}).Where("id = ?", runID).Updates(upd).Error; err != nil {
+		return err
+	}
+	return tx.Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND id = ?"), runID).Error
+}
+
+// crashStaleStubs marks the started stubs of reclaimed jobs crashed and logs
+// each one's finish, in the caller's transaction — one statement on PostgreSQL,
+// two on SQLite, for the reasons finalizeRunRow gives.
+//
+// The stub records the reclaim as its job state, so a crashed attempt's effect
+// on the job — back to available — is countable from runs alone, like every
+// finalized attempt's.
+func crashStaleStubs(tx *gorm.DB, jobIDs []string, now time.Time) error {
+	upd := map[string]any{
+		"outcome":     string(OutcomeCrashed),
+		"finished_at": now.UTC(),
+		"job_state":   string(StateAvailable),
+	}
+	if tx.Name() == "postgres" {
+		set, args := updateSetClause(upd)
+		args = append(args, jobIDs, string(OutcomeStarted))
+		return tx.Exec(`WITH u AS (UPDATE job_runs SET `+set+` WHERE job_id IN ? AND outcome = ? RETURNING id, finished_at) `+
+			fmt.Sprintf(finishLogInsert, "u", ""), args...).Error
+	}
+	if err := tx.Model(&jobRunRow{}).
+		Where("job_id IN ? AND outcome = ?", jobIDs, string(OutcomeStarted)).Updates(upd).Error; err != nil {
+		return err
+	}
+	return tx.Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND job_id IN ? AND outcome = ? AND finished_at = ?"),
+		jobIDs, string(OutcomeCrashed), now.UTC()).Error
+}
+
+// updateSetClause renders a column map as an UPDATE's SET list for raw SQL, in
+// column order so the statement text is stable. A gorm.Expr value is spliced as
+// its SQL with its own bind values; every other value is one bind. The column
+// names are the runtime's own fixed identifiers, never caller input.
+func updateSetClause(upd map[string]any) (string, []any) {
+	cols := make([]string, 0, len(upd))
+	for col := range upd {
+		cols = append(cols, col)
+	}
+	slices.Sort(cols)
+	parts := make([]string, len(cols))
+	var args []any
+	for i, col := range cols {
+		if expr, ok := upd[col].(clause.Expr); ok {
+			parts[i] = col + " = " + expr.SQL
+			args = append(args, expr.Vars...)
+			continue
+		}
+		parts[i] = col + " = ?"
+		args = append(args, upd[col])
+	}
+	return strings.Join(parts, ", "), args
 }
 
 // reclaimUpdate is the jobs-row column set for a lease reclaim, shared by both

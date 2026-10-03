@@ -27,8 +27,8 @@ const statusMessageWidth = 80
 //nolint:gochecknoglobals // static, read-only display ordering
 var statusStateOrder = []flywheel.JobState{
 	flywheel.StateAvailable, flywheel.StateRunning, flywheel.StateRetryable,
-	flywheel.StateScheduled, flywheel.StateSucceeded, flywheel.StateCancelled,
-	flywheel.StateDiscarded,
+	flywheel.StateScheduled, flywheel.StatePaused, flywheel.StateSucceeded,
+	flywheel.StateCancelled, flywheel.StateDiscarded,
 }
 
 // statusReport is the combined diagnostic snapshot `flywheel status` renders: the

@@ -36,7 +36,7 @@ const requirePostgresEnv = "FLYWHEEL_REQUIRE_POSTGRES"
 // strictness guarantee is only worth as much as its least-guarded caller, and a
 // second helper that read the environment directly would silently reopen the
 // hole this closes.
-func requirePostgresDSN(t *testing.T) string {
+func requirePostgresDSN(t testing.TB) string {
 	t.Helper()
 
 	if dsn := os.Getenv(testDatabaseURLEnv); dsn != "" {
@@ -82,7 +82,7 @@ var pgIsolatedSeq atomic.Uint64
 // It lives in the core integration suite; the peeled packages (node, and any
 // later peel) reach an equivalent fixture through internal/flywheeltest, which
 // the test-import-cycle rule keeps core's own tests from sharing.
-func NewPostgresIsolatedDB(t *testing.T) *gorm.DB {
+func NewPostgresIsolatedDB(t testing.TB) *gorm.DB {
 	t.Helper()
 
 	dsn := requirePostgresDSN(t)

@@ -68,7 +68,14 @@ type RunSeed struct {
 //
 // The seeded row is byte-identical in shape to a runtime-written one: the same
 // marshaling and the same error truncation, reached through the same helpers the
-// finalize path uses.
+// finalize path uses, the same kind and queue copied from its job, and the same
+// UTC timestamps, and — for a finished run — the same job_run_finishes entry a
+// finalize writes, in the same transaction. What a seed cannot know it leaves
+// NULL — the queue wait and the job state the attempt applied — so a seeded run
+// is counted by outcome and duration, never as a retry or a discard.
+//
+// A seeded run that finishes in an hour the stats rollup has already closed is
+// not in that hour's rollup until RebuildStats covers it.
 func SeedRun(ctx context.Context, db *gorm.DB, seed RunSeed) (string, error) {
 	if seed.JobID == "" {
 		return "", newValidationError("job_id", "is required")
@@ -94,10 +101,24 @@ func SeedRun(ctx context.Context, db *gorm.DB, seed RunSeed) (string, error) {
 		outcome = OutcomeStarted
 	}
 
+	// The run's kind and queue are its job's, read on the same handle the row is
+	// written on — the caller's transaction when Tx is set, so a job inserted
+	// earlier in that transaction is visible. Unscoped, because a soft-deleted job's
+	// history is still history. A job that does not exist leaves both empty, which
+	// the stats aggregate resolves through jobs exactly as it does a row an older
+	// binary wrote.
+	var job jobRow
+	if err := target.WithContext(ctx).Unscoped().Model(&jobRow{}).
+		Select("kind, queue").Where("id = ?", seed.JobID).Limit(1).Find(&job).Error; err != nil {
+		return "", fmt.Errorf("flywheel: SeedRun: read job: %w", err)
+	}
+
 	row := jobRunRow{
 		ID:            models.NewID(),
 		JobID:         seed.JobID,
 		Attempt:       seed.Attempt,
+		Kind:          job.Kind,
+		Queue:         job.Queue,
 		ExecutorClass: string(seed.ExecutorClass),
 		ExecutorID:    seed.ExecutorID,
 		StartedAt:     startedAt,
@@ -118,18 +139,38 @@ func SeedRun(ctx context.Context, db *gorm.DB, seed RunSeed) (string, error) {
 		row.ErrorMessage = &message
 		row.ErrorPayload = payload
 	}
-	output, err := marshalRunOutput(seed.Output)
-	if err != nil {
-		return "", fmt.Errorf("flywheel: SeedRun: %w", err)
+	output, marshalErr := marshalRunOutput(seed.Output)
+	if marshalErr != nil {
+		return "", fmt.Errorf("flywheel: SeedRun: %w", marshalErr)
 	}
 	row.Output = output
 
-	if createErr := target.WithContext(ctx).Create(&row).Error; createErr != nil {
-		wrapped := models.WrapDBError(createErr)
-		if errors.Is(wrapped, models.ErrDuplicateKey) {
-			return "", ErrRunAlreadyRecorded
+	// The run and its finish-log entry are written together, as a finalize writes
+	// them: on the caller's transaction when Tx is set, or in one of their own.
+	write := func(tx *gorm.DB) error {
+		if createErr := tx.WithContext(ctx).Create(&row).Error; createErr != nil {
+			wrapped := models.WrapDBError(createErr)
+			if errors.Is(wrapped, models.ErrDuplicateKey) {
+				return ErrRunAlreadyRecorded
+			}
+			return fmt.Errorf("flywheel: SeedRun: %w", wrapped)
 		}
-		return "", fmt.Errorf("flywheel: SeedRun: %w", wrapped)
+		if row.FinishedAt == nil {
+			return nil
+		}
+		if err := tx.WithContext(ctx).Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND id = ?"), row.ID).Error; err != nil {
+			return fmt.Errorf("flywheel: SeedRun: log finish: %w", err)
+		}
+		return nil
+	}
+	var err error
+	if seed.Tx != nil {
+		err = write(seed.Tx)
+	} else {
+		err = target.WithContext(ctx).Transaction(write)
+	}
+	if err != nil {
+		return "", err
 	}
 	return row.ID, nil
 }

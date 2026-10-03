@@ -204,13 +204,16 @@ func (h *Harness) sampleTableStats(ctx context.Context, sample *StorageSample) e
 		AutoanalyzeCount int64
 		SeqScan          int64
 		IdxScan          int64
+		NTupUpd          int64
+		NTupHotUpd       int64
 	}
 	var rows []row
 	// idx_scan is NULL until the table has been scanned through an index at
 	// least once, which is exactly the correctness-only condition's normal state.
 	if err := h.probe.WithContext(ctx).Raw(`
 		SELECT relname, n_live_tup, n_dead_tup, autovacuum_count, autoanalyze_count,
-		       coalesce(seq_scan, 0) AS seq_scan, coalesce(idx_scan, 0) AS idx_scan
+		       coalesce(seq_scan, 0) AS seq_scan, coalesce(idx_scan, 0) AS idx_scan,
+		       n_tup_upd, n_tup_hot_upd
 		FROM pg_stat_user_tables
 		WHERE schemaname = current_schema()`).Scan(&rows).Error; err != nil {
 		return fmt.Errorf("loadtest: sample table stats: %w", err)
@@ -222,7 +225,11 @@ func (h *Harness) sampleTableStats(ctx context.Context, sample *StorageSample) e
 	sample.AutoanalyzeCount = make(map[string]int64, len(rows))
 	sample.SeqScans = make(map[string]int64, len(rows))
 	sample.IdxScans = make(map[string]int64, len(rows))
+	sample.TupleUpdates = make(map[string]int64, len(rows))
+	sample.HOTUpdates = make(map[string]int64, len(rows))
 	for _, r := range rows {
+		sample.TupleUpdates[r.Relname] = r.NTupUpd
+		sample.HOTUpdates[r.Relname] = r.NTupHotUpd
 		sample.LiveTuples[r.Relname] = r.NLiveTup
 		sample.DeadTuples[r.Relname] = r.NDeadTup
 		sample.AutovacuumCount[r.Relname] = r.AutovacuumCount

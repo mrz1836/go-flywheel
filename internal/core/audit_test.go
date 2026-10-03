@@ -51,7 +51,7 @@ func TestRunnerAuditOneRunRowPerAttempt(t *testing.T) {
 		Select("outcome, attempt, error_class, error_message").
 		Where("job_id = ?", id).Order("attempt ASC").Scan(&rows).Error)
 
-	require.Len(t, rows, 1, "with MaxAttempts=1 and a permanent failure we expect one append-only row")
+	require.Len(t, rows, 1, "with MaxAttempts=1 and a permanent failure we expect one audit row")
 	assert.Equal(t, "error", rows[0].Outcome)
 	require.NotNil(t, rows[0].ErrorClass)
 	assert.Equal(t, "permanent", *rows[0].ErrorClass)

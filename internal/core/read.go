@@ -17,24 +17,76 @@ var ErrJobNotFound = errors.New("flywheel: job not found")
 // JobView is the public read projection of a job. The runtime keeps its row
 // struct unexported and exposes this stable, JSON-tagged view instead, so a host
 // inspection API binds to flywheel's contract rather than the mutable schema.
+//
+// It carries every column a dashboard shows and none it should not: the args
+// payload is deliberately absent (it can be large and may hold data a dashboard
+// must not render — ListActiveByKind is the host-internal seam that carries it).
 type JobView struct {
 	ID          string    `json:"id"`
 	Kind        string    `json:"kind"`
+	Queue       string    `json:"queue"`
 	State       string    `json:"state"`
 	ParentJobID string    `json:"parent_job_id"`
 	EnqueuedAt  time.Time `json:"enqueued_at"`
 	Attempt     int       `json:"attempt"`
+	MaxAttempts int       `json:"max_attempts"`
+	Priority    int       `json:"priority"`
+	// ExecutorClass is the routing label the job was enqueued with; empty is the
+	// AnyClass wildcard.
+	ExecutorClass string `json:"executor_class"`
+	// ScheduledAt is when the job is (or was last) claimable. A retry or a snooze
+	// moves it forward, so it is not the enqueue time.
+	ScheduledAt time.Time `json:"scheduled_at"`
+	// FinalizedAt is when the job reached a terminal state; nil while it is still
+	// in flight.
+	FinalizedAt *time.Time `json:"finalized_at,omitempty"`
+	// UpdatedAt is the job row's last write. It moves on every state transition
+	// and on every lease renewal, so it is a liveness signal, not a start time —
+	// ListRunning reads the attempt's own started_at for that.
+	UpdatedAt time.Time `json:"updated_at"`
+	Tags      []string  `json:"tags"`
 }
 
-// JobRunView is the public read projection of a single job attempt.
+// JobRunView is the public read projection of a single job attempt — one
+// job_runs row.
 type JobRunView struct {
-	ID            string     `json:"id"`
+	ID      string `json:"id"`
+	JobID   string `json:"job_id"`
+	Attempt int    `json:"attempt"`
+	// Kind and Queue are the job's, recorded on the attempt. They are empty on a
+	// row an older binary wrote before the columns existed.
+	Kind          string     `json:"kind"`
+	Queue         string     `json:"queue"`
 	Outcome       string     `json:"outcome"`
 	ExecutorClass string     `json:"executor_class"`
+	ExecutorID    string     `json:"executor_id"`
 	StartedAt     time.Time  `json:"started_at"`
 	FinishedAt    *time.Time `json:"finished_at"`
+	// DurationMs is the attempt's wall time from start to finalize. It is nil
+	// while the attempt runs and for an attempt the lease sweep marked crashed,
+	// which never reported a finish of its own.
+	DurationMs *int `json:"duration_ms,omitempty"`
+	// QueueWaitMs is how long the attempt waited for a worker after it became
+	// claimable. It is nil on a row written before the column existed.
+	QueueWaitMs *int `json:"queue_wait_ms,omitempty"`
+	// ErrorClass classifies a failed attempt's error (transient, permanent,
+	// validation, timeout); empty when the attempt carried none.
+	ErrorClass string `json:"error_class,omitempty"`
 	// Error is the worker error recorded for a failed attempt, if any.
 	Error *string `json:"error,omitempty"`
+	// CostMicros is the attempt's accumulated external-call cost, as the worker
+	// reported it in Result.CostMicros.
+	CostMicros       *int64 `json:"cost_micros,omitempty"`
+	EnqueuedChildren int    `json:"enqueued_children"`
+	// JobState is the job state this attempt's finalize applied — retryable or
+	// discarded is what separates a retried failure from a final one. It is empty
+	// while the attempt runs, when the finalize was superseded, and on a row
+	// written before the column existed.
+	JobState string `json:"job_state,omitempty"`
+	// Superseded reports that the attempt's claim was gone by the time it
+	// finalized — the job was cancelled or reclaimed underneath it — so its
+	// outcome was recorded but never applied to the job.
+	Superseded bool `json:"superseded"`
 	// Output is the worker's structured Result.Output as stored in job_runs.output
 	// (for the command workers, an ExecOutput with exit code and captured streams).
 	// It is empty when the attempt produced no output.
@@ -111,20 +163,39 @@ type OverviewParams struct {
 	Kind string
 }
 
-// ListJobsParams filters and pages a ListJobs query. State and Kind, when set,
-// are exact-match filters; Limit caps the page (default 50).
+// ListJobsParams filters and pages a ListJobs query. The zero value lists the
+// newest 50 jobs of every state, kind, and queue.
 type ListJobsParams struct {
+	// State, Kind, and Queue, when set, are exact-match filters.
 	State string
 	Kind  string
+	Queue string
+	// BeforeID is a keyset cursor: when set, only jobs whose id sorts strictly
+	// before it are returned. Pass the last id of the previous page to fetch the
+	// next one.
+	BeforeID string
+	// Limit caps the page (default 50 when not positive).
 	Limit int
 }
 
 // defaultListJobsLimit caps a ListJobs page when the caller passes no limit.
 const defaultListJobsLimit = 50
 
-// ListJobs returns jobs newest-first (created_at desc, id desc), reading through
-// db and optionally filtered by exact state and kind. Soft-deleted jobs are
-// excluded. It is the inspection seam behind a "list jobs" CLI or dashboard.
+// ListJobs returns jobs newest-first by id, reading through db and optionally
+// filtered by exact state, kind, and queue. Soft-deleted jobs are excluded. It is
+// the inspection seam behind a "list jobs" CLI or dashboard.
+//
+// # Ordered by id, not created_at
+//
+// Job ids are UUIDv7, whose leading bits are the insert's millisecond timestamp,
+// so id order is insertion order. Ordering by it lets the primary key serve the
+// page — a LIMIT that stops early — where ORDER BY created_at, which no index
+// carries, sorted the whole matching set on every call. BeforeID pages by the
+// same key.
+//
+// The one place the two orders differ is a job whose created_at was not the wall
+// clock at insert: a job inserted under a models.SimulatedClock or FixedClock, or
+// seeded with an explicit CreatedAt. Such a job is listed where its id puts it.
 func ListJobs(ctx context.Context, db *gorm.DB, p ListJobsParams) ([]JobView, error) {
 	query := db.WithContext(ctx).Model(&jobRow{})
 	if p.State != "" {
@@ -133,12 +204,18 @@ func ListJobs(ctx context.Context, db *gorm.DB, p ListJobsParams) ([]JobView, er
 	if p.Kind != "" {
 		query = query.Where("kind = ?", p.Kind)
 	}
+	if p.Queue != "" {
+		query = query.Where("queue = ?", p.Queue)
+	}
+	if p.BeforeID != "" {
+		query = query.Where("id < ?", p.BeforeID)
+	}
 	limit := p.Limit
 	if limit <= 0 {
 		limit = defaultListJobsLimit
 	}
 	var rows []jobRow
-	if err := query.Order("created_at desc, id desc").Limit(limit).Find(&rows).Error; err != nil {
+	if err := query.Order("id desc").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("flywheel: list jobs: %w", err)
 	}
 	views := make([]JobView, len(rows))
@@ -169,7 +246,9 @@ func FindJob(ctx context.Context, db *gorm.DB, id string) (JobView, error) {
 func ListRuns(ctx context.Context, db *gorm.DB, jobID string, p ListRunsParams) ([]JobRunView, error) {
 	query := db.WithContext(ctx).Model(&jobRunRow{}).Where("job_id = ?", jobID)
 	if !p.Before.IsZero() {
-		query = query.Where("created_at < ?", p.Before)
+		// UTC, because job_runs timestamps are stamped in UTC: on SQLite the
+		// comparison is textual, and a cursor in another zone would compare wrong.
+		query = query.Where("created_at < ?", p.Before.UTC())
 	}
 	if p.Limit > 0 {
 		query = query.Limit(p.Limit)
@@ -253,30 +332,65 @@ func CountActiveJobs(ctx context.Context, db *gorm.DB) (int64, error) {
 }
 
 // jobViewFromRow projects an unexported jobRow into the public JobView.
+//
+// Tags are decoded best-effort: the runtime always writes a JSON array, so a
+// value that does not decode is a hand-written row, and it reads as no tags
+// rather than failing the whole page it sits on.
 func jobViewFromRow(r jobRow) JobView {
 	parent := ""
 	if r.ParentJobID != nil {
 		parent = *r.ParentJobID
 	}
+	tags := []string{}
+	if len(r.Tags) > 0 {
+		var decoded []string
+		if err := json.Unmarshal(r.Tags, &decoded); err == nil && decoded != nil {
+			tags = decoded
+		}
+	}
 	return JobView{
-		ID:          r.ID,
-		Kind:        r.Kind,
-		State:       r.State,
-		ParentJobID: parent,
-		EnqueuedAt:  r.CreatedAt,
-		Attempt:     r.Attempt,
+		ID:            r.ID,
+		Kind:          r.Kind,
+		Queue:         r.Queue,
+		State:         r.State,
+		ParentJobID:   parent,
+		EnqueuedAt:    r.CreatedAt,
+		Attempt:       r.Attempt,
+		MaxAttempts:   r.MaxAttempts,
+		Priority:      r.Priority,
+		ExecutorClass: r.ExecutorClass,
+		ScheduledAt:   r.ScheduledAt,
+		FinalizedAt:   r.FinalizedAt,
+		UpdatedAt:     r.UpdatedAt,
+		Tags:          tags,
 	}
 }
 
 // jobRunViewFromRow projects an unexported jobRunRow into the public JobRunView.
 func jobRunViewFromRow(r jobRunRow) JobRunView {
 	v := JobRunView{
-		ID:            r.ID,
-		Outcome:       r.Outcome,
-		ExecutorClass: r.ExecutorClass,
-		StartedAt:     r.StartedAt,
-		FinishedAt:    r.FinishedAt,
-		Error:         r.ErrorMessage,
+		ID:               r.ID,
+		JobID:            r.JobID,
+		Attempt:          r.Attempt,
+		Kind:             r.Kind,
+		Queue:            r.Queue,
+		Outcome:          r.Outcome,
+		ExecutorClass:    r.ExecutorClass,
+		ExecutorID:       r.ExecutorID,
+		StartedAt:        r.StartedAt,
+		FinishedAt:       r.FinishedAt,
+		DurationMs:       r.DurationMs,
+		QueueWaitMs:      r.QueueWaitMs,
+		Error:            r.ErrorMessage,
+		CostMicros:       r.CostMicros,
+		EnqueuedChildren: r.EnqueuedChildren,
+		Superseded:       r.Superseded,
+	}
+	if r.ErrorClass != nil {
+		v.ErrorClass = *r.ErrorClass
+	}
+	if r.JobState != nil {
+		v.JobState = *r.JobState
 	}
 	if len(r.Output) > 0 {
 		v.Output = json.RawMessage(r.Output)

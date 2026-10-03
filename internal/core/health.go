@@ -141,6 +141,10 @@ const defaultRecentFailuresLimit = 20
 // reading through db. Soft-deleted jobs are excluded. It powers the failures
 // section of `flywheel status` so an operator can glance and see what broke.
 //
+// The page is one range scan of the jobs_finished index — (state, finalized_at,
+// id) with state = 'discarded' — which hands back rows already in page order, so
+// the read stops at Limit instead of sorting every discarded job.
+//
 // The errors come from a second read keyed by the page's job ids rather than a
 // SQL join, so the page size bounds both queries and the dialects stay identical:
 // the runs for the page are loaded ordered by attempt, and the last row seen per

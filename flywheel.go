@@ -31,8 +31,14 @@ type Job[A Args] = core.Job[A]
 type Worker[A Args] = core.Worker[A]
 
 type (
+	ActiveCount           = core.ActiveCount
+	Anomaly               = core.Anomaly
+	AnomalyParams         = core.AnomalyParams
+	AnomalySignal         = core.AnomalySignal
+	AnomalyThresholds     = core.AnomalyThresholds
 	Args                  = core.Args
 	Barrier               = core.Barrier
+	Baseline              = core.Baseline
 	BatchItem             = core.BatchItem
 	BatchOpts             = core.BatchOpts
 	BatchProgress         = core.BatchProgress
@@ -47,12 +53,14 @@ type (
 	DrainTimeoutError     = core.DrainTimeoutError
 	Driver                = core.Driver
 	DriverOpts            = core.DriverOpts
+	DurationSummary       = core.DurationSummary
 	ErrorClass            = core.ErrorClass
 	ExecutorClass         = core.ExecutorClass
 	FailureView           = core.FailureView
 	FakeHTTPDoer          = testutil.FakeHTTPDoer
 	FinalizeOutcome       = core.FinalizeOutcome
 	FinishEvent           = core.FinishEvent
+	FinishedCursor        = core.FinishedCursor
 	FollowUp              = core.FollowUp
 	Grant                 = core.Grant
 	HTTPDoer              = core.HTTPDoer
@@ -69,19 +77,26 @@ type (
 	JobState              = core.JobState
 	JobView               = core.JobView
 	JobsOverview          = core.JobsOverview
+	KindStats             = core.KindStats
 	LeaseRenewal          = core.LeaseRenewal
 	Limiter               = core.Limiter
+	ListFinishedParams    = core.ListFinishedParams
 	ListJobsParams        = core.ListJobsParams
+	ListRunningParams     = core.ListRunningParams
 	ListRunsParams        = core.ListRunsParams
 	MigrateOpts           = core.MigrateOpts
 	Node                  = node.Node
 	NodeConfig            = node.NodeConfig
 	Observer              = core.Observer
+	OutcomeCounts         = core.OutcomeCounts
 	OverviewParams        = core.OverviewParams
 	PeriodicSpec          = core.PeriodicSpec
 	PeriodicView          = core.PeriodicView
+	QueueDepth            = core.QueueDepth
 	QueueHealth           = core.QueueHealth
 	RawJob                = core.RawJob
+	RebuildOpts           = core.RebuildOpts
+	RebuildResult         = core.RebuildResult
 	RecentFailuresParams  = core.RecentFailuresParams
 	Registry              = core.Registry
 	ReplayOpts            = core.ReplayOpts
@@ -90,15 +105,25 @@ type (
 	RetryEvent            = core.RetryEvent
 	RetryOpts             = core.RetryOpts
 	Retryable             = core.Retryable
+	RollupResult          = core.RollupResult
 	RunOutcome            = core.RunOutcome
 	RunSeed               = core.RunSeed
 	Runner                = core.Runner
 	RunnerConfig          = core.RunnerConfig
+	RunningJob            = core.RunningJob
 	SQLiteOpts            = core.SQLiteOpts
 	Scheduler             = core.Scheduler
 	SchedulerConfig       = core.SchedulerConfig
+	SchemaDrift           = core.SchemaDrift
 	ScopeOpts             = core.ScopeOpts
 	ScopeResult           = core.ScopeResult
+	SeriesInterval        = core.SeriesInterval
+	SeriesParams          = core.SeriesParams
+	SlowRunsParams        = core.SlowRunsParams
+	StatsCoverage         = core.StatsCoverage
+	StatsParams           = core.StatsParams
+	StatsPoint            = core.StatsPoint
+	StatsResult           = core.StatsResult
 	StorageParameter      = core.StorageParameter
 	StorageParameterDrift = core.StorageParameterDrift
 	SupersedeEvent        = core.SupersedeEvent
@@ -110,28 +135,32 @@ type (
 )
 
 const (
-	AnyClass         = core.AnyClass
-	ErrorPermanent   = core.ErrorPermanent
-	ErrorTimeout     = core.ErrorTimeout
-	ErrorTransient   = core.ErrorTransient
-	ErrorValidation  = core.ErrorValidation
-	IndexCorrectness = core.IndexCorrectness
-	IndexPerformance = core.IndexPerformance
-	OutcomeCancelled = core.OutcomeCancelled
-	OutcomeCrashed   = core.OutcomeCrashed
-	OutcomeError     = core.OutcomeError
-	OutcomeSnooze    = core.OutcomeSnooze
-	OutcomeStarted   = core.OutcomeStarted
-	OutcomeSuccess   = core.OutcomeSuccess
-	OutcomeTimeout   = core.OutcomeTimeout
-	StateAvailable   = core.StateAvailable
-	StateCancelled   = core.StateCancelled
-	StateDiscarded   = core.StateDiscarded
-	StatePaused      = core.StatePaused
-	StateRetryable   = core.StateRetryable
-	StateRunning     = core.StateRunning
-	StateScheduled   = core.StateScheduled
-	StateSucceeded   = core.StateSucceeded
+	AnyClass                 = core.AnyClass
+	ErrorPermanent           = core.ErrorPermanent
+	ErrorTimeout             = core.ErrorTimeout
+	ErrorTransient           = core.ErrorTransient
+	ErrorValidation          = core.ErrorValidation
+	IndexCorrectness         = core.IndexCorrectness
+	IndexPerformance         = core.IndexPerformance
+	IntervalDay              = core.IntervalDay
+	IntervalHour             = core.IntervalHour
+	OutcomeCancelled         = core.OutcomeCancelled
+	OutcomeCrashed           = core.OutcomeCrashed
+	OutcomeError             = core.OutcomeError
+	OutcomeSnooze            = core.OutcomeSnooze
+	OutcomeStarted           = core.OutcomeStarted
+	OutcomeSuccess           = core.OutcomeSuccess
+	OutcomeTimeout           = core.OutcomeTimeout
+	SignalDurationRegression = core.SignalDurationRegression
+	SignalFailureSpike       = core.SignalFailureSpike
+	StateAvailable           = core.StateAvailable
+	StateCancelled           = core.StateCancelled
+	StateDiscarded           = core.StateDiscarded
+	StatePaused              = core.StatePaused
+	StateRetryable           = core.StateRetryable
+	StateRunning             = core.StateRunning
+	StateScheduled           = core.StateScheduled
+	StateSucceeded           = core.StateSucceeded
 )
 
 var (
@@ -149,10 +178,24 @@ var (
 	ErrRunnerStopped      = core.ErrRunnerStopped
 	ErrSQLiteConcurrency  = core.ErrSQLiteConcurrency
 	ErrSQLitePragma       = core.ErrSQLitePragma
+	ErrSchemaOutdated     = core.ErrSchemaOutdated
+	ErrStatsNotRolledUp   = core.ErrStatsNotRolledUp
 	ErrUnknownKind        = core.ErrUnknownKind
 	ErrUnsupportedDialect = core.ErrUnsupportedDialect
 	ErrValidation         = core.ErrValidation
 )
+
+func Anomalies(ctx context.Context, db *gorm.DB, p AnomalyParams) ([]Anomaly, error) {
+	return core.Anomalies(ctx, db, p)
+}
+
+func BackfillRunFinishes(ctx context.Context, db *gorm.DB) (int64, error) {
+	return core.BackfillRunFinishes(ctx, db)
+}
+
+func Baselines(ctx context.Context, db *gorm.DB, window time.Duration) ([]Baseline, error) {
+	return core.Baselines(ctx, db, window)
+}
 
 func CancelByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
 	return core.CancelByParent(ctx, db, parentJobID, opts)
@@ -164,6 +207,10 @@ func CancelJob(ctx context.Context, db *gorm.DB, id string) error {
 
 func ChildOutputs(ctx context.Context, db *gorm.DB, parentJobID string, p ListRunsParams) ([]ChildOutput, error) {
 	return core.ChildOutputs(ctx, db, parentJobID, p)
+}
+
+func CountActiveByKind(ctx context.Context, db *gorm.DB) ([]ActiveCount, error) {
+	return core.CountActiveByKind(ctx, db)
 }
 
 func CountActiveJobs(ctx context.Context, db *gorm.DB) (int64, error) {
@@ -198,6 +245,10 @@ func FindJob(ctx context.Context, db *gorm.DB, id string) (JobView, error) {
 	return core.FindJob(ctx, db, id)
 }
 
+func HistogramBounds(version int) []int64 {
+	return core.HistogramBounds(version)
+}
+
 func IndexSet(dialect string) ([]Index, error) {
 	return core.IndexSet(dialect)
 }
@@ -212,6 +263,10 @@ func InsertMany(ctx context.Context, c *Client, items []BatchItem, opts BatchOpt
 
 func InspectIndexes(ctx context.Context, db *gorm.DB) ([]IndexDrift, error) {
 	return core.InspectIndexes(ctx, db)
+}
+
+func InspectSchema(ctx context.Context, db *gorm.DB) ([]SchemaDrift, error) {
+	return core.InspectSchema(ctx, db)
 }
 
 func InspectStorageParameters(ctx context.Context, db *gorm.DB) ([]StorageParameterDrift, error) {
@@ -234,12 +289,20 @@ func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsV
 	return core.ListActiveByKind(ctx, db, kind)
 }
 
+func ListFinished(ctx context.Context, db *gorm.DB, p ListFinishedParams) ([]JobView, error) {
+	return core.ListFinished(ctx, db, p)
+}
+
 func ListJobs(ctx context.Context, db *gorm.DB, p ListJobsParams) ([]JobView, error) {
 	return core.ListJobs(ctx, db, p)
 }
 
 func ListPeriodics(ctx context.Context, db *gorm.DB) ([]PeriodicView, error) {
 	return core.ListPeriodics(ctx, db)
+}
+
+func ListRunning(ctx context.Context, db *gorm.DB, p ListRunningParams) ([]RunningJob, error) {
+	return core.ListRunning(ctx, db, p)
 }
 
 func ListRuns(ctx context.Context, db *gorm.DB, jobID string, p ListRunsParams) ([]JobRunView, error) {
@@ -314,6 +377,10 @@ func NonTerminalStates() []JobState {
 	return core.NonTerminalStates()
 }
 
+func NormalizeRunTimestamps(ctx context.Context, db *gorm.DB) (int64, error) {
+	return core.NormalizeRunTimestamps(ctx, db)
+}
+
 func Overview(ctx context.Context, db *gorm.DB, p OverviewParams) (JobsOverview, error) {
 	return core.Overview(ctx, db, p)
 }
@@ -332,6 +399,14 @@ func ProgressByKind(ctx context.Context, db *gorm.DB, kinds []string) (map[strin
 
 func ProgressMany(ctx context.Context, db *gorm.DB, parentJobIDs []string) (map[string]BatchProgress, error) {
 	return core.ProgressMany(ctx, db, parentJobIDs)
+}
+
+func QueueDepths(ctx context.Context, db *gorm.DB) ([]QueueDepth, error) {
+	return core.QueueDepths(ctx, db)
+}
+
+func RebuildStats(ctx context.Context, db *gorm.DB, opts RebuildOpts) (RebuildResult, error) {
+	return core.RebuildStats(ctx, db, opts)
 }
 
 func RecentFailures(ctx context.Context, db *gorm.DB, p RecentFailuresParams) ([]FailureView, error) {
@@ -368,6 +443,18 @@ func SeedRun(ctx context.Context, db *gorm.DB, seed RunSeed) (string, error) {
 
 func SetPeriodicActive(ctx context.Context, db *gorm.DB, slug string, active bool) error {
 	return core.SetPeriodicActive(ctx, db, slug, active)
+}
+
+func SlowRuns(ctx context.Context, db *gorm.DB, p SlowRunsParams) ([]JobRunView, error) {
+	return core.SlowRuns(ctx, db, p)
+}
+
+func Stats(ctx context.Context, db *gorm.DB, p StatsParams) (StatsResult, error) {
+	return core.Stats(ctx, db, p)
+}
+
+func StatsSeries(ctx context.Context, db *gorm.DB, p SeriesParams) ([]StatsPoint, error) {
+	return core.StatsSeries(ctx, db, p)
 }
 
 func StorageParameterSet(dialect string) ([]StorageParameter, error) {

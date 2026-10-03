@@ -411,3 +411,22 @@ func TestNodeRunSurfacesHealthListenError(t *testing.T) {
 	err = node.Run(ctx)
 	require.ErrorContains(t, err, "health server", "the health listen failure is surfaced as the node's first error")
 }
+
+// TestNodeFailsFastOnAnOutdatedSchema proves the deploy-order guard reaches a
+// Node: a binary newer than the database's schema stops at Run with
+// ErrSchemaOutdated, naming the missing column, rather than claiming work it
+// cannot record. A column is dropped from a migrated database to stand in for a
+// database nobody migrated.
+func TestNodeFailsFastOnAnOutdatedSchema(t *testing.T) {
+	t.Parallel()
+	db := ft.NewDB(t)
+	require.NoError(t, db.Exec(`ALTER TABLE job_runs DROP COLUMN superseded`).Error)
+
+	n, err := NewNode(NodeConfig{Runners: []core.RunnerConfig{sqliteRunner(db, core.NewRegistry())}})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = n.Run(ctx)
+	require.ErrorIs(t, err, core.ErrSchemaOutdated)
+	assert.Contains(t, err.Error(), "job_runs.superseded")
+}

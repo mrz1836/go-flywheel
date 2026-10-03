@@ -12,11 +12,12 @@ import (
 // TestStorageParameterSetTargetsOnlyTheChurningTable pins which tables get
 // parameters and which deliberately do not.
 //
-// jobs is the only table with update churn: every job transitions
-// available → running → terminal, plus a pair per retry. job_runs is
-// append-only and job_periodics holds one row per schedule, so a lower
-// fillfactor on either would reserve free space on every page for updates that
-// never arrive.
+// jobs is the only table with update churn the settings act on: every job
+// transitions available → running → terminal, plus a pair per retry, and none of
+// those updates is HOT. job_runs takes one update per run, and that update is
+// HOT-eligible (it writes no indexed column), so it is pruned on its own page;
+// job_periodics holds one row per schedule. A lower fillfactor on either would
+// reserve free space for churn that is not there.
 func TestStorageParameterSetTargetsOnlyTheChurningTable(t *testing.T) {
 	t.Parallel()
 

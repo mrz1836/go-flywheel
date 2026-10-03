@@ -206,3 +206,31 @@ func TestCLIServeProcessesEnqueuedAndScheduledJobs(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestCLIMigrateReportsAnUpgradeAndTakesLiveFlags proves `flywheel migrate` is
+// the upgrade: on a database missing the analytics columns it reports what it
+// added, accepts the live-upgrade flags (no-ops on SQLite), and a re-run reports
+// nothing new.
+func TestCLIMigrateReportsAnUpgradeAndTakesLiveFlags(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfg := writeCLIConfig(t, dir, "")
+	ctx := context.Background()
+
+	_, err := runRoot(ctx, "--config", cfg, "migrate")
+	require.NoError(t, err)
+	loaded, err := LoadConfig(cfg)
+	require.NoError(t, err)
+	db, _, err := openDB(loaded)
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`ALTER TABLE job_runs DROP COLUMN queue_wait_ms`).Error)
+	closeDB(db)
+
+	out, err := runRoot(ctx, "--config", cfg, "migrate", "--concurrently", "--lock-timeout", "5s")
+	require.NoError(t, err)
+	assert.Contains(t, out, "added: job_runs.queue_wait_ms")
+
+	out, err = runRoot(ctx, "--config", cfg, "migrate")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "added:", "an up-to-date schema adds nothing")
+}

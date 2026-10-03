@@ -155,3 +155,21 @@ func TestCollapseSpace(t *testing.T) {
 		t.Errorf("collapseSpace = %q", got)
 	}
 }
+
+// TestParseFlagsAcceptsEveryQuery pins the -query vocabulary, the stats
+// characterization included, and the rejection of anything else.
+func TestParseFlagsAcceptsEveryQuery(t *testing.T) {
+	for _, q := range []string{"claim", "claim-fair", "progress", "stats"} {
+		opts, err := parseFlags([]string{"-dsn", testDSN, "-query", q}, io.Discard)
+		if err != nil {
+			t.Errorf("-query %s: %v", q, err)
+			continue
+		}
+		if opts.query != q {
+			t.Errorf("-query %s parsed as %q", q, opts.query)
+		}
+	}
+	if _, err := parseFlags([]string{"-dsn", testDSN, "-query", "nope"}, io.Discard); err == nil {
+		t.Error("an unknown -query must be rejected")
+	}
+}

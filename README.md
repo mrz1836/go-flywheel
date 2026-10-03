@@ -128,7 +128,8 @@ The runtime is built from focused, composable pieces:
 - **Retries with backoff** — exponential backoff with jitter, overridable per worker; consecutive poll failures climb their own ladder so a failing database is not hammered ([runner.go](internal/core/runner.go))
 - **Lease-based recovery** — orphaned, crashed jobs reclaimed via `leased_until` sweeps ([scheduler.go](internal/core/scheduler.go))
 - **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](internal/core/runner.go))
-- **Per-run audit** — append-only `job_runs` table records every attempt, outcome, timing, and cost ([read.go](internal/core/read.go))
+- **Per-run audit** — the `job_runs` table records every attempt: outcome, timing, queue wait, cost, and whether its claim was lost ([read.go](internal/core/read.go))
+- **Job analytics for dashboards** — what is running now, what just finished, per-kind stats over any window, hourly and daily trends from rollups that outlive retention, and low-noise regression alerts ([docs/INTEGRATING.md](docs/INTEGRATING.md))
 - **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work ([client.go](internal/core/client.go))
 - **Outbox pattern** — enqueue on the caller's own `*gorm.DB` transaction for exactly-once side effects ([client.go](internal/core/client.go))
 - **Follow-up jobs (DAG)** — workers return child jobs that are enqueued atomically ([types.go](internal/core/types.go))
@@ -1013,6 +1014,15 @@ node, _ := flywheel.NewNode(flywheel.NodeConfig{
 The [`flywheel` CLI](cmd/flywheel/README.md) turns all of this on by default and adds `flywheel status`
 for an at-a-glance report of queue health, schedules, and recent failures.
 
+**Dashboards over the database.** For history rather than this minute, set the scheduler's
+`StatsRollupInterval` and read the runtime's own tables: `ListRunning` (what is running now, slow runs
+flagged), `ListFinished`, `QueueDepths`, `Stats` and `StatsSeries` (per-kind outcomes, success rate,
+duration and queue-wait percentiles over any window, from hourly rollups that outlive retention),
+`Baselines`, and `Anomalies` (a low-noise "this kind got slower / started failing"). Every read is
+bounded and indexed — tens of milliseconds at a million runs. [`docs/INTEGRATING.md`](docs/INTEGRATING.md)
+covers the data contract, each API's cost, recipes, direct SQL, and the upgrade for an existing
+database; [`examples/dashboard-api`](examples/dashboard-api/main.go) is a read-only JSON API over all of it.
+
 </details>
 
 <details>
@@ -1187,6 +1197,7 @@ command, the config reference, and the macOS launchd setup.
 - **API Reference** – Dive into the godocs at [pkg.go.dev/github.com/mrz1836/go-flywheel](https://pkg.go.dev/github.com/mrz1836/go-flywheel)
 - **Contract** – The exactly-once guarantees and their limits in [`docs/CONTRACT.md`](docs/CONTRACT.md)
 - **Cookbook** – Unique-key recipes for deduplication and side-effect correlation in [`docs/COOKBOOK.md`](docs/COOKBOOK.md)
+- **Integrating** – Building dashboards and external platforms on the runtime's data, and upgrading an existing database, in [`docs/INTEGRATING.md`](docs/INTEGRATING.md)
 - **Runbook** – Operating the runtime and reading its metrics in [`docs/RUNBOOK.md`](docs/RUNBOOK.md)
 - **Tuning** – Sizing the knobs from measured numbers in [`docs/TUNING.md`](docs/TUNING.md)
 - **Dashboards** – An importable Grafana dashboard over the metrics in [`docs/dashboards/`](docs/dashboards/)

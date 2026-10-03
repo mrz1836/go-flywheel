@@ -37,6 +37,10 @@ func newServeCmd(configPath *string) *cobra.Command {
 // exercised with an injected handle.
 func runServe(ctx context.Context, cfg *Config, db *gorm.DB, driver flywheel.Driver) error {
 	logger := newLogger(cfg)
+	statsRollup, rollupOff := cfg.Runtime.effectiveStatsRollup()
+	if rollupOff != "" {
+		logger.Warn("flywheel serve: stats rollup disabled", "reason", rollupOff)
+	}
 	if err := flywheel.Migrate(db); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
@@ -86,6 +90,11 @@ func runServe(ctx context.Context, cfg *Config, db *gorm.DB, driver flywheel.Dri
 			Observer:             obs,
 			RetentionMaxAge:      cfg.Runtime.Retention.Std(),
 			HealthSampleInterval: cfg.Runtime.HealthSampleInterval.Std(),
+			// The hourly stats rollup is on by default for the daemon — it is what
+			// `flywheel stats` reads past the last few hours — and so is the anomaly
+			// log, which warns once when a kind slows down or starts failing.
+			StatsRollupInterval: statsRollup,
+			StatsAnomalyLog:     true,
 		},
 		Health: health,
 		Logger: logger,
@@ -103,6 +112,7 @@ func runServe(ctx context.Context, cfg *Config, db *gorm.DB, driver flywheel.Dri
 		"concurrency", cfg.Runtime.Concurrency,
 		"schedules", len(cfg.Schedules),
 		"retention", cfg.Runtime.Retention.Std().String(),
+		"stats_rollup", statsRollup.String(),
 		"metrics_addr", cfg.Runtime.MetricsAddr)
 	return node.Run(sigCtx)
 }

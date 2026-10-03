@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -24,20 +25,23 @@ func Models() []any {
 	return []any{
 		&jobRow{}, &jobRunRow{}, &jobPeriodicRow{},
 		&limiterBucketRow{}, &limiterHoldRow{},
+		&jobRunFinishRow{}, &jobStatsHourlyRow{},
 	}
 }
 
 // Migrate is the library-owned install: it brings up the runtime's tables — the
-// three job tables (jobs, job_runs, job_periodics) and the two limiter tables
-// (limiter_buckets, limiter_holds) the DBLimiter uses — with their NOT-NULL
-// constraints, column defaults, and the jobs soft-delete column, plus the
-// partial/unique indexes GORM AutoMigrate cannot express. A host in this mode
-// calls Migrate(db) and nothing else. The limiter tables are additive: a host
-// that never constructs a DBLimiter simply leaves them empty.
+// three job tables (jobs, job_runs, job_periodics), the two limiter tables
+// (limiter_buckets, limiter_holds) the DBLimiter uses, and the two stats tables
+// (job_run_finishes, the finish log every finalize writes, and job_stats_hourly,
+// the rollup) — with their NOT-NULL constraints, column defaults, and the jobs
+// soft-delete column, plus the partial/unique indexes GORM AutoMigrate cannot
+// express. A host in this mode calls Migrate(db) and nothing else. The limiter
+// tables are additive: a host that never constructs a DBLimiter simply leaves
+// them empty.
 //
 // # Choosing an install mode
 //
-// The runtime owns five tables and there are two ways to install them. They are
+// The runtime owns seven tables and there are two ways to install them. They are
 // not layers. A host picks exactly one; running both means two migration
 // authorities against one database.
 //
@@ -91,6 +95,10 @@ func Migrate(db *gorm.DB) error {
 // MigrateOpts configures MigrateWithOptions. The zero value is the library-owned
 // install: the runtime brings up its own tables and indexes against a database it
 // is the only writer of.
+//
+// Upgrading a live PostgreSQL database that running workers are writing to wants
+// Concurrently and LockTimeout set — see the upgrade runbook in
+// docs/INTEGRATING.md. Its fields mirror IndexOpts exactly.
 type MigrateOpts struct {
 	// Reconcile drops and recreates any index whose installed definition has
 	// drifted from the runtime's, rather than failing with an IndexDriftError. It
@@ -103,6 +111,19 @@ type MigrateOpts struct {
 	// An absent index is still created and a matching one still left alone; this
 	// governs only what happens to a drifted one.
 	Reconcile bool
+
+	// Concurrently creates absent indexes with CREATE INDEX CONCURRENTLY on
+	// PostgreSQL, so adding an index to a loaded table never blocks its writers.
+	// See IndexOpts.Concurrently.
+	Concurrently bool
+
+	// LockTimeout, when positive, bounds how long each schema statement waits for
+	// its table lock on PostgreSQL — the column additions and storage parameters
+	// run in one transaction under SET LOCAL lock_timeout, and so does each plain
+	// index build. A statement that cannot get its lock fails the Migrate instead
+	// of queueing every later query on the table behind it; retry it. Zero waits
+	// indefinitely. See IndexOpts.LockTimeout.
+	LockTimeout time.Duration
 }
 
 // MigrateWithOptions installs the schema per opts: AutoMigrate over Models,
@@ -116,20 +137,30 @@ type MigrateOpts struct {
 // index, leaves a matching one alone, and — with opts.Reconcile unset — fails
 // with an IndexDriftError on one whose definition has drifted rather than
 // silently keeping the stale index. Set opts.Reconcile to rebuild it in place.
+//
+// # Upgrading
+//
+// Against a database an older release installed, Migrate is the upgrade: the
+// columns and tables a release adds are all additive — defaulted or nullable — so
+// AutoMigrate adds them without rewriting a row (on PostgreSQL 11+ a constant
+// default is a catalog change only), and binaries still running the older
+// release keep working against the result. Migrate, then deploy.
 func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 	if db == nil {
 		return fmt.Errorf("flywheel: Migrate: db is nil")
 	}
 
-	if err := db.AutoMigrate(Models()...); err != nil {
-		return fmt.Errorf("flywheel: Migrate: automigrate: %w", err)
-	}
-
-	// Storage parameters go on between the tables and the indexes. The order is
-	// load-bearing rather than tidy: fillfactor governs only pages written after
-	// it is set, so applying it after rows exist leaves every existing page at
-	// the old target. On SQLite this is a no-op.
-	if err := applyStorageParameters(context.Background(), db); err != nil {
+	// The tables, then the storage parameters, in one transaction when a lock
+	// timeout must be scoped to them. The order is load-bearing rather than tidy:
+	// fillfactor governs only pages written after it is set, so applying it after
+	// rows exist leaves every existing page at the old target. On SQLite the
+	// storage step is a no-op.
+	if err := withLockTimeout(db, opts.LockTimeout, func(tx *gorm.DB) error {
+		if err := tx.AutoMigrate(Models()...); err != nil {
+			return fmt.Errorf("automigrate: %w", err)
+		}
+		return applyStorageParameters(context.Background(), tx)
+	}); err != nil {
 		return fmt.Errorf("flywheel: Migrate: %w", err)
 	}
 
@@ -137,4 +168,19 @@ func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 		return fmt.Errorf("flywheel: Migrate: %w", err)
 	}
 	return nil
+}
+
+// withLockTimeout runs fn against db directly, or — on PostgreSQL with a positive
+// timeout — inside a transaction that scopes the timeout with SET LOCAL, so it
+// can never leak onto a pooled connection another caller reuses.
+func withLockTimeout(db *gorm.DB, timeout time.Duration, fn func(tx *gorm.DB) error) error {
+	if timeout <= 0 || db.Name() != "postgres" {
+		return fn(db)
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := setLocalLockTimeout(tx, timeout); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
 }

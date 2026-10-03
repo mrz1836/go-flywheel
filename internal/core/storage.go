@@ -264,11 +264,13 @@ func applyStorageParameters(ctx context.Context, db *gorm.DB) error {
 
 // runtimeStorageParameters is the PostgreSQL storage-parameter set.
 //
-// job_runs and job_periodics carry none, and that is a decision rather than an
-// omission: job_runs is append-only (see jobRunRow) and job_periodics holds one
-// row per schedule. Neither has the update churn either setting acts on, and a
-// lower fillfactor on an append-only table is pure waste — it reserves free
-// space on every page for updates that never come.
+// job_runs, job_periodics, and the stats tables carry none, and that is a
+// decision rather than an omission. job_periodics holds one row per schedule;
+// job_run_finishes and job_stats_hourly are written once per run and once per
+// hour. job_runs is insert-plus-one-update (see jobRunRow), but that one update
+// writes no indexed column, so it is HOT-eligible: the old version is pruned
+// on its own page without a vacuum and leaves no dead index entry, which is why
+// neither setting has churn to act on there.
 func runtimeStorageParameters() []StorageParameter {
 	return []StorageParameter{
 		{

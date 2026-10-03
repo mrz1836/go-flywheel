@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -93,9 +94,13 @@ func Indexes(dialect string) ([]string, error) {
 }
 
 // IndexOpts configures InstallIndexesWithOptions. The zero value reports drift as
-// an error and installs nothing over a drifted index — the safe default, because
+// an error, installs nothing over a drifted index, and creates an absent index
+// with a plain CREATE INDEX — the safe default for a fresh database, because
 // correcting drift takes a table-wide lock a host should choose to pay
 // deliberately rather than have the library take on a deploy it did not ask for.
+//
+// A host adding indexes to a live, loaded PostgreSQL database sets Concurrently,
+// and usually LockTimeout: see the upgrade runbook in docs/INTEGRATING.md.
 type IndexOpts struct {
 	// Reconcile drops and recreates an index whose installed definition has drifted
 	// from the runtime's, rather than reporting it. It is off by default because the
@@ -107,13 +112,38 @@ type IndexOpts struct {
 	// The drop and recreate run inside one transaction, so the lock is held for the
 	// whole rebuild and a correctness-bearing unique index is never briefly absent —
 	// no duplicate slips through the window. CREATE INDEX CONCURRENTLY, which would
-	// avoid the lock, cannot run inside a transaction and is out of scope; a host
-	// that needs it acts on the InspectIndexes report by hand.
+	// avoid the lock, cannot run inside a transaction, so Reconcile never uses it; a
+	// host that needs a lock-free rebuild acts on the InspectIndexes report by hand.
 	//
 	// With Reconcile off, drift is returned as an IndexDriftError naming each index,
 	// its installed definition, and the expected one, and no index is dropped. An
 	// absent index is created either way — that is a first install, not drift.
 	Reconcile bool
+
+	// Concurrently creates an absent index with CREATE INDEX CONCURRENTLY on
+	// PostgreSQL, which builds it without blocking the table's writers. A plain
+	// CREATE INDEX holds a SHARE lock for the whole build, and on a live jobs table
+	// that stalls every claim and finalize until it finishes — seconds at a million
+	// rows. It has no effect on SQLite, which has no concurrent build and a single
+	// writer anyway.
+	//
+	// A concurrent build cannot run inside a transaction, so db must not be one. A
+	// concurrent build that fails part-way — a deadlock, a cancelled deploy — leaves
+	// an index PostgreSQL marks invalid: present, maintained on every write, never
+	// used by a query. InspectIndexes reports it (IndexDrift.Invalid), and a re-run
+	// with Concurrently repairs an invalid performance index by dropping and
+	// rebuilding it concurrently. An invalid correctness index is reported as drift
+	// rather than repaired, because dropping a unique index — even an invalid one —
+	// is a guarantee the host gives up on purpose, through Reconcile.
+	Concurrently bool
+
+	// LockTimeout, when positive, bounds how long each schema statement waits to
+	// acquire its table lock on PostgreSQL (SET LOCAL lock_timeout). A DDL statement
+	// queued behind a long-running transaction blocks every later query on the
+	// table while it waits; with a timeout it fails instead, and the install can be
+	// retried at a quieter moment. Zero waits indefinitely, as PostgreSQL does by
+	// default. It does not apply to a concurrent build, whose waits block no one.
+	LockTimeout time.Duration
 }
 
 // InstallIndexes applies every index for db's dialect, reporting drift as an
@@ -177,6 +207,11 @@ func applyIndexes(ctx context.Context, db *gorm.DB, opts IndexOpts) error {
 	if err != nil {
 		return err
 	}
+	concurrent := opts.Concurrently && db.Name() == "postgres"
+	kinds := make(map[string]IndexKind, len(set))
+	for _, idx := range set {
+		kinds[idx.Name] = idx.Kind
+	}
 	var drifted []IndexDrift
 	for _, d := range drift {
 		switch {
@@ -192,11 +227,17 @@ func applyIndexes(ctx context.Context, db *gorm.DB, opts IndexOpts) error {
 		case d.Installed == "":
 			// Absent: a first install, not drift. Create it. inspectIndexes preserves
 			// IndexSet order, so absent indexes are created in that order.
-			if err := db.WithContext(ctx).Exec(d.Expected).Error; err != nil {
+			if err := createIndex(ctx, db, d.Expected, concurrent, opts.LockTimeout); err != nil {
 				return fmt.Errorf("create index %s: %w", d.Name, err)
 			}
+		case d.Invalid && concurrent && kinds[d.Name] == IndexPerformance:
+			// The leftover of a failed concurrent build. It serves no query, so
+			// replacing it concurrently gives up nothing and blocks no writer.
+			if err := repairInvalidIndex(ctx, db, d); err != nil {
+				return err
+			}
 		case opts.Reconcile:
-			if err := reconcileIndex(ctx, db, d); err != nil {
+			if err := reconcileIndex(ctx, db, d, opts.LockTimeout); err != nil {
 				return err
 			}
 		default:
@@ -215,8 +256,11 @@ func applyIndexes(ctx context.Context, db *gorm.DB, opts IndexOpts) error {
 // keeps the lock for the whole rebuild — so a correctness-bearing unique index is
 // never briefly absent and no duplicate slips through the window between drop and
 // create.
-func reconcileIndex(ctx context.Context, db *gorm.DB, d IndexDrift) error {
+func reconcileIndex(ctx context.Context, db *gorm.DB, d IndexDrift, lockTimeout time.Duration) error {
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := setLocalLockTimeout(tx, lockTimeout); err != nil {
+			return fmt.Errorf("reconcile index %s: %w", d.Name, err)
+		}
 		if err := tx.Exec(`DROP INDEX ` + quoteIndexIdent(d.Name)).Error; err != nil {
 			return fmt.Errorf("reconcile index %s: drop: %w", d.Name, err)
 		}
@@ -225,6 +269,68 @@ func reconcileIndex(ctx context.Context, db *gorm.DB, d IndexDrift) error {
 		}
 		return nil
 	})
+}
+
+// createIndex applies one index's DDL. A concurrent build runs as a bare
+// statement, because CREATE INDEX CONCURRENTLY refuses to run inside a
+// transaction block; a plain build runs inside a transaction only when a lock
+// timeout must be scoped to it with SET LOCAL.
+func createIndex(ctx context.Context, db *gorm.DB, ddl string, concurrent bool, lockTimeout time.Duration) error {
+	if concurrent {
+		return db.WithContext(ctx).Exec(concurrentIndexDDL(ddl)).Error
+	}
+	if lockTimeout <= 0 || db.Name() != "postgres" {
+		return db.WithContext(ctx).Exec(ddl).Error
+	}
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := setLocalLockTimeout(tx, lockTimeout); err != nil {
+			return err
+		}
+		return tx.Exec(ddl).Error
+	})
+}
+
+// repairInvalidIndex replaces an index a failed concurrent build left invalid,
+// without blocking writers: DROP INDEX CONCURRENTLY, then a fresh concurrent
+// build. Neither statement may run inside a transaction, so the two are not
+// atomic — which is acceptable only because the caller restricts it to
+// performance indexes, whose brief absence costs plans and no guarantee.
+func repairInvalidIndex(ctx context.Context, db *gorm.DB, d IndexDrift) error {
+	if err := db.WithContext(ctx).Exec(`DROP INDEX CONCURRENTLY IF EXISTS ` + quoteIndexIdent(d.Name)).Error; err != nil {
+		return fmt.Errorf("repair invalid index %s: drop: %w", d.Name, err)
+	}
+	if err := db.WithContext(ctx).Exec(concurrentIndexDDL(d.Expected)).Error; err != nil {
+		return fmt.Errorf("repair invalid index %s: create: %w", d.Name, err)
+	}
+	return nil
+}
+
+// concurrentIndexDDL rewrites one of the runtime's CREATE [UNIQUE] INDEX IF NOT
+// EXISTS statements into its CONCURRENTLY form. The runtime's DDL is written in
+// one fixed shape, so a prefix rewrite is exact; the definition the build installs
+// is identical, which is what lets InspectIndexes accept an index built either way.
+func concurrentIndexDDL(ddl string) string {
+	for _, prefix := range []string{"CREATE UNIQUE INDEX ", "CREATE INDEX "} {
+		if rest, ok := strings.CutPrefix(ddl, prefix); ok {
+			return prefix + "CONCURRENTLY " + rest
+		}
+	}
+	return ddl
+}
+
+// setLocalLockTimeout scopes a lock_timeout to tx's transaction on PostgreSQL.
+// SET cannot take a bind parameter, so the value is formatted in — it is an
+// integer the caller cannot inject through. A non-positive timeout, or SQLite,
+// sets nothing.
+func setLocalLockTimeout(tx *gorm.DB, timeout time.Duration) error {
+	if timeout <= 0 || tx.Name() != "postgres" {
+		return nil
+	}
+	ms := max(timeout.Milliseconds(), 1)
+	if err := tx.Exec(fmt.Sprintf(`SET LOCAL lock_timeout = '%dms'`, ms)).Error; err != nil {
+		return fmt.Errorf("set lock_timeout: %w", err)
+	}
+	return nil
 }
 
 // quoteIndexIdent double-quotes an index name for a DROP INDEX statement. The
@@ -254,6 +360,13 @@ type IndexDrift struct {
 	// sees the straggler, but it is never counted as drift and never fails an
 	// install.
 	Retired bool
+	// Invalid is true when the index is installed but PostgreSQL marks it invalid
+	// (pg_index.indisvalid is false) — the leftover of a CREATE INDEX CONCURRENTLY
+	// that failed part-way. Its definition may match exactly, which is why a check
+	// that compared definitions alone would pass it; but the planner never uses it,
+	// while every write still pays to maintain it. It is drift: see
+	// IndexOpts.Concurrently for how a re-install repairs it.
+	Invalid bool
 }
 
 // InspectIndexes reports every runtime index that is absent from db or whose
@@ -307,12 +420,14 @@ func inspectIndexes(ctx context.Context, db *gorm.DB, set []Index) ([]IndexDrift
 	}
 	var drift []IndexDrift
 	for _, idx := range set {
-		def, ok := installed[idx.Name]
+		got, ok := installed[idx.Name]
 		switch {
 		case !ok:
 			drift = append(drift, IndexDrift{Name: idx.Name, Installed: "", Expected: idx.DDL})
-		case normalizeIndexDef(def) != normalizeIndexDef(idx.DDL):
-			drift = append(drift, IndexDrift{Name: idx.Name, Installed: def, Expected: idx.DDL})
+		case !got.valid:
+			drift = append(drift, IndexDrift{Name: idx.Name, Installed: got.def, Expected: idx.DDL, Invalid: true})
+		case normalizeIndexDef(got.def) != normalizeIndexDef(idx.DDL):
+			drift = append(drift, IndexDrift{Name: idx.Name, Installed: got.def, Expected: idx.DDL})
 		}
 	}
 	// Retired stragglers: an index the runtime once installed and no longer
@@ -321,37 +436,52 @@ func inspectIndexes(ctx context.Context, db *gorm.DB, set []Index) ([]IndexDrift
 	// entries come last, after every desired-set entry, so applyIndexes creates any
 	// absent covering index before dropping the one it supersedes.
 	for _, name := range retiredIndexNames() {
-		if def, ok := installed[name]; ok {
-			drift = append(drift, IndexDrift{Name: name, Installed: def, Retired: true})
+		if got, ok := installed[name]; ok {
+			drift = append(drift, IndexDrift{Name: name, Installed: got.def, Retired: true})
 		}
 	}
 	return drift, nil
 }
 
+// installedIndex is one index as the catalog reports it: the definition it holds
+// and whether PostgreSQL considers it valid. SQLite has no invalid state.
+type installedIndex struct {
+	def   string
+	valid bool
+}
+
 // readInstalledIndexDefs reads db's catalog into a name→definition map for the
 // runtime's tables. The definition is the statement the database actually holds —
 // pg_indexes.indexdef on PostgreSQL, sqlite_master.sql on SQLite — which is the
-// only authority the name-level install cannot fake.
+// only authority the name-level install cannot fake. On PostgreSQL it also reads
+// pg_index.indisvalid, because a failed concurrent build leaves an index whose
+// definition matches and which serves nothing.
 //
 // The PostgreSQL branch names the tables explicitly, so a new runtime table's
 // indexes must be added to its IN list or InspectIndexes reports them as
 // perpetually absent; the SQLite branch reads every index and needs no change.
-func readInstalledIndexDefs(ctx context.Context, db *gorm.DB) (map[string]string, error) {
-	out := map[string]string{}
+func readInstalledIndexDefs(ctx context.Context, db *gorm.DB) (map[string]installedIndex, error) {
+	out := map[string]installedIndex{}
 	switch db.Name() {
 	case "postgres":
 		var rows []struct {
-			Indexname string
-			Indexdef  string
+			Indexname  string
+			Indexdef   string
+			Indisvalid bool
 		}
 		if err := db.WithContext(ctx).Raw(`
-			SELECT indexname, indexdef FROM pg_indexes
-			WHERE schemaname = current_schema()
-			  AND tablename IN ('jobs', 'job_runs', 'job_periodics', 'limiter_buckets', 'limiter_holds')`).Scan(&rows).Error; err != nil {
+			SELECT i.indexname, i.indexdef, x.indisvalid
+			FROM pg_indexes i
+			JOIN pg_namespace n ON n.nspname = i.schemaname
+			JOIN pg_class c ON c.relname = i.indexname AND c.relnamespace = n.oid
+			JOIN pg_index x ON x.indexrelid = c.oid
+			WHERE i.schemaname = current_schema()
+			  AND i.tablename IN ('jobs', 'job_runs', 'job_periodics', 'limiter_buckets', 'limiter_holds',
+			                      'job_run_finishes', 'job_stats_hourly')`).Scan(&rows).Error; err != nil {
 			return nil, fmt.Errorf("read installed index definitions: %w", err)
 		}
 		for _, r := range rows {
-			out[r.Indexname] = r.Indexdef
+			out[r.Indexname] = installedIndex{def: r.Indexdef, valid: r.Indisvalid}
 		}
 	case "sqlite":
 		// sqlite_master.sql is NULL for the indexes SQLite creates implicitly for a
@@ -368,7 +498,7 @@ func readInstalledIndexDefs(ctx context.Context, db *gorm.DB) (map[string]string
 			return nil, fmt.Errorf("read installed index definitions: %w", err)
 		}
 		for _, r := range rows {
-			out[r.Name] = r.Sql
+			out[r.Name] = installedIndex{def: r.Sql, valid: true}
 		}
 	default:
 		return nil, fmt.Errorf(
@@ -542,6 +672,27 @@ func runtimeIndexes() []Index {
 			// jobRow.DeletedAt.
 			Name: "idx_jobs_deleted_at", Kind: IndexPerformance, Table: "jobs",
 			DDL: `CREATE INDEX IF NOT EXISTS idx_jobs_deleted_at ON jobs (deleted_at) WHERE deleted_at IS NOT NULL`,
+		},
+		{
+			// Performance: "recently finished", newest first, per terminal state.
+			//
+			// Readers: ListFinished, which runs one LIMIT n range scan per requested
+			// state and merges them, and RecentFailures (state = 'discarded'). The
+			// trailing id makes the (finalized_at desc, id desc) tie-break part of
+			// the index order, so neither needs a sort — SQLite would otherwise build
+			// a temp B-tree for the tie-break on every call.
+			//
+			// Write cost: one entry per job lifetime. The predicate admits a row only
+			// once finalized_at is set, which happens once, on the transition into a
+			// terminal state — jobs is the hottest table, every transition on it is
+			// non-HOT, and a full-table index here would cost an index insert on
+			// each of them. The terminal tuple is the last version a job has.
+			//
+			// state leads so each per-state scan is one contiguous range. The
+			// retention prune (state IN terminal AND finalized_at < cutoff) can use
+			// it too; whether the planner does is a cost decision it makes per run.
+			Name: "jobs_finished", Kind: IndexPerformance, Table: "jobs",
+			DDL: `CREATE INDEX IF NOT EXISTS jobs_finished ON jobs (state, finalized_at, id) WHERE finalized_at IS NOT NULL`,
 		},
 		{
 			// Correctness: one audit row per attempt. The attempt counter is the

@@ -634,8 +634,153 @@ by the byte should weigh that against the bloat and throughput it buys.
   are not directly comparable between them. The slope over the final third is the comparison that is,
   which is why it is the one reported.
 
-`job_runs` and `job_periodics` get no parameters: neither has update churn, and a lower fillfactor on
-an append-only table reserves free space on every page for updates that never come.
+`job_runs` and `job_periodics` get no parameters. `job_runs` takes one update per run, and that update
+writes no indexed column, so it is HOT-eligible: the old version is pruned on its own page, not by
+vacuum — the [job analytics A/B](#job-analytics) measured 94–99% of them HOT. `job_periodics` barely
+changes. A lower fillfactor on either reserves free space for churn that is not there.
+
+<br/>
+
+## Job analytics
+
+The analytics surface — per-attempt columns on `job_runs`, the `job_run_finishes` finish log, the
+`jobs_finished` index, and the hourly `job_stats_hourly` rollups (see [INTEGRATING.md](INTEGRATING.md)) —
+measured for what it costs the queue and what its reads cost a dashboard. These runs are on a different
+machine from the rest of this document: **Apple M1 Max, 10 cores, 32 GB, PostgreSQL 17.11**, the same
+non-default parameters as [above](#environment), Go 1.27.1. Every write comparison is the previous release
+(`master` at `3f12fbd`, in a worktree) against this one, `-storage-tuning` on both arms, a `CHECKPOINT`
+before every run, and arms interleaved; each pair drained a byte-identical workload (matching digests).
+Per-run numbers: [`benchmarks/analytics-write-ab.txt`](benchmarks/analytics-write-ab.txt); the soak
+reports: [`analytics-soak-1m-before.json`](benchmarks/analytics-soak-1m-before.json),
+[`analytics-soak-1m-after.json`](benchmarks/analytics-soak-1m-after.json).
+
+### The obvious design, measured and rejected
+
+The natural way to find "runs that finished in this hour" is a btree index on `job_runs.finished_at`. It
+was built first, and measured:
+
+| | 100k drain, zero-work (median of 4) | 10k drain, 0.5–2 s work | 1M soak |
+|---|---|---|---|
+| Drain throughput | **−9.7%** | +0.3% (work-bound) | **−5.1%** |
+| WAL per job | **+21.2%** | **+14.4%** | **+20.4%** |
+| `job_runs` table | +38% | +27% | **+38%** |
+| `job_runs` dead tuples at the end | ×6.5 | ×12 | ×5.6 |
+| `job_runs` updates that were HOT | 95% → **0%** | 91% → **0%** | 94% → **0%** |
+
+The last row is the mechanism. A HOT update — the new tuple version on the same page, no index entry —
+requires that no indexed column change; finalize sets `finished_at`, so indexing it made every finalize a
+full non-HOT update: a new tuple wherever there was room, an entry in all three `job_runs` indexes, and a
+dead tuple for vacuum. It failed the budget the change was held to (≤5% throughput, ≤10% WAL per job) on
+every axis.
+
+### The shipped design: a finish log
+
+`job_runs.finished_at` stays unindexed. The finalize writes one `(finished_at, run_id)` row to
+`job_run_finishes` instead — on PostgreSQL in the same statement as its `job_runs` UPDATE, a
+data-modifying CTE, so there is no extra round trip — and the window reads go through that table's
+primary key. The finalize UPDATE stays HOT-eligible.
+
+| | 100k drain, zero-work (median of 4) | 10k drain, 0.5–2 s work | 1M soak |
+|---|---|---|---|
+| Drain throughput | −2.8% (within noise; individual pairs −13.5% to +13.3%) | −0.3% | **+4.0%** (noise) |
+| WAL per job | +21.8% (+413 B) | +16.5% (+504 B) | **+9.6%** (+654 B) |
+| `job_runs` table | +0% to +18% (wider rows) | +12% | +11% |
+| `job_runs` updates that were HOT | 96% → **98%** | 93% → **92%** | 95% → **94%** |
+| `jobs` index bytes | +38% (`jobs_finished`) | +52% | +45% |
+
+`BenchmarkFinalize100k` (1 ms of work per job, six runs per arm, benchstat): **no significant change** —
+5.33k → 5.44k jobs/s (p = 0.94), finalize p99 6.3 → 4.8 ms (p = 0.35).
+
+**Where the bytes go**, attributed by removing one piece at a time (100k zero-work drain, three interleaved
+rounds, medians):
+
+| Piece | WAL per job |
+|---|---|
+| the finish-log row and its primary-key entry | 273 B |
+| the `jobs_finished` entry, on each job's terminal transition | 179 B |
+| the five new `job_runs` columns, written by the insert and again by the HOT update | 136 B |
+| **total**, measured directly | **429 B** (the pieces overlap slightly) |
+
+The absolute cost is about 0.43–0.65 KB of WAL per job. What that is as a percentage depends on the
+baseline: about 2 KB per job on a zero-work drain with empty payloads, which makes it +22%, and about
+6.8 KB per job at the 1M soak, where checkpoint full-page images dominate, which makes it +9.6%. The
+budget was met at the soak and not on short zero-work drains; the design was accepted with that
+documented. The `jobs_finished` growth is the index holding every retained terminal job — bounded by
+retention, like the table.
+
+### Reads at 1,000,000 runs
+
+`explain -query stats` seeds a million runs over 30 days across 20 kinds and 3 queues, plus one hour of
+100,000 runs, rolls every closed hour up, `VACUUM (ANALYZE)`s, then captures the SQL each read API emits,
+explains it with `EXPLAIN (ANALYZE, BUFFERS)`, and times the whole call — median of 7 after a warm-up:
+[`benchmarks/stats-plans-1m.txt`](benchmarks/stats-plans-1m.txt).
+
+| Read | Median | Target |
+|---|---|---|
+| `Stats`, 24 h, every kind | **12.3 ms** | < 50 ms |
+| `Stats`, 24 h, one kind | 9.4 ms | |
+| `Stats`, 30 d, every kind | 79.4 ms | |
+| `StatsSeries`, 30 d hourly | **20.5 ms** | < 50 ms |
+| `StatsSeries`, 30 d daily | 19.0 ms | |
+| `Baselines`, 7 d (memoized) | 0.08 ms | |
+| `Anomalies`, latest hour | 21.1 ms | |
+| `ListRunning` with baselines | **2.5 ms** | < 5 ms |
+| `ListFinished` | **2.5 ms** | < 5 ms |
+| `RecentFailures` | 1.0 ms | |
+| `SlowRuns`, 24 h | 69.1 ms | |
+| `QueueDepths` | 2.2 ms | |
+| `CountActiveByKind` | 2.1 ms | |
+| `ListJobs` | 1.2 ms | |
+| Roll up one hour of ~1.4k runs | 15.2 ms | |
+| Roll up one hour of 100,000 runs | **263 ms** | < 2 s |
+| Roll up all 720 hours from scratch | 8.8 s | |
+
+Three changes got the reads there; the first characterization had `Stats` 30 d at 612 ms, the 100k-run hour
+at 2.9 s, and `ListRunning` with baselines at 147 ms:
+
+- **A raw window is read once and aggregated in Go.** Every run in a window costs one `job_runs`
+  primary-key probe, about 6 µs, and that probe is the read's whole cost. The first aggregate computed
+  counters, two ~100-bucket histograms, and the slowest run in SQL — four statements, four passes of
+  probes, and a statement with ~230 aggregates that took 4 ms just to plan.
+- **Each rolled hour stores total rows beside its groups**: one per kind across queues, one for the hour.
+  A 30-day all-kinds trend reads 720 rows instead of 43,200, and a per-kind breakdown a third as many.
+  With PostgreSQL's execution at ~12 ms, the rest of the old 600 ms was moving and decoding those rows.
+- **Rollup rows are scanned by hand and their histograms parsed without `encoding/json`, and baselines are
+  memoized by the rollup watermark**, which only moves hourly.
+
+On SQLite, a 100k-run month (`go test -run '^$' -bench SQLite ./internal/core`): `Stats` 24 h **0.98 ms**
+(target < 100 ms), 30 d 14.0 ms, `StatsSeries` 30 d hourly 6.7 ms, one rollup hour 2.5 ms, `ListRunning`
+0.41 ms. The same reads against PostgreSQL at 100k (`-tags=integration -bench StatsReadsPostgres`): 3.5,
+13.0, 7.7, 2.5, and 0.31 ms.
+
+### The retention prune, with `jobs_finished` in place
+
+`jobs_finished` carries `finalized_at`, so it was worth checking whether the planner would now prefer it
+for the retention batch. At 1M terminal jobs it does not: a first batch, a mid-pass batch with a cursor,
+and a steady-state batch with few rows eligible all stay on the `jobs_pkey` walk, at about 20 buffers and
+0.33 ms each.
+
+### Reproducing
+
+```bash
+export FLYWHEEL_LOADTEST_DATABASE_URL="postgres://localhost:5432/flywheel_test?sslmode=disable"
+
+# Reads at 1M.
+go run -tags=loadtest ./loadtest/cmd/explain -query stats -jobs 1000000 \
+  -out docs/benchmarks/stats-plans-1m.txt
+
+# Write cost: the same commands in a worktree of the previous release and in this one, interleaved,
+# with a CHECKPOINT before each.
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -runners 4 -workers 8 -mix drain -storage-tuning
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 10000 -runners 1 -workers 80 -mix drain \
+  -work 1250ms -jitter 1500ms -storage-tuning
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 1000000 -runners 4 -workers 8 -mix drain \
+  -storage-tuning -timeout 90m
+go test -tags=loadtest -run '^$' -bench 'BenchmarkFinalize100k$' -count 6 ./loadtest/
+```
+
+The reports now carry `TupleUpdates` and `HOTUpdates` per table (`n_tup_upd`, `n_tup_hot_upd`), which is
+where the HOT ratios above come from.
 
 <br/>
 
