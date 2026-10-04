@@ -45,8 +45,8 @@ github.com/mattn/go-sqlite3 v1.14.47 h1:jOBI62gS7nKeZv+as1oGEy0+1qISgXwH/QBlR6Kb
 github.com/mattn/go-sqlite3 v1.14.47/go.mod h1:6JTjA44L93a0QCyJef5YvlPoKXntQPjzWv5gtm9sB6w=
 github.com/microsoft/go-mssqldb v1.7.2 h1:CHkFJiObW7ItKTJfHo1QX7QBBD1iV+mn1eOyRP3b/PA=
 github.com/microsoft/go-mssqldb v1.7.2/go.mod h1:kOvZKUdrhhFQmxLZqbwUV0rHkNkZpthMITIb2Ko1IoA=
-github.com/mrz1836/go-foundation v0.8.0 h1:tzTEvwi2O/zn1LA26WC7BoL9GVZJu2cvFMLVQoEQJPU=
-github.com/mrz1836/go-foundation v0.8.0/go.mod h1:FggvY5xff37zQypTGnXp4tyT1tS8C+5jbwMbRMCM3n8=
+github.com/mrz1836/go-foundation v0.9.0 h1:ftQw+4G7pW1bjVPh6RTW7XeBKPG0gkc1hdrvWMoSGm8=
+github.com/mrz1836/go-foundation v0.9.0/go.mod h1:+bH5C66ce9Jh/qOw6Fcpz7bsGgSSv7Auja8o9f4OfKw=
 github.com/mrz1836/go-selfupdate v0.1.4 h1:WXlZShndYe7GROnVufKJOeFPvnQrNyU5fTTdUQFGGpQ=
 github.com/mrz1836/go-selfupdate v0.1.4/go.mod h1:yREEv9yuDdiZ/inozWcfD39dNATgtEr7wpcszmbxupw=
 github.com/ncruces/go-strftime v1.1.0 h1:vtPmPWMkb539RGV9WpWT9EwJGvrOCKvMNI4obWL47Hk=
