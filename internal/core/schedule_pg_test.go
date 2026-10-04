@@ -158,3 +158,48 @@ func TestUpsertPeriodicInsertHonorsActivePostgres(t *testing.T) {
 	assert.True(t, active["on"], "an active upsert is stored active")
 	assert.False(t, active["off"], "an inactive upsert is stored inactive")
 }
+
+// TestUpsertPeriodicConcurrentInsertOfOneSlugPostgres is the race the adopt path
+// exists for, under real concurrency: sixteen hosts declaring the same new slug at
+// once. Every call succeeds and exactly one row exists. It fails against a plain
+// read-then-insert, where every caller whose lookup missed but whose insert lost
+// returned the unique violation.
+func TestUpsertPeriodicConcurrentInsertOfOneSlugPostgres(t *testing.T) {
+	t.Parallel()
+	db := NewPostgresIsolatedDB(t)
+	ctx := context.Background()
+
+	const rounds, callers = 10, 16
+	for round := range rounds {
+		slug := fmt.Sprintf("race-%d", round)
+		start := make(chan struct{})
+		errs := make([]error, callers)
+		var wg sync.WaitGroup
+		for i := range callers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				errs[i] = UpsertPeriodic(ctx, db, PeriodicSpec{
+					Slug: slug, Kind: "test.race", Every: time.Duration(i+1) * time.Minute, Active: true,
+				})
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		for i, err := range errs {
+			require.NoError(t, err, "round %d caller %d", round, i)
+		}
+		var rows int64
+		require.NoError(t, db.Model(&jobPeriodicRow{}).Where("slug = ?", slug).Count(&rows).Error)
+		assert.EqualValues(t, 1, rows, "round %d: one row for the slug however many hosts declared it", round)
+	}
+}
+
+// TestInsertPeriodicReportsWhetherItLandedPostgres pins the RowsAffected
+// attribution on PostgreSQL's RETURNING path.
+func TestInsertPeriodicReportsWhetherItLandedPostgres(t *testing.T) {
+	t.Parallel()
+	assertInsertPeriodicReportsWhetherItLanded(t, NewPostgresIsolatedDB(t))
+}

@@ -11,6 +11,7 @@ import (
 	"github.com/robfig/cron/v3"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // PeriodicSpec declares a periodic (cron or fixed-interval) job. It is the
@@ -104,46 +105,87 @@ func nextFireAfter(spec PeriodicSpec, now time.Time) (time.Time, error) {
 // immediately). On update it preserves the existing next_run_at cursor unless the
 // schedule itself changed, so reconciling an unchanged config on restart does not
 // reset the cadence. Active is written on both paths: a definition upserted
-// inactive is stored inactive. It is the exported writer for job_periodics, which
-// the CLI and a host's startup reconciliation use to declare schedules in code.
+// inactive is stored inactive.
+//
+// It is safe to call concurrently for one slug — two hosts declaring the same new
+// schedule at once. The call whose insert loses adopts the row that landed and
+// updates it, so concurrent upserts end exactly where the same calls made one
+// after the other would: the last writer's spec wins.
+//
+// It is the exported writer for job_periodics, which the CLI and a host's startup
+// reconciliation use to declare schedules in code.
 func UpsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) error {
 	if err := spec.validate(); err != nil {
 		return err
 	}
 	now := models.ClockFrom(ctx).Now(ctx)
 
-	args := spec.ArgsTemplate
-	if len(args) == 0 {
-		args = []byte("{}")
+	existing, found, err := loadPeriodic(ctx, db, spec.Slug)
+	if err != nil {
+		return err
 	}
+	if !found {
+		_, inserted, ierr := insertPeriodic(ctx, db, spec, now)
+		if ierr != nil || inserted {
+			return ierr
+		}
+		// A concurrent writer inserted the slug between the lookup and the insert.
+		// Treating that as success could leave its spec in place rather than this
+		// one — a rolling deploy that changes a cron would keep the old one — so
+		// adopt the row that landed and apply this spec to it.
+		if existing, found, err = loadPeriodic(ctx, db, spec.Slug); err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("flywheel: upsert periodic %q: inserted and removed concurrently", spec.Slug)
+		}
+	}
+	return updatePeriodic(ctx, db, existing, spec, now)
+}
+
+// loadPeriodic reads the periodic definition for slug, reporting a missing one as
+// found == false rather than as an error. The lookup is quiet about the miss, so
+// declaring a new schedule logs no "record not found".
+func loadPeriodic(ctx context.Context, db *gorm.DB, slug string) (jobPeriodicRow, bool, error) {
+	var row jobPeriodicRow
+	err := quietMissing(db).WithContext(ctx).Where("slug = ?", slug).First(&row).Error
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return jobPeriodicRow{}, false, nil
+	case err != nil:
+		return jobPeriodicRow{}, false, fmt.Errorf("flywheel: load periodic %q: %w", slug, err)
+	default:
+		return row, true, nil
+	}
+}
+
+// periodicQueueAndArgs resolves spec's queue and args template, applying the
+// defaults an empty value selects.
+func periodicQueueAndArgs(spec PeriodicSpec) (string, datatypes.JSON) {
 	queue := spec.Queue
 	if queue == "" {
 		queue = defaultPeriodicQueue
 	}
-
-	var existing jobPeriodicRow
-	err := quietMissing(db).WithContext(ctx).Where("slug = ?", spec.Slug).First(&existing).Error
-	switch {
-	case errors.Is(err, gorm.ErrRecordNotFound):
-		return insertPeriodic(ctx, db, spec, queue, args, now)
-	case err != nil:
-		return fmt.Errorf("flywheel: load periodic %q: %w", spec.Slug, err)
-	default:
-		return updatePeriodic(ctx, db, existing, spec, queue, args, now)
+	args := spec.ArgsTemplate
+	if len(args) == 0 {
+		args = []byte("{}")
 	}
+	return queue, datatypes.JSON(args)
 }
 
-// insertPeriodic creates a new periodic row with a freshly computed next_run_at.
-func insertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec, queue string, args []byte, now time.Time) error {
+// periodicRow builds the job_periodics row spec declares, with next_run_at at its
+// first fire time after now.
+func periodicRow(spec PeriodicSpec, now time.Time) (jobPeriodicRow, error) {
 	nextRun, err := nextFireAfter(spec, now)
 	if err != nil {
-		return err
+		return jobPeriodicRow{}, err
 	}
+	queue, args := periodicQueueAndArgs(spec)
 	row := jobPeriodicRow{
 		Slug:         spec.Slug,
 		Kind:         spec.Kind,
 		Queue:        queue,
-		ArgsTemplate: datatypes.JSON(args),
+		ArgsTemplate: args,
 		NextRunAt:    nextRun,
 		IsActive:     new(spec.Active),
 	}
@@ -154,20 +196,49 @@ func insertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec, queue s
 		cronExpr := spec.Cron
 		row.CronExpr = &cronExpr
 	}
-	if err := db.WithContext(ctx).Create(&row).Error; err != nil {
-		return fmt.Errorf("flywheel: insert periodic %q: %w", spec.Slug, models.WrapDBError(err))
+	return row, nil
+}
+
+// insertPeriodic inserts spec as a new periodic row, with next_run_at at its first
+// fire time after now, and reports whether the insert landed, returning the row
+// it wrote when it did. The insert does nothing when the slug already exists: a
+// concurrent writer that inserted it first is (jobPeriodicRow{}, false, nil), not
+// an error, and the caller decides what losing means.
+//
+// The conflict clause is targetless, as conflictInsertChunk's is. It covers
+// idx_job_periodics_slug without naming it, so a host-owned install that lacks the
+// index gets a plain insert rather than PostgreSQL's "no unique or exclusion
+// constraint matching the ON CONFLICT specification". A targetless DO NOTHING is
+// also what keeps a caller's transaction usable: a unique violation on PostgreSQL
+// would abort it.
+//
+// RowsAffected is exact here, unlike conflictInsertChunk's: a single-struct create
+// counts the rows its RETURNING clause yields, and a skipped insert yields none.
+// TestInsertPeriodicReportsWhetherItLanded pins it on both dialects.
+func insertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec, now time.Time) (jobPeriodicRow, bool, error) {
+	row, err := periodicRow(spec, now)
+	if err != nil {
+		return jobPeriodicRow{}, false, err
 	}
-	return nil
+	res := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
+	if res.Error != nil {
+		return jobPeriodicRow{}, false, fmt.Errorf(
+			"flywheel: insert periodic %q: %w", spec.Slug, models.WrapDBError(res.Error),
+		)
+	}
+	if res.RowsAffected != 1 {
+		return jobPeriodicRow{}, false, nil
+	}
+	return row, true, nil
 }
 
 // updatePeriodic reconciles an existing periodic row in place.
-func updatePeriodic(
-	ctx context.Context, db *gorm.DB, existing jobPeriodicRow, spec PeriodicSpec, queue string, args []byte, now time.Time,
-) error {
+func updatePeriodic(ctx context.Context, db *gorm.DB, existing jobPeriodicRow, spec PeriodicSpec, now time.Time) error {
+	queue, args := periodicQueueAndArgs(spec)
 	updates := map[string]any{
 		"kind":             spec.Kind,
 		"queue":            queue,
-		"args_template":    datatypes.JSON(args),
+		"args_template":    args,
 		"is_active":        spec.Active,
 		"updated_at":       now,
 		"cron_expr":        nil,

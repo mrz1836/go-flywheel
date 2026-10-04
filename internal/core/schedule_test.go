@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -215,6 +216,113 @@ func TestPeriodicSpecCronErrorKeepsItsText(t *testing.T) {
 	assert.Equal(t, `flywheel: parse cron "not a cron": `+parseErr.Error(), err.Error(),
 		"the message is the parse error's, without the sentinel's text appended")
 	assert.NotContains(t, err.Error(), ErrValidation.Error())
+}
+
+// insertCompetingPeriodic writes a job_periodics row for slug directly, the way a
+// second host's insert would land between this one's lookup and its insert.
+func insertCompetingPeriodic(t *testing.T, db *gorm.DB, slug string) {
+	t.Helper()
+	now := time.Now().UTC()
+	require.NoError(t, db.Exec(
+		`INSERT INTO job_periodics(id, slug, kind, args_template, queue, cron_expr, next_run_at, is_active, created_at, updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		models.NewID(), slug, "test.competitor", "{}", "competitor", "0 3 * * *", now.Add(time.Hour), false, now, now,
+	).Error)
+}
+
+// afterPeriodicLookupMiss runs fn once, right after the first job_periodics read
+// that finds nothing. It is the deterministic form of a race: a second host's
+// insert lands in the window between UpsertPeriodic's lookup and its own insert.
+func afterPeriodicLookupMiss(t *testing.T, db *gorm.DB, fn func()) {
+	t.Helper()
+	var fired atomic.Bool
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register("test:after_periodic_miss", func(tx *gorm.DB) {
+		if tx.Statement.Table == "job_periodics" && errors.Is(tx.Error, gorm.ErrRecordNotFound) && fired.CompareAndSwap(false, true) {
+			fn()
+		}
+	}))
+}
+
+// TestUpsertPeriodicAdoptsARowInsertedConcurrently proves an upsert that loses
+// the insert to a concurrent writer of the same new slug does not fail: it adopts
+// the row that landed and applies its own spec to it, which is where the two calls
+// made one after the other would have ended. It fails against a plain read-then-
+// insert, which surfaced the unique violation as "flywheel: insert periodic".
+func TestUpsertPeriodicAdoptsARowInsertedConcurrently(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	afterPeriodicLookupMiss(t, db, func() { insertCompetingPeriodic(t, db, "p") })
+
+	require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{
+		Slug: "p", Kind: "test.mine", Every: time.Minute, Queue: "mine", Active: true,
+	}))
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	require.Len(t, views, 1, "the losing insert adopted the row rather than duplicating it")
+	assert.Equal(t, "test.mine", views[0].Kind, "the caller's spec is applied to the adopted row")
+	assert.Equal(t, "mine", views[0].Queue)
+	assert.Equal(t, 60, views[0].IntervalSeconds)
+	assert.Empty(t, views[0].Cron, "the competitor's cron is replaced by the caller's interval")
+	assert.True(t, views[0].Active)
+}
+
+// TestUpsertPeriodicReportsARowRemovedMidUpsert covers the narrowest window: the
+// insert lost to a concurrent writer, and the row it lost to was deleted before the
+// upsert could re-read it. There is nothing to adopt, so it says so rather than
+// reporting success for a definition that does not exist.
+func TestUpsertPeriodicReportsARowRemovedMidUpsert(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+
+	var deleteNext atomic.Bool
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:delete_before_reread", func(tx *gorm.DB) {
+		if tx.Statement.Table == "job_periodics" && deleteNext.CompareAndSwap(true, false) {
+			require.NoError(t, db.Exec(`DELETE FROM job_periodics WHERE slug = ?`, "p").Error)
+		}
+	}))
+	afterPeriodicLookupMiss(t, db, func() {
+		insertCompetingPeriodic(t, db, "p")
+		deleteNext.Store(true)
+	})
+
+	err := UpsertPeriodic(ctx, db, PeriodicSpec{Slug: "p", Kind: "test.mine", Every: time.Minute, Active: true})
+	require.ErrorContains(t, err, `flywheel: upsert periodic "p": inserted and removed concurrently`)
+}
+
+// assertInsertPeriodicReportsWhetherItLanded is the body of
+// TestInsertPeriodicReportsWhetherItLanded and its PostgreSQL mirror: the first
+// insert of a slug lands and the second is skipped, and each says which. The
+// fixes that rely on the flag — UpsertPeriodic's adopt path and the reconcile's
+// warn-once — rest on GORM counting a single-struct conflict insert exactly.
+func assertInsertPeriodicReportsWhetherItLanded(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	spec := PeriodicSpec{Slug: "landed", Kind: "test.landed", Every: time.Minute, Active: true}
+
+	first, inserted, err := insertPeriodic(ctx, db, spec, now)
+	require.NoError(t, err)
+	assert.True(t, inserted, "the first insert of a slug lands")
+	assert.NotEmpty(t, first.ID)
+
+	spec.Kind = "test.second"
+	lost, inserted, err := insertPeriodic(ctx, db, spec, now)
+	require.NoError(t, err, "a skipped insert is not an error")
+	assert.False(t, inserted, "the second insert of the slug is skipped and says so")
+	assert.Equal(t, jobPeriodicRow{}, lost, "a skipped insert returns no row: the one it built does not exist")
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	require.Len(t, views, 1)
+	assert.Equal(t, "test.landed", views[0].Kind, "the skipped insert changed nothing")
+}
+
+func TestInsertPeriodicReportsWhetherItLanded(t *testing.T) {
+	t.Parallel()
+	assertInsertPeriodicReportsWhetherItLanded(t, newDB(t))
 }
 
 func TestUpsertPeriodicThenSchedulerFiresWhenDue(t *testing.T) {
