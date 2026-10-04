@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mrz1836/go-foundation/models"
+	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -92,14 +93,59 @@ func TestUpsertPeriodicRejectsInvalidSpecs(t *testing.T) {
 		"missing kind":     {Slug: "s", Every: time.Minute},
 		"neither schedule": {Slug: "s", Kind: "k"},
 		"both schedules":   {Slug: "s", Kind: "k", Every: time.Minute, Cron: "* * * * *"},
+		"sub-second every": {Slug: "s", Kind: "k", Every: 500 * time.Millisecond},
 		"malformed cron":   {Slug: "s", Kind: "k", Cron: "not a cron"},
+		"malformed args":   {Slug: "s", Kind: "k", Every: time.Minute, ArgsTemplate: []byte("{not json")},
 	}
 	for name, spec := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			require.Error(t, UpsertPeriodic(ctx, db, spec))
+			// Every rejection is a validation failure, so a caller can tell a spec
+			// it must fix from a database it must retry with one errors.Is.
+			require.ErrorIs(t, UpsertPeriodic(ctx, db, spec), ErrValidation)
 		})
 	}
+}
+
+// TestUpsertPeriodicRejectsAnArgsTemplateThatIsNotJSON proves a template that
+// is not JSON is refused up front and nothing is written. Without the check
+// SQLite stored it as given and every fire enqueued args no worker could decode,
+// while PostgreSQL's jsonb column refused it only at the insert, as a database
+// error rather than a validation failure.
+func TestUpsertPeriodicRejectsAnArgsTemplateThatIsNotJSON(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+
+	err := UpsertPeriodic(ctx, db, PeriodicSpec{
+		Slug: "bad-args", Kind: "k", Every: time.Minute, Active: true, ArgsTemplate: []byte("{not json"),
+	})
+	require.ErrorIs(t, err, ErrValidation)
+	assert.EqualError(t, err, "flywheel: args_template must be valid JSON")
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	assert.Empty(t, views, "nothing is written for a rejected spec")
+
+	require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{
+		Slug: "good-args", Kind: "k", Every: time.Minute, Active: true, ArgsTemplate: []byte(`{"n":1}`),
+	}), "a JSON template is accepted")
+}
+
+// TestPeriodicSpecCronErrorKeepsItsText proves wrapping ErrValidation did not
+// change what a malformed cron reports: the text is still the parse error's, which
+// is what an operator searches a log for, and the parser's own error is still
+// reachable beneath it.
+func TestPeriodicSpecCronErrorKeepsItsText(t *testing.T) {
+	t.Parallel()
+	_, parseErr := cron.ParseStandard("not a cron")
+	require.Error(t, parseErr)
+
+	err := PeriodicSpec{Slug: "s", Kind: "k", Cron: "not a cron"}.validate()
+	require.ErrorIs(t, err, ErrValidation)
+	assert.Equal(t, `flywheel: parse cron "not a cron": `+parseErr.Error(), err.Error(),
+		"the message is the parse error's, without the sentinel's text appended")
+	assert.NotContains(t, err.Error(), ErrValidation.Error())
 }
 
 func TestUpsertPeriodicThenSchedulerFiresWhenDue(t *testing.T) {

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -25,7 +26,7 @@ type PeriodicSpec struct {
 	// Queue is the queue the enqueued jobs land on. Empty defaults to "periodic".
 	Queue string
 	// ArgsTemplate is the JSON args payload for each enqueued job. Empty defaults
-	// to an empty object.
+	// to an empty object; anything else must be valid JSON.
 	ArgsTemplate []byte
 	// Cron is a standard 5-field cron expression. Mutually exclusive with Every.
 	Cron string
@@ -37,7 +38,8 @@ type PeriodicSpec struct {
 }
 
 // validate checks the required fields and the exactly-one-of-schedule rule,
-// parsing a cron expression to reject a malformed one up front.
+// parsing a cron expression to reject a malformed one up front, and rejects an
+// args template that is not JSON. Every failure wraps ErrValidation.
 func (s PeriodicSpec) validate() error {
 	if s.Slug == "" {
 		return newValidationError("slug", "is required")
@@ -57,11 +59,32 @@ func (s PeriodicSpec) validate() error {
 	}
 	if hasCron {
 		if _, err := cron.ParseStandard(s.Cron); err != nil {
-			return fmt.Errorf("flywheel: parse cron %q: %w", s.Cron, err)
+			return &cronSpecError{err: fmt.Errorf("flywheel: parse cron %q: %w", s.Cron, err)}
 		}
+	}
+	if len(s.ArgsTemplate) > 0 && !json.Valid(s.ArgsTemplate) {
+		// Checked here because neither dialect does it usefully: SQLite stores
+		// any text, so every fire would enqueue args no worker can decode, and
+		// PostgreSQL's jsonb refuses it only at the insert, as a database error.
+		return newValidationError("args_template", "must be valid JSON")
 	}
 	return nil
 }
+
+// cronSpecError is a malformed cron expression PeriodicSpec.validate rejects. Its
+// text is the parse error's, unchanged — operators search logs for it — and it
+// unwraps to both ErrValidation, which every other validation failure wraps, and
+// the parser's own error.
+//
+// It is a type rather than a second %w because fmt.Errorf prints every operand:
+// wrapping ErrValidation that way would append the sentinel's text to the message.
+type cronSpecError struct{ err error }
+
+// Error returns the parse error's text.
+func (e *cronSpecError) Error() string { return e.err.Error() }
+
+// Unwrap exposes ErrValidation and the parse error for errors.Is and errors.As.
+func (e *cronSpecError) Unwrap() []error { return []error{ErrValidation, e.err} }
 
 // nextFireAfter returns the first fire time strictly after now for spec.
 func nextFireAfter(spec PeriodicSpec, now time.Time) (time.Time, error) {
