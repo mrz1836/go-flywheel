@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	flywheel "github.com/mrz1836/go-flywheel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -154,13 +155,81 @@ func TestCLIPruneDeletesOldFinishedJobs(t *testing.T) {
 	).Error)
 	closeDB(db)
 
+	// The stats rollup is on by default and has not run: the prune holds for it
+	// rather than deleting runs it has yet to count.
 	out, err := runRoot(ctx, "--config", cfg, "prune", "--older-than", "14d")
 	require.NoError(t, err)
+	assert.Contains(t, out, "pruned 0")
+	assert.Contains(t, out, "held for the stats rollup")
+
+	out, err = runRoot(ctx, "--config", cfg, "prune", "--older-than", "14d", "--ignore-stats-rollup")
+	require.NoError(t, err)
 	assert.Contains(t, out, "pruned 1")
+	assert.NotContains(t, out, "held for")
 
 	out, err = runRoot(ctx, "--config", cfg, "jobs", "ls", "--json")
 	require.NoError(t, err)
 	assert.NotContains(t, out, "old-done", "the old finished job is pruned")
+}
+
+// TestCLIPruneHoldsForTheStatsRollup proves `flywheel prune` follows the
+// rollup's progress: once the rollup has counted the old job's run it may go,
+// and with the rollup off in the config there is nothing to hold for.
+func TestCLIPruneHoldsForTheStatsRollup(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	seed := func(t *testing.T, cfg string) *Config {
+		t.Helper()
+		_, err := runRoot(ctx, "--config", cfg, "migrate")
+		require.NoError(t, err)
+		loaded, err := LoadConfig(cfg)
+		require.NoError(t, err)
+		db, _, err := openDB(loaded)
+		require.NoError(t, err)
+		defer closeDB(db)
+		require.NoError(t, db.Exec(
+			`INSERT INTO jobs(id, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, finalized_at, executor_class, tags, created_at, updated_at, metadata)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			"old-done", "exec", "default", "{}", 100, "succeeded", 1, 25, old, old, "", "[]", old, old, "{}",
+		).Error)
+		return loaded
+	}
+
+	t.Run("after the rollup has run", func(t *testing.T) {
+		t.Parallel()
+		cfg := writeCLIConfig(t, t.TempDir(), "")
+		loaded := seed(t, cfg)
+		db, _, err := openDB(loaded)
+		require.NoError(t, err)
+		_, err = flywheel.RebuildStats(ctx, db, flywheel.RebuildOpts{From: old.Add(-time.Hour), To: time.Now()})
+		require.NoError(t, err)
+		closeDB(db)
+
+		out, err := runRoot(ctx, "--config", cfg, "prune", "--older-than", "14d")
+		require.NoError(t, err)
+		assert.Contains(t, out, "pruned 1", "the rollup covers the job's hour, so it may go")
+	})
+
+	t.Run("with the rollup off", func(t *testing.T) {
+		t.Parallel()
+		cfg := writeCLIConfig(t, t.TempDir(), "")
+		require.NoError(t, os.WriteFile(cfg, []byte(strings.Replace(mustRead(t, cfg),
+			"  poll_interval: 30ms\n", "  poll_interval: 30ms\n  stats_rollup: -1s\n", 1)), 0o600))
+		seed(t, cfg)
+		out, err := runRoot(ctx, "--config", cfg, "prune", "--older-than", "14d")
+		require.NoError(t, err)
+		assert.Contains(t, out, "pruned 1")
+		assert.NotContains(t, out, "held for")
+	})
+}
+
+// mustRead returns a file's contents.
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path) //nolint:gosec // a test's own temp file
+	require.NoError(t, err)
+	return string(b)
 }
 
 func TestCLIServeProcessesEnqueuedAndScheduledJobs(t *testing.T) {
@@ -205,4 +274,32 @@ func TestCLIServeProcessesEnqueuedAndScheduledJobs(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// TestCLIMigrateReportsAnUpgradeAndTakesLiveFlags proves `flywheel migrate` is
+// the upgrade: on a database missing the analytics columns it reports what it
+// added, accepts the live-upgrade flags (no-ops on SQLite), and a re-run reports
+// nothing new.
+func TestCLIMigrateReportsAnUpgradeAndTakesLiveFlags(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfg := writeCLIConfig(t, dir, "")
+	ctx := context.Background()
+
+	_, err := runRoot(ctx, "--config", cfg, "migrate")
+	require.NoError(t, err)
+	loaded, err := LoadConfig(cfg)
+	require.NoError(t, err)
+	db, _, err := openDB(loaded)
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`ALTER TABLE job_runs DROP COLUMN queue_wait_ms`).Error)
+	closeDB(db)
+
+	out, err := runRoot(ctx, "--config", cfg, "migrate", "--concurrently", "--lock-timeout", "5s")
+	require.NoError(t, err)
+	assert.Contains(t, out, "added: job_runs.queue_wait_ms")
+
+	out, err = runRoot(ctx, "--config", cfg, "migrate")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "added:", "an up-to-date schema adds nothing")
 }

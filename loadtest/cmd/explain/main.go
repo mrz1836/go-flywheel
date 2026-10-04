@@ -15,6 +15,9 @@
 //	  -dsn "$FLYWHEEL_LOADTEST_DATABASE_URL" -jobs 1000000 -queues 3 \
 //	  -out docs/benchmarks/claim-plans-1m-before.txt
 //
+//	go run -tags=loadtest ./loadtest/cmd/explain -query stats -jobs 1000000 \
+//	  -out docs/benchmarks/stats-plans-1m.txt
+//
 // The artifact it writes carries no credentials: the DSN is redacted to host,
 // port, and database, which is what makes these files safe to commit.
 package main
@@ -63,6 +66,19 @@ func run(args []string, stdout, stderr *os.File) error {
 		}
 		if !opts.quiet {
 			printProgressSummary(stderr, report)
+		}
+		return runErr
+	}
+
+	// The stats query characterizes the analytics read surface: every read API's
+	// statements and plans at -jobs runs, plus each call's measured latency.
+	if opts.query == "stats" {
+		report, runErr := loadtest.ExplainStats(ctx, opts.cfg)
+		if writeErr := writeArtifact(report.Text(), opts.out, stdout); writeErr != nil {
+			return errors.Join(runErr, writeErr)
+		}
+		if !opts.quiet {
+			printStatsSummary(stderr, report)
 		}
 		return runErr
 	}
@@ -224,5 +240,21 @@ func printProgressSummary(w *os.File, r loadtest.ProgressExplainReport) {
 			scan = scan[:89] + "…"
 		}
 		p("  statement %d: %s\n", i+1, scan)
+	}
+}
+
+// printStatsSummary writes the stats characterization's latency table to
+// stderr. Write errors are ignored for the same reason printSummary ignores
+// them.
+func printStatsSummary(w *os.File, r loadtest.StatsExplainReport) {
+	p := func(format string, args ...any) { _, _ = fmt.Fprintf(w, format, args...) }
+	if len(r.Reads) == 0 {
+		p("\nno reads measured\n")
+		return
+	}
+	p("\nruns=%d kinds=%d days=%d rollup-rows=%d (rolled in %s)\n", r.Runs, r.Kinds, r.Days, r.StatsRows, r.RollupAll)
+	p("%-36s %12s %6s\n", "read", "median", "stmts")
+	for _, read := range r.Reads {
+		p("%-36s %12s %6d\n", read.Name, read.Median, len(read.Statements))
 	}
 }

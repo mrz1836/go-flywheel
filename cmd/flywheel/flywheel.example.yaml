@@ -17,6 +17,7 @@ runtime:
   # retention: 14d  # prune finished jobs (and their runs) older than this; unset = keep forever
   # metrics_addr: ":9090"  # expose /healthz, /readyz, and a Prometheus /metrics endpoint; unset = off
   # health_sample_interval: 30s  # log a queue-health heartbeat (ready/in-flight/lag) on this cadence; unset = off
+  # stats_rollup: 1m  # roll finished runs into hourly stats for `flywheel stats`; unset = 1m, negative (-1s) = off
   # env_allowlist: [PATH, HOME, SHELL, LANG, TMPDIR]  # host env exec jobs inherit
 
 log:

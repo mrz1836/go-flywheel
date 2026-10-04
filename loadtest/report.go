@@ -39,6 +39,11 @@ type StorageSample struct {
 	// index-condition comparison from an inference about timing into direct
 	// evidence about the plan.
 	SeqScans, IdxScans map[string]int64
+	// TupleUpdates and HOTUpdates are n_tup_upd and n_tup_hot_upd from the same
+	// view: every update, and the subset that was heap-only. Their ratio is the
+	// direct measure of what an index on an updated column costs — a HOT update
+	// writes no index entry, and an update to an indexed column cannot be HOT.
+	TupleUpdates, HOTUpdates map[string]int64
 	// TableBytes and IndexBytes come from pg_total_relation_size and
 	// pg_indexes_size; FreePercent and DeadTuplePercent from pgstattuple_approx
 	// when the extension is installed. Absent, the two percent maps are nil and

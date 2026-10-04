@@ -1,0 +1,65 @@
+Job analytics — write-cost A/B against the previous release (master 3f12fbd)
+PostgreSQL 17.11, Apple M1 Max, 10 cores, 32 GB; shared_buffers 128MB, max_wal_size 1GB; -storage-tuning on both arms;
+CHECKPOINT before every run; WAL is pg_stat_wal's cluster-wide delta over the run divided by jobs drained.
+
+== Rejected design: btree index on job_runs.finished_at (finalize UPDATE becomes non-HOT)
+
+run            arm        jobs/s  WAL B/job fin p99 ms  runs MB runs idx MB jobs idx MB runs HOT  digest
+drain100k-1    main         6348       1879       4.84     39.7        15.0        20.2    94.8%  07340949bdc6
+drain100k-1    branch       6246       2205       6.25     55.1        25.5        29.1     0.0%  07340949bdc6
+drain100k-2    main         6547       2037       4.84     39.9        14.8        20.0    95.0%  07340949bdc6
+drain100k-2    branch       5791       2460       6.25     53.3        25.5        28.9     0.0%  07340949bdc6
+drain100k-3    main         6775       1880       6.25     37.6        14.7        20.8    96.1%  07340949bdc6
+drain100k-3    branch       6239       2287       6.25     54.2        25.4        29.1     0.0%  07340949bdc6
+drain100k-4    main         6775       1901       6.25     37.5        14.8        20.8    95.9%  07340949bdc6
+drain100k-4    branch       5859       2450       7.66     53.0        22.4        29.2     0.0%  07340949bdc6
+slow10k        main           62       3102      61.26      3.7         1.5         1.6    91.4%  4d2d84fb92be
+slow10k        branch         62       3550      50.02      4.7         2.0         2.5     0.0%  4d2d84fb92be
+soak1m         main         4236       6324       9.69    375.3       146.3       191.8    94.1%  d78465f907e8
+soak1m         branch       4020       7612       7.66    517.5       217.4       279.0     0.0%  d78465f907e8
+
+== Shipped design: job_run_finishes log (finalize UPDATE stays HOT-eligible)
+
+run            arm        jobs/s  WAL B/job fin p99 ms  runs MB runs idx MB jobs idx MB runs HOT  digest
+drain100k-1    main         6529       1991       6.25     38.1        15.0        20.9    95.9%  07340949bdc6
+drain100k-1    branch       6059       2389       9.69     44.8        14.7        29.1    96.2%  07340949bdc6
+drain100k-2    main         6244       1887       9.69     38.7        14.7        21.0    96.5%  07340949bdc6
+drain100k-2    branch       5401       2351       9.69     41.7        14.4        28.7    98.8%  07340949bdc6
+drain100k-3    main         5786       2087       9.69     43.5        14.6        21.1    95.9%  07340949bdc6
+drain100k-3    branch       6553       2386       7.66     43.8        14.4        29.0    98.3%  07340949bdc6
+drain100k-4    main         6437       1957       6.25     42.6        14.6        20.8    95.6%  07340949bdc6
+drain100k-4    branch       6547       2418       6.25     42.5        14.5        29.0    98.6%  07340949bdc6
+slow10k        main           62       3060      61.26      3.7         1.5         1.6    92.9%  4d2d84fb92be
+slow10k        branch         62       3564      77.49      4.2         1.5         2.5    91.6%  4d2d84fb92be
+soak1m         main         3980       6848       9.69    385.8       146.2       189.6    94.8%  d78465f907e8
+soak1m         branch       4141       7502       7.66    429.0       146.6       275.2    94.1%  d78465f907e8
+
+== Attribution: 100k zero-work drain, three rounds, arms interleaved in one session
+
+main = previous release; branch = shipped; vA = shipped minus jobs_finished; vB = minus the finish log; vC = minus the new job_runs columns
+main    median jobs/s    6346   median WAL B/job   1962   runs [1957, 1976, 1962]
+branch  median jobs/s    6152   median WAL B/job   2391   runs [2391, 2420, 2363]
+vA      median jobs/s    6447   median WAL B/job   2212   runs [2246, 2203, 2212]
+vB      median jobs/s    5125   median WAL B/job   2119   runs [2093, 2189, 2119]
+vC      median jobs/s    5967   median WAL B/job   2255   runs [2255, 2260, 2198]
+
+per-feature WAL: jobs_finished 179 B/job, finish log 273 B/job, job_runs columns 136 B/job; total vs main +429 B/job
+
+== BenchmarkFinalize100k (1 ms work), shipped design, n=6 per arm, benchstat
+
+                │ main-finalize-bench.txt │  branch-finalize-bench.txt   │
+                │         sec/op          │   sec/op     vs base         │
+Finalize100k-10               18.76 ± 49%   18.38 ± 20%  ~ (p=0.937 n=6)
+
+                │ main-finalize-bench.txt │   branch-finalize-bench.txt    │
+                │      claim-p99-sec      │ claim-p99-sec  vs base         │
+Finalize100k-10             4.336m ± 477%   3.478m ± 120%  ~ (p=0.372 n=6)
+
+                │ main-finalize-bench.txt │     branch-finalize-bench.txt     │
+                │    finalize-p99-sec     │ finalize-p99-sec  vs base         │
+Finalize100k-10             6.253m ± 520%      4.843m ± 216%  ~ (p=0.348 n=6)
+
+                │ main-finalize-bench.txt │   branch-finalize-bench.txt   │
+                │         jobs/s          │    jobs/s     vs base         │
+Finalize100k-10              5.332k ± 33%   5.442k ± 17%  ~ (p=0.937 n=6)
+

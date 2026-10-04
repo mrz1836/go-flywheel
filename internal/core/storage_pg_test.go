@@ -40,15 +40,15 @@ func TestMigrateInstallsTheStorageParametersPostgres(t *testing.T) {
 }
 
 // TestStorageParametersLeaveTheAppendOnlyTablesAlonePostgres pins the negative
-// half. An append-only table gains nothing from either setting, and a lower
-// fillfactor on one is pure waste — free space reserved on every page for
-// updates that never come.
+// half. job_runs' one update per run is HOT-eligible and job_periodics barely
+// changes, so neither gains from either setting, and a lower fillfactor on one
+// is pure waste — free space reserved on every page for churn that is not there.
 func TestStorageParametersLeaveTheAppendOnlyTablesAlonePostgres(t *testing.T) {
 	t.Parallel()
 	db := NewPostgresIsolatedDB(t)
 
 	assert.Empty(t, reloptionsFor(t, db, "job_runs"),
-		"job_runs is append-only and must carry no storage parameters")
+		"job_runs' one update per run is HOT-eligible and must carry no storage parameters")
 	assert.Empty(t, reloptionsFor(t, db, "job_periodics"),
 		"job_periodics holds one row per schedule and must carry no storage parameters")
 }

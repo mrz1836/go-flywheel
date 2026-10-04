@@ -36,6 +36,12 @@ type Scheduler struct {
 	retentionInterval    time.Duration
 	retentionOpts        RetentionOpts
 	healthSampleInterval time.Duration
+
+	// The stats rollup (stats_scheduler.go). statsInterval is zero when it is off.
+	statsInterval   time.Duration
+	statsCfg        rollupConfig
+	statsAnomalyLog bool
+	stats           statsState
 }
 
 // SchedulerConfig configures a Scheduler. DB, Client, and Driver are required;
@@ -82,6 +88,14 @@ type SchedulerConfig struct {
 	// job_runs) finalized longer ago than this are hard-deleted. Zero (the
 	// default) disables retention entirely — no surprise deletes for an embedded
 	// consumer that never asked for them.
+	//
+	// With the stats rollup enabled, retention never deletes a run the rollup has
+	// not counted yet: the cutoff is the earlier of now minus RetentionMaxAge and
+	// the rollup watermark (or, while the rollup is still working back through
+	// history, the oldest hour it keeps), and nothing is pruned until the rollup
+	// has run once. See RetentionOpts.HoldForStatsRollup.
+	// A RetentionMaxAge shorter than one hour plus StatsRollupGrace is rejected,
+	// because no run would live long enough to be rolled up.
 	RetentionMaxAge time.Duration
 	// RetentionInterval is the cadence of the retention sweep. It applies only
 	// when RetentionMaxAge is set; left zero, it defaults to one hour.
@@ -103,7 +117,47 @@ type SchedulerConfig struct {
 	// (the default) disables it — no surprise log output for an embedded
 	// consumer that never asked for a heartbeat; a `/metrics` scrape samples
 	// fresh regardless.
+	//
+	// With the stats rollup enabled the pulse also carries slow_running: how many
+	// running attempts have run longer than max(3 × their kind's baseline p99,
+	// p99 + 1m). The first time an attempt crosses that line it is logged once,
+	// at warn.
 	HealthSampleInterval time.Duration
+
+	// StatsRollupInterval enables the hourly stats rollup: when > 0 the Scheduler
+	// rolls each closed hour of job_runs into job_stats_hourly on this cadence,
+	// which is what serves Stats, StatsSeries, Baselines, and Anomalies past the
+	// last few hours and what keeps trends after retention prunes the raw runs.
+	// Zero (the default) disables it, the same opt-in convention as
+	// HealthSampleInterval; `flywheel serve` enables it. A minute is a sensible
+	// cadence — a pass with nothing to roll is two primary-key reads and a range
+	// delete that finds nothing, and writes no row.
+	//
+	// Run it on one Scheduler per database, as CONTRACT.md already asks of the
+	// Scheduler. A duplicate is harmless — every pass replaces whole hours,
+	// idempotently — only wasted work.
+	StatsRollupInterval time.Duration
+	// StatsRollupGrace is how long after an hour ends the rollup waits before
+	// closing it, so a run that finalizes a moment late still lands in its own
+	// hour. Zero selects five minutes. A run finalized later than this — a node's
+	// clock skewed further — is missed by the rollup until RebuildStats covers its
+	// hour.
+	StatsRollupGrace time.Duration
+	// StatsMaxHoursPerPass bounds the hours one rollup pass closes. Zero selects
+	// 24, which spreads a first pass over a long history — or a catch-up after
+	// downtime — across ticks instead of one long pass. Empty hours are skipped
+	// without counting against it.
+	StatsMaxHoursPerPass int
+	// StatsRetention is how long hourly rollup rows are kept. Zero selects 400
+	// days, enough for a year-over-year comparison. It also bounds how far back a
+	// first pass reaches into existing history.
+	StatsRetention time.Duration
+	// StatsAnomalyLog, when set alongside StatsRollupInterval, evaluates each
+	// newly rolled hour with Anomalies and logs each anomaly's onset once, at
+	// warn: a kind whose successful runs got markedly slower, or whose jobs are
+	// discarded at markedly more than their baseline rate. Hours rolled while the
+	// rollup is catching up on old history are not evaluated.
+	StatsAnomalyLog bool
 }
 
 // NewScheduler returns a Scheduler over db and the producer client with the
@@ -205,6 +259,9 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 	if s.retentionMaxAge > 0 && s.retentionInterval <= 0 {
 		s.retentionInterval = defaultRetentionInterval
 	}
+	if err := s.configureStats(cfg); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -284,7 +341,15 @@ func (a *activity) tick(ctx context.Context, logger *slog.Logger) {
 // before returning. That wait is bounded by one batch rather than one backlog —
 // which is true only because the sweep and the retention prune are batched, and
 // is what makes a Node's DrainTimeout a meaningful bound on shutdown.
+//
+// The one early return is a schema older than the binary: before starting any
+// activity, Run checks that the tables its sweep writes (and, with the stats
+// rollup on, the rollup's tables) carry every column, and returns
+// ErrSchemaOutdated naming what is missing.
 func (s *Scheduler) Run(ctx context.Context) error {
+	if err := s.checkSchema(ctx); err != nil {
+		return err
+	}
 	s.runActivities(ctx, s.activities())
 	return fmt.Errorf("jobs: scheduler stopped: %w", ctx.Err())
 }
@@ -326,6 +391,11 @@ func (s *Scheduler) activities() []*activity {
 	if s.healthSampleInterval > 0 {
 		acts = append(acts, &activity{
 			name: "health", interval: s.healthSampleInterval, run: s.logHealth,
+		})
+	}
+	if s.statsInterval > 0 {
+		acts = append(acts, &activity{
+			name: "stats", interval: s.statsInterval, run: s.rollupOnce,
 		})
 	}
 	return acts
@@ -397,21 +467,28 @@ func (s *Scheduler) SampleHealth(ctx context.Context) (QueueHealth, error) {
 // alarm on it). It is the value the flywheel_queue_oldest_ready_seconds gauge
 // reports, and it is always present, zero when nothing is ready, so every pulse
 // yields a datapoint.
+//
+// With the stats rollup enabled it adds slow_running — a number, so a log-only
+// deployment can alarm on it like the lag — and warns once per attempt the
+// first time one crosses its kind's slow line. See SchedulerConfig.
 func (s *Scheduler) logHealth(ctx context.Context) {
 	qh, err := s.SampleHealth(ctx)
 	if err != nil {
 		s.logger.ErrorContext(ctx, "jobs: queue health sample failed", "error", err)
 		return
 	}
-	s.logger.InfoContext(
-		ctx, "jobs: queue health",
+	attrs := []any{
 		"ready", qh.Ready,
 		"inflight", qh.InFlight,
 		"scheduled_ahead", qh.ScheduledAhead,
 		"oldest_ready", qh.OldestReadyAge.String(),
 		"oldest_ready_seconds", qh.OldestReadyAge.Seconds(),
 		"discarded", qh.CountsByState[string(StateDiscarded)],
-	)
+	}
+	if s.statsInterval > 0 {
+		attrs = append(attrs, "slow_running", s.countSlowRunning(ctx))
+	}
+	s.logger.InfoContext(ctx, "jobs: queue health", attrs...)
 }
 
 // Tick processes every due, active periodic definition once and reports how
@@ -469,12 +546,18 @@ func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
 //
 // The returned count is meaningful alongside a non-nil error: committed batches
 // are not rolled back by a later batch's failure.
+//
+// With the stats rollup enabled the pass holds for it, as
+// RetentionOpts.HoldForStatsRollup does: retention never deletes a run before
+// the rollup has counted it, and nothing is pruned until the rollup has run.
 func (s *Scheduler) PruneRetention(ctx context.Context) (int64, error) {
 	if s.retentionMaxAge <= 0 {
 		return 0, nil
 	}
+	opts := s.retentionOpts
+	opts.HoldForStatsRollup = opts.HoldForStatsRollup || s.statsInterval > 0
 	cutoff := models.ClockFrom(ctx).Now(ctx).Add(-s.retentionMaxAge)
-	return DeleteFinishedJobsWithOptions(ctx, s.db, cutoff, s.retentionOpts)
+	return DeleteFinishedJobsWithOptions(ctx, s.db, cutoff, opts)
 }
 
 // prunedOnItsCeiling reports whether a pass that deleted n rows used every

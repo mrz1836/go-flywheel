@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mrz1836/go-foundation/ctxutil"
@@ -209,6 +210,9 @@ type Runner struct {
 	// wait inside the loop is derived from it.
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	// schemaChecked records that the startup schema probe ran and found every
+	// column the run path writes, so a Runner reused across invocations probes once.
+	schemaChecked atomic.Bool
 }
 
 // NewRunner validates cfg and returns a Runner. It returns ErrSQLiteConcurrency
@@ -635,6 +639,9 @@ func (r *Runner) RunUntilIdle(ctx context.Context) error { return r.run(ctx, tru
 // for it. A slow job therefore holds one slot, not the loop: the remaining slots
 // keep claiming.
 func (r *Runner) run(ctx context.Context, untilIdle bool) error {
+	if err := r.checkSchema(ctx); err != nil {
+		return err
+	}
 	loopCtx, endLoop := r.loopContext(ctx)
 	defer endLoop()
 
@@ -759,6 +766,28 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			return r.ended(ctx, untilIdle)
 		}
 	}
+}
+
+// checkSchema runs the startup schema probe over the tables the run path writes,
+// once per Runner: jobs and job_runs, which the claim, the stub insert, and the
+// finalize update write, and job_run_finishes, which every finalize logs to in
+// the same transaction. A database missing any of them fails the run before
+// anything is claimed: claiming first would lease a job, fail its stub insert or
+// its finalize, and leave the lease sweep to reclaim the same jobs forever. A
+// probe that cannot reach the database is not a verdict and is retried on the
+// next run — see probeSchema.
+func (r *Runner) checkSchema(ctx context.Context) error {
+	if r.schemaChecked.Load() {
+		return nil
+	}
+	checked, err := probeSchema(ctx, r.cfg.DB, runPathModels()...)
+	if err != nil {
+		return fmt.Errorf("jobs: runner schema check: %w", err)
+	}
+	if checked {
+		r.schemaChecked.Store(true)
+	}
+	return nil
 }
 
 // sleep waits d out, reporting ctx's error when the wait was cut short.

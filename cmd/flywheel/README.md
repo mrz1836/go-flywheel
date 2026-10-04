@@ -93,17 +93,21 @@ flywheel serve                        # run the runtime until Ctrl+C
 
 | Command | Purpose |
 |---|---|
-| `flywheel serve` | Run the runner + scheduler until SIGINT/SIGTERM (drains in-flight work) |
-| `flywheel migrate` | Create or update the schema |
+| `flywheel serve` | Migrate (concurrent index builds on PostgreSQL; an up-to-date schema issues no DDL), then run the runner + scheduler until SIGINT/SIGTERM (drains in-flight work) |
+| `flywheel migrate` | Create or upgrade the schema, reporting what it added (`--concurrently --lock-timeout 5s` for a live PostgreSQL database) |
 | `flywheel enqueue <kind> <json>` | Enqueue one job (`--queue --unique --priority --at`) |
-| `flywheel jobs ls` | List recent jobs (`--state --kind --limit --json`) |
+| `flywheel jobs ls` | List recent jobs, newest first (`--state --kind --queue --before <id> --limit --json`) |
+| `flywheel jobs running` | List running jobs, longest-running first, flagging any far slower than their kind's baseline (`--kind --queue --limit --json`) |
 | `flywheel jobs inspect <id>` | Show a job and its run history |
 | `flywheel jobs retry <id>` | Force a job back to available |
 | `flywheel jobs cancel <id>` | Move a job to cancelled (refused once a job is terminal) |
 | `flywheel schedule ls` | List periodic schedules |
 | `flywheel schedule add <slug> <kind>` | Add/update a schedule (`--cron \| --every`, `--args`) |
+| `flywheel prune` | Delete finished jobs and their runs older than a cutoff, holding for the stats rollup when it is on (`--older-than 14d --ignore-stats-rollup`) |
 | `flywheel status` | Show queue health, schedules, and recent failures (`--json --watch`) |
-| `flywheel doctor` | Validate config, check the database, print effective settings |
+| `flywheel stats` | Per-kind outcomes, success rate, duration percentiles, and queue wait (`--since 24h --kind --queue --json`) |
+| `flywheel stats rebuild` | Backfill the finish log for runs an older release finalized, then recompute the hourly stats rollups for a range, rolling any hours between it and the rollup's progress too (`--from --to [--force]`) |
+| `flywheel doctor` | Validate config, migrate (as `serve` does), print effective settings and the stats rollup's lag |
 
 All commands take `--config <path>` (default `./flywheel.yaml`, else
 `$XDG_CONFIG_HOME/flywheel/flywheel.yaml`).
@@ -184,9 +188,37 @@ curl localhost:9090/metrics      # flywheel_jobs_* counters + flywheel_queue_* g
 
 Each heartbeat is one `jobs: queue health` log line with `ready`, `inflight`,
 `scheduled_ahead`, `oldest_ready` (the lag as a duration string, e.g. `1m30.5s`),
-`oldest_ready_seconds` (the same lag as a number, `0` when nothing is ready), and
-`discarded`. Alarm on `oldest_ready_seconds` when you derive metrics from logs
-rather than scraping `/metrics`.
+`oldest_ready_seconds` (the same lag as a number, `0` when nothing is ready),
+`discarded`, and — with the stats rollup on — `slow_running`, the number of
+running jobs far slower than their kind's baseline. Alarm on
+`oldest_ready_seconds` when you derive metrics from logs rather than scraping
+`/metrics`.
+
+## Job statistics
+
+`serve` rolls finished runs into hourly statistics on the `runtime.stats_rollup`
+cadence (on by default, every minute), so `flywheel stats` answers for any window
+quickly and trends survive `runtime.retention`:
+
+```yaml
+runtime:
+  stats_rollup: 1m               # unset = 1m; negative (e.g. -1s) = off
+```
+
+```bash
+flywheel stats                   # last 24h: per-kind attempts, success rate, p50/p95/p99, queue wait
+flywheel stats --since 7d --kind exec
+flywheel stats --json            # the full result, including the slowest run per kind
+flywheel jobs running            # what is running now, and whether it is far slower than usual
+flywheel stats rebuild --from 2026-06-01 --to 2026-06-08   # backfill or repair a range
+```
+
+With the rollup on, `serve` also logs one `jobs: stats anomaly` warning the hour
+a kind's successful runs become markedly slower than its 7-day baseline, or its
+jobs start failing at markedly more than their usual rate, and one warning the
+first time a running job crosses its kind's slow line. Without the rollup,
+`flywheel stats` reads raw runs and refuses windows longer than 7 days.
+`flywheel doctor` reports how far the rollup trails now.
 
 ## Run as a background daemon (macOS, launchd)
 

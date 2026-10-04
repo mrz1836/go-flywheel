@@ -126,8 +126,37 @@ not keep pace (two passes in two minutes).
 - **The cost is real: WAL per job rose 54 %** (7.0 → 10.8 KB) under tuning, because vacuuming more often
   writes more WAL and a sub-100 fillfactor puts fewer tuples per page. A deployment paying for
   replication or backup by the byte should weigh that against the bloat and throughput it buys.
-- **Do not tune `job_runs` or `job_periodics`.** Neither has update churn, and a lower fillfactor on an
-  append-only table reserves free space for updates that never come.
+- **Do not tune `job_runs` or `job_periodics`.** `job_runs` takes one update per run, and it writes no
+  indexed column, so it is HOT-eligible and pruned on its own page — measured at 94–99% HOT. That is also
+  why `job_runs.finished_at` is deliberately not indexed: an index there made every finalize non-HOT and
+  cost ~10% of drain throughput (see [`BENCHMARKS.md`](BENCHMARKS.md#job-analytics)). `job_periodics`
+  barely changes. A lower fillfactor on either reserves free space for churn that is not there.
+
+<br>
+
+## The stats rollup
+
+`StatsRollupInterval` turns on the hourly rollup the history reads (`Stats`, `StatsSeries`, `Baselines`,
+`Anomalies`) are served from; see [`INTEGRATING.md`](INTEGRATING.md#turning-the-stats-on).
+
+- **Interval: a minute is right for almost everyone.** A pass with nothing to roll is two primary-key
+  probes; a pass that closes an hour costs one indexed read of that hour's runs — 15 ms at 1.4k runs,
+  263 ms at 100k. A longer interval only delays when a closed hour becomes visible.
+- **Grace (`StatsRollupGrace`, 5m): the clock skew you tolerate.** A run finalized after its hour closed is
+  missed until `RebuildStats` covers the hour. Raise it if your nodes' clocks drift further than five
+  minutes; lowering it buys nothing but fresher hours.
+- **`StatsMaxHoursPerPass` (24): the catch-up duty cycle.** Only hours with runs count against it. A first
+  pass over a long history, or a catch-up after downtime, spreads across ticks at this many hours each; a
+  month at a million runs rolls from scratch in under ten seconds in one `RebuildStats`, so raise it (or
+  rebuild once) if you would rather catch up at once.
+- **Retention must outlive the grace.** With the rollup on, `RetentionMaxAge` below one hour plus the
+  grace is refused, and retention never prunes a run the rollup has not counted yet (the watermark, or
+  the oldest hour it keeps while it works back through history). Keep raw runs as long as you
+  want per-run drill-down (`ListRuns`, `SlowRuns`); keep rollups (`StatsRetention`, 400 days) as long as you
+  want trends.
+- **The write cost is fixed per job, not per read.** The analytics add about 0.4–0.65 KB of WAL per job —
+  the finish-log row, the `jobs_finished` entry, and the wider run row — whether or not anything reads
+  them. The [benchmarks](BENCHMARKS.md#job-analytics) break it down.
 
 <br>
 

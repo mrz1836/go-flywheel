@@ -150,7 +150,7 @@ func TestRunnerTransientErrorRetriesThenSucceeds(t *testing.T) {
 
 	assert.Equal(t, string(StateSucceeded), jobState(t, db, id))
 	assert.EqualValues(t, 3, w.calls.Load(), "two failures + one success")
-	assert.EqualValues(t, 3, runCount(t, db, id), "one job_runs row per attempt — append-only audit")
+	assert.EqualValues(t, 3, runCount(t, db, id), "one job_runs row per attempt")
 }
 
 func TestRunnerPermanentErrorDiscardsImmediately(t *testing.T) {

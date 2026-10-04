@@ -89,7 +89,7 @@ func TestJobRowSoftDeleteScopesQueries(t *testing.T) {
 	assert.EqualValues(t, 1, all, "Unscoped still sees the soft-deleted row")
 }
 
-// TestJobRunRowBeforeCreateRequiresMandatoryFields proves the append-only audit
+// TestJobRunRowBeforeCreateRequiresMandatoryFields proves the audit
 // row enforces its required identity fields.
 func TestJobRunRowBeforeCreateRequiresMandatoryFields(t *testing.T) {
 	t.Parallel()

@@ -1,0 +1,809 @@
+stats read plans — postgres://localhost:5432/flywheel_test
+server: PostgreSQL 17.11 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit
+schema: lt_dlvkxiuiiirs_1nvr_1
+fixture: 1000000 runs over 30 days across 20 kinds, plus one hour of 100000 runs; 200 running, 5000 ready
+job_runs: 273.1 MB total, 81.2 MB of indexes; job_run_finishes: 100.4 MB; jobs: 337.9 MB total
+job_stats_hourly: 58243 rows, 65.2 MB, rolled up from scratch in 7.251s (719 hours)
+
+Every statement was captured from the flywheel read API named above it through a recording GORM
+logger and explained verbatim with EXPLAIN (ANALYZE, BUFFERS), after VACUUM (ANALYZE). The clock is
+fixed at the end of the seeded range: the rollups cover every closed hour, and the hour in
+progress is read raw. Latency is the wall time of the whole API call — every statement plus the
+Go-side merge — as the median of 7 calls after a warm-up. The rollup pass runs through a Scheduler
+that has made its start-up pass, on its own handle, so its statements (primary-key reads of
+job_stats_progress and an empty range delete) are not captured.
+
+read                                     median        min        max  stmts
+Stats 24h                              12.496ms   11.964ms   12.834ms      3
+Stats 30d                              78.488ms   76.494ms   79.305ms      3
+Stats 24h, one kind                     9.345ms    9.190ms    9.645ms      3
+StatsSeries 30d hourly                 21.121ms   19.507ms   21.229ms      3
+StatsSeries 30d daily                  19.034ms   18.612ms   19.268ms      3
+Baselines 7d                            0.054ms    0.040ms    0.081ms      2
+Anomalies (latest hour)                20.762ms   20.020ms   21.941ms      2
+ListRunning (with baseline)             2.403ms    2.344ms    2.512ms      2
+ListFinished                            2.526ms    2.464ms    2.590ms      3
+RecentFailures                          1.052ms    0.984ms    1.103ms      2
+SlowRuns 24h                           71.238ms   67.839ms   80.370ms      1
+QueueDepths                             2.360ms    2.007ms    2.514ms      6
+CountActiveByKind                       1.815ms    1.668ms    2.763ms      1
+ListJobs                                1.201ms    1.196ms    1.300ms      1
+Rollup pass, caught up                  0.250ms    0.225ms    0.261ms      0
+BackfillRunFinishes, none to log       39.549ms   39.316ms   40.971ms      1
+Roll up one hour (~1.4k runs)          16.266ms   14.140ms   22.103ms      4
+Roll up one hour of 100k runs         262.328ms  192.342ms  264.925ms      4
+
+=== Stats 24h ===
+
+--- statement 1 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Index Scan using job_stats_progress_pkey on job_stats_progress  (cost=0.15..8.17 rows=1 width=32) (actual time=0.008..0.008 rows=1 loops=1)
+    Index Cond: (id = 1)
+    Buffers: shared hit=5
+  Planning:
+    Buffers: shared hit=5
+  Planning Time: 0.023 ms
+  Execution Time: 0.011 ms
+
+--- statement 2 ---
+SELECT bucket_start_unix, kind, queue, attempts, success, error, timeout, snooze, cancelled, crashed, superseded, discarded, dur_count, dur_sum_ms, dur_max_ms, dur_hist, slowest_run_id, wait_count, wait_sum_ms, wait_max_ms, wait_hist, cost_micros_sum, hist_version FROM job_stats_hourly WHERE bucket_start_unix >= 1769731200 AND bucket_start_unix < 1769814000 AND kind <> '' AND queue = '' ORDER BY bucket_start_unix
+
+plan:
+  Index Scan using job_stats_hourly_pkey on job_stats_hourly  (cost=0.29..915.49 rows=468 width=996) (actual time=0.009..0.357 rows=460 loops=1)
+    Index Cond: ((bucket_start_unix >= 1769731200) AND (bucket_start_unix < 1769814000) AND (queue = ''::text))
+    Filter: (kind <> ''::text)
+    Rows Removed by Filter: 23
+    Buffers: shared hit=269
+  Planning:
+    Buffers: shared hit=9
+  Planning Time: 0.037 ms
+  Execution Time: 0.371 ms
+
+--- statement 3 ---
+SELECT t.kind, t.queue, t.id, t.outcome, t.sup, t.job_state, t.duration_ms, t.queue_wait_ms, t.cost_micros FROM (SELECT CASE WHEN r.kind = '' THEN COALESCE((SELECT j.kind FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.kind END AS kind, CASE WHEN r.queue = '' THEN COALESCE((SELECT j.queue FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.queue END AS queue, r.id AS id, r.outcome AS outcome, CASE WHEN r.superseded THEN 1 ELSE 0 END AS sup, CASE WHEN r.job_state IS NOT NULL THEN r.job_state WHEN NOT r.superseded AND r.outcome IN ('error', 'timeout') THEN (SELECT CASE WHEN j.state = 'discarded' AND j.attempt = r.attempt THEN 'discarded' END FROM jobs j WHERE j.id = r.job_id) END AS job_state, r.duration_ms AS duration_ms, r.queue_wait_ms AS queue_wait_ms, r.cost_micros AS cost_micros FROM job_run_finishes f JOIN job_runs r ON r.id = f.run_id WHERE f.finished_at >= '2026-01-30 23:00:00' AND f.finished_at < '2026-01-31 00:00:00') t
+
+plan:
+  Nested Loop  (cost=0.85..43107.24 rows=1297 width=144) (actual time=0.015..8.627 rows=1388 loops=1)
+    Buffers: shared hit=5562
+    ->  Index Only Scan using job_run_finishes_pkey on job_run_finishes f  (cost=0.43..54.37 rows=1297 width=14) (actual time=0.005..0.067 rows=1388 loops=1)
+          Index Cond: ((finished_at >= '2026-01-30 23:00:00+00'::timestamp with time zone) AND (finished_at < '2026-01-31 00:00:00+00'::timestamp with time zone))
+          Heap Fetches: 0
+          Buffers: shared hit=10
+    ->  Index Scan using job_runs_pkey on job_runs r  (cost=0.43..7.85 rows=1 width=88) (actual time=0.006..0.006 rows=1 loops=1388)
+          Index Cond: (id = f.run_id)
+          Buffers: shared hit=5552
+    SubPlan 1
+      ->  Index Scan using jobs_pkey on jobs j  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 2
+      ->  Index Scan using jobs_pkey on jobs j_1  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 3
+      ->  Index Scan using jobs_pkey on jobs j_2  (cost=0.43..8.45 rows=1 width=32) (never executed)
+            Index Cond: (id = r.job_id)
+  Planning:
+    Buffers: shared hit=28
+  Planning Time: 0.176 ms
+  Execution Time: 8.673 ms
+
+=== Stats 30d ===
+
+--- statement 1 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Index Scan using job_stats_progress_pkey on job_stats_progress  (cost=0.15..8.17 rows=1 width=32) (actual time=0.004..0.004 rows=1 loops=1)
+    Index Cond: (id = 1)
+    Buffers: shared hit=2
+  Planning Time: 0.027 ms
+  Execution Time: 0.009 ms
+
+--- statement 2 ---
+SELECT bucket_start_unix, kind, queue, attempts, success, error, timeout, snooze, cancelled, crashed, superseded, discarded, dur_count, dur_sum_ms, dur_max_ms, dur_hist, slowest_run_id, wait_count, wait_sum_ms, wait_max_ms, wait_hist, cost_micros_sum, hist_version FROM job_stats_hourly WHERE bucket_start_unix >= 1767225600 AND bucket_start_unix < 1769814000 AND kind <> '' AND queue = '' ORDER BY bucket_start_unix
+
+plan:
+  Gather Merge  (cost=12666.43..14124.87 rows=12500 width=996) (actual time=17.476..24.386 rows=14382 loops=1)
+    Workers Planned: 2
+    Workers Launched: 2
+    Buffers: shared hit=8166, temp read=2219 written=2222
+    ->  Sort  (cost=11666.41..11682.03 rows=6250 width=996) (actual time=15.578..16.575 rows=4794 loops=3)
+          Sort Key: bucket_start_unix
+          Sort Method: external merge  Disk: 7912kB
+          Buffers: shared hit=8166, temp read=2219 written=2222
+          Worker 0:  Sort Method: external merge  Disk: 4936kB
+          Worker 1:  Sort Method: external merge  Disk: 4904kB
+          ->  Parallel Seq Scan on job_stats_hourly  (cost=0.00..8535.36 rows=6250 width=996) (actual time=0.007..6.753 rows=4794 loops=3)
+                Filter: ((bucket_start_unix >= 1767225600) AND (bucket_start_unix < 1769814000) AND (kind <> ''::text) AND (queue = ''::text))
+                Rows Removed by Filter: 14620
+                Buffers: shared hit=8050
+  Planning:
+    Buffers: shared hit=6
+  Planning Time: 0.047 ms
+  Execution Time: 26.007 ms
+
+--- statement 3 ---
+SELECT t.kind, t.queue, t.id, t.outcome, t.sup, t.job_state, t.duration_ms, t.queue_wait_ms, t.cost_micros FROM (SELECT CASE WHEN r.kind = '' THEN COALESCE((SELECT j.kind FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.kind END AS kind, CASE WHEN r.queue = '' THEN COALESCE((SELECT j.queue FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.queue END AS queue, r.id AS id, r.outcome AS outcome, CASE WHEN r.superseded THEN 1 ELSE 0 END AS sup, CASE WHEN r.job_state IS NOT NULL THEN r.job_state WHEN NOT r.superseded AND r.outcome IN ('error', 'timeout') THEN (SELECT CASE WHEN j.state = 'discarded' AND j.attempt = r.attempt THEN 'discarded' END FROM jobs j WHERE j.id = r.job_id) END AS job_state, r.duration_ms AS duration_ms, r.queue_wait_ms AS queue_wait_ms, r.cost_micros AS cost_micros FROM job_run_finishes f JOIN job_runs r ON r.id = f.run_id WHERE f.finished_at >= '2026-01-30 23:00:00' AND f.finished_at < '2026-01-31 00:00:00') t
+
+plan:
+  Nested Loop  (cost=0.85..43107.24 rows=1297 width=144) (actual time=0.018..8.693 rows=1388 loops=1)
+    Buffers: shared hit=5562
+    ->  Index Only Scan using job_run_finishes_pkey on job_run_finishes f  (cost=0.43..54.37 rows=1297 width=14) (actual time=0.006..0.076 rows=1388 loops=1)
+          Index Cond: ((finished_at >= '2026-01-30 23:00:00+00'::timestamp with time zone) AND (finished_at < '2026-01-31 00:00:00+00'::timestamp with time zone))
+          Heap Fetches: 0
+          Buffers: shared hit=10
+    ->  Index Scan using job_runs_pkey on job_runs r  (cost=0.43..7.85 rows=1 width=88) (actual time=0.006..0.006 rows=1 loops=1388)
+          Index Cond: (id = f.run_id)
+          Buffers: shared hit=5552
+    SubPlan 1
+      ->  Index Scan using jobs_pkey on jobs j  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 2
+      ->  Index Scan using jobs_pkey on jobs j_1  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 3
+      ->  Index Scan using jobs_pkey on jobs j_2  (cost=0.43..8.45 rows=1 width=32) (never executed)
+            Index Cond: (id = r.job_id)
+  Planning:
+    Buffers: shared hit=28
+  Planning Time: 0.254 ms
+  Execution Time: 8.743 ms
+
+=== Stats 24h, one kind ===
+
+--- statement 1 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Index Scan using job_stats_progress_pkey on job_stats_progress  (cost=0.15..8.17 rows=1 width=32) (actual time=0.003..0.003 rows=1 loops=1)
+    Index Cond: (id = 1)
+    Buffers: shared hit=2
+  Planning Time: 0.015 ms
+  Execution Time: 0.006 ms
+
+--- statement 2 ---
+SELECT bucket_start_unix, kind, queue, attempts, success, error, timeout, snooze, cancelled, crashed, superseded, discarded, dur_count, dur_sum_ms, dur_max_ms, dur_hist, slowest_run_id, wait_count, wait_sum_ms, wait_max_ms, wait_hist, cost_micros_sum, hist_version FROM job_stats_hourly WHERE bucket_start_unix >= 1769731200 AND bucket_start_unix < 1769814000 AND kind <> '' AND queue = '' AND kind = 'kind-7' ORDER BY bucket_start_unix
+
+plan:
+  Index Scan using job_stats_hourly_pkey on job_stats_hourly  (cost=0.29..112.08 rows=22 width=996) (actual time=0.009..0.071 rows=23 loops=1)
+    Index Cond: ((bucket_start_unix >= 1769731200) AND (bucket_start_unix < 1769814000) AND (kind = 'kind-7'::text) AND (queue = ''::text))
+    Buffers: shared hit=34
+  Planning:
+    Buffers: shared hit=3
+  Planning Time: 0.045 ms
+  Execution Time: 0.077 ms
+
+--- statement 3 ---
+SELECT t.kind, t.queue, t.id, t.outcome, t.sup, t.job_state, t.duration_ms, t.queue_wait_ms, t.cost_micros FROM (SELECT CASE WHEN r.kind = '' THEN COALESCE((SELECT j.kind FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.kind END AS kind, CASE WHEN r.queue = '' THEN COALESCE((SELECT j.queue FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.queue END AS queue, r.id AS id, r.outcome AS outcome, CASE WHEN r.superseded THEN 1 ELSE 0 END AS sup, CASE WHEN r.job_state IS NOT NULL THEN r.job_state WHEN NOT r.superseded AND r.outcome IN ('error', 'timeout') THEN (SELECT CASE WHEN j.state = 'discarded' AND j.attempt = r.attempt THEN 'discarded' END FROM jobs j WHERE j.id = r.job_id) END AS job_state, r.duration_ms AS duration_ms, r.queue_wait_ms AS queue_wait_ms, r.cost_micros AS cost_micros FROM job_run_finishes f JOIN job_runs r ON r.id = f.run_id WHERE f.finished_at >= '2026-01-30 23:00:00' AND f.finished_at < '2026-01-31 00:00:00') t WHERE t.kind = 'kind-7'
+
+plan:
+  Nested Loop  (cost=0.85..21343.27 rows=6 width=144) (actual time=0.110..8.286 rows=69 loops=1)
+    Buffers: shared hit=5562
+    ->  Index Only Scan using job_run_finishes_pkey on job_run_finishes f  (cost=0.43..54.37 rows=1297 width=14) (actual time=0.005..0.064 rows=1388 loops=1)
+          Index Cond: ((finished_at >= '2026-01-30 23:00:00+00'::timestamp with time zone) AND (finished_at < '2026-01-31 00:00:00+00'::timestamp with time zone))
+          Heap Fetches: 0
+          Buffers: shared hit=10
+    ->  Index Scan using job_runs_pkey on job_runs r  (cost=0.43..16.30 rows=1 width=88) (actual time=0.006..0.006 rows=0 loops=1388)
+          Index Cond: (id = f.run_id)
+          Filter: (CASE WHEN (kind = ''::text) THEN COALESCE((SubPlan 4), '(unknown)'::text) ELSE kind END = 'kind-7'::text)
+          Rows Removed by Filter: 1
+          Buffers: shared hit=5552
+          SubPlan 4
+            ->  Index Scan using jobs_pkey on jobs j_3  (cost=0.43..8.45 rows=1 width=7) (never executed)
+                  Index Cond: (id = r.job_id)
+    SubPlan 1
+      ->  Index Scan using jobs_pkey on jobs j  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 2
+      ->  Index Scan using jobs_pkey on jobs j_1  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 3
+      ->  Index Scan using jobs_pkey on jobs j_2  (cost=0.43..8.45 rows=1 width=32) (never executed)
+            Index Cond: (id = r.job_id)
+  Planning:
+    Buffers: shared hit=32
+  Planning Time: 0.187 ms
+  Execution Time: 8.303 ms
+
+=== StatsSeries 30d hourly ===
+
+--- statement 1 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Index Scan using job_stats_progress_pkey on job_stats_progress  (cost=0.15..8.17 rows=1 width=32) (actual time=0.004..0.004 rows=1 loops=1)
+    Index Cond: (id = 1)
+    Buffers: shared hit=2
+  Planning Time: 0.026 ms
+  Execution Time: 0.009 ms
+
+--- statement 2 ---
+SELECT bucket_start_unix, kind, queue, attempts, success, error, timeout, snooze, cancelled, crashed, superseded, discarded, dur_count, dur_sum_ms, dur_max_ms, dur_hist, slowest_run_id, wait_count, wait_sum_ms, wait_max_ms, wait_hist, cost_micros_sum, hist_version FROM job_stats_hourly WHERE bucket_start_unix >= 1767225600 AND bucket_start_unix < 1769814000 AND kind = '' AND queue = '' ORDER BY bucket_start_unix
+
+plan:
+  Index Scan using job_stats_hourly_pkey on job_stats_hourly  (cost=0.29..2363.36 rows=179 width=996) (actual time=0.011..2.244 rows=719 loops=1)
+    Index Cond: ((bucket_start_unix >= 1767225600) AND (bucket_start_unix < 1769814000) AND (kind = ''::text) AND (queue = ''::text))
+    Buffers: shared hit=1008
+  Planning:
+    Buffers: shared hit=6
+  Planning Time: 0.041 ms
+  Execution Time: 2.263 ms
+
+--- statement 3 ---
+SELECT t.kind, t.queue, t.id, t.outcome, t.sup, t.job_state, t.duration_ms, t.queue_wait_ms, t.cost_micros FROM (SELECT CASE WHEN r.kind = '' THEN COALESCE((SELECT j.kind FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.kind END AS kind, CASE WHEN r.queue = '' THEN COALESCE((SELECT j.queue FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.queue END AS queue, r.id AS id, r.outcome AS outcome, CASE WHEN r.superseded THEN 1 ELSE 0 END AS sup, CASE WHEN r.job_state IS NOT NULL THEN r.job_state WHEN NOT r.superseded AND r.outcome IN ('error', 'timeout') THEN (SELECT CASE WHEN j.state = 'discarded' AND j.attempt = r.attempt THEN 'discarded' END FROM jobs j WHERE j.id = r.job_id) END AS job_state, r.duration_ms AS duration_ms, r.queue_wait_ms AS queue_wait_ms, r.cost_micros AS cost_micros FROM job_run_finishes f JOIN job_runs r ON r.id = f.run_id WHERE f.finished_at >= '2026-01-30 23:00:00' AND f.finished_at < '2026-01-31 00:00:00') t
+
+plan:
+  Nested Loop  (cost=0.85..43107.24 rows=1297 width=144) (actual time=0.018..8.763 rows=1388 loops=1)
+    Buffers: shared hit=5562
+    ->  Index Only Scan using job_run_finishes_pkey on job_run_finishes f  (cost=0.43..54.37 rows=1297 width=14) (actual time=0.005..0.080 rows=1388 loops=1)
+          Index Cond: ((finished_at >= '2026-01-30 23:00:00+00'::timestamp with time zone) AND (finished_at < '2026-01-31 00:00:00+00'::timestamp with time zone))
+          Heap Fetches: 0
+          Buffers: shared hit=10
+    ->  Index Scan using job_runs_pkey on job_runs r  (cost=0.43..7.85 rows=1 width=88) (actual time=0.006..0.006 rows=1 loops=1388)
+          Index Cond: (id = f.run_id)
+          Buffers: shared hit=5552
+    SubPlan 1
+      ->  Index Scan using jobs_pkey on jobs j  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 2
+      ->  Index Scan using jobs_pkey on jobs j_1  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 3
+      ->  Index Scan using jobs_pkey on jobs j_2  (cost=0.43..8.45 rows=1 width=32) (never executed)
+            Index Cond: (id = r.job_id)
+  Planning:
+    Buffers: shared hit=28
+  Planning Time: 0.205 ms
+  Execution Time: 8.805 ms
+
+=== StatsSeries 30d daily ===
+
+--- statement 1 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Index Scan using job_stats_progress_pkey on job_stats_progress  (cost=0.15..8.17 rows=1 width=32) (actual time=0.005..0.005 rows=1 loops=1)
+    Index Cond: (id = 1)
+    Buffers: shared hit=2
+  Planning Time: 0.032 ms
+  Execution Time: 0.009 ms
+
+--- statement 2 ---
+SELECT bucket_start_unix, kind, queue, attempts, success, error, timeout, snooze, cancelled, crashed, superseded, discarded, dur_count, dur_sum_ms, dur_max_ms, dur_hist, slowest_run_id, wait_count, wait_sum_ms, wait_max_ms, wait_hist, cost_micros_sum, hist_version FROM job_stats_hourly WHERE bucket_start_unix >= 1767225600 AND bucket_start_unix < 1769814000 AND kind = '' AND queue = '' ORDER BY bucket_start_unix
+
+plan:
+  Index Scan using job_stats_hourly_pkey on job_stats_hourly  (cost=0.29..2363.36 rows=179 width=996) (actual time=0.011..2.288 rows=719 loops=1)
+    Index Cond: ((bucket_start_unix >= 1767225600) AND (bucket_start_unix < 1769814000) AND (kind = ''::text) AND (queue = ''::text))
+    Buffers: shared hit=1008
+  Planning:
+    Buffers: shared hit=6
+  Planning Time: 0.046 ms
+  Execution Time: 2.308 ms
+
+--- statement 3 ---
+SELECT t.kind, t.queue, t.id, t.outcome, t.sup, t.job_state, t.duration_ms, t.queue_wait_ms, t.cost_micros FROM (SELECT CASE WHEN r.kind = '' THEN COALESCE((SELECT j.kind FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.kind END AS kind, CASE WHEN r.queue = '' THEN COALESCE((SELECT j.queue FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.queue END AS queue, r.id AS id, r.outcome AS outcome, CASE WHEN r.superseded THEN 1 ELSE 0 END AS sup, CASE WHEN r.job_state IS NOT NULL THEN r.job_state WHEN NOT r.superseded AND r.outcome IN ('error', 'timeout') THEN (SELECT CASE WHEN j.state = 'discarded' AND j.attempt = r.attempt THEN 'discarded' END FROM jobs j WHERE j.id = r.job_id) END AS job_state, r.duration_ms AS duration_ms, r.queue_wait_ms AS queue_wait_ms, r.cost_micros AS cost_micros FROM job_run_finishes f JOIN job_runs r ON r.id = f.run_id WHERE f.finished_at >= '2026-01-30 23:00:00' AND f.finished_at < '2026-01-31 00:00:00') t
+
+plan:
+  Nested Loop  (cost=0.85..43107.24 rows=1297 width=144) (actual time=0.015..8.493 rows=1388 loops=1)
+    Buffers: shared hit=5562
+    ->  Index Only Scan using job_run_finishes_pkey on job_run_finishes f  (cost=0.43..54.37 rows=1297 width=14) (actual time=0.005..0.073 rows=1388 loops=1)
+          Index Cond: ((finished_at >= '2026-01-30 23:00:00+00'::timestamp with time zone) AND (finished_at < '2026-01-31 00:00:00+00'::timestamp with time zone))
+          Heap Fetches: 0
+          Buffers: shared hit=10
+    ->  Index Scan using job_runs_pkey on job_runs r  (cost=0.43..7.85 rows=1 width=88) (actual time=0.006..0.006 rows=1 loops=1388)
+          Index Cond: (id = f.run_id)
+          Buffers: shared hit=5552
+    SubPlan 1
+      ->  Index Scan using jobs_pkey on jobs j  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 2
+      ->  Index Scan using jobs_pkey on jobs j_1  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 3
+      ->  Index Scan using jobs_pkey on jobs j_2  (cost=0.43..8.45 rows=1 width=32) (never executed)
+            Index Cond: (id = r.job_id)
+  Planning:
+    Buffers: shared hit=28
+  Planning Time: 0.236 ms
+  Execution Time: 8.538 ms
+
+=== Baselines 7d ===
+
+--- statement 1 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Index Scan using job_stats_progress_pkey on job_stats_progress  (cost=0.15..8.17 rows=1 width=32) (actual time=0.005..0.006 rows=1 loops=1)
+    Index Cond: (id = 1)
+    Buffers: shared hit=2
+  Planning Time: 0.039 ms
+  Execution Time: 0.021 ms
+
+--- statement 2 ---
+SELECT bucket_start_unix, kind, queue, attempts, success, error, timeout, snooze, cancelled, crashed, superseded, discarded, dur_count, dur_sum_ms, dur_max_ms, dur_hist, slowest_run_id, wait_count, wait_sum_ms, wait_max_ms, wait_hist, cost_micros_sum, hist_version FROM job_stats_hourly WHERE bucket_start_unix >= 1769209200 AND bucket_start_unix < 1769814000 AND kind <> '' AND queue = '' ORDER BY bucket_start_unix
+
+plan:
+  Index Scan using job_stats_hourly_pkey on job_stats_hourly  (cost=0.29..5871.54 rows=3515 width=996) (actual time=0.009..2.068 rows=3360 loops=1)
+    Index Cond: ((bucket_start_unix >= 1769209200) AND (bucket_start_unix < 1769814000) AND (queue = ''::text))
+    Filter: (kind <> ''::text)
+    Rows Removed by Filter: 168
+    Buffers: shared hit=1951
+  Planning:
+    Buffers: shared hit=3
+  Planning Time: 0.041 ms
+  Execution Time: 2.140 ms
+
+=== Anomalies (latest hour) ===
+
+--- statement 1 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Index Scan using job_stats_progress_pkey on job_stats_progress  (cost=0.15..8.17 rows=1 width=32) (actual time=0.007..0.008 rows=1 loops=1)
+    Index Cond: (id = 1)
+    Buffers: shared hit=2
+  Planning Time: 0.042 ms
+  Execution Time: 0.016 ms
+
+--- statement 2 ---
+SELECT bucket_start_unix, kind, queue, attempts, success, error, timeout, snooze, cancelled, crashed, superseded, discarded, dur_count, dur_sum_ms, dur_max_ms, dur_hist, slowest_run_id, wait_count, wait_sum_ms, wait_max_ms, wait_hist, cost_micros_sum, hist_version FROM job_stats_hourly WHERE bucket_start_unix >= 1769133600 AND bucket_start_unix < 1769814000 AND kind <> '' AND queue = '' ORDER BY bucket_start_unix
+
+plan:
+  Index Scan using job_stats_hourly_pkey on job_stats_hourly  (cost=0.29..6490.74 rows=3963 width=996) (actual time=0.011..2.636 rows=3780 loops=1)
+    Index Cond: ((bucket_start_unix >= 1769133600) AND (bucket_start_unix < 1769814000) AND (queue = ''::text))
+    Filter: (kind <> ''::text)
+    Rows Removed by Filter: 189
+    Buffers: shared hit=2194
+  Planning:
+    Buffers: shared hit=3
+  Planning Time: 0.042 ms
+  Execution Time: 2.717 ms
+
+=== ListRunning (with baseline) ===
+
+--- statement 1 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Seq Scan on job_stats_progress  (cost=0.00..1.01 rows=1 width=32) (actual time=0.003..0.004 rows=1 loops=1)
+    Filter: (id = 1)
+    Buffers: shared hit=1
+  Planning Time: 0.017 ms
+  Execution Time: 0.007 ms
+
+--- statement 2 ---
+SELECT j.id AS job_id, j.kind, j.queue, j.attempt, j.max_attempts, j.parent_job_id, j.leased_until, r.id AS run_id, r.executor_class, r.executor_id, r.started_at FROM jobs AS j LEFT JOIN job_runs r ON r.job_id = j.id AND r.attempt = j.attempt WHERE j.state = 'running' AND j.deleted_at IS NULL ORDER BY CASE WHEN r.started_at IS NULL THEN 1 ELSE 0 END, r.started_at ASC, j.id ASC LIMIT 100
+
+plan:
+  Limit  (cost=1572.17..1572.42 rows=100 width=112) (actual time=1.167..1.173 rows=100 loops=1)
+    Buffers: shared hit=980
+    ->  Sort  (cost=1572.17..1572.63 rows=184 width=112) (actual time=1.167..1.169 rows=100 loops=1)
+          Sort Key: (CASE WHEN (r.started_at IS NULL) THEN 1 ELSE 0 END), r.started_at, j.id
+          Sort Method: quicksort  Memory: 51kB
+          Buffers: shared hit=980
+          ->  Nested Loop Left Join  (cost=0.57..1565.25 rows=184 width=112) (actual time=0.009..0.966 rows=200 loops=1)
+                Buffers: shared hit=980
+                ->  Index Scan using jobs_running_leased on jobs j  (cost=0.14..18.91 rows=184 width=81) (actual time=0.002..0.056 rows=200 loops=1)
+                      Filter: (deleted_at IS NULL)
+                      Buffers: shared hit=180
+                ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.43..8.40 rows=1 width=46) (actual time=0.004..0.004 rows=1 loops=200)
+                      Index Cond: ((job_id = j.id) AND (attempt = j.attempt))
+                      Buffers: shared hit=800
+  Planning:
+    Buffers: shared hit=20
+  Planning Time: 0.113 ms
+  Execution Time: 1.188 ms
+
+=== ListFinished ===
+
+--- statement 1 ---
+SELECT * FROM "jobs" WHERE (state = 'succeeded' AND finalized_at IS NOT NULL) AND "jobs"."deleted_at" IS NULL ORDER BY finalized_at DESC, id DESC LIMIT 50
+
+plan:
+  Limit  (cost=0.43..6.27 rows=50 width=294) (actual time=0.006..0.015 rows=50 loops=1)
+    Buffers: shared hit=5
+    ->  Index Scan Backward using jobs_finished on jobs  (cost=0.43..125472.03 rows=1073309 width=294) (actual time=0.006..0.012 rows=50 loops=1)
+          Index Cond: (state = 'succeeded'::text)
+          Filter: (deleted_at IS NULL)
+          Buffers: shared hit=5
+  Planning:
+    Buffers: shared hit=4
+  Planning Time: 0.046 ms
+  Execution Time: 0.021 ms
+
+--- statement 2 ---
+SELECT * FROM "jobs" WHERE (state = 'cancelled' AND finalized_at IS NOT NULL) AND "jobs"."deleted_at" IS NULL ORDER BY finalized_at DESC, id DESC LIMIT 50
+
+plan:
+  Limit  (cost=4.96..4.96 rows=1 width=294) (actual time=0.006..0.007 rows=0 loops=1)
+    Buffers: shared hit=3
+    ->  Sort  (cost=4.96..4.96 rows=1 width=294) (actual time=0.006..0.006 rows=0 loops=1)
+          Sort Key: finalized_at DESC, id DESC
+          Sort Method: quicksort  Memory: 25kB
+          Buffers: shared hit=3
+          ->  Index Scan using jobs_state on jobs  (cost=0.43..4.95 rows=1 width=294) (actual time=0.005..0.005 rows=0 loops=1)
+                Index Cond: (state = 'cancelled'::text)
+                Filter: (finalized_at IS NOT NULL)
+                Buffers: shared hit=3
+  Planning:
+    Buffers: shared hit=4
+  Planning Time: 0.039 ms
+  Execution Time: 0.012 ms
+
+--- statement 3 ---
+SELECT * FROM "jobs" WHERE (state = 'discarded' AND finalized_at IS NOT NULL) AND "jobs"."deleted_at" IS NULL ORDER BY finalized_at DESC, id DESC LIMIT 50
+
+plan:
+  Limit  (cost=0.43..77.50 rows=50 width=294) (actual time=0.010..0.030 rows=50 loops=1)
+    Buffers: shared hit=30
+    ->  Index Scan Backward using jobs_finished on jobs  (cost=0.43..33635.09 rows=21820 width=294) (actual time=0.010..0.027 rows=50 loops=1)
+          Index Cond: (state = 'discarded'::text)
+          Filter: (deleted_at IS NULL)
+          Buffers: shared hit=30
+  Planning:
+    Buffers: shared hit=4
+  Planning Time: 0.078 ms
+  Execution Time: 0.041 ms
+
+=== RecentFailures ===
+
+--- statement 1 ---
+SELECT * FROM "jobs" WHERE (state = 'discarded' AND finalized_at IS NOT NULL) AND "jobs"."deleted_at" IS NULL ORDER BY finalized_at desc, id desc LIMIT 20
+
+plan:
+  Limit  (cost=0.43..31.26 rows=20 width=294) (actual time=0.006..0.010 rows=20 loops=1)
+    Buffers: shared hit=13
+    ->  Index Scan Backward using jobs_finished on jobs  (cost=0.43..33635.09 rows=21820 width=294) (actual time=0.006..0.009 rows=20 loops=1)
+          Index Cond: (state = 'discarded'::text)
+          Filter: (deleted_at IS NULL)
+          Buffers: shared hit=13
+  Planning:
+    Buffers: shared hit=4
+  Planning Time: 0.043 ms
+  Execution Time: 0.015 ms
+
+--- statement 2 ---
+SELECT * FROM "job_runs" WHERE job_id IN ('sr-00999996','sr-00999995','sr-00999896','sr-00999895','sr-00999796','sr-00999795','sr-00999696','sr-00999695','sr-00999596','sr-00999595','sr-00999496','sr-00999495','sr-00999396','sr-00999395','sr-00999296','sr-00999295','sr-00999196','sr-00999195','sr-00999096','sr-00999095') ORDER BY attempt asc
+
+plan:
+  Sort  (cost=158.70..158.75 rows=20 width=232) (actual time=0.122..0.122 rows=20 loops=1)
+    Sort Key: attempt
+    Sort Method: quicksort  Memory: 28kB
+    Buffers: shared hit=26
+    ->  Index Scan using job_runs_job_attempt on job_runs  (cost=0.43..158.26 rows=20 width=232) (actual time=0.042..0.119 rows=20 loops=1)
+          Index Cond: (job_id = ANY ('{sr-00999996,sr-00999995,sr-00999896,sr-00999895,sr-00999796,sr-00999795,sr-00999696,sr-00999695,sr-00999596,sr-00999595,sr-00999496,sr-00999495,sr-00999396,sr-00999395,sr-00999296,sr-00999295,sr-00999196,sr-00999195,sr-00999096,sr-00999095}'::text[]))
+          Buffers: shared hit=26
+  Planning Time: 0.024 ms
+  Execution Time: 0.127 ms
+
+=== SlowRuns 24h ===
+
+--- statement 1 ---
+SELECT r.* FROM job_run_finishes AS f JOIN job_runs r ON r.id = f.run_id WHERE f.finished_at >= '2026-01-30 00:00:00' AND r.duration_ms IS NOT NULL ORDER BY r.duration_ms DESC, r.id DESC LIMIT 20
+
+plan:
+  Limit  (cost=33653.12..33655.46 rows=20 width=232) (actual time=80.098..81.402 rows=20 loops=1)
+    Buffers: shared hit=6594 read=18264
+    ->  Gather Merge  (cost=33653.12..36806.61 rows=27028 width=232) (actual time=80.097..81.400 rows=20 loops=1)
+          Workers Planned: 2
+          Workers Launched: 2
+          Buffers: shared hit=6594 read=18264
+          ->  Sort  (cost=32653.10..32686.89 rows=13514 width=232) (actual time=78.416..78.418 rows=17 loops=3)
+                Sort Key: r.duration_ms DESC, r.id DESC
+                Sort Method: top-N heapsort  Memory: 34kB
+                Buffers: shared hit=6594 read=18264
+                Worker 0:  Sort Method: top-N heapsort  Memory: 34kB
+                Worker 1:  Sort Method: top-N heapsort  Memory: 33kB
+                ->  Parallel Hash Join  (cost=1375.62..32293.50 rows=13514 width=232) (actual time=65.518..75.800 rows=11000 loops=3)
+                      Hash Cond: (r.id = f.run_id)
+                      Buffers: shared hit=6564 read=18264
+                      ->  Parallel Seq Scan on job_runs r  (cost=0.00..29136.17 rows=453924 width=232) (actual time=0.028..38.709 rows=363000 loops=3)
+                            Filter: (duration_ms IS NOT NULL)
+                            Rows Removed by Filter: 3733
+                            Buffers: shared hit=6288 read=18264
+                      ->  Parallel Hash  (cost=1134.77..1134.77 rows=19268 width=14) (actual time=1.798..1.798 rows=11111 loops=3)
+                            Buckets: 32768  Batches: 1  Memory Usage: 1856kB
+                            Buffers: shared hit=170
+                            ->  Parallel Index Only Scan using job_run_finishes_pkey on job_run_finishes f  (cost=0.43..1134.77 rows=19268 width=14) (actual time=0.018..0.622 rows=11111 loops=3)
+                                  Index Cond: (finished_at >= '2026-01-30 00:00:00+00'::timestamp with time zone)
+                                  Heap Fetches: 0
+                                  Buffers: shared hit=170
+  Planning:
+    Buffers: shared hit=16
+  Planning Time: 0.176 ms
+  Execution Time: 81.420 ms
+
+=== QueueDepths ===
+
+--- statement 1 ---
+SELECT queue, count(*) AS n FROM "jobs" WHERE (state IN ('available','retryable','scheduled') AND scheduled_at <= '2026-01-31 00:00:00') AND "jobs"."deleted_at" IS NULL GROUP BY "queue"
+
+plan:
+  GroupAggregate  (cost=0.28..305.71 rows=3 width=15) (actual time=0.201..0.592 rows=3 loops=1)
+    Group Key: queue
+    Buffers: shared hit=49
+    ->  Index Only Scan using jobs_ready on jobs  (cost=0.28..281.38 rows=4862 width=7) (actual time=0.006..0.328 rows=5000 loops=1)
+          Index Cond: (scheduled_at <= '2026-01-31 00:00:00+00'::timestamp with time zone)
+          Heap Fetches: 0
+          Buffers: shared hit=49
+  Planning:
+    Buffers: shared hit=4
+  Planning Time: 0.047 ms
+  Execution Time: 0.597 ms
+
+--- statement 2 ---
+SELECT queue, count(*) AS n FROM "jobs" WHERE (state IN ('available','retryable','scheduled') AND scheduled_at > '2026-01-31 00:00:00') AND "jobs"."deleted_at" IS NULL GROUP BY "queue"
+
+plan:
+  GroupAggregate  (cost=0.28..232.78 rows=1 width=15) (actual time=0.106..0.106 rows=0 loops=1)
+    Group Key: queue
+    Buffers: shared hit=48
+    ->  Index Only Scan using jobs_ready on jobs  (cost=0.28..232.76 rows=1 width=7) (actual time=0.106..0.106 rows=0 loops=1)
+          Index Cond: (scheduled_at > '2026-01-31 00:00:00+00'::timestamp with time zone)
+          Heap Fetches: 0
+          Buffers: shared hit=48
+  Planning:
+    Buffers: shared hit=4
+  Planning Time: 0.045 ms
+  Execution Time: 0.110 ms
+
+--- statement 3 ---
+SELECT queue, state, count(*) AS n FROM "jobs" WHERE state IN ('running','paused') AND "jobs"."deleted_at" IS NULL GROUP BY queue, state
+
+plan:
+  HashAggregate  (cost=113.23..113.35 rows=12 width=24) (actual time=0.092..0.093 rows=1 loops=1)
+    Group Key: queue, state
+    Batches: 1  Memory Usage: 24kB
+    Buffers: shared hit=182
+    ->  Index Scan using jobs_state on jobs  (cost=0.43..111.85 rows=184 width=16) (actual time=0.010..0.057 rows=200 loops=1)
+          Index Cond: (state = ANY ('{running,paused}'::text[]))
+          Buffers: shared hit=182
+  Planning:
+    Buffers: shared hit=7
+  Planning Time: 0.055 ms
+  Execution Time: 0.100 ms
+
+--- statement 4 ---
+SELECT "scheduled_at" FROM "jobs" WHERE (queue = 'bulk' AND state IN ('available','retryable','scheduled') AND scheduled_at <= '2026-01-31 00:00:00') AND "jobs"."deleted_at" IS NULL ORDER BY scheduled_at ASC LIMIT 1
+
+plan:
+  Limit  (cost=97.46..97.46 rows=1 width=8) (actual time=0.162..0.163 rows=1 loops=1)
+    Buffers: shared hit=17
+    ->  Sort  (cost=97.46..101.18 rows=1487 width=8) (actual time=0.162..0.162 rows=1 loops=1)
+          Sort Key: scheduled_at
+          Sort Method: top-N heapsort  Memory: 25kB
+          Buffers: shared hit=17
+          ->  Index Only Scan using jobs_ready on jobs  (cost=0.28..90.02 rows=1487 width=8) (actual time=0.011..0.119 rows=1667 loops=1)
+                Index Cond: ((queue = 'bulk'::text) AND (scheduled_at <= '2026-01-31 00:00:00+00'::timestamp with time zone))
+                Heap Fetches: 0
+                Buffers: shared hit=17
+  Planning:
+    Buffers: shared hit=4
+  Planning Time: 0.059 ms
+  Execution Time: 0.166 ms
+
+--- statement 5 ---
+SELECT "scheduled_at" FROM "jobs" WHERE (queue = 'default' AND state IN ('available','retryable','scheduled') AND scheduled_at <= '2026-01-31 00:00:00') AND "jobs"."deleted_at" IS NULL ORDER BY scheduled_at ASC LIMIT 1
+
+plan:
+  Limit  (cost=128.04..128.05 rows=1 width=8) (actual time=0.162..0.163 rows=1 loops=1)
+    Buffers: shared hit=17
+    ->  Sort  (cost=128.04..132.82 rows=1910 width=8) (actual time=0.162..0.162 rows=1 loops=1)
+          Sort Key: scheduled_at
+          Sort Method: top-N heapsort  Memory: 25kB
+          Buffers: shared hit=17
+          ->  Index Only Scan using jobs_ready on jobs  (cost=0.28..118.49 rows=1910 width=8) (actual time=0.011..0.120 rows=1666 loops=1)
+                Index Cond: ((queue = 'default'::text) AND (scheduled_at <= '2026-01-31 00:00:00+00'::timestamp with time zone))
+                Heap Fetches: 0
+                Buffers: shared hit=17
+  Planning:
+    Buffers: shared hit=4
+  Planning Time: 0.055 ms
+  Execution Time: 0.166 ms
+
+--- statement 6 ---
+SELECT "scheduled_at" FROM "jobs" WHERE (queue = 'priority' AND state IN ('available','retryable','scheduled') AND scheduled_at <= '2026-01-31 00:00:00') AND "jobs"."deleted_at" IS NULL ORDER BY scheduled_at ASC LIMIT 1
+
+plan:
+  Limit  (cost=96.91..96.91 rows=1 width=8) (actual time=0.175..0.176 rows=1 loops=1)
+    Buffers: shared hit=21
+    ->  Sort  (cost=96.91..100.57 rows=1465 width=8) (actual time=0.175..0.175 rows=1 loops=1)
+          Sort Key: scheduled_at
+          Sort Method: top-N heapsort  Memory: 25kB
+          Buffers: shared hit=21
+          ->  Index Only Scan using jobs_ready on jobs  (cost=0.28..89.58 rows=1465 width=8) (actual time=0.009..0.130 rows=1667 loops=1)
+                Index Cond: ((queue = 'priority'::text) AND (scheduled_at <= '2026-01-31 00:00:00+00'::timestamp with time zone))
+                Heap Fetches: 0
+                Buffers: shared hit=21
+  Planning:
+    Buffers: shared hit=4
+  Planning Time: 0.063 ms
+  Execution Time: 0.180 ms
+
+=== CountActiveByKind ===
+
+--- statement 1 ---
+SELECT kind, queue, state, count(*) AS count FROM "jobs" WHERE state IN ('available','running','retryable','scheduled','paused') AND "jobs"."deleted_at" IS NULL GROUP BY kind, queue, state ORDER BY kind, queue, state
+
+plan:
+  Sort  (cost=2635.53..2636.16 rows=252 width=31) (actual time=1.707..1.708 rows=80 loops=1)
+    Sort Key: kind, queue, state
+    Sort Method: quicksort  Memory: 29kB
+    Buffers: shared hit=656
+    ->  HashAggregate  (cost=2622.96..2625.48 rows=252 width=31) (actual time=1.580..1.588 rows=80 loops=1)
+          Group Key: kind, queue, state
+          Batches: 1  Memory Usage: 37kB
+          Buffers: shared hit=656
+          ->  Index Scan using jobs_state on jobs  (cost=0.43..2572.49 rows=5047 width=23) (actual time=0.013..0.548 rows=5200 loops=1)
+                Index Cond: (state = ANY ('{available,running,retryable,scheduled,paused}'::text[]))
+                Buffers: shared hit=656
+  Planning:
+    Buffers: shared hit=7
+  Planning Time: 0.071 ms
+  Execution Time: 1.720 ms
+
+=== ListJobs ===
+
+--- statement 1 ---
+SELECT * FROM "jobs" WHERE "jobs"."deleted_at" IS NULL ORDER BY id desc LIMIT 50
+
+plan:
+  Limit  (cost=0.43..6.32 rows=50 width=294) (actual time=0.003..0.011 rows=50 loops=1)
+    Buffers: shared hit=5
+    ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.43..130321.43 rows=1105200 width=294) (actual time=0.003..0.009 rows=50 loops=1)
+          Filter: (deleted_at IS NULL)
+          Buffers: shared hit=5
+  Planning:
+    Buffers: shared hit=4
+  Planning Time: 0.032 ms
+  Execution Time: 0.017 ms
+
+=== Rollup pass, caught up ===
+
+=== BackfillRunFinishes, none to log ===
+
+--- statement 1 ---
+SELECT r.id FROM job_runs r WHERE r.kind = '' AND r.finished_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM job_run_finishes f WHERE f.finished_at = r.finished_at AND f.run_id = r.id) LIMIT 1
+
+plan:
+  Limit  (cost=1000.43..31286.77 rows=1 width=13) (actual time=38.236..39.317 rows=0 loops=1)
+    Buffers: shared hit=6735 read=17817 written=53
+    ->  Nested Loop Anti Join  (cost=1000.43..31286.77 rows=1 width=13) (actual time=38.236..39.316 rows=0 loops=1)
+          Buffers: shared hit=6735 read=17817 written=53
+          ->  Gather  (cost=1000.00..31282.31 rows=1 width=21) (actual time=38.236..39.315 rows=0 loops=1)
+                Workers Planned: 2
+                Workers Launched: 2
+                Buffers: shared hit=6735 read=17817 written=53
+                ->  Parallel Seq Scan on job_runs r  (cost=0.00..30282.21 rows=1 width=21) (actual time=36.735..36.735 rows=0 loops=3)
+                      Filter: ((finished_at IS NOT NULL) AND (kind = ''::text))
+                      Rows Removed by Filter: 366733
+                      Buffers: shared hit=6735 read=17817 written=53
+          ->  Index Only Scan using job_run_finishes_pkey on job_run_finishes f  (cost=0.43..4.45 rows=1 width=22) (never executed)
+                Index Cond: ((finished_at = r.finished_at) AND (run_id = r.id))
+                Heap Fetches: 0
+  Planning:
+    Buffers: shared hit=14 read=2
+  Planning Time: 0.173 ms
+  Execution Time: 39.332 ms
+
+=== Roll up one hour (~1.4k runs) ===
+
+--- statement 1 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Seq Scan on job_stats_progress  (cost=0.00..1.01 rows=1 width=32) (actual time=0.002..0.002 rows=1 loops=1)
+    Filter: (id = 1)
+    Buffers: shared hit=1
+  Planning Time: 0.009 ms
+  Execution Time: 0.004 ms
+
+--- statement 2 ---
+SELECT t.kind, t.queue, t.id, t.outcome, t.sup, t.job_state, t.duration_ms, t.queue_wait_ms, t.cost_micros FROM (SELECT CASE WHEN r.kind = '' THEN COALESCE((SELECT j.kind FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.kind END AS kind, CASE WHEN r.queue = '' THEN COALESCE((SELECT j.queue FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.queue END AS queue, r.id AS id, r.outcome AS outcome, CASE WHEN r.superseded THEN 1 ELSE 0 END AS sup, CASE WHEN r.job_state IS NOT NULL THEN r.job_state WHEN NOT r.superseded AND r.outcome IN ('error', 'timeout') THEN (SELECT CASE WHEN j.state = 'discarded' AND j.attempt = r.attempt THEN 'discarded' END FROM jobs j WHERE j.id = r.job_id) END AS job_state, r.duration_ms AS duration_ms, r.queue_wait_ms AS queue_wait_ms, r.cost_micros AS cost_micros FROM job_run_finishes f JOIN job_runs r ON r.id = f.run_id WHERE f.finished_at >= '2026-01-21 09:00:00' AND f.finished_at < '2026-01-21 10:00:00') t
+
+plan:
+  Nested Loop  (cost=0.85..45330.49 rows=1365 width=144) (actual time=0.021..9.235 rows=1389 loops=1)
+    Buffers: shared hit=5567
+    ->  Index Only Scan using job_run_finishes_pkey on job_run_finishes f  (cost=0.43..59.73 rows=1365 width=14) (actual time=0.007..0.075 rows=1389 loops=1)
+          Index Cond: ((finished_at >= '2026-01-21 09:00:00+00'::timestamp with time zone) AND (finished_at < '2026-01-21 10:00:00+00'::timestamp with time zone))
+          Heap Fetches: 0
+          Buffers: shared hit=11
+    ->  Index Scan using job_runs_pkey on job_runs r  (cost=0.43..7.82 rows=1 width=88) (actual time=0.006..0.006 rows=1 loops=1389)
+          Index Cond: (id = f.run_id)
+          Buffers: shared hit=5556
+    SubPlan 1
+      ->  Index Scan using jobs_pkey on jobs j  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 2
+      ->  Index Scan using jobs_pkey on jobs j_1  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 3
+      ->  Index Scan using jobs_pkey on jobs j_2  (cost=0.43..8.45 rows=1 width=32) (never executed)
+            Index Cond: (id = r.job_id)
+  Planning:
+    Buffers: shared hit=20
+  Planning Time: 0.208 ms
+  Execution Time: 9.277 ms
+
+--- statement 3 ---
+SELECT pg_advisory_xact_lock(1718385015, 491385)
+
+plan:
+  Result  (cost=0.00..0.01 rows=1 width=4) (actual time=0.001..0.001 rows=1 loops=1)
+  Planning Time: 0.006 ms
+  Execution Time: 0.007 ms
+
+--- statement 4 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Seq Scan on job_stats_progress  (cost=0.00..1.01 rows=1 width=32) (actual time=0.005..0.005 rows=1 loops=1)
+    Filter: (id = 1)
+    Buffers: shared hit=1
+  Planning Time: 0.021 ms
+  Execution Time: 0.007 ms
+
+=== Roll up one hour of 100k runs ===
+
+--- statement 1 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Seq Scan on job_stats_progress  (cost=0.00..1.01 rows=1 width=32) (actual time=0.002..0.002 rows=1 loops=1)
+    Filter: (id = 1)
+    Buffers: shared hit=1
+  Planning Time: 0.018 ms
+  Execution Time: 0.004 ms
+
+--- statement 2 ---
+SELECT t.kind, t.queue, t.id, t.outcome, t.sup, t.job_state, t.duration_ms, t.queue_wait_ms, t.cost_micros FROM (SELECT CASE WHEN r.kind = '' THEN COALESCE((SELECT j.kind FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.kind END AS kind, CASE WHEN r.queue = '' THEN COALESCE((SELECT j.queue FROM jobs j WHERE j.id = r.job_id), '(unknown)') ELSE r.queue END AS queue, r.id AS id, r.outcome AS outcome, CASE WHEN r.superseded THEN 1 ELSE 0 END AS sup, CASE WHEN r.job_state IS NOT NULL THEN r.job_state WHEN NOT r.superseded AND r.outcome IN ('error', 'timeout') THEN (SELECT CASE WHEN j.state = 'discarded' AND j.attempt = r.attempt THEN 'discarded' END FROM jobs j WHERE j.id = r.job_id) END AS job_state, r.duration_ms AS duration_ms, r.queue_wait_ms AS queue_wait_ms, r.cost_micros AS cost_micros FROM job_run_finishes f JOIN job_runs r ON r.id = f.run_id WHERE f.finished_at >= '2026-01-16 12:00:00' AND f.finished_at < '2026-01-16 13:00:00') t
+
+plan:
+  Gather  (cost=4594.87..2287376.66 rows=88487 width=144) (actual time=37.313..83.343 rows=101388 loops=1)
+    Workers Planned: 2
+    Workers Launched: 2
+    Buffers: shared hit=8718 read=16842
+    ->  Parallel Hash Join  (cost=3594.87..34603.73 rows=36870 width=88) (actual time=35.681..73.523 rows=33796 loops=3)
+          Hash Cond: (r.id = f.run_id)
+          Buffers: shared hit=8718 read=16842
+          ->  Parallel Seq Scan on job_runs r  (cost=0.00..29136.17 rows=458417 width=88) (actual time=0.032..20.519 rows=366733 loops=3)
+                Buffers: shared hit=7710 read=16842
+          ->  Parallel Hash  (cost=3133.99..3133.99 rows=36870 width=14) (actual time=5.573..5.573 rows=33796 loops=3)
+                Buckets: 131072  Batches: 1  Memory Usage: 5824kB
+                Buffers: shared hit=902
+                ->  Parallel Index Only Scan using job_run_finishes_pkey on job_run_finishes f  (cost=0.43..3133.99 rows=36870 width=14) (actual time=0.022..2.509 rows=33796 loops=3)
+                      Index Cond: ((finished_at >= '2026-01-16 12:00:00+00'::timestamp with time zone) AND (finished_at < '2026-01-16 13:00:00+00'::timestamp with time zone))
+                      Heap Fetches: 0
+                      Buffers: shared hit=902
+    SubPlan 1
+      ->  Index Scan using jobs_pkey on jobs j  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 2
+      ->  Index Scan using jobs_pkey on jobs j_1  (cost=0.43..8.45 rows=1 width=7) (never executed)
+            Index Cond: (id = r.job_id)
+    SubPlan 3
+      ->  Index Scan using jobs_pkey on jobs j_2  (cost=0.43..8.45 rows=1 width=32) (never executed)
+            Index Cond: (id = r.job_id)
+  Planning:
+    Buffers: shared hit=20
+  Planning Time: 0.195 ms
+  Execution Time: 85.496 ms
+
+--- statement 3 ---
+SELECT pg_advisory_xact_lock(1718385015, 491268)
+
+plan:
+  Result  (cost=0.00..0.01 rows=1 width=4) (actual time=0.002..0.002 rows=1 loops=1)
+  Planning Time: 0.018 ms
+  Execution Time: 0.010 ms
+
+--- statement 4 ---
+SELECT covered_from_unix, covered_to_unix, retain_from_unix, version FROM job_stats_progress WHERE id = 1
+
+plan:
+  Seq Scan on job_stats_progress  (cost=0.00..1.01 rows=1 width=32) (actual time=0.005..0.005 rows=1 loops=1)
+    Filter: (id = 1)
+    Buffers: shared hit=1
+  Planning Time: 0.031 ms
+  Execution Time: 0.008 ms

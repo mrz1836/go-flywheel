@@ -719,9 +719,13 @@ func (h *Harness) startRunners(ctx context.Context) error {
 	}
 
 	h.wg.Go(func() {
-		// Run returns its stop reason as an error, and the only way it stops is
-		// cancellation at the end of the run, which is not a failure.
-		if err := scheduler.Run(sweepCtx); err != nil && sweepCtx.Err() == nil {
+		// Run always returns its stop reason as an error, so the error alone
+		// cannot tell a failure from the end of the run. What can is whether the
+		// run was over: returning before sweepCtx was cancelled — a schema it
+		// refused, say — is a failure; returning after is the expected stop.
+		// (errs.add ignores nil, should Run ever return one.)
+		err := scheduler.Run(sweepCtx)
+		if sweepCtx.Err() == nil {
 			h.errs.add(err)
 		}
 	})

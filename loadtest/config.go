@@ -130,8 +130,8 @@ const (
 	// StorageTuned applies a lower fillfactor and a per-table autovacuum scale
 	// factor to jobs.
 	//
-	// job_runs is deliberately untouched: it is append-only, so it has no update
-	// churn for either setting to act on.
+	// job_runs is deliberately untouched: its one update per run is HOT-eligible,
+	// pruned on its own page, so it has no churn for either setting to act on.
 	StorageTuned StorageCondition = "tuned"
 )
 

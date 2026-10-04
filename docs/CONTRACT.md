@@ -28,7 +28,9 @@ lost to a crash.
 claim mints a lease token, and the finalize's state update is scoped to `id = ? AND lease_token = ?`. If
 the job was reclaimed (by a sweep) or moved (by a cancel) while the attempt ran, the token no longer
 matches, the update touches no row, and the attempt's outcome is *discarded* rather than racing the new
-claim. Whichever attempt holds the lease wins; the other does not silently overwrite it.
+claim. Whichever attempt holds the lease wins; the other does not silently overwrite it. The discarded
+attempt is still recorded: its `job_runs` row carries its real outcome with `superseded = true`, a
+durable trace of the double execution beyond the `SupersedeEvent` an observer sees.
 
 **Every attempt is audited.** Before the worker body runs, the runtime commits a `job_runs` row with
 outcome `started` — the run stub. Because it is committed first, a crash mid-attempt leaves a record,
@@ -89,8 +91,8 @@ in any worker whose duration you need bounded.
 
 **The scheduler is a singleton by deployment, not by election.** The runtime holds no lock guaranteeing
 only one scheduler runs. Running two doubles the sweep and retention load (periodic ticks collapse
-harmlessly on the bucketed unique key). Enforce one scheduler in your deployment — see
-[`RUNBOOK.md`](RUNBOOK.md).
+harmlessly on the bucketed unique key, and the stats rollup replaces whole hours idempotently). Enforce
+one scheduler in your deployment — see [`RUNBOOK.md`](RUNBOOK.md).
 
 <br>
 

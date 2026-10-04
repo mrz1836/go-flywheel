@@ -88,9 +88,58 @@ type RuntimeConfig struct {
 	// heartbeat in `serve`: a one-line pulse (ready, in-flight, lag, discarded)
 	// logged on this cadence. Zero (the default) disables it.
 	HealthSampleInterval Duration `yaml:"health_sample_interval"`
+	// StatsRollup is the cadence of the scheduler's hourly stats rollup in
+	// `serve`, which rolls finished runs into job_stats_hourly so `flywheel stats`
+	// can answer for any window and trends outlive retention. Unset (zero) selects
+	// one minute — the rollup is on by default; a negative value (e.g. -1s)
+	// disables it. With it on, serve also logs the onset of a duration regression
+	// or failure spike once, at warn.
+	StatsRollup Duration `yaml:"stats_rollup"`
 	// EnvAllowlist names the host environment variables exec jobs inherit. Nil
 	// uses the ExecWorker default (PATH, HOME, SHELL, LANG, TMPDIR).
 	EnvAllowlist []string `yaml:"env_allowlist"`
+}
+
+// defaultStatsRollup is the stats rollup cadence `serve` uses when
+// runtime.stats_rollup is unset. A pass with nothing to roll is two primary-key
+// reads and a range delete that finds nothing, so a minute keeps the rollup
+// current at negligible cost.
+const defaultStatsRollup = time.Minute
+
+// rollupMinRetention is the shortest runtime.retention the stats rollup can
+// work beside: one hour plus the scheduler's default five-minute closing grace.
+// Retention any shorter would delete runs before their hour closes, so the
+// scheduler refuses the combination.
+const rollupMinRetention = time.Hour + 5*time.Minute
+
+// statsRollupInterval resolves runtime.stats_rollup to the scheduler's
+// StatsRollupInterval: the default when unset, zero (off) when negative. See
+// effectiveStatsRollup for the retention guard serve applies on top.
+func (r RuntimeConfig) statsRollupInterval() time.Duration {
+	interval, _ := r.effectiveStatsRollup()
+	return interval
+}
+
+// effectiveStatsRollup resolves runtime.stats_rollup and, when the rollup is off
+// only because of the retention guard, says why.
+//
+// The guard applies to the default alone. A config written before the rollup
+// existed may carry a retention shorter than the rollup can work beside, and an
+// upgrade must not turn that config into a daemon that refuses to start: the
+// default steps aside, with a warning. A config that sets stats_rollup
+// explicitly asked for both, and the scheduler's own validation rejects it.
+func (r RuntimeConfig) effectiveStatsRollup() (time.Duration, string) {
+	switch {
+	case r.StatsRollup < 0:
+		return 0, ""
+	case r.StatsRollup > 0:
+		return r.StatsRollup.Std(), ""
+	case r.Retention > 0 && r.Retention.Std() < rollupMinRetention:
+		return 0, fmt.Sprintf("runtime.retention (%s) is shorter than the %s the stats rollup needs; "+
+			"raise it, or set runtime.stats_rollup explicitly", r.Retention.Std(), rollupMinRetention)
+	default:
+		return defaultStatsRollup, ""
+	}
 }
 
 // LogConfig configures the daemon's structured logger.

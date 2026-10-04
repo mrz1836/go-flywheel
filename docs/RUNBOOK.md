@@ -160,6 +160,9 @@ doubled:
 - **Sweeps and retention double their load.** Two schedulers each run the full sweep and the full
   retention prune on their own cadence, so the database does twice the maintenance work for no benefit.
   Under load that doubled scan and delete traffic is exactly the contention you do not want.
+- **The stats rollup stays correct, and doubles its work.** Every pass replaces whole hours inside one
+  transaction, serialized per hour by an advisory lock on PostgreSQL, so two schedulers rolling the same
+  hour leave exactly the rows one would.
 
 **Deployment patterns for a single scheduler.**
 
@@ -170,6 +173,68 @@ doubled:
   singleton `Deployment`/`StatefulSet` with one replica), run the scheduler only on the leader.
 - **A single all-in-one process.** For a small deployment, one process running both runners and the
   scheduler is correct and simplest.
+
+<br>
+
+## Stats and the upgrade that brings them
+
+The analytics surface — the `job_runs` columns, `job_run_finishes`, `job_stats_hourly`, `jobs_finished` —
+is documented for consumers in [`INTEGRATING.md`](INTEGRATING.md). Operating it comes down to a handful of
+signals.
+
+**Deploying a release that changes the schema.** Migrate first, then deploy: `flywheel migrate
+--concurrently --lock-timeout 5s` (library-owned), or your migration tool plus `InstallIndexesWithOptions`
+with `Concurrently` (host-owned) — the runbook is
+[Upgrading an existing database](INTEGRATING.md#upgrading-an-existing-database). A binary deployed before
+the migration does not run half-working: it stops at startup with
+
+```
+jobs: runner schema check: flywheel: database schema is older than this binary: missing job_runs.kind, …;
+migrate before deploying this binary: …
+```
+
+and claims nothing. Migrate and restart it. A binary of the previous release is fine against the migrated
+schema, so the rollback is a redeploy.
+
+**`flywheel doctor` after an upgrade** reports what the migration added, index parity, and the rollup's
+lag:
+
+```
+  schema:       upgraded (added job_runs.kind, …, job_stats_progress (table))
+  indexes:      in sync
+  stats:        rolled up through 2026-10-03T14:00:00Z (lag 1h2m)
+```
+
+A lag of about an hour is normal — an hour closes, then waits out the grace. A lag growing past a few
+hours means the rollup is not running (no Scheduler with `StatsRollupInterval`, or `runtime.stats_rollup`
+negative) or is catching up.
+
+**Log lines.**
+
+| Line | Level | Meaning |
+|---|---|---|
+| `jobs: stats rollup catching up` | info | a pass stopped on `StatsMaxHoursPerPass` with closed hours left — normal on a first pass over history; a long `Stats` window answers `ErrStatsNotRolledUp` until it finishes |
+| `jobs: stats rollup failed` | error | the pass hit a database error; the next tick retries it |
+| `jobs: stats anomaly` | warn | a kind's duration regressed or its discards spiked, at its onset (`StatsAnomalyLog`) — fields `kind`, `signal`, `metric`, `recent`, `baseline`, `ratio` |
+| `jobs: run is far slower than its kind's baseline` | warn | a running attempt passed `max(3 × p99, p99 + 1m)` for its kind, once per attempt; the heartbeat's `slow_running` counts them |
+
+**`ErrStatsNotRolledUp`** from `Stats`/`StatsSeries` means the window would aggregate more than
+`MaxRawSpan` (7 days) of raw runs: the rollup is off, or still catching up. Turn it on, wait, or
+`flywheel stats rebuild --from … --to …` to catch up at once — a rebuild of only the recent hours also
+rolls the ones between the rollup's progress and them, so it never leaves a gap. When the message names
+`StatsRetention` instead, the window reaches back past the oldest hour the rollups keep: narrow it, or keep
+rollups longer.
+
+**Stats look short after an import or a skewed clock.** A run that finished in an hour after the rollup
+closed it — a `SeedRun` import of history, or a node whose clock ran more than `StatsRollupGrace` behind —
+is in the raw data but not that hour's rollup. `flywheel stats rebuild` over the affected range recounts
+it; it refuses to shrink an hour retention has pruned (`--force` overrides). Runs an older release
+finalized during a rolling deploy need nothing: the backfill that logs them re-rolls their hours.
+
+**`flywheel prune` deleted fewer jobs than expected.** With the stats rollup on in its config it holds,
+like the daemon's retention, for runs the rollup has not counted yet, and says so (`held for the stats
+rollup`). Let the rollup catch up, or pass `--ignore-stats-rollup` if those hours' history does not
+matter.
 
 <br>
 

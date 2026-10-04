@@ -276,9 +276,9 @@ type ChildOutput struct {
 
 // ChildOutputs returns the recorded output of each terminal child of a parent,
 // newest attempt per child, reading through db. It pages the terminal children by
-// created_at (newest first) exactly as ListRuns pages a job's runs: p.Before is a
-// created_at cursor (zero means newest) and a positive p.Limit caps the page; a
-// zero p.Limit reads every terminal child, which is the fold a barrier continuation
+// created_at (newest first): p.Before is a created_at cursor (zero means newest),
+// p.BeforeAttempt is ignored, and a positive p.Limit caps the page; a zero
+// p.Limit reads every terminal child, which is the fold a barrier continuation
 // wants over a bounded generation.
 //
 // The outputs come from a second read keyed by the page's child ids rather than a

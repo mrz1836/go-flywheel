@@ -148,7 +148,7 @@ func TestReconcileIndexSurfacesDropAndCreateErrors(t *testing.T) {
 		db := newBareSQLite(t)
 		require.NoError(t, db.AutoMigrate(Models()...))
 		// No index named "ghost" exists, so the unguarded DROP INDEX fails.
-		err := reconcileIndex(ctx, db, IndexDrift{Name: "ghost", Expected: `CREATE INDEX ghost ON jobs (state)`})
+		err := reconcileIndex(ctx, db, IndexDrift{Name: "ghost", Expected: `CREATE INDEX ghost ON jobs (state)`}, 0)
 		require.ErrorContains(t, err, "drop")
 	})
 
@@ -158,7 +158,7 @@ func TestReconcileIndexSurfacesDropAndCreateErrors(t *testing.T) {
 		require.NoError(t, db.AutoMigrate(Models()...))
 		require.NoError(t, db.Exec(`CREATE INDEX tmp_idx ON jobs (state)`).Error)
 		// The drop succeeds; the create fails on a table that does not exist.
-		err := reconcileIndex(ctx, db, IndexDrift{Name: "tmp_idx", Expected: `CREATE INDEX tmp_idx ON no_such_table (col)`})
+		err := reconcileIndex(ctx, db, IndexDrift{Name: "tmp_idx", Expected: `CREATE INDEX tmp_idx ON no_such_table (col)`}, 0)
 		require.ErrorContains(t, err, "create")
 	})
 }

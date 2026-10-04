@@ -64,9 +64,16 @@ func (j *jobRow) BeforeCreate(tx *gorm.DB) error {
 	return nil
 }
 
-// BeforeCreate mints the ID, requires the mandatory audit fields, and defaults
-// StartedAt and CreatedAt to the context clock's now. job_runs is append-only,
-// so there is no save-time hook.
+// BeforeCreate mints the ID, requires the mandatory audit fields, defaults
+// StartedAt and CreatedAt to the context clock's now, and stamps every timestamp
+// in UTC. There is no save-time hook: the one update a run row receives is a
+// column map (Finalize, the sweep), which carries its own UTC stamps.
+//
+// The UTC stamp is load-bearing on SQLite, where a timestamp is stored as text in
+// the zone it was written in. A range read over job_runs — every stats window,
+// the rollup's hour scan — compares that text, and only a single zone makes text
+// order agree with time order, across a DST change included. On PostgreSQL the
+// columns are timestamptz and the conversion is a no-op.
 func (r *jobRunRow) BeforeCreate(tx *gorm.DB) error {
 	now := models.ClockFrom(tx.Statement.Context).Now(tx.Statement.Context)
 	if r.ID == "" {
@@ -86,6 +93,12 @@ func (r *jobRunRow) BeforeCreate(tx *gorm.DB) error {
 	}
 	if r.CreatedAt.IsZero() {
 		r.CreatedAt = now
+	}
+	r.StartedAt = r.StartedAt.UTC()
+	r.CreatedAt = r.CreatedAt.UTC()
+	if r.FinishedAt != nil {
+		finished := r.FinishedAt.UTC()
+		r.FinishedAt = &finished
 	}
 	return nil
 }

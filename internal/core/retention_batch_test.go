@@ -212,11 +212,15 @@ func (r *stmtRecorder) deletes() []string {
 	defer r.mu.Unlock()
 	var out []string
 	for _, sql := range r.sqls {
-		upper := strings.ToUpper(sql)
+		// Identifier quoting differs by dialect (backticks, double quotes); it is
+		// not what the order is about.
+		upper := strings.ToUpper(strings.NewReplacer("`", "", `"`, "").Replace(sql))
 		if !strings.HasPrefix(strings.TrimSpace(upper), "DELETE") {
 			continue
 		}
 		switch {
+		case strings.HasPrefix(strings.TrimSpace(upper), "DELETE FROM JOB_RUN_FINISHES"):
+			out = append(out, "job_run_finishes")
 		case strings.Contains(upper, "JOB_RUNS"):
 			out = append(out, "job_runs")
 		case strings.Contains(upper, "JOBS"):
@@ -253,9 +257,10 @@ func TestDeleteFinishedJobsDeletesRunsBeforeJobsInEveryBatch(t *testing.T) {
 	require.EqualValues(t, 25, deleted)
 
 	order := rec.deletes()
-	require.Len(t, order, 6, "three batches, two deletes each")
-	for i := 0; i < len(order); i += 2 {
-		assert.Equal(t, "job_runs", order[i], "batch %d deletes audit rows first", i/2)
-		assert.Equal(t, "jobs", order[i+1], "batch %d deletes jobs second", i/2)
+	require.Len(t, order, 9, "three batches, three deletes each")
+	for i := 0; i < len(order); i += 3 {
+		assert.Equal(t, "job_run_finishes", order[i], "batch %d deletes the runs' finish entries first", i/3)
+		assert.Equal(t, "job_runs", order[i+1], "batch %d deletes audit rows second", i/3)
+		assert.Equal(t, "jobs", order[i+2], "batch %d deletes jobs last", i/3)
 	}
 }

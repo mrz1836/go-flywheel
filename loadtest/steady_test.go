@@ -174,8 +174,8 @@ func TestStorageTuningIsInstalledAndReported(t *testing.T) {
 			if !strings.Contains(opts["jobs"], tc.wantJobs) {
 				t.Errorf("jobs reloptions = %q, want it to contain %q", opts["jobs"], tc.wantJobs)
 			}
-			// job_runs is append-only, so neither setting has anything to act on
-			// and neither condition should touch it.
+			// job_runs' one update per run is HOT-eligible, so neither setting has
+			// churn to act on and neither condition should touch it.
 			if opts["job_runs"] != "" {
 				t.Errorf("job_runs must carry no storage parameters, got %q", opts["job_runs"])
 			}

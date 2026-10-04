@@ -25,7 +25,7 @@ func closeDB(t *testing.T, db *gorm.DB) {
 
 // --- base.go lifecycle hook validation branches -----------------------------
 
-// TestJobRunRowBeforeCreateRequiresAuditFields proves the append-only job_runs
+// TestJobRunRowBeforeCreateRequiresAuditFields proves the job_runs
 // hook rejects a row missing either mandatory audit field (executor_id, outcome)
 // before it ever reaches the database.
 func TestJobRunRowBeforeCreateRequiresAuditFields(t *testing.T) {
