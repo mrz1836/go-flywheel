@@ -93,7 +93,7 @@ flywheel serve                        # run the runtime until Ctrl+C
 
 | Command | Purpose |
 |---|---|
-| `flywheel serve` | Migrate (concurrent index builds on PostgreSQL; an up-to-date schema issues no DDL), then run the runner + scheduler until SIGINT/SIGTERM (drains in-flight work) |
+| `flywheel serve` | Validate the config (a malformed schedule is refused before the database is touched), migrate (concurrent index builds on PostgreSQL; an up-to-date schema issues no DDL), disable the schedules the config does not name, then run the runner + scheduler until SIGINT/SIGTERM (drains in-flight work), applying the config's `schedules:` on start and re-creating a declared schedule deleted while it runs |
 | `flywheel migrate` | Create or upgrade the schema, reporting what it added (`--concurrently --lock-timeout 5s` for a live PostgreSQL database) |
 | `flywheel enqueue <kind> <json>` | Enqueue one job and print its id (`--queue --unique --priority --at`); a `--unique` collision fails with the id of the job holding the key |
 | `flywheel jobs ls` | List recent jobs, newest first (`--state --kind --queue --before <id> --limit --json`) |
@@ -103,11 +103,13 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel jobs cancel <id>` | Move a job to cancelled (refused once a job is terminal) |
 | `flywheel schedule ls` | List periodic schedules |
 | `flywheel schedule add <slug> <kind>` | Add/update a schedule (`--cron \| --every`, `--args`) |
+| `flywheel schedule rm <slug>` | Remove a schedule (warns when the config declares it: `serve` re-creates it) |
+| `flywheel schedule enable <slug>` / `disable <slug>` | Reactivate or deactivate a schedule, keeping its row |
 | `flywheel prune` | Delete finished jobs and their runs older than a cutoff, holding for the stats rollup when it is on (`--older-than 14d --ignore-stats-rollup`) |
 | `flywheel status` | Show queue health, schedules, and recent failures (`--json --watch`) |
 | `flywheel stats` | Per-kind outcomes, success rate, duration percentiles, and queue wait (`--since 24h --kind --queue --json`) |
 | `flywheel stats rebuild` | Backfill the finish log for runs an older release finalized, then recompute the hourly stats rollups for a range, rolling any hours between it and the rollup's progress too (`--from --to [--force]`) |
-| `flywheel doctor` | Validate config, migrate (as `serve` does), print effective settings and the stats rollup's lag |
+| `flywheel doctor` | Validate the config as `serve` does (failing on anything `serve` would refuse, such as a malformed schedule), migrate (as `serve` does), print effective settings, compare the declared schedules with the database (missing, inactive, differing, undeclared), and report the stats rollup's lag |
 
 All commands take `--config <path>` (default `./flywheel.yaml`, else
 `$XDG_CONFIG_HOME/flywheel/flywheel.yaml`).
@@ -158,6 +160,29 @@ After a run, see its captured stdout/stderr and exit code with `flywheel jobs
 inspect <id>`. A complete [`flywheel.example.yaml`](flywheel.example.yaml) with
 every worker type ships alongside this README.
 
+**The file is the source of truth.** Every `serve` start applies the
+`schedules:` list — an unchanged schedule keeps its cadence, a changed one is
+updated, and one an operator disabled is enabled again — and disables any active
+schedule the file does not name, keeping its row and history. While `serve`
+runs, a declared schedule whose row is deleted (`flywheel schedule rm`, a
+restore, a rebuilt database) comes back within `runtime.schedule_reconcile`,
+with a `jobs: declared periodic was missing and has been re-created` warning:
+
+```yaml
+runtime:
+  schedule_reconcile: 1m         # unset = 1m; negative (e.g. -1s) = off
+```
+
+To retire a schedule, remove it from the file first and restart `serve`; delete
+the row afterwards if you want it gone. `flywheel schedule rm` on a slug the
+config still declares warns that `serve` will bring it back, and `flywheel
+schedule disable` holds only until the next start. A schedule `serve` would
+refuse — a malformed cron, or an interval under a second — stops `serve`
+before it touches the database, and fails `flywheel doctor` too.
+Otherwise `flywheel doctor` shows which declared schedules are missing, inactive,
+or different in the database, and which active ones the file does not declare,
+without failing: `serve` repairs all of it on start.
+
 ## Metrics & status
 
 `flywheel status` prints an at-a-glance operator report — queue health (ready /
@@ -192,7 +217,9 @@ Each heartbeat is one `jobs: queue health` log line with `ready`, `inflight`,
 `discarded`, and — with the stats rollup on — `slow_running`, the number of
 running jobs far slower than their kind's baseline. Alarm on
 `oldest_ready_seconds` when you derive metrics from logs rather than scraping
-`/metrics`.
+`/metrics`. The heartbeat logs at info through `serve`'s logger, like every
+scheduler line, so it follows `log.level` and `log.format`: `log.level: warn`
+hides it.
 
 ## Job statistics
 

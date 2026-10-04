@@ -163,6 +163,9 @@ doubled:
 - **The stats rollup stays correct, and doubles its work.** Every pass replaces whole hours inside one
   transaction, serialized per hour by an advisory lock on PostgreSQL, so two schedulers rolling the same
   hour leave exactly the rows one would.
+- **Declared periodics are re-created once.** Two schedulers re-creating the same missing declared
+  definition write one row — the insert does nothing when the slug exists — and only the one whose insert
+  landed logs it. Two schedulers applying the same declarations at start end where one would.
 
 **Deployment patterns for a single scheduler.**
 
@@ -173,6 +176,63 @@ doubled:
   singleton `Deployment`/`StatefulSet` with one replica), run the scheduler only on the leader.
 - **A single all-in-one process.** For a small deployment, one process running both runners and the
   scheduler is correct and simplest.
+
+<br>
+
+## Declared periodics come back
+
+A scheduler with `SchedulerConfig.Periodics` set — `flywheel serve` declares its `schedules:` list this
+way — re-creates a declared definition whose row goes missing, within `ReconcileInterval`
+(`runtime.schedule_reconcile` in the CLI; one minute by default), and says so at warn:
+
+```
+jobs: declared periodic was missing and has been re-created slug=nightly-report kind=send_report next_run_at=…
+```
+
+That line means something removed a schedule out from under a running node: a restore from an older
+snapshot, a database rebuilt under it, or a `DeletePeriodic` (`flywheel schedule rm`) of a slug that is
+still declared. The re-created definition fires next at its first fire time after the re-creation; the
+runs it missed while gone are not backfilled.
+
+**Retiring a declared schedule.** Order matters:
+
+1. Remove it from the declarations — `Periodics`, or the `schedules:` list — and deploy that to every
+   node that runs a scheduler. During a rolling deploy, a node still running the old declarations
+   re-creates the row.
+2. Then delete the row with `DeletePeriodic` or `flywheel schedule rm`. `flywheel serve` also disables a
+   schedule its file no longer names on its next start, which keeps the row and its history.
+
+`flywheel schedule rm` warns when the slug is still declared in the config it loaded.
+
+**Pausing a declared schedule.** `SetPeriodicActive(false)` (`flywheel schedule disable`) holds while the
+scheduler runs — the reconcile only inserts, and never re-activates — but the next start re-applies the
+declaration, `Active` included. To keep a schedule off across restarts, declare it with `Active: false`,
+or remove it from the CLI's file.
+
+**`flywheel doctor`** compares the file with the database and reports, without failing the check:
+
+```
+  schedules:    4 declared (1 missing, 1 inactive, 1 differs)
+    - nightly              exec  0 2 * * *
+    - ping                 http  every 1m0s  [not in database: serve creates it]
+    - sync                 shell every 24h0m0s  [inactive: serve re-activates it on start]
+    - deps                 mage  every 24h0m0s  [differs (schedule): serve updates it on start]
+  undeclared:   1 active (legacy): serve disables it on start
+```
+
+**Log lines.**
+
+| Line | Level | Meaning |
+|---|---|---|
+| `jobs: declared periodic was missing and has been re-created` | warn | a declared definition's row was gone and this scheduler re-created it — fields `slug`, `kind`, `next_run_at` |
+| `jobs: declared periodic apply failed` | error | `Run` could not apply some declarations at start (`pending` says how many); they are retried every `retry_in` until they land — the reconcile cadence, or a minute with the pass off. Meanwhile the reconcile keeps every other declared definition present |
+| `jobs: declared periodics applied` | info | the retry landed every declaration |
+| `jobs: periodic reconcile failed` | error | a reconcile pass hit a database error; the next pass retries |
+
+**A host-owned schema without `idx_job_periodics_slug`.** The re-creation inserts once because the slug
+is unique. Without the index, two schedulers re-creating the same slug at the same moment can both
+insert; their fires still collapse on the bucketed unique key, but the extra row stays. `InspectIndexes`
+reports the missing index.
 
 <br>
 

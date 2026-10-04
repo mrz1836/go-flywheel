@@ -1287,8 +1287,9 @@ schedules:
       url: https://gateway.internal/healthz
 ```
 
-Every run's stdout, stderr, and exit code are captured to the `job_runs` audit trail — inspect
-them with `flywheel jobs inspect <id>`. Prefer to wire it from Go? The
+The file is the source of truth: `serve` applies it on every start, disables the schedules it does
+not name, and re-creates a declared schedule deleted while it runs. Every run's stdout, stderr, and
+exit code are captured to the `job_runs` audit trail — inspect them with `flywheel jobs inspect <id>`. Prefer to wire it from Go? The
 [examples/local-tasks](examples/local-tasks) program registers the shell, python, and mage
 workers and schedules one of each. See the [CLI README](cmd/flywheel/README.md) for every
 command, the config reference, and the macOS launchd setup.

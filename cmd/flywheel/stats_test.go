@@ -375,7 +375,7 @@ func TestRunDoctorReportsTheSchemaUpgradeAndRollupLag(t *testing.T) {
 	cfg := &Config{DB: DBConfig{SQLite: "/x/y.db"}, Runtime: defaultConfig().Runtime}
 
 	var buf bytes.Buffer
-	require.NoError(t, runDoctor(statusClockCtx(), &buf, "cfg.yaml", cfg, db))
+	require.NoError(t, runDoctor(statusClockCtx(), &buf, "cfg.yaml", cfg, db, cliTestDriver(t, db)))
 	out := buf.String()
 	assert.Contains(t, out, "schema:       upgraded (added jobs (table)", "the first doctor run reports what Migrate created")
 	assert.Contains(t, out, "job_stats_hourly (table)")
@@ -388,7 +388,7 @@ func TestRunDoctorReportsTheSchemaUpgradeAndRollupLag(t *testing.T) {
 	rollUp(t, db, flywheel.NewSQLiteDriver(db))
 	buf.Reset()
 	cfg.Runtime.StatsRollup = Duration(-time.Second)
-	require.NoError(t, runDoctor(statusClockCtx(), &buf, "cfg.yaml", cfg, db))
+	require.NoError(t, runDoctor(statusClockCtx(), &buf, "cfg.yaml", cfg, db, cliTestDriver(t, db)))
 	out = buf.String()
 	assert.Contains(t, out, "schema:       up to date")
 	assert.Contains(t, out, "stats_rollup: off", "a negative stats_rollup disables it")
@@ -403,7 +403,8 @@ func TestRunDoctorSurfacesASchemaInspectionFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var buf bytes.Buffer
-	err := runDoctor(ctx, &buf, "cfg.yaml", &Config{DB: DBConfig{SQLite: "x"}, Runtime: defaultConfig().Runtime}, db)
+	cfg := &Config{DB: DBConfig{SQLite: "x"}, Runtime: defaultConfig().Runtime}
+	err := runDoctor(ctx, &buf, "cfg.yaml", cfg, db, cliTestDriver(t, db))
 	require.Error(t, err)
 }
 

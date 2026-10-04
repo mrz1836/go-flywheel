@@ -94,7 +94,7 @@ func TestRunDoctorRepairsAnInvalidIndexPostgres(t *testing.T) {
 
 	var out bytes.Buffer
 	cfg := &Config{DB: DBConfig{Postgres: "postgres://unused"}, Runtime: defaultConfig().Runtime}
-	require.NoError(t, runDoctor(context.Background(), &out, "cfg.yaml", cfg, db))
+	require.NoError(t, runDoctor(context.Background(), &out, "cfg.yaml", cfg, db, flywheel.NewPostgresDriver(db)))
 	assert.Contains(t, out.String(), "indexes:      in sync")
 	assert.Contains(t, out.String(), "status:       OK")
 }

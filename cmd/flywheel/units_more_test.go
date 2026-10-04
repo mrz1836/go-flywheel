@@ -183,36 +183,18 @@ func TestDoctorReportsUnreachableDatabase(t *testing.T) {
 	require.Error(t, pingDB(context.Background(), db))
 }
 
-func TestReconcileSchedulesArgsMarshalError(t *testing.T) {
+func TestDisableOrphanSchedulesListErrorOnClosedDB(t *testing.T) {
 	t.Parallel()
-	db := newCLITestDB(t)
-	// An http worker with a nil HTTP spec makes argsTemplate dereference a nil
-	// pointer — guard against that by using exec with a nil Exec, which panics; so
-	// instead drive the marshal-error path through reconcile with a closed DB to
-	// hit the UpsertPeriodic error branch.
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	require.NoError(t, sqlDB.Close())
-
-	cfg := &Config{Schedules: []ScheduleEntry{
-		{Slug: "x", Worker: "exec", Every: Duration(time.Minute), Exec: &execSpec{Command: "true"}},
-	}}
-	err = reconcileSchedules(context.Background(), db, cfg)
-	require.Error(t, err, "a closed database fails the upsert")
-}
-
-func TestReconcileSchedulesListErrorOnClosedDB(t *testing.T) {
-	t.Parallel()
-	// With no configured schedules, reconcile skips the upsert loop and fails at the
-	// ListPeriodics step on a closed database.
+	// Listing the existing schedules is the orphan-disable's first database touch,
+	// so a closed database fails it there.
 	db := newCLITestDB(t)
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	require.NoError(t, sqlDB.Close())
 
-	err = reconcileSchedules(context.Background(), db, &Config{})
+	err = disableOrphanSchedules(context.Background(), db, &Config{})
 	require.Error(t, err, "listing existing schedules fails on a closed database")
-	assert.Contains(t, err.Error(), "reconcile schedules")
+	assert.Contains(t, err.Error(), "reconcile schedules: ")
 }
 
 func TestRunStatusWatchStopsImmediatelyOnCancelledContext(t *testing.T) {
