@@ -1,0 +1,15 @@
+# golangci-lint configuration. The linters are golangci-lint's defaults, the
+# same set `magex lint` ran before this file existed; what this file adds is
+# coverage.
+#
+# Two kinds of code in this module only compile under a build tag: the
+# PostgreSQL suites (`integration`) and the load, soak, and chaos harness
+# (`loadtest`, every file under loadtest/). Without the tags, `golangci-lint run
+# ./...` — and so `magex lint` and CI — never sees them, and issues there go
+# unnoticed until someone runs those suites by hand.
+version: "2"
+
+run:
+  build-tags:
+    - integration
+    - loadtest
