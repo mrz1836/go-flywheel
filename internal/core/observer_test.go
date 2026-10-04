@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"testing"
 
@@ -182,11 +183,21 @@ func TestObserverOnRetryFiresForTransientError(t *testing.T) {
 	assert.Equal(t, OutcomeSuccess, finishes[1].Outcome)
 }
 
-func TestObserverOnFinishForUnknownKindHasNoStart(t *testing.T) {
+// TestObserverOnFinishForADiscardedUnknownKindHasNoStart pins what an observer
+// sees of an unknown kind's discard. The deferral that precedes a discard under
+// the default grace is covered in runner_unknown_kind_test.go.
+func TestObserverOnFinishForADiscardedUnknownKindHasNoStart(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	obs := &recordingObserver{}
-	r := rwRunner(t, db, NewRegistry(), func(c *RunnerConfig) { c.Observer = obs }) // empty registry
+	// The grace is disabled so the first claim discards. With the default,
+	// RunUntilIdle would wait out the fifteen-minute window for a runner that
+	// registers the kind.
+	r := rwRunner(t, db, NewRegistry(), func(c *RunnerConfig) { // empty registry
+		c.Observer = obs
+		c.UnknownKindGrace = -1
+		c.Logger = slog.New(slog.DiscardHandler)
+	})
 	ctx := context.Background()
 
 	id, err := Insert(ctx, NewClient(db), successArgs{V: "orphan"}, InsertOpts{})
@@ -200,6 +211,7 @@ func TestObserverOnFinishForUnknownKindHasNoStart(t *testing.T) {
 	assert.Equal(t, id, finishes[0].JobID)
 	assert.Equal(t, OutcomeError, finishes[0].Outcome)
 	assert.Equal(t, ErrorPermanent, finishes[0].ErrorClass, "an unknown kind is a permanent error")
+	require.ErrorIs(t, finishes[0].Err, ErrUnknownKind)
 	assert.Empty(t, retries, "a permanent error does not retry")
 }
 

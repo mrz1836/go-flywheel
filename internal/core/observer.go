@@ -15,8 +15,11 @@ import (
 // methods receive the worker ctx, so a tracing implementation can pull the active
 // span and ctxutil.RequestIDFrom(ctx) without extra plumbing.
 //
-// OnStart fires only for a registered kind; a job whose kind has no worker goes
-// straight to OnFinish (with a permanent error) and never OnStart.
+// OnStart fires only for a registered kind. A job whose kind the Runner does not
+// register never starts: it goes straight to OnFinish carrying ErrUnknownKind,
+// as a snooze with no error class while RunnerConfig.UnknownKindGrace defers it
+// for a runner that registers the kind, and as a permanent error once the job is
+// discarded.
 //
 // # What follows an OnStart
 //
@@ -101,9 +104,13 @@ type FinishEvent struct {
 	// Outcome is the attempt's recorded outcome (success, error, snooze,
 	// cancelled, or timeout).
 	Outcome RunOutcome
-	// ErrorClass is the failure classification; it is the zero value on success.
+	// ErrorClass is the failure classification; it is the zero value on success
+	// and on a snooze.
 	ErrorClass ErrorClass
-	// Err is the worker error, or nil on success.
+	// Err is the attempt's error, or nil on success. A snooze carries one when
+	// the attempt reported both: a worker that returned an error alongside its
+	// Result.Snooze, or a job of a kind the Runner does not register, deferred
+	// with ErrUnknownKind.
 	Err error
 	// Duration is the wall time the worker body took.
 	Duration time.Duration

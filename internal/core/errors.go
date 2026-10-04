@@ -109,8 +109,12 @@ var ErrBarrierNoChildren = errors.New("flywheel: barrier declared with no child 
 // recorded and the caller's write was a duplicate.
 var ErrRunAlreadyRecorded = errors.New("flywheel: run already recorded for this attempt")
 
-// ErrUnknownKind is returned by the registry when a job's kind has no
-// registered worker.
+// ErrUnknownKind is the error a Runner records for a claimed job whose kind its
+// Registry does not register. Within RunnerConfig.UnknownKindGrace of the job's
+// enqueue the job is deferred, a snooze that spends none of its retry budget,
+// with this error on its audit row and its FinishEvent, so a runner that
+// registers the kind can take it. Past the window it is the permanent error the
+// job is discarded with. Match it with errors.Is: the discard wraps it.
 var ErrUnknownKind = errors.New("jobs: unknown job kind")
 
 // ErrUnsupportedDialect is returned by Migrate, IndexSet, Indexes, and

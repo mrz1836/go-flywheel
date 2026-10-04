@@ -446,7 +446,8 @@ handle are all safe to share. `Drain` **does not cancel in-flight work** — a
 worker that must be interrupted should respect the context it was given, and `DefaultTimeout` already
 bounds a hung attempt. Its contract is "no new claims, then wait", which is what makes a rolling deploy
 lose no work. On timeout the still-running jobs keep their leases and are recovered by the lease sweep,
-exactly as they would be after a process kill.
+exactly as they would be after a process kill. A rolling deploy that adds a job kind has one more thing to
+get right; see **Rolling deploys and new job kinds** below.
 
 **A `Node` does this for you.** Cancelling a `Node`'s context is a *drain* request, not an abort: every
 runner is told to stop claiming, each is drained against `NodeConfig.DrainTimeout`, the timeout warning
@@ -454,6 +455,97 @@ names how many jobs were still in flight, and only then is the scheduler and hea
 A zero `DrainTimeout` waits for in-flight work however long it takes — genuinely unbounded, since the
 heartbeat renews a running job's lease indefinitely. Size it to the longest drain your deployment will
 tolerate.
+
+</details>
+
+<details>
+<summary><strong><code>Rolling deploys and new job kinds</code></strong></summary>
+<br>
+
+A runner claims every ready job on its queues, whatever its kind. During a rolling deploy, runners of the
+old release and the new one poll the same queues, so a runner of the old release can claim a job of a kind
+only the new release registers, whether a new producer, an operator, or a periodic the new release
+declares enqueued it. It does not discard that job; it **defers** it.
+
+**How deferral works.** A runner that claims a job of a kind its `Registry` does not register hands the
+job back as a snooze while the job is younger than `UnknownKindGrace`, measured from the job's enqueue
+(15 minutes by default). A snooze spends none of the retry budget, so the job reaches a runner of the new
+release with the headroom it was enqueued with. Its attempt number still advances, one per claim: the
+worker's first run of the job can see an `Attempt` above 1, and a retry backoff keyed on the attempt
+starts from that rung. Each deferral waits on a ladder of its own, whatever the retry settings: a second
+on the first claim, doubling per claim, capped at a minute and at what is left of the window. Past the
+window the job is discarded with `ErrUnknownKind`, as work no runner in the fleet can run.
+
+```go
+flywheel.RunnerConfig{
+    // Optional. How long a job of a kind this runner does not register is
+    // deferred, from its enqueue, before it is discarded. Zero selects 15m; a
+    // negative value discards it on its first claim.
+    UnknownKindGrace: 30 * time.Minute,
+}
+```
+
+**Size the window to the deploy.** It must exceed the span from the moment the new kind can first be
+enqueued to the moment the last old runner has drained. A job enqueued in that span is never older than
+the span when an old runner claims it, so it is covered, including one inserted with a `ScheduleAt`. The
+default suits a rollout that finishes in minutes; raise it for a slow, canaried, or paused rollout.
+
+**The grace is applied by the runner that lacks the kind, which is the old one.** So the first rollout of
+a release that carries `UnknownKindGrace` is not protected by it: the runners it replaces predate it, and
+they discard a job of a kind they do not register on its first claim. Any runner older than that release
+does the same. Until the whole fleet runs a release that has it, and for a producer that ships ahead of
+its consumers, use one of the two orders that need no grace:
+
+- **Put the new kind on a new queue** that only the new release's runners poll. An old runner never
+  claims a job it cannot run.
+- **Roll out in two phases.** Deploy the worker everywhere first, then the code that enqueues the kind,
+  a declared periodic of the kind included. This is also the rule for a producer that lives in another
+  service.
+
+**The window is measured from enqueue, not from the first claim.** It covers the work a deploy creates
+and nothing older. A job older than the window that reaches a runner without its kind is discarded on
+its first claim: a replay of old work onto runners that do not register its kind, or a job of a kind the
+new release removed. Before removing a worker, drain its kind; `CountActiveByKind` shows what is left.
+
+**A rollback strands new-kind jobs the same way.** Rolling back to a release without the kind puts every
+runner on the old side, so jobs of the new kind are deferred for the window and then discarded, or
+discarded at once by a release that predates `UnknownKindGrace`. Roll forward within the window, or
+replay them once a release with the worker is back.
+
+**Seeing deferrals.** The runner logs `jobs: deferring jobs of a kind this runner does not register` at
+warn, once per kind for each runner (and again if it is still deferring the kind once the grace has
+passed since), naming the kind, the job it deferred, its queue, the grace, and when that job will be
+discarded (`discard_at`). Every discard is logged at error as
+`jobs: discarded a job of a kind this runner does not register`, with the job's age. To everything else
+a deferral is an ordinary snooze: a `job_runs` row with outcome `snooze`, `error_message`
+`jobs: unknown job kind`, and no `error_class`; an increment of
+`flywheel_jobs_finished_total{outcome="snooze"}`; and a job that counts as `scheduled`, not ready. A
+discarded job shows in `RecentFailures` and `flywheel status` with `jobs: unknown job kind`. A job of a
+kind no runner registers writes at most 21 `job_runs` rows over the default window, one per claim and
+whatever the retry settings, before it is discarded.
+
+**Recovering discarded jobs.** Once every runner registers the kind, replay them:
+
+```go
+res, err := flywheel.Replay(ctx, db, flywheel.ReplayOpts{
+    Kinds:       []string{"new_kind"},
+    FailedSince: deployStart,
+})
+```
+
+A plain replay is enough: the deferrals spent none of the budget, so a discarded job keeps all of its
+headroom but the one attempt its discard used, and `ResetAttempts` with no `Budget` would add
+`max_attempts`, which every deferral raised, on top.
+
+A replay keeps each job's enqueue time, so a replayed job is already past its window. Replay only once
+the deploy, or the roll-forward, is complete; a runner still without the kind discards it again at once.
+
+**`RunUntilIdle` waits out the window.** A deferred job is not terminal, so `RunUntilIdle` over a queue
+holding a job of a kind no runner registers keeps polling until the window has passed and the job is
+discarded: 15 minutes at the default, longer than `go test`'s default 10-minute timeout. The window is
+read from the context's clock, so under a frozen test clock a deferred job never ages and `RunUntilIdle`
+runs until its context ends. A test that enqueues a kind it deliberately leaves unregistered sets
+`UnknownKindGrace` negative. For a test that forgot to `Register` a worker, the warn line names the kind.
 
 </details>
 
@@ -1019,6 +1111,10 @@ That is why the deadline branch is separate: `context.DeadlineExceeded` means "b
 | `"burst"` | a runner with `ExecutorClass: "burst"`, or any runner with `ClaimAnyClass: true` |
 
 Leave a job unpinned unless it genuinely needs one pool's hardware, credentials, or budget.
+
+**Deploying the two binaries at different times is a rolling deploy across executors.** A job of a kind
+only the newer binary registers can be claimed by the older one, so **Rolling deploys and new job kinds**
+above applies, its first-rollout caveat included.
 
 > **The trap: the scheduler must run on exactly one process.** It owns the periodic ticks *and* the
 > stuck-lease sweep that reclaims jobs whose executor died. Two schedulers means every tick fires twice

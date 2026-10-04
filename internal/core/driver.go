@@ -263,6 +263,11 @@ type finalizePlan struct {
 // preserves the retry headroom (max_attempts - attempt) exactly, which is the
 // observable guarantee.
 //
+// The Runner leans on the snooze's precedence over an error when it defers a job
+// of a kind it does not register: it finalizes a snooze carrying ErrUnknownKind,
+// so the error reaches the audit row's error_message while the snooze is what
+// the job takes.
+//
 //nolint:gocognit // one switch over the four mutually exclusive outcomes
 func planFinalize(raw RawJob, result Result, workErr error, finishedAt time.Time) finalizePlan {
 	switch {

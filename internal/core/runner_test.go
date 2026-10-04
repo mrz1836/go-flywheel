@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -227,11 +228,22 @@ func TestRunnerSnoozeReschedulesWithoutConsumingAttempt(t *testing.T) {
 	assert.Equal(t, 3, maxAttempts, "snooze raises max_attempts by 1 to preserve retry headroom")
 }
 
-func TestRunnerUnknownKindIsTerminallyDiscarded(t *testing.T) {
+// TestRunnerUnknownKindDiscardedAtOnceWithGraceDisabled pins what a negative
+// UnknownKindGrace selects: a job whose kind the Runner does not register is a
+// permanent dispatch error on its first claim, recorded on the run row and
+// logged. The deferral the default grace applies is covered in
+// runner_unknown_kind_test.go.
+func TestRunnerUnknownKindDiscardedAtOnceWithGraceDisabled(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
-	reg := NewRegistry() // empty; nothing registered
-	r := newRunner(t, db, reg)
+	logs := &recordingHandler{}
+	// The grace is disabled because this test is about the discard. With the
+	// default, RunUntilIdle would wait out the fifteen-minute window for a runner
+	// that registers the kind.
+	r := rwRunner(t, db, NewRegistry(), func(c *RunnerConfig) { // empty registry
+		c.UnknownKindGrace = -1
+		c.Logger = slog.New(logs)
+	})
 
 	id, err := Insert(context.Background(), NewClient(db), successArgs{V: "orphan"}, InsertOpts{})
 	require.NoError(t, err)
@@ -239,6 +251,14 @@ func TestRunnerUnknownKindIsTerminallyDiscarded(t *testing.T) {
 	runToIdle(t, context.Background(), r)
 
 	assert.Equal(t, string(StateDiscarded), jobState(t, db, id), "an unknown kind is a permanent dispatch error")
+	runs := runsOf(t, db, id)
+	require.Len(t, runs, 1, "discarded on the first claim")
+	requireDiscardRun(t, runs[0])
+	discards := logsFor(logs, slog.LevelError, discardErrMsg)
+	require.Len(t, discards, 1, "the discard is logged")
+	assert.Equal(t, "test.success", discards[0]["kind"])
+	assert.Equal(t, time.Duration(0), discards[0]["grace"], "the log says the grace was disabled")
+	assert.Empty(t, logsFor(logs, slog.LevelWarn, deferWarnMsg))
 }
 
 func TestRunnerCtxCancelStopsRunUntilIdle(t *testing.T) {

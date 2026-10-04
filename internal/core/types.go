@@ -160,10 +160,18 @@ type Timeouter interface {
 
 // Job is what a worker receives. RunID and Logger are injected by the Runner.
 type Job[A Args] struct {
-	ID          string
-	Kind        string
-	Queue       string
-	Args        A
+	ID    string
+	Kind  string
+	Queue string
+	Args  A
+	// Attempt is this run's attempt number: 1 on the job's first claim and one
+	// more on every claim after it. Every claim counts, including one that ended
+	// in a snooze, which raises MaxAttempts by one so it spends none of the retry
+	// budget, and a deferral by a runner that does not register the kind (see
+	// RunnerConfig.UnknownKindGrace), which is a snooze too. So a worker's first
+	// run of a job can see an Attempt above 1, and a retry backoff keyed on it
+	// (the Runner's, or a Retryable's) starts from that rung. What a snooze
+	// preserves is the headroom, MaxAttempts - Attempt.
 	Attempt     int
 	MaxAttempts int
 	ParentJobID *string
@@ -206,7 +214,8 @@ type RawJob struct {
 	ParentJobID *string
 	Tags        []string
 	// CreatedAt is when the job was inserted; the Runner hands it to the worker
-	// as Job.EnqueuedAt.
+	// as Job.EnqueuedAt and measures RunnerConfig.UnknownKindGrace from it. A
+	// Driver that leaves it zero opts every job out of that grace.
 	CreatedAt time.Time
 	// ScheduledAt is when this attempt became claimable. A retry or a snooze
 	// moves it forward, so it is not the enqueue time.

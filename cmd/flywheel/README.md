@@ -95,7 +95,7 @@ flywheel serve                        # run the runtime until Ctrl+C
 |---|---|
 | `flywheel serve` | Validate the config (a malformed schedule is refused before the database is touched), migrate (concurrent index builds on PostgreSQL; an up-to-date schema issues no DDL), disable the schedules the config does not name, then run the runner + scheduler until SIGINT/SIGTERM (drains in-flight work), applying the config's `schedules:` on start and re-creating a declared schedule deleted while it runs |
 | `flywheel migrate` | Create or upgrade the schema, reporting what it added (`--concurrently --lock-timeout 5s` for a live PostgreSQL database) |
-| `flywheel enqueue <kind> <json>` | Enqueue one job and print its id (`--queue --unique --priority --at`); a `--unique` collision fails with the id of the job holding the key |
+| `flywheel enqueue <kind> <json>` | Enqueue one job and print its id (`--queue --unique --priority --at`); a `--unique` collision fails with the id of the job holding the key. A kind no runner registers, a typo included, waits as `scheduled` for the runner's unknown-kind grace (15 minutes) before it is discarded |
 | `flywheel jobs ls` | List recent jobs, newest first (`--state --kind --queue --before <id> --limit --json`) |
 | `flywheel jobs running` | List running jobs, longest-running first, flagging any far slower than their kind's baseline (`--kind --queue --limit --json`) |
 | `flywheel jobs inspect <id>` | Show a job and its run history |
