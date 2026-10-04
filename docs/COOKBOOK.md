@@ -94,6 +94,13 @@ jobs)`, it re-runs on every enqueue, and — worse than slow — it has a race: 
 both find nothing, and both enqueue. `UniqueActiveKey` has none of those problems; the collision is
 resolved atomically by the database.
 
+**Re-running finished jobs keeps the one-live-job guarantee.** A forced `RetryJobWithOptions` on a
+terminal job whose key a newer live job holds returns an `*AlreadyEnqueuedError` naming that job. A
+`Replay` or `ReplayByParent` never puts a job live while another job holds its key: of the replayed jobs
+in a batch that share a key the first in id order goes live, and the others, like any job whose key is
+held when its batch runs, stay terminal. The replay counts them in `ScopeResult.SkippedActiveKey` and
+completes.
+
 <br>
 
 ## 3. Enqueue or join the in-flight job, then wait — `AlreadyEnqueuedError` + `WaitForJob`

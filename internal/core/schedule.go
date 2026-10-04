@@ -596,6 +596,11 @@ const defaultScopeBatchSize = 1000
 
 // ScopeResult reports what a parent-scoped operation did. The skipped counts are
 // broken out by reason so a caller distinguishes "nothing to do" from "refused".
+//
+// For a replay, Changed + SkippedTerminal + SkippedRunning + SkippedActiveKey is
+// every in-scope job that was terminal or running when the replay began, unless a
+// concurrent operation moved one mid-replay. A FailedSince window leaves the
+// targeted jobs finalized before it out of the sum.
 type ScopeResult struct {
 	// Changed is the number of children whose state the operation advanced.
 	Changed int64
@@ -608,7 +613,17 @@ type ScopeResult struct {
 	// operations interrupts a running attempt: it finalizes normally, and the pause
 	// or cancel applies to its next claim.
 	SkippedRunning int64
-	// Batches is the number of transactions that changed rows.
+	// SkippedActiveKey is set by a replay alone; the batch controls leave it zero. It
+	// is the number of targeted jobs left terminal because another job held their
+	// UniqueActiveKey live when their batch ran: a job outside the cohort, or one the
+	// replay itself returned to available, earlier in the same batch or in an
+	// earlier one. The index allows one live job per key at a time, so of the
+	// targeted jobs in a batch that share a key, the first in id order is the one
+	// replayed.
+	SkippedActiveKey int64
+	// Batches is the number of transactions that changed rows. A batch that changed
+	// none is not counted: one whose rows a concurrent operation moved first, or a
+	// replay batch whose jobs were all left terminal for their key.
 	Batches int
 }
 
@@ -747,7 +762,7 @@ func scopeByParent(
 			return result, fmt.Errorf("flywheel: %s by parent: %w", t.op, err)
 		}
 		result.Changed += changed
-		if selected > 0 {
+		if changed > 0 {
 			result.Batches++
 		}
 		if selected < batchSize {
