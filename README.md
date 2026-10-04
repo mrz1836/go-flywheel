@@ -927,10 +927,12 @@ res, err := flywheel.ReplayByParent(ctx, db, parentID, flywheel.ReplayOpts{
 
 **A replay restores the retry budget as headroom, not by rewinding the counter.** A job discarded at
 `attempt == max_attempts` has no budget left, so a plain retry gives it exactly one more attempt before
-it discards again. `ResetAttempts` raises `max_attempts` — to `attempt + Budget`, or the job's original
-budget when `Budget` is zero — so the job gets a real second life. `attempt` is never lowered: it is the
-`job_runs(job_id, attempt)` audit key, so the replay's runs continue the sequence rather than colliding
-with the recorded failures. It is the same mechanism a snooze uses to stay free.
+it discards again. `ResetAttempts` raises `max_attempts` — to `attempt + Budget`, or to
+`attempt + max_attempts` when `Budget` is zero — so the job gets a real second life. With `Budget` zero
+the grant is the job's current `max_attempts`, which is its original budget only if it never snoozed:
+every snooze raised it by one. Set `Budget` to grant an exact number. `attempt` is never lowered: it is
+the `job_runs(job_id, attempt)` audit key, so the replay's runs continue the sequence rather than
+colliding with the recorded failures. It is the same mechanism a snooze uses to stay free.
 
 **A replay is bounded by construction.** Empty `States` replays discarded jobs only — never succeeded
 work; naming `StateSucceeded` additionally requires `Force`. An unscoped `Replay` with neither `Kinds`

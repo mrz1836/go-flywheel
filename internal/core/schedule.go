@@ -372,10 +372,13 @@ type RetryOpts struct {
 	// attempt == max_attempts is re-claimed exactly once and discarded again on that
 	// attempt, which is rarely what "replay the failures" intends.
 	ResetAttempts bool
-	// Budget is the number of attempts to grant when ResetAttempts is set. Zero (or
-	// negative) restores the job's original max_attempts as headroom — max_attempts
-	// becomes attempt + max_attempts — while a positive value sets max_attempts to
-	// attempt + Budget. It is ignored when ResetAttempts is false.
+	// Budget is the number of attempts to grant when ResetAttempts is set. A
+	// positive value sets max_attempts to attempt + Budget. Zero (or negative)
+	// grants the job's current max_attempts as headroom — max_attempts becomes
+	// attempt + max_attempts — which is its original budget only for a job that
+	// never snoozed: every snooze raised max_attempts by one, so a job that
+	// snoozed n times gets n more attempts than it was enqueued with. Set Budget
+	// to grant an exact number. It is ignored when ResetAttempts is false.
 	Budget int
 	// Delay, when > 0, schedules the job that far in the future instead of making it
 	// immediately available. The claim gates on scheduled_at <= now in both drivers,
@@ -486,11 +489,11 @@ func retryHolder(ctx context.Context, db *gorm.DB, id string) *AlreadyEnqueuedEr
 // applyRetryBudget adds the max_attempts reset to a retry's column map when
 // opts.ResetAttempts is set. The budget is restored as headroom above the current
 // attempt — max_attempts = attempt + Budget, or attempt + max_attempts (the
-// original budget) when Budget is non-positive — applied in-SQL per row, mirroring
-// the free-snooze path's gorm.Expr in jobFinalizeUpdate. attempt itself is never
-// written, so it stays strictly monotonic as the job_runs(job_id, attempt) audit
-// key and a replayed job's next run continues the sequence rather than colliding
-// with it. It is shared by RetryJobWithOptions and the bulk replay engine, so the
+// current max_attempts, which every snooze raised by one) when Budget is
+// non-positive — applied in-SQL per row, mirroring the free-snooze path's
+// gorm.Expr in jobFinalizeUpdate. attempt itself is never written, so it stays
+// strictly monotonic as the job_runs(job_id, attempt) audit key and a replayed
+// job's next run continues the sequence rather than colliding with it. It is shared by RetryJobWithOptions and the bulk replay engine, so the
 // two cannot drift on the arithmetic that makes a replay obviously correct.
 func applyRetryBudget(upd map[string]any, opts RetryOpts) {
 	if !opts.ResetAttempts {
