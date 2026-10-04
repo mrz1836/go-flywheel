@@ -160,7 +160,8 @@ func TestSweepLeavesSoftDeletedJobsAlonePostgres(t *testing.T) {
 }
 
 // seedExpiredLeasesBulkPG writes n running jobs with expired leases, plus their
-// started run stubs, in one server-side statement per table.
+// started run stubs, generated server-side in slices (execSeriesInSlicesPG says
+// why not one statement per table).
 //
 // A row-at-a-time seed of 200k jobs through GORM would dominate the test's
 // runtime and measure the seeder rather than the sweep.
@@ -168,19 +169,19 @@ func seedExpiredLeasesBulkPG(t *testing.T, db *gorm.DB, n int, now time.Time) {
 	t.Helper()
 	expired := now.Add(-time.Hour)
 
-	require.NoError(t, db.Exec(`
+	execSeriesInSlicesPG(t, db, `
 		INSERT INTO jobs (id, created_at, updated_at, metadata, kind, queue, args, priority,
 		                  state, attempt, max_attempts, scheduled_at, leased_until, lease_token,
 		                  executor_class, tags)
 		SELECT 'bulk-expired-' || g, ?, ?, '{}'::jsonb, 'sweep.batch', 'default', '{}'::jsonb, 100,
 		       'running', 1, 25, ?, ?, 'token-' || g, '', '[]'::jsonb
-		FROM generate_series(0, ?) AS g`,
-		expired, expired, expired, expired, n-1).Error)
+		FROM generate_series(?::int, ?::int) AS g`,
+		n, expired, expired, expired, expired)
 
-	require.NoError(t, db.Exec(`
+	execSeriesInSlicesPG(t, db, `
 		INSERT INTO job_runs (id, job_id, attempt, executor_class, executor_id, started_at,
 		                      outcome, enqueued_children, created_at)
 		SELECT 'bulk-run-' || g, 'bulk-expired-' || g, 1, 'local', 'exec-1', ?, ?, 0, ?
-		FROM generate_series(0, ?) AS g`,
-		expired, string(OutcomeStarted), expired, n-1).Error)
+		FROM generate_series(?::int, ?::int) AS g`,
+		n, expired, string(OutcomeStarted), expired)
 }

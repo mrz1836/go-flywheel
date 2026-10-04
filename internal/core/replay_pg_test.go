@@ -277,13 +277,29 @@ func backendPID(t *testing.T, tx *gorm.DB) int64 {
 	return pid
 }
 
-// awaitBlockedBy waits until some backend is waiting on a lock the backend pid
-// holds: the barrier a lock-ordering test advances on.
+// awaitBlockedBy waits until some backend is waiting on the transaction the
+// backend pid has open: a write blocked on a row or an index entry that
+// transaction wrote, which is how a replay's UPDATE waits on an uncommitted
+// holder. It is the barrier a lock-ordering test advances on.
+//
+// It matches the waiter's transactionid lock against the one pid holds rather
+// than asking pg_blocking_pids who pid blocks. A CREATE INDEX CONCURRENTLY in a
+// parallel test waits out every transaction in the database that held a snapshot
+// when it looked: pid's, if it was running a statement then, as it is while a
+// host's enqueue sits blocked on the replay. The build then waits on pid's
+// virtualxid until pid commits, and counting it as the replay lets a test commit
+// before the replay's UPDATE has even started.
 func awaitBlockedBy(t *testing.T, db *gorm.DB, pid int64, msg string) {
 	t.Helper()
 	require.Eventually(t, func() bool {
 		var waiting int64
-		err := db.Raw("SELECT count(*) FROM pg_stat_activity WHERE ? = ANY(pg_blocking_pids(pid))", pid).
+		err := db.Raw(`
+			SELECT count(*)
+			FROM pg_locks waiter
+			JOIN pg_locks holder
+			  ON holder.locktype = 'transactionid' AND holder.transactionid = waiter.transactionid
+			WHERE waiter.locktype = 'transactionid' AND NOT waiter.granted
+			  AND holder.granted AND holder.pid = ?`, pid).
 			Scan(&waiting).Error
 		return err == nil && waiting > 0
 	}, 10*time.Second, 5*time.Millisecond, msg)

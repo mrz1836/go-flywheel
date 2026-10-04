@@ -197,23 +197,24 @@ func TestDeleteFinishedJobsOnAUUIDKeyedSchemaPostgres(t *testing.T) {
 }
 
 // seedTerminalJobsBulkPG writes n succeeded jobs finalized at finalizedAt, plus
-// their finished run rows, in one server-side statement per table.
+// their finished run rows, generated server-side in slices
+// (execSeriesInSlicesPG says why not one statement per table).
 func seedTerminalJobsBulkPG(t *testing.T, db *gorm.DB, n int, finalizedAt time.Time) {
 	t.Helper()
 
-	require.NoError(t, db.Exec(`
+	execSeriesInSlicesPG(t, db, `
 		INSERT INTO jobs (id, created_at, updated_at, metadata, kind, queue, args, priority,
 		                  state, attempt, max_attempts, scheduled_at, finalized_at,
 		                  executor_class, tags)
 		SELECT 'bulk-terminal-' || g, ?, ?, '{}'::jsonb, 'retention.batch', 'default', '{}'::jsonb, 100,
 		       'succeeded', 1, 25, ?, ?, '', '[]'::jsonb
-		FROM generate_series(0, ?) AS g`,
-		finalizedAt, finalizedAt, finalizedAt, finalizedAt, n-1).Error)
+		FROM generate_series(?::int, ?::int) AS g`,
+		n, finalizedAt, finalizedAt, finalizedAt, finalizedAt)
 
-	require.NoError(t, db.Exec(`
+	execSeriesInSlicesPG(t, db, `
 		INSERT INTO job_runs (id, job_id, attempt, executor_class, executor_id, started_at,
 		                      finished_at, outcome, enqueued_children, created_at)
 		SELECT 'bulk-trun-' || g, 'bulk-terminal-' || g, 1, 'local', 'exec-1', ?, ?, ?, 0, ?
-		FROM generate_series(0, ?) AS g`,
-		finalizedAt, finalizedAt, string(OutcomeSuccess), finalizedAt, n-1).Error)
+		FROM generate_series(?::int, ?::int) AS g`,
+		n, finalizedAt, finalizedAt, string(OutcomeSuccess), finalizedAt)
 }

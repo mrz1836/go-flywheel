@@ -136,3 +136,37 @@ func withSearchPath(dsn, schema string) string {
 	}
 	return dsn + sep + "search_path=" + schema
 }
+
+// bulkSeedSlicePG is the most rows one bulk-seed statement writes.
+const bulkSeedSlicePG = 10_000
+
+// execSeriesInSlicesPG runs a server-side bulk seed over the series [0, n) in
+// slices of bulkSeedSlicePG rows, each its own autocommitted statement. sql is an
+// INSERT … SELECT that ends in `FROM generate_series(?::int, ?::int) AS g`: args
+// bind the placeholders before that clause, and each slice's bounds bind its two.
+// The casts are required: with both bounds bound as parameters, PostgreSQL cannot
+// choose among generate_series's integer, bigint, and numeric forms.
+//
+// # Why not one statement
+//
+// Every schema NewPostgresIsolatedDB mints lives in one database, and CREATE
+// INDEX CONCURRENTLY waits for every transaction in the database holding a
+// snapshot older than its own (vacuum aside), whatever schema that transaction
+// writes. A seed of 200k rows in one statement is a single transaction of about
+// ten seconds while a full -race suite loads the server, so a concurrent index
+// build in any parallel test waits it out: past the 5s lock_timeout the
+// documented upgrade DDL sets (TestDocumentedUpgradeDDLPostgres), and on a loaded
+// machine past the concurrent-migration test's one-minute guard.
+// Slices keep each transaction under a second, so such a build waits for one
+// slice at most.
+func execSeriesInSlicesPG(t testing.TB, db *gorm.DB, sql string, n int, args ...any) {
+	t.Helper()
+
+	for lo := 0; lo < n; lo += bulkSeedSlicePG {
+		hi := min(lo+bulkSeedSlicePG, n) - 1
+		bound := append(append(make([]any, 0, len(args)+2), args...), lo, hi)
+		if err := db.Exec(sql, bound...).Error; err != nil {
+			t.Fatalf("bulk seed rows %d-%d: %v", lo, hi, err)
+		}
+	}
+}
