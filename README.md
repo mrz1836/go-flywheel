@@ -922,7 +922,8 @@ res, err := flywheel.ReplayByParent(ctx, db, parentID, flywheel.ReplayOpts{
     RetryOpts: flywheel.RetryOpts{ResetAttempts: true}, // restore the retry budget
     Stagger:   5 * time.Minute,                         // spread arrivals over five minutes
 })
-// res.Changed replayed; res.SkippedTerminal left as they were; res.SkippedRunning left in flight.
+// res.Changed replayed; res.SkippedTerminal left as they were; res.SkippedRunning left in flight;
+// res.SkippedActiveKey left terminal because their UniqueActiveKey was already held.
 ```
 
 **A replay restores the retry budget as headroom, not by rewinding the counter.** A job discarded at
@@ -939,6 +940,15 @@ work; naming `StateSucceeded` additionally requires `Force`. An unscoped `Replay
 nor `FailedSince` is refused with `ErrReplayUnbounded` rather than replaying every discarded job in the
 database by accident.
 
+**A replay never puts two live jobs on one `UniqueActiveKey` at a time.** A replayed job whose key
+another job holds live when its batch runs stays terminal, is counted in `SkippedActiveKey`, and the
+replay carries on past it. Of the jobs in one batch that share a key, the first in id order goes live; a
+job in a later batch is skipped while that job is live, and goes live itself if that job has already
+finished. With `States` naming a live state, a targeted job that is already live keeps its key. To run a
+skipped job, replay or retry it once the job holding its key has finished. With no `FailedSince` window,
+`Changed + SkippedTerminal + SkippedRunning + SkippedActiveKey` accounts for every job in scope that was
+finished or running when the replay began, unless another operation changed one of them mid-replay.
+
 ```go
 // The incident-shaped recovery: one kind, bounded to the outage window, budget of three.
 res, err := flywheel.Replay(ctx, db, flywheel.ReplayOpts{
@@ -950,9 +960,9 @@ res, err := flywheel.Replay(ctx, db, flywheel.ReplayOpts{
 
 **`Stagger` shapes when the cohort arrives; it is not a rate ceiling.** With `Stagger` set, job *i* of
 *n* becomes claimable at `now + Stagger*i/n`, so 30,000 replayed jobs do not all hit a just-recovered
-dependency at once. The placement is deterministic, so you can predict when the last job lands. It does
-not cap how fast the cohort is claimed once each job is due — an actual claim-rate ceiling is a separate
-capability.
+dependency at once. The placement is deterministic, so you can predict when the last job lands, and a
+job left terminal for its key keeps its slot empty rather than moving the rest. It does not cap how fast
+the cohort is claimed once each job is due — an actual claim-rate ceiling is a separate capability.
 
 **Retry an existing row; do not re-enqueue it under the same key.** Which mechanism recovers a unit of
 work depends on the intent:

@@ -279,3 +279,32 @@ func TestScopeByParentSurfacesErrors(t *testing.T) {
 		require.ErrorContains(t, err, "cancel by parent", "the batch UPDATE failure is surfaced")
 	})
 }
+
+// TestScopedBatchThatChangesNothingIsNotCounted pins ScopeResult.Batches to its
+// doc for the batch controls: just before the batch's UPDATE runs, its rows move
+// out of the source state on the batch's own transaction, as a concurrent
+// operation could move them. The re-guarded UPDATE changes nothing, so the batch
+// is not counted.
+func TestScopedBatchThatChangesNothingIsNotCounted(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	seedChildrenBulk(t, db, "P", 3, StateAvailable, time.Now().UTC())
+
+	var fired atomic.Bool
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register("test:finish_first",
+		func(tx *gorm.DB) {
+			if fired.Swap(true) {
+				return
+			}
+			if _, err := tx.Statement.ConnPool.ExecContext(tx.Statement.Context,
+				`UPDATE jobs SET state = 'succeeded' WHERE parent_job_id = 'P'`); err != nil {
+				_ = tx.AddError(err)
+			}
+		}))
+
+	res, err := CancelByParent(context.Background(), db, "P", ScopeOpts{})
+	require.NoError(t, err)
+	require.True(t, fired.Load())
+	assert.Zero(t, res.Changed, "the re-guard leaves the finished children alone")
+	assert.Zero(t, res.Batches, "a transaction that changed no rows is not a counted batch")
+}
