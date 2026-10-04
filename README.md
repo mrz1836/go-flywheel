@@ -1092,7 +1092,7 @@ case errors.Is(err, context.DeadlineExceeded):
     // Budget spent with work outstanding. Normal for a bounded invocation, not a
     // failure: the leftover jobs stay claimable for the next one.
 default:
-    return err // a real failure — driver error, unregistered kind
+    return err // a real failure — an outdated schema or a database error
 }
 ```
 
@@ -1101,7 +1101,9 @@ not merely when this runner found nothing to claim. A job another pool is still 
 runner has in flight in its own worker pool, or one waiting out a retry backoff all keep it looping.
 That is why the deadline branch is separate: `context.DeadlineExceeded` means "budget spent", not
 "something broke". A transient database error does not end it either — it backs off and retries — and
-`flywheel.ErrRunnerStopped` is what it returns if `Stop` ended it before the queue drained.
+`flywheel.ErrRunnerStopped` is what it returns if `Stop` ended it before the queue drained. A job of a
+kind this runner does not register is not an error: it keeps the loop going until `UnknownKindGrace` has
+passed since the job's enqueue, and is then discarded (see **Rolling deploys and new job kinds** above).
 
 **Routing rules:**
 

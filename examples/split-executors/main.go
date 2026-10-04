@@ -287,8 +287,10 @@ func runBurstProcess(ctx context.Context, db *gorm.DB, logger *slog.Logger) erro
 		logger.InfoContext(ctx, "shutdown signal received; exiting cleanly")
 		return nil
 	default:
-		// Anything else is a real failure — a driver error, an unregistered kind
-		// — and should fail the invocation.
+		// Anything else is a real failure — an outdated schema or a database
+		// error — and should fail the invocation. A job of a kind this binary
+		// does not register is not one: RunUntilIdle defers it for
+		// RunnerConfig.UnknownKindGrace and then discards it.
 		return fmt.Errorf("run until idle: %w", err)
 	}
 }
