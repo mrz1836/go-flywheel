@@ -131,6 +131,7 @@ The runtime is built from focused, composable pieces:
 - **Per-run audit** — the `job_runs` table records every attempt: outcome, timing, queue wait, cost, and whether its claim was lost ([read.go](internal/core/read.go))
 - **Job analytics for dashboards** — what is running now, what just finished, per-kind stats over any window, hourly and daily trends from rollups that outlive retention, and low-noise regression alerts ([docs/INTEGRATING.md](docs/INTEGRATING.md))
 - **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work, and a collision names the job holding the key ([client.go](internal/core/client.go))
+- **Waiting on a job** — `WaitForJob` blocks until a job reaches a terminal state, polling with backoff under your deadline; joined with the job a collision names, a unit of work runs once for every caller that asks while it is in flight ([wait.go](internal/core/wait.go))
 - **Outbox pattern** — enqueue on the caller's own `*gorm.DB` transaction for exactly-once side effects ([client.go](internal/core/client.go))
 - **Follow-up jobs (DAG)** — workers return child jobs that are enqueued atomically ([types.go](internal/core/types.go))
 - **Bulk enqueue** — `InsertMany` writes N jobs in bounded, dialect-aware chunks, honoring the outbox transaction and per-row idempotency ([batch.go](internal/core/batch.go))
@@ -585,6 +586,55 @@ runID, err := flywheel.SeedRun(ctx, db, flywheel.RunSeed{
 > duplicates most of the `jobs` row, it drifts from the real outcome the moment a retry happens, and
 > nothing can answer "which attempt wrote this?". If you have domain columns to store, keep the table
 > and give it a `job_run_id` — the lifecycle columns belong to `job_runs`.
+
+</details>
+
+<details>
+<summary><strong><code>Waiting on a job — enqueue or join, then wait</code></strong></summary>
+<br>
+
+**Enqueue returns at once; `WaitForJob` is how a caller that needs the outcome gets it.** An operator
+command that should not report success until the job ran, a deploy script waiting on a backfill, a
+request that joins a rebuild already in flight — each enqueues (or joins), then waits:
+
+```go
+id, err := flywheel.Insert(ctx, client, RebuildCache{RepoID: repoID}, flywheel.InsertOpts{
+    UniqueActiveKey: "rebuild:" + repoID,
+})
+var dup *flywheel.AlreadyEnqueuedError
+if errors.As(err, &dup) && dup.ExistingID != "" {
+    id, err = dup.ExistingID, nil // a rebuild is already in flight: join it
+}
+if err != nil {
+    return err
+}
+
+ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+defer cancel()
+job, err := flywheel.WaitForJob(ctx, db, id) // blocks until succeeded, cancelled, or discarded
+if err != nil {
+    return err // e.g. `flywheel: wait for job "…": still running: context deadline exceeded`
+}
+run, _, err := flywheel.LatestRun(ctx, db, id) // the final attempt: Outcome, Error, Output
+```
+
+- **It polls, cheaply.** The first read is immediate; later reads back off from 500 ms to a 5 s ceiling,
+  each one primary-key read. `WaitForJobWithOptions` takes a `WaitOpts` to change the cadence.
+- **`WaitOpts.States` ends the wait early** on a live state — `StateRunning`, to return once a runner has
+  claimed the job. A terminal state always ends it.
+- **`ctx` is the only bound.** When it ends first, the call returns the last view it read and an error
+  wrapping `ctx.Err()` that names the state the job was still in. Without a deadline, a paused job is
+  waited on forever.
+- **A job that is gone returns `ErrJobNotFound` at once**, rather than being polled until the deadline.
+  A job enqueued on `InsertOpts.Tx` is invisible until your transaction commits, so wait after the
+  commit — and wait on the primary, not a replica: a lagging replica reads a job enqueued or named a
+  moment ago as missing.
+- **`LatestRun`** reads a job's newest attempt — once the job succeeded, the attempt that did, with the
+  worker's `Result.Output`.
+
+Callers that enqueue-or-join the same `UniqueActiveKey` while a job holds it resolve to that job and see
+its outcome, so the work runs once for all of them. The [cookbook](docs/COOKBOOK.md) has the full recipe,
+including the rare collision whose holder finished before it could be named.
 
 </details>
 
@@ -1201,7 +1251,7 @@ command, the config reference, and the macOS launchd setup.
 
 - **API Reference** – Dive into the godocs at [pkg.go.dev/github.com/mrz1836/go-flywheel](https://pkg.go.dev/github.com/mrz1836/go-flywheel)
 - **Contract** – The exactly-once guarantees and their limits in [`docs/CONTRACT.md`](docs/CONTRACT.md)
-- **Cookbook** – Unique-key recipes for deduplication and side-effect correlation in [`docs/COOKBOOK.md`](docs/COOKBOOK.md)
+- **Cookbook** – Unique-key recipes for deduplication, joining an in-flight job, and side-effect correlation in [`docs/COOKBOOK.md`](docs/COOKBOOK.md)
 - **Integrating** – Building dashboards and external platforms on the runtime's data, and upgrading an existing database, in [`docs/INTEGRATING.md`](docs/INTEGRATING.md)
 - **Runbook** – Operating the runtime and reading its metrics in [`docs/RUNBOOK.md`](docs/RUNBOOK.md)
 - **Tuning** – Sizing the knobs from measured numbers in [`docs/TUNING.md`](docs/TUNING.md)
@@ -1306,7 +1356,7 @@ Four complete, runnable programs live under [`examples/`](examples), smallest fi
 - **[`local-tasks`](examples/local-tasks)** — local developer tasks run durably: a shell script, a Python script, and a magex/mage target, each a typed worker with a captured audit trail.
 - **[`split-executors`](examples/split-executors)** — one registry across two executors, a long-running pool and a bounded invocation-scoped burst, routed by `ExecutorClass`.
 
-Testing your own integration? The [`flywheeltest`](flywheeltest) package ships ready-made fixtures — an in-memory or file-backed SQLite database (or an isolated PostgreSQL schema) with the runtime schema migrated in, plus `WaitForJobState` and a trivial success worker — so your tests can enqueue and assert without a bespoke harness.
+Testing your own integration? The [`flywheeltest`](flywheeltest) package ships ready-made fixtures — an in-memory or file-backed SQLite database (or an isolated PostgreSQL schema) with the runtime schema migrated in, plus `WaitForJobState`, which fails fast on a wrong terminal state or a missing job, and a trivial success worker — so your tests can enqueue and assert without a bespoke harness.
 
 All unit tests run via [GitHub Actions](https://github.com/mrz1836/go-flywheel/actions) and use [Go version 1.26.x](https://go.dev/doc/go1.26). View the [configuration file](.github/workflows/fortress.yml).
 

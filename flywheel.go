@@ -133,6 +133,7 @@ type (
 	TokenBucket           = core.TokenBucket
 	TokenBucketConfig     = core.TokenBucketConfig
 	ValidationError       = core.ValidationError
+	WaitOpts              = core.WaitOpts
 )
 
 const (
@@ -284,6 +285,10 @@ func InstallIndexesWithOptions(ctx context.Context, db *gorm.DB, opts IndexOpts)
 
 func InstallStorageParameters(ctx context.Context, db *gorm.DB) error {
 	return core.InstallStorageParameters(ctx, db)
+}
+
+func LatestRun(ctx context.Context, db *gorm.DB, jobID string) (JobRunView, bool, error) {
+	return core.LatestRun(ctx, db, jobID)
 }
 
 func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsView, error) {
@@ -472,6 +477,14 @@ func TerminalStates() []JobState {
 
 func UpsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) error {
 	return core.UpsertPeriodic(ctx, db, spec)
+}
+
+func WaitForJob(ctx context.Context, db *gorm.DB, id string) (JobView, error) {
+	return core.WaitForJob(ctx, db, id)
+}
+
+func WaitForJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts WaitOpts) (JobView, error) {
+	return core.WaitForJobWithOptions(ctx, db, id, opts)
 }
 
 // Generic function forwarders. A generic function cannot be an alias, so each

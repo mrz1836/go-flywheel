@@ -292,7 +292,8 @@ func ListFinished(ctx context.Context, db *gorm.DB, p ListFinishedParams) ([]Job
 	return views, nil
 }
 
-// finishedPage reads one state's page off jobs_finished, newest first.
+// finishedPage reads one state's page off jobs_finished, newest first, loading
+// only the columns a JobView carries.
 func finishedPage(ctx context.Context, db *gorm.DB, state JobState, p ListFinishedParams, limit int) ([]jobRow, error) {
 	query := db.WithContext(ctx).Model(&jobRow{}).
 		Where("state = ? AND finalized_at IS NOT NULL", string(state))
@@ -310,7 +311,7 @@ func finishedPage(ctx context.Context, db *gorm.DB, state JobState, p ListFinish
 			p.Before.FinalizedAt, p.Before.FinalizedAt, p.Before.ID)
 	}
 	var rows []jobRow
-	if err := query.Order("finalized_at DESC, id DESC").Limit(limit).Find(&rows).Error; err != nil {
+	if err := query.Select(jobViewColumns()).Order("finalized_at DESC, id DESC").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("read %s page: %w", state, err)
 	}
 	return rows, nil

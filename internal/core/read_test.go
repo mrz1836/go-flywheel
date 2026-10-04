@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -396,4 +398,173 @@ func TestListJobsExcludesSoftDeleted(t *testing.T) {
 	got, err := ListJobs(context.Background(), db, ListJobsParams{})
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+// fullJobRow is a jobs row with every column set, so a projection that misses one
+// of JobView's columns reads a zero value where the full row has a real one. The
+// reflection guard in assertJobViewProjectionIsComplete keeps it that way as
+// columns are added.
+func fullJobRow() jobRow {
+	at := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	ptr := func(s string) *string { return &s }
+	timeout := 30_000
+	leased, finalized := at.Add(2*time.Minute), at.Add(3*time.Minute)
+	return jobRow{
+		ID:              "job-full",
+		CreatedAt:       at,
+		UpdatedAt:       at.Add(4 * time.Minute),
+		Metadata:        datatypes.JSON(`{"request_id":"req-1"}`),
+		Kind:            "full.kind",
+		Queue:           "full-queue",
+		Args:            datatypes.JSON(`{"secret":"never-loaded"}`),
+		Priority:        7,
+		State:           string(StateSucceeded),
+		Attempt:         2,
+		MaxAttempts:     9,
+		TimeoutMs:       &timeout,
+		ScheduledAt:     at.Add(time.Minute),
+		LeasedUntil:     &leased,
+		LeaseToken:      ptr("token"),
+		UniqueKey:       ptr("full-uk"),
+		UniqueActiveKey: ptr("full-uak"),
+		ParentJobID:     ptr("parent-1"),
+		ExecutorClass:   "gpu",
+		FinalizedAt:     &finalized,
+		BarrierKind:     ptr("barrier.kind"),
+		BarrierSpec:     datatypes.JSON(`{"kind":"barrier.kind"}`),
+		Tags:            datatypes.JSON(`["a","b"]`),
+	}
+}
+
+// assertJobViewProjectionIsComplete proves the narrowed reads lose nothing: FindJob,
+// ListJobs, and ListFinished each return exactly jobViewFromRow of the same row
+// read with SELECT *. It is shared by the SQLite and (integration) PostgreSQL
+// suites, whose jsonb and timestamptz scans differ.
+func assertJobViewProjectionIsComplete(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	ctx := context.Background()
+	fixture := fullJobRow()
+	v := reflect.ValueOf(fixture)
+	for i := range v.NumField() {
+		name := v.Type().Field(i).Name
+		if name == "DeletedAt" {
+			continue
+		}
+		require.Falsef(t, v.Field(i).IsZero(), "fullJobRow leaves %s zero; set it so the projection test covers it", name)
+	}
+	seedJob(t, db, fixture)
+
+	var full jobRow
+	require.NoError(t, db.Where("id = ?", fixture.ID).First(&full).Error)
+	want := jobViewFromRow(full)
+	require.Equal(t, []string{"a", "b"}, want.Tags, "the fixture round-trips")
+
+	found, err := FindJob(ctx, db, fixture.ID)
+	require.NoError(t, err)
+	assert.Equal(t, want, found, "FindJob")
+
+	listed, err := ListJobs(ctx, db, ListJobsParams{})
+	require.NoError(t, err)
+	assert.Equal(t, []JobView{want}, listed, "ListJobs")
+
+	finished, err := ListFinished(ctx, db, ListFinishedParams{})
+	require.NoError(t, err)
+	assert.Equal(t, []JobView{want}, finished, "ListFinished")
+}
+
+func TestJobViewProjectionIsComplete(t *testing.T) {
+	t.Parallel()
+	assertJobViewProjectionIsComplete(t, newDB(t))
+}
+
+// TestJobViewReadsNeverLoadArgs proves the reads that return a JobView select
+// its columns by name and none of the payload columns it omits.
+func TestJobViewReadsNeverLoadArgs(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	seedJob(t, db, fullJobRow())
+	ctx := context.Background()
+
+	reads := captureSQL(t, db, func(db *gorm.DB) {
+		_, err := FindJob(ctx, db, "job-full")
+		require.NoError(t, err)
+		_, err = ListJobs(ctx, db, ListJobsParams{})
+		require.NoError(t, err)
+		_, err = ListFinished(ctx, db, ListFinishedParams{})
+		require.NoError(t, err)
+	})
+	require.Len(t, reads, 5, "FindJob, ListJobs, and one ListFinished page per terminal state")
+	for _, stmt := range reads {
+		assert.NotContains(t, stmt, "*", stmt)
+		for _, col := range []string{"args", "metadata", "barrier_spec"} {
+			assert.NotContains(t, stmt, col, stmt)
+		}
+	}
+}
+
+// TestLatestRun covers a job's newest attempt: none, one, several (the highest
+// attempt wins, even where created_at orders the runs the other way), and a job
+// that does not exist, which reads like one that has not started.
+func TestLatestRun(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Each run's created_at runs backwards against its attempt, so a read ordered
+	// by created_at would return the lowest attempt, not the highest.
+	run := func(id, jobID string, attempt int, outcome RunOutcome) jobRunRow {
+		at := base.Add(-time.Duration(attempt) * time.Minute)
+		return jobRunRow{
+			ID: id, JobID: jobID, Attempt: attempt, ExecutorClass: "local", ExecutorID: "e",
+			Outcome: string(outcome), StartedAt: at, CreatedAt: at,
+			Output: datatypes.JSON(`{"attempt":` + strconv.Itoa(attempt) + `}`),
+		}
+	}
+	tests := []struct {
+		name   string
+		runs   []jobRunRow
+		jobID  string
+		wantID string
+	}{
+		{name: "no runs yet", jobID: "j"},
+		{name: "one run", runs: []jobRunRow{run("r1", "j", 1, OutcomeSuccess)}, jobID: "j", wantID: "r1"},
+		{
+			name: "several runs: the highest attempt",
+			runs: []jobRunRow{
+				run("r1", "j", 1, OutcomeError), run("r3", "j", 3, OutcomeSuccess),
+				run("r2", "j", 2, OutcomeError), run("other", "k", 4, OutcomeSuccess),
+			},
+			jobID: "j", wantID: "r3",
+		},
+		{name: "unknown job", runs: []jobRunRow{run("r1", "j", 1, OutcomeSuccess)}, jobID: "nope"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
+			for _, r := range tc.runs {
+				seedRun(t, db, r)
+			}
+			got, ok, err := LatestRun(context.Background(), db, tc.jobID)
+			require.NoError(t, err)
+			if tc.wantID == "" {
+				assert.False(t, ok)
+				assert.Equal(t, JobRunView{}, got)
+				return
+			}
+			require.True(t, ok)
+			assert.Equal(t, tc.wantID, got.ID)
+			assert.Equal(t, string(OutcomeSuccess), got.Outcome)
+			assert.JSONEq(t, `{"attempt":`+strconv.Itoa(got.Attempt)+`}`, string(got.Output))
+		})
+	}
+}
+
+// TestLatestRunSurfacesAReadError proves a failed read is returned, not reported
+// as a job with no runs.
+func TestLatestRunSurfacesAReadError(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	closeDB(t, db)
+	_, ok, err := LatestRun(context.Background(), db, "j")
+	require.ErrorContains(t, err, "flywheel: list runs")
+	assert.False(t, ok)
 }

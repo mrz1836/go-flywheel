@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	flywheel "github.com/mrz1836/go-flywheel"
@@ -83,6 +84,37 @@ func ExampleAlreadyEnqueuedError() {
 		fmt.Println(dup.ExistingID == first, dup.Key, errors.Is(err, flywheel.ErrAlreadyEnqueued))
 	}
 	// Output: true report:acct-42 true
+}
+
+// ExampleWaitForJob is enqueue-or-join, then wait: start the report unless one
+// for this account is already in flight, join whichever job is, and block until
+// it finishes — at most two minutes — before reading what it produced. It needs a
+// running Node to work the job, so it has no checked output.
+func ExampleWaitForJob() {
+	db, _ := gorm.Open(sqlite.Open("flywheel.db"), &gorm.Config{})
+	ctx, client := context.Background(), flywheel.NewClient(db)
+
+	id, err := flywheel.Insert(ctx, client, EmailArgs{To: "ops@example.com", Subject: "report"},
+		flywheel.InsertOpts{UniqueActiveKey: "report:acct-42"})
+	var dup *flywheel.AlreadyEnqueuedError
+	switch {
+	case errors.As(err, &dup) && dup.ExistingID != "":
+		id = dup.ExistingID // a report is already in flight: join it
+	case err != nil:
+		panic(err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	job, err := flywheel.WaitForJob(waitCtx, db, id)
+	if err != nil {
+		panic(err) // still running at the deadline, or the job is gone
+	}
+	if job.State != string(flywheel.StateSucceeded) {
+		panic("report " + job.State)
+	}
+	run, _, _ := flywheel.LatestRun(ctx, db, id)
+	fmt.Println(string(run.Output))
 }
 
 // ExampleNewNode wires a complete job-runtime daemon — a runner, the periodic
