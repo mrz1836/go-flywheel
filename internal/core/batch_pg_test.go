@@ -108,8 +108,8 @@ func TestInsertManyHonorsCallerTransactionPostgres(t *testing.T) {
 }
 
 // TestInsertManyReportsPartialProgressPostgres is A3 on Postgres: a row whose
-// BeforeCreate fails in the third chunk leaves chunks 0–1 committed and names
-// chunk 2 in the error.
+// BeforeCreate fails in the third chunk leaves chunks 0–1 committed, names chunk 2
+// in the error, and reports no id for a row that never landed.
 func TestInsertManyReportsPartialProgressPostgres(t *testing.T) {
 	t.Parallel()
 	db := NewPostgresIsolatedDB(t)
@@ -129,11 +129,18 @@ func TestInsertManyReportsPartialProgressPostgres(t *testing.T) {
 	var count int64
 	require.NoError(t, db.Table("jobs").Count(&count).Error)
 	assert.EqualValues(t, 200, count, "the failing chunk rolled back whole")
+
+	require.Len(t, res.IDs, len(items), "IDs stays aligned to the input")
+	for i, id := range res.IDs[:200] {
+		assert.NotEmptyf(t, id, "IDs[%d] landed in a committed chunk", i)
+	}
+	assert.Equal(t, make([]string, len(items)-200), res.IDs[200:],
+		"a row that never landed has no id: its chunk failed")
 }
 
 // TestInsertManySkipsDuplicatesPerRowPostgres is A4 on Postgres: 250 unique_key
 // and 100 unique_active_key collisions → Inserted 650, Skipped 350, exactly the
-// 350 colliding IDs empty, no error.
+// 350 colliding IDs empty, each naming its holder in ExistingIDs, no error.
 func TestInsertManySkipsDuplicatesPerRowPostgres(t *testing.T) {
 	t.Parallel()
 	db := NewPostgresIsolatedDB(t)
@@ -145,13 +152,16 @@ func TestInsertManySkipsDuplicatesPerRowPostgres(t *testing.T) {
 		ukCollisions  = 250
 		uakCollisions = 100
 	)
+	holders := make([]string, 0, ukCollisions+uakCollisions)
 	for i := range ukCollisions {
-		_, err := Enqueue(ctx, c, "pre", []byte(`{}`), InsertOpts{UniqueKey: fmt.Sprintf("uk-%d", i)})
+		id, err := Enqueue(ctx, c, "pre", []byte(`{}`), InsertOpts{UniqueKey: fmt.Sprintf("uk-%d", i)})
 		require.NoError(t, err)
+		holders = append(holders, id)
 	}
 	for i := range uakCollisions {
-		_, err := Enqueue(ctx, c, "pre", []byte(`{}`), InsertOpts{UniqueActiveKey: fmt.Sprintf("uak-%d", i)})
+		id, err := Enqueue(ctx, c, "pre", []byte(`{}`), InsertOpts{UniqueActiveKey: fmt.Sprintf("uak-%d", i)})
 		require.NoError(t, err)
+		holders = append(holders, id)
 	}
 
 	items := make([]BatchItem, total)
@@ -179,6 +189,28 @@ func TestInsertManySkipsDuplicatesPerRowPostgres(t *testing.T) {
 		}
 	}
 	assert.Equal(t, ukCollisions+uakCollisions, emptyIDs)
+
+	// Each skipped row names the pre-existing job holding its key; every row that
+	// landed has no holder.
+	require.Len(t, res.ExistingIDs, total, "ExistingIDs is aligned with IDs")
+	assert.Equal(t, holders, res.ExistingIDs[:ukCollisions+uakCollisions])
+	assert.Equal(t, make([]string, total-ukCollisions-uakCollisions), res.ExistingIDs[ukCollisions+uakCollisions:])
+}
+
+// TestInsertManyIntraBatchDuplicatesNameTheSiblingThatLandedPostgres proves an
+// intra-batch duplicate names the sibling that landed on PostgreSQL, where one
+// multi-row ON CONFLICT DO NOTHING statement inserts the rows in input order.
+func TestInsertManyIntraBatchDuplicatesNameTheSiblingThatLandedPostgres(t *testing.T) {
+	t.Parallel()
+	assertInsertManyIntraBatchDuplicatesNameTheSibling(t, NewPostgresIsolatedDB(t))
+}
+
+// TestInsertManyTxNamesHoldersOnTheCallersTransactionPostgres proves the batch's
+// holder read sees a holder still uncommitted on the caller's transaction, which
+// no other connection can.
+func TestInsertManyTxNamesHoldersOnTheCallersTransactionPostgres(t *testing.T) {
+	t.Parallel()
+	assertInsertManyTxNamesHolders(t, NewPostgresIsolatedDB(t))
 }
 
 // TestConflictChunkRowsAffectedIsUnusableForCountingPostgres is the RowsAffected

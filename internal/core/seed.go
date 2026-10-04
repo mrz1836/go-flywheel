@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -151,11 +150,10 @@ func SeedRun(ctx context.Context, db *gorm.DB, seed RunSeed) (string, error) {
 	// them: on the caller's transaction when Tx is set, or in one of their own.
 	write := func(tx *gorm.DB) error {
 		if createErr := tx.WithContext(ctx).Create(&row).Error; createErr != nil {
-			wrapped := models.WrapDBError(createErr)
-			if errors.Is(wrapped, models.ErrDuplicateKey) {
+			if isDuplicateKey(createErr) {
 				return ErrRunAlreadyRecorded
 			}
-			return fmt.Errorf("flywheel: SeedRun: %w", wrapped)
+			return fmt.Errorf("flywheel: SeedRun: %w", models.WrapDBError(createErr))
 		}
 		if row.FinishedAt == nil {
 			return nil

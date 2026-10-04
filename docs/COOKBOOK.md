@@ -25,14 +25,18 @@ if err != nil {
 }
 ```
 
+The error also names the original job: `errors.As` into a `*flywheel.AlreadyEnqueuedError` and its
+`ExistingID` is the job holding the key, ready to report or inspect.
+
 **The consequence to plan for: this job can never be re-enqueued.** The key collides with the original
 row forever, so a second `Insert` with the same key always returns `ErrAlreadyEnqueued`, even after the
 first job succeeded. To run that unit of work *again*, keep its row and replay it rather than
 re-enqueuing:
 
 ```go
-// Re-run one job by id (resets its attempt budget)...
-err := flywheel.RetryJob(ctx, db, jobID)
+// Re-run one job by id. Force re-runs a terminal job (plain RetryJob refuses one
+// with ErrJobTerminal), and ResetAttempts restores its attempt budget...
+err := flywheel.RetryJobWithOptions(ctx, db, jobID, flywheel.RetryOpts{Force: true, ResetAttempts: true})
 // ...or a whole failed cohort by lineage or failure window.
 _, err = flywheel.ReplayByParent(ctx, db, parentJobID, flywheel.ReplayOpts{})
 ```
@@ -60,7 +64,8 @@ if errors.Is(err, flywheel.ErrAlreadyEnqueued) {
 ```
 
 That is the whole check. The unique index answers "is there already an active job for this subject?" in
-the insert itself.
+the insert itself, and the error answers "which one?": `errors.As` into a
+`*flywheel.AlreadyEnqueuedError` and its `ExistingID` is the in-flight job.
 
 **The anti-pattern it replaces — don't do this:**
 
@@ -157,7 +162,7 @@ job. The runtime already keeps `job_runs`: one audit row per attempt, with the o
 | At most one active per subject | `UniqueActiveKey` | a still-live job with the key | the job reaches a terminal state | Yes, once the active one finishes |
 | At most one per time window | either, with the bucket in the key | same-bucket job | per the key type above | per the key type above |
 | Correlate an effect to an attempt | *(not a unique key)* — use `Job.RunID` | — | — | — |
-| Enqueue atomically with your own write | *(any key)* + `InsertOpts.Tx` | per the key | per the key | the job exists iff your transaction commits |
+| Enqueue atomically with your own write | *(any key)* + `InsertOpts.Tx` | per the key | per the key | the job exists iff your transaction commits; a collision leaves the transaction usable |
 
 The distinction that trips people up: **`UniqueKey` colliding with a terminal job is a feature, not a
 bug.** It is what "at most once, ever" means. If you find yourself wanting the key to free up after the

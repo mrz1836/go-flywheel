@@ -756,11 +756,10 @@ func (d *baseDriver) InsertChild(
 		return err
 	}
 	if createErr := tx.WithContext(ctx).Create(&row).Error; createErr != nil {
-		wrapped := models.WrapDBError(createErr)
-		if errors.Is(wrapped, models.ErrDuplicateKey) {
+		if isDuplicateKey(createErr) {
 			return ErrAlreadyEnqueued
 		}
-		return fmt.Errorf("jobs: insert child: %w", wrapped)
+		return fmt.Errorf("jobs: insert child: %w", models.WrapDBError(createErr))
 	}
 	return nil
 }

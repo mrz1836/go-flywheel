@@ -4,13 +4,15 @@ import (
 	"context"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
 
 // assertUniqueActiveKeyEnforced exercises the unique-while-active contract end to
-// end against db: a second active enqueue of the same key collides, a different
-// key is unaffected, and once the holding job is terminal the key enqueues again.
+// end against db: a second active enqueue of the same key collides and names the
+// job holding it, a different key is unaffected, and once the holding job is
+// terminal the key enqueues again — a terminal holder is no collision at all.
 // It is shared by the SQLite and (integration) Postgres suites so both dialects
 // prove enforcement.
 func assertUniqueActiveKeyEnforced(t *testing.T, db *gorm.DB) {
@@ -23,6 +25,10 @@ func assertUniqueActiveKeyEnforced(t *testing.T, db *gorm.DB) {
 
 	_, err = Enqueue(ctx, c, "k", []byte(`{}`), InsertOpts{UniqueActiveKey: "subject-1"})
 	require.ErrorIs(t, err, ErrAlreadyEnqueued, "a second active job for the same key is rejected")
+	var dup *AlreadyEnqueuedError
+	require.ErrorAs(t, err, &dup)
+	assert.Equal(t, id, dup.ExistingID, "the collision names the active job holding the key")
+	assert.Equal(t, "subject-1", dup.Key)
 
 	_, err = Enqueue(ctx, c, "k", []byte(`{}`), InsertOpts{UniqueActiveKey: "subject-2"})
 	require.NoError(t, err, "a different active key is unaffected")

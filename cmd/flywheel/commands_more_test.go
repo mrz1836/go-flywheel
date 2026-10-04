@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	flywheel "github.com/mrz1836/go-flywheel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -91,6 +93,43 @@ func TestCLIEnqueueWithScheduleAtAndFlags(t *testing.T) {
 		"--at", "2999-01-01T00:00:00Z")
 	require.NoError(t, err)
 	assert.NotEmpty(t, strings.TrimSpace(out), "enqueue prints the new job id")
+}
+
+// TestCLIEnqueueCollisionNamesTheHolder proves a second enqueue under the same
+// --unique key fails with the id of the job holding the key, so an operator can
+// go straight to that job.
+func TestCLIEnqueueCollisionNamesTheHolder(t *testing.T) {
+	t.Parallel()
+	cfg := migratedCLIConfig(t)
+	out, err := runRoot(context.Background(), "--config", cfg, "enqueue", "exec", `{"command":"true"}`, "--unique", "u1")
+	require.NoError(t, err)
+	holder := strings.TrimSpace(out)
+	require.NotEmpty(t, holder)
+
+	_, err = runRoot(context.Background(), "--config", cfg, "enqueue", "exec", `{"command":"true"}`, "--unique", "u1")
+	require.ErrorIs(t, err, flywheel.ErrAlreadyEnqueued)
+	assert.EqualError(t, err, `jobs: already enqueued: job `+holder+` holds key "u1"`)
+}
+
+// TestDescribeCollision pins the three messages: a named holder, a holder that
+// could not be identified, and an error that is not a collision at all.
+func TestDescribeCollision(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"named holder", &flywheel.AlreadyEnqueuedError{ExistingID: "j1", Key: "k"}, `jobs: already enqueued: job j1 holds key "k"`},
+		{"unidentified holder", &flywheel.AlreadyEnqueuedError{Key: "k"}, `jobs: already enqueued: key "k" (the job holding it could not be identified)`},
+		{"not a collision", errors.New("boom"), "boom"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.EqualError(t, describeCollision(tc.err), tc.want)
+		})
+	}
 }
 
 func TestCLIEnqueueRejectsBadAtTimestamp(t *testing.T) {

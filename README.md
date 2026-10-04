@@ -130,7 +130,7 @@ The runtime is built from focused, composable pieces:
 - **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](internal/core/runner.go))
 - **Per-run audit** — the `job_runs` table records every attempt: outcome, timing, queue wait, cost, and whether its claim was lost ([read.go](internal/core/read.go))
 - **Job analytics for dashboards** — what is running now, what just finished, per-kind stats over any window, hourly and daily trends from rollups that outlive retention, and low-noise regression alerts ([docs/INTEGRATING.md](docs/INTEGRATING.md))
-- **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work ([client.go](internal/core/client.go))
+- **Idempotent enqueue** — `jobs_unique_key` partial unique index dedupes work, and a collision names the job holding the key ([client.go](internal/core/client.go))
 - **Outbox pattern** — enqueue on the caller's own `*gorm.DB` transaction for exactly-once side effects ([client.go](internal/core/client.go))
 - **Follow-up jobs (DAG)** — workers return child jobs that are enqueued atomically ([types.go](internal/core/types.go))
 - **Bulk enqueue** — `InsertMany` writes N jobs in bounded, dialect-aware chunks, honoring the outbox transaction and per-row idempotency ([batch.go](internal/core/batch.go))
@@ -613,12 +613,15 @@ for i, subject := range subjects {
 res, err := flywheel.InsertMany(ctx, client, items, flywheel.BatchOpts{})
 // res.Inserted + res.Skipped == len(items).
 // res.IDs stays aligned to the input — empty at any row a unique-key collision skipped.
+// res.ExistingIDs is aligned too: at a skipped row, the id of the job holding its key.
 ```
 
 Everything `Enqueue` guarantees for one row holds per row here: the same defaults, the same
 `unique_key`/`unique_active_key` idempotency, the same `ErrAlreadyEnqueued` meaning — a collision is a
-per-row skip, never a failed batch. `res.Skipped` counts the collisions; set `BatchOpts.SkipDuplicates`
-to drop them silently instead. `InsertManyTyped[A]` is the generic form: it reads each job's kind from
+per-row skip, never a failed batch. `res.Skipped` counts the collisions and `res.ExistingIDs` names the
+job holding each skipped row's key (an earlier job, or a sibling earlier in the batch), at the cost of
+one read per chunk that skipped a row. Set `BatchOpts.SkipDuplicates` to drop collisions silently
+instead, which skips that read. `InsertManyTyped[A]` is the generic form: it reads each job's kind from
 the args value, exactly as `Insert` does.
 
 **The outbox guarantee carries over.** Set `BatchOpts.Tx` and every chunk writes on your transaction —

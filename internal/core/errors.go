@@ -34,10 +34,51 @@ func newValidationError(field, msg string) error {
 	return &ValidationError{Field: field, Message: msg}
 }
 
-// ErrAlreadyEnqueued is returned by Insert when a job with the same unique_key
-// already exists. Callers compare it with errors.Is and treat the work as
-// already submitted.
+// ErrAlreadyEnqueued reports that an enqueue collided with a job already holding
+// one of its unique keys: the job carrying the same UniqueKey, in any state for as
+// long as its row exists, or the live job carrying the same UniqueActiveKey.
+// Callers compare it with errors.Is and treat the work as already submitted.
+//
+// Insert and Enqueue return it inside an *AlreadyEnqueuedError naming that job, so
+// errors.As recovers the holder's id and errors.Is matches either form. The
+// retained Driver.InsertChild seam returns it bare.
 var ErrAlreadyEnqueued = errors.New("jobs: already enqueued")
+
+// AlreadyEnqueuedError is what Insert and Enqueue return when a unique key
+// collides, and what RetryJobWithOptions wraps when a forced retry cannot go live
+// because another job holds its UniqueActiveKey. It names the job already holding
+// the key, so a caller that wanted the work done can join that job — wait on
+// ExistingID — rather than drop the request. It unwraps to ErrAlreadyEnqueued and
+// its message is that sentinel's, so errors.Is(err, ErrAlreadyEnqueued) and every
+// match on the text keep working.
+//
+// The holder is read after the collision, on the handle the write ran on — the
+// caller's transaction when InsertOpts.Tx is set. ExistingID is empty only when the
+// holder could not be identified: it left the key's scope before the read (a
+// UniqueActiveKey holder reached a terminal state, which frees the key, or
+// retention hard-deleted a UniqueKey holder), or the read itself failed. A failed
+// read never masks the collision it follows. A soft-deleted job still holds its
+// key — neither unique index excludes deleted_at — so ExistingID can name a job
+// FindJob reports as not found.
+type AlreadyEnqueuedError struct {
+	// ExistingID is the id of the job holding Key, or empty when it could not be
+	// identified.
+	ExistingID string
+	// Key is the colliding key: the UniqueKey when a job holds it, otherwise the
+	// UniqueActiveKey a live job holds. When the read succeeded but found no
+	// holder, it is the UniqueActiveKey if the write set one, else the UniqueKey:
+	// the key freed between the collision and the read, and a live holder reaching
+	// a terminal state is what almost always frees one (a UniqueKey frees only
+	// when retention hard-deletes its holder). When the read failed, it is the
+	// first key the write set, UniqueKey before UniqueActiveKey.
+	Key string
+}
+
+// Error returns ErrAlreadyEnqueued's message unchanged: the text is a contract.
+func (e *AlreadyEnqueuedError) Error() string { return ErrAlreadyEnqueued.Error() }
+
+// Unwrap exposes ErrAlreadyEnqueued for errors.Is.
+func (e *AlreadyEnqueuedError) Unwrap() error { return ErrAlreadyEnqueued }
 
 // ErrFollowUpLimit is returned by Finalize when a worker returns more follow-ups
 // than the configured limit. It is deliberately fatal rather than truncating:

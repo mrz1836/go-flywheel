@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -156,7 +158,8 @@ func TestInsertManyDefaultChunkSizeIsDialectDefault(t *testing.T) {
 
 // TestInsertManySkipsDuplicatesPerRow is A4 on SQLite: 250 unique_key and 100
 // unique_active_key collisions against pre-existing jobs → Inserted 650,
-// Skipped 350, and exactly the 350 colliding IDs empty, with no error.
+// Skipped 350, exactly the 350 colliding IDs empty, each naming its holder in
+// ExistingIDs, with no error.
 func TestInsertManySkipsDuplicatesPerRow(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
@@ -168,13 +171,16 @@ func TestInsertManySkipsDuplicatesPerRow(t *testing.T) {
 		ukCollisions  = 250
 		uakCollisions = 100
 	)
+	holders := make([]string, 0, ukCollisions+uakCollisions)
 	for i := range ukCollisions {
-		_, err := Enqueue(ctx, c, "pre", []byte(`{}`), InsertOpts{UniqueKey: fmt.Sprintf("uk-%d", i)})
+		id, err := Enqueue(ctx, c, "pre", []byte(`{}`), InsertOpts{UniqueKey: fmt.Sprintf("uk-%d", i)})
 		require.NoError(t, err)
+		holders = append(holders, id)
 	}
 	for i := range uakCollisions {
-		_, err := Enqueue(ctx, c, "pre", []byte(`{}`), InsertOpts{UniqueActiveKey: fmt.Sprintf("uak-%d", i)})
+		id, err := Enqueue(ctx, c, "pre", []byte(`{}`), InsertOpts{UniqueActiveKey: fmt.Sprintf("uak-%d", i)})
 		require.NoError(t, err)
+		holders = append(holders, id)
 	}
 
 	items := make([]BatchItem, total)
@@ -202,28 +208,36 @@ func TestInsertManySkipsDuplicatesPerRow(t *testing.T) {
 		}
 	}
 	assert.Equal(t, ukCollisions+uakCollisions, emptyIDs)
+
+	// Each skipped row names the pre-existing job holding its key; every row that
+	// landed has no holder.
+	require.Len(t, res.ExistingIDs, total, "ExistingIDs is aligned with IDs")
+	assert.Equal(t, holders, res.ExistingIDs[:ukCollisions+uakCollisions])
+	assert.Equal(t, make([]string, total-ukCollisions-uakCollisions), res.ExistingIDs[ukCollisions+uakCollisions:])
 }
 
-// TestInsertManySkipDuplicatesFlag pins the one thing the flag governs: whether a
-// collision is reported in Skipped. Both modes land the same rows and clear the
+// TestInsertManySkipDuplicatesFlag pins what the flag governs: whether a
+// collision is reported — counted in Skipped and its holder named in ExistingIDs,
+// which takes a read the flag skips. Both modes land the same rows and clear the
 // same IDs.
 func TestInsertManySkipDuplicatesFlag(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name        string
-		skip        bool
-		wantSkipped int
+		name            string
+		skip            bool
+		wantSkipped     int
+		wantHolder      bool
+		wantHolderReads int
 	}{
-		{"reported by default", false, 1},
-		{"dropped when SkipDuplicates", true, 0},
+		{"reported by default", false, 1, true, 1},
+		{"dropped when SkipDuplicates", true, 0, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			db := newDB(t)
-			c := NewClient(db)
 			ctx := context.Background()
 
-			_, err := Enqueue(ctx, c, "pre", []byte(`{}`), InsertOpts{UniqueKey: "dup"})
+			holder, err := Enqueue(ctx, NewClient(db), "pre", []byte(`{}`), InsertOpts{UniqueKey: "dup"})
 			require.NoError(t, err)
 
 			items := []BatchItem{
@@ -231,20 +245,166 @@ func TestInsertManySkipDuplicatesFlag(t *testing.T) {
 				{Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueKey: "dup"}},
 				{Kind: "b", Args: []byte(`{}`)},
 			}
-			res, err := InsertMany(ctx, c, items, BatchOpts{SkipDuplicates: tc.skip})
+			var res BatchResult
+			reads := captureSQL(t, db, func(db *gorm.DB) {
+				res, err = InsertMany(ctx, NewClient(db), items, BatchOpts{SkipDuplicates: tc.skip})
+			})
 			require.NoError(t, err)
 			assert.Equal(t, 2, res.Inserted)
 			assert.Equal(t, tc.wantSkipped, res.Skipped)
 			assert.NotEmpty(t, res.IDs[0])
 			assert.Empty(t, res.IDs[1], "the colliding row's id is cleared in both modes")
 			assert.NotEmpty(t, res.IDs[2])
+
+			want := []string{"", "", ""}
+			if tc.wantHolder {
+				want[1] = holder
+			}
+			assert.Equal(t, want, res.ExistingIDs)
+			assert.Len(t, holderReads(reads), tc.wantHolderReads)
 		})
 	}
 }
 
+// holderReads returns the statements among reads that are holder reads — the
+// only SELECT naming unique_active_key.
+func holderReads(reads []string) []string {
+	var out []string
+	for _, r := range reads {
+		if strings.Contains(r, "unique_active_key") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// assertInsertManyIntraBatchDuplicatesNameTheSibling proves a row skipped by a
+// sibling earlier in the same batch names that sibling, for both kinds of key. It
+// is shared by the SQLite and (integration) PostgreSQL suites.
+func assertInsertManyIntraBatchDuplicatesNameTheSibling(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	items := []BatchItem{
+		{Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueKey: "A"}},
+		{Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueKey: "A"}},
+		{Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueActiveKey: "B"}},
+		{Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueActiveKey: "B"}},
+	}
+	res, err := InsertMany(context.Background(), NewClient(db), items, BatchOpts{})
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Inserted)
+	assert.Equal(t, 2, res.Skipped)
+	require.NotEmpty(t, res.IDs[0])
+	require.NotEmpty(t, res.IDs[2])
+	assert.Equal(t, []string{res.IDs[0], "", res.IDs[2], ""}, res.IDs)
+	assert.Equal(t, []string{"", res.IDs[0], "", res.IDs[2]}, res.ExistingIDs,
+		"each duplicate names the sibling that landed")
+}
+
+func TestInsertManyIntraBatchDuplicatesNameTheSiblingThatLanded(t *testing.T) {
+	t.Parallel()
+	assertInsertManyIntraBatchDuplicatesNameTheSibling(t, newDB(t))
+}
+
+// TestInsertManyNamesHoldersAcrossChunks proves the holder read is per chunk and
+// only for a chunk that skipped a row: a duplicate of a sibling that landed two
+// chunks earlier names it, a pre-existing holder is named in a later chunk, and a
+// clean chunk costs no read.
+func TestInsertManyNamesHoldersAcrossChunks(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	pre, err := Enqueue(ctx, NewClient(db), "pre", []byte(`{}`), InsertOpts{UniqueActiveKey: "held"})
+	require.NoError(t, err)
+
+	plain := BatchItem{Kind: "b", Args: []byte(`{}`)}
+	items := []BatchItem{
+		{Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueKey: "A"}}, plain, // chunk 0: lands
+		plain, plain, // chunk 1: no key
+		{Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueKey: "A"}}, plain, // chunk 2: the sibling's duplicate
+		{Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueKey: "C"}}, plain, // chunk 3: keyed, lands
+		plain, {Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueActiveKey: "held"}}, // chunk 4: pre-existing holder
+	}
+	var res BatchResult
+	reads := captureSQL(t, db, func(db *gorm.DB) {
+		res, err = InsertMany(ctx, NewClient(db), items, BatchOpts{ChunkSize: 2})
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 5, res.Chunks)
+	assert.Equal(t, 8, res.Inserted)
+	assert.Equal(t, 2, res.Skipped)
+
+	want := make([]string, len(items))
+	want[4], want[9] = res.IDs[0], pre
+	assert.Equal(t, want, res.ExistingIDs)
+	assert.Len(t, holderReads(reads), 2, "one holder read per chunk that skipped a row")
+}
+
+// assertInsertManyTxNamesHolders proves the batch's holder read runs on the
+// caller's transaction: a holder enqueued earlier in the same, still-open
+// transaction is named, and the transaction still commits. On a single-connection
+// SQLite pool a read on the write connection would wait on the transaction's own
+// connection until ctx expired; on PostgreSQL it could not see the uncommitted
+// holder. It is shared by both suites.
+func assertInsertManyTxNamesHolders(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c := NewClient(db)
+
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		holder, err := Enqueue(ctx, c, "holder", []byte(`{}`), InsertOpts{UniqueKey: "x", Tx: tx})
+		require.NoError(t, err)
+
+		items := []BatchItem{
+			{Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueKey: "x"}},
+			{Kind: "b", Args: []byte(`{}`)},
+		}
+		res, err := InsertMany(ctx, c, items, BatchOpts{Tx: tx})
+		require.NoError(t, err)
+		assert.Equal(t, []string{holder, ""}, res.ExistingIDs, "the holder written earlier on the transaction is named")
+		return nil
+	}))
+
+	var count int64
+	require.NoError(t, db.Model(&jobRow{}).Count(&count).Error)
+	assert.EqualValues(t, 2, count, "the holder and the unkeyed row committed")
+}
+
+func TestInsertManyTxNamesHoldersOnTheCallersTransaction(t *testing.T) {
+	t.Parallel()
+	assertInsertManyTxNamesHolders(t, newSingleConnMemoryDB(t))
+}
+
+// TestInsertManyHolderReadFailureLeavesTheRowsLanded proves the holder read is
+// best effort and runs after the chunk is written: when it fails, the rows that
+// landed stay landed and the skipped row simply names no holder.
+func TestInsertManyHolderReadFailureLeavesTheRowsLanded(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	_, err := Enqueue(ctx, NewClient(db), "pre", []byte(`{}`), InsertOpts{UniqueKey: "dup"})
+	require.NoError(t, err)
+	_ = failHolderReads(t, db)
+
+	items := []BatchItem{
+		{Kind: "b", Args: []byte(`{}`)},
+		{Kind: "b", Args: []byte(`{}`), Opts: InsertOpts{UniqueKey: "dup"}},
+	}
+	res, err := InsertMany(ctx, NewClient(db), items, BatchOpts{})
+	require.NoError(t, err, "a failed holder read is not a failed batch")
+	assert.Equal(t, 1, res.Inserted)
+	assert.Equal(t, 1, res.Skipped)
+	assert.Equal(t, []string{"", ""}, res.ExistingIDs)
+
+	var landed int64
+	require.NoError(t, db.Model(&jobRow{}).Where("kind = ?", "b").Count(&landed).Error)
+	assert.EqualValues(t, 1, landed, "the chunk's landed row is committed")
+}
+
 // TestInsertManyReportsPartialProgress is A3 on SQLite: a row whose BeforeCreate
 // fails in the third chunk aborts that chunk before any SQL, leaves chunks 0–1
-// committed, and names chunk 2 in the error.
+// committed, names chunk 2 in the error, and reports no id for a row that never
+// landed.
 func TestInsertManyReportsPartialProgress(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
@@ -264,6 +424,13 @@ func TestInsertManyReportsPartialProgress(t *testing.T) {
 	var count int64
 	require.NoError(t, db.Table("jobs").Count(&count).Error)
 	assert.EqualValues(t, 200, count, "the failing chunk rolled back whole")
+
+	require.Len(t, res.IDs, len(items), "IDs stays aligned to the input")
+	for i, id := range res.IDs[:200] {
+		assert.NotEmptyf(t, id, "IDs[%d] landed in a committed chunk", i)
+	}
+	assert.Equal(t, make([]string, len(items)-200), res.IDs[200:],
+		"a row that never landed has no id: its chunk failed")
 }
 
 // TestInsertManyHonorsCallerTransaction proves the Tx seam on SQLite: a

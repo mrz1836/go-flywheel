@@ -32,6 +32,7 @@ type Worker[A Args] = core.Worker[A]
 
 type (
 	ActiveCount           = core.ActiveCount
+	AlreadyEnqueuedError  = core.AlreadyEnqueuedError
 	Anomaly               = core.Anomaly
 	AnomalyParams         = core.AnomalyParams
 	AnomalySignal         = core.AnomalySignal

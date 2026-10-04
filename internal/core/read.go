@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -125,6 +126,28 @@ func NonTerminalStates() []JobState {
 // conversion instead of each re-deriving it.
 func nonTerminalStateStrings() []string {
 	return stateStrings(NonTerminalStates())
+}
+
+// liveStatesSQL returns the live states as a parenthesized list of quoted SQL
+// literals — ('available', 'running', 'retryable', 'scheduled', 'paused') —
+// built from nonTerminalStateStrings, in its order.
+//
+// A query meant to be served by the partial index jobs_unique_active_key spells
+// its state condition with this list instead of binding nonTerminalStateStrings.
+// A planner may use a partial index only when it can prove the query's WHERE
+// implies the index's, and neither SQLite, which matches the index's terms one by
+// one against the query's, nor a PostgreSQL generic plan can prove it through
+// bound parameters: with a bound list the read falls back to scanning jobs. The
+// index's DDL lists the same states in the same order, which
+// TestHolderLookupMirrorsTheUniqueIndexes pins. The states are the runtime's own
+// constants, so inlining them carries no injection risk.
+func liveStatesSQL() string {
+	states := nonTerminalStateStrings()
+	quoted := make([]string, len(states))
+	for i, s := range states {
+		quoted[i] = "'" + s + "'"
+	}
+	return "(" + strings.Join(quoted, ", ") + ")"
 }
 
 // TerminalStates returns the job states a job can no longer progress from

@@ -46,9 +46,15 @@ result, the shutdown that arrives a millisecond later cannot lose it.
 **Enqueue is idempotent under a unique key, and enqueue-in-transaction is atomic with your state.** An
 insert carrying `UniqueKey` collides with any job that ever bore that key and returns
 `ErrAlreadyEnqueued` instead of creating a duplicate; `UniqueActiveKey` does the same only while a job is
-still live. Passing `InsertOpts.Tx` writes the job row on your transaction, so the job exists **if and
-only if** your own state change commits — the transactional-outbox pattern, without a separate outbox
-table. See [`COOKBOOK.md`](COOKBOOK.md).
+still live. The error is an `*AlreadyEnqueuedError` that names the job holding the key (`errors.As`), so
+a caller can join that job instead of dropping the request. Passing `InsertOpts.Tx` writes the job row
+on your transaction, so the job exists **if and only if** your own state change commits — the
+transactional-outbox pattern, without a separate outbox table. A collision on `InsertOpts.Tx` leaves
+your transaction usable at READ COMMITTED, PostgreSQL's default: the keyed insert skips the duplicate
+rather than failing, so your own writes still commit. Under REPEATABLE READ or SERIALIZABLE, a collision
+with a holder that committed after your transaction took its snapshot surfaces as PostgreSQL's
+serialization failure (SQLSTATE 40001), which such a caller already has to retry; the retried
+transaction sees the holder and gets the `*AlreadyEnqueuedError`. See [`COOKBOOK.md`](COOKBOOK.md).
 
 <br>
 

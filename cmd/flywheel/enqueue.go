@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 // newEnqueueCmd builds `flywheel enqueue <kind> <json-args>`: enqueue one job of
 // an arbitrary kind from a JSON payload. It is the seam for ad-hoc work and for
 // triggering an exec/http job by hand (e.g. `enqueue exec '{"command":"..."}'`).
+// A --unique collision fails the command with the id of the job holding the key,
+// so an operator can inspect or wait on that job instead of hunting for it.
 func newEnqueueCmd(configPath *string) *cobra.Command {
 	var (
 		queue    string
@@ -46,7 +49,7 @@ func newEnqueueCmd(configPath *string) *cobra.Command {
 
 			id, err := flywheel.Enqueue(cmd.Context(), flywheel.NewClient(db), kind, payload, opts)
 			if err != nil {
-				return err
+				return describeCollision(err)
 			}
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), id)
 			return nil
@@ -57,4 +60,18 @@ func newEnqueueCmd(configPath *string) *cobra.Command {
 	cmd.Flags().IntVar(&priority, "priority", 0, "priority; lower runs first")
 	cmd.Flags().StringVar(&at, "at", "", "schedule for a future RFC3339 time")
 	return cmd
+}
+
+// describeCollision adds the holder's id and key to a unique-key collision, so
+// the message names the job the enqueue collided with. Any other error is
+// returned as it is.
+func describeCollision(err error) error {
+	var dup *flywheel.AlreadyEnqueuedError
+	if !errors.As(err, &dup) {
+		return err
+	}
+	if dup.ExistingID == "" {
+		return fmt.Errorf("%w: key %q (the job holding it could not be identified)", err, dup.Key)
+	}
+	return fmt.Errorf("%w: job %s holds key %q", err, dup.ExistingID, dup.Key)
 }

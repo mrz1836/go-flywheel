@@ -2,6 +2,7 @@ package flywheel_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/glebarez/sqlite"
 	flywheel "github.com/mrz1836/go-flywheel"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // EmailArgs is a job's typed arguments. Its Kind method names the worker that
@@ -56,6 +58,31 @@ func ExampleInsert() {
 	}
 	fmt.Println(id != "")
 	// Output: true
+}
+
+// ExampleAlreadyEnqueuedError finds the job an insert collided with: a second
+// insert under the same UniqueActiveKey collides, and the error names the job
+// holding the key, so the caller can join that job instead of dropping the
+// request. (The silent logger keeps GORM's duplicate-key log line out of the
+// example's output.)
+func ExampleAlreadyEnqueuedError() {
+	db, _ := gorm.Open(sqlite.Open("file:example-already-enqueued?mode=memory&cache=shared"),
+		&gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	_ = flywheel.Migrate(db)
+	ctx, client := context.Background(), flywheel.NewClient(db)
+	opts := flywheel.InsertOpts{UniqueActiveKey: "report:acct-42"}
+
+	first, err := flywheel.Insert(ctx, client, EmailArgs{To: "a@example.com"}, opts)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = flywheel.Insert(ctx, client, EmailArgs{To: "a@example.com"}, opts)
+	var dup *flywheel.AlreadyEnqueuedError
+	if errors.As(err, &dup) {
+		fmt.Println(dup.ExistingID == first, dup.Key, errors.Is(err, flywheel.ErrAlreadyEnqueued))
+	}
+	// Output: true report:acct-42 true
 }
 
 // ExampleNewNode wires a complete job-runtime daemon — a runner, the periodic

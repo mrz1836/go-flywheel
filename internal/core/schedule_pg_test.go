@@ -120,3 +120,19 @@ func TestRetryResetAttemptsKeepsJobRunsContinuousPostgres(t *testing.T) {
 			"job_runs is continuous 1,2,3 with no gap and no unique-index collision")
 	}
 }
+
+// TestRetryJobForceOnAHeldActiveKeyNamesTheHolderPostgres is the forced-retry
+// collision on PostgreSQL, where the duplicate-key UPDATE raises 23505.
+func TestRetryJobForceOnAHeldActiveKeyNamesTheHolderPostgres(t *testing.T) {
+	t.Parallel()
+	assertRetryForceOnAHeldActiveKeyNamesTheHolder(t, NewPostgresIsolatedDB(t))
+}
+
+// TestRetryJobForceOnACallerTransactionLeavesItUsablePostgres is the dialect
+// where a refused retry on a caller's transaction could abort it: the
+// duplicate-key UPDATE raises 23505, and only a savepoint around it keeps the
+// transaction alive for the holder read and the caller's own writes.
+func TestRetryJobForceOnACallerTransactionLeavesItUsablePostgres(t *testing.T) {
+	t.Parallel()
+	assertRetryForceOnACallerTransactionLeavesItUsable(t, NewPostgresIsolatedDB(t))
+}
