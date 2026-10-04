@@ -22,7 +22,9 @@ const (
 	defaultRetentionInterval = time.Hour
 )
 
-// Scheduler enqueues jobs from periodic definitions and reclaims stuck jobs.
+// Scheduler enqueues jobs from periodic definitions and reclaims stuck jobs. With
+// SchedulerConfig.Periodics set it also applies the definitions the host declares
+// and keeps them present.
 type Scheduler struct {
 	db                   *gorm.DB
 	client               *Client
@@ -42,6 +44,18 @@ type Scheduler struct {
 	statsCfg        rollupConfig
 	statsAnomalyLog bool
 	stats           statsState
+
+	// The declared periodics (scheduler_periodics.go). periodics is the validated
+	// copy of SchedulerConfig.Periodics and never changes after construction;
+	// reconcileInterval is zero when the reconcile pass is off.
+	periodics         []PeriodicSpec
+	reconcileInterval time.Duration
+	// periodicsMu guards the start-up apply's retry state: the declarations Run
+	// could not apply, and whether a failure has been logged since the last
+	// success. Run's apply and the reconcile activity run on different goroutines.
+	periodicsMu      sync.Mutex
+	pendingPeriodics []PeriodicSpec
+	applyFailed      bool
 }
 
 // SchedulerConfig configures a Scheduler. DB, Client, and Driver are required;
@@ -67,7 +81,8 @@ type SchedulerConfig struct {
 	// clause and needs none), so a Scheduler that picked its own implementation
 	// would be choosing a dialect it was never told.
 	Driver Driver
-	// Logger logs tick and sweep failures. Optional; defaults to slog.Default().
+	// Logger logs tick and sweep failures, and the re-creation of a declared
+	// periodic that went missing. Optional; defaults to slog.Default().
 	Logger *slog.Logger
 	// Observer receives a SweepEvent after each stuck-lease reclaim pass, so sweep
 	// timing joins the same telemetry stream as claims and finalizes. Optional;
@@ -158,6 +173,42 @@ type SchedulerConfig struct {
 	// discarded at markedly more than their baseline rate. Hours rolled while the
 	// rollup is catching up on old history are not evaluated.
 	StatsAnomalyLog bool
+
+	// Periodics are the periodic definitions this host declares. Run applies them
+	// on start with UpsertPeriodic's semantics — a missing definition is inserted, a
+	// changed one updated, an unchanged one keeps its next_run_at cursor — so every
+	// restart re-applies the whole declaration, Active included: a declared
+	// definition an operator deactivated is active again after the next start.
+	//
+	// While Run runs, the reconcile activity re-creates any declared definition
+	// whose row has gone missing — a database restored from an older snapshot, one
+	// rebuilt from migrations under a running node, a DeletePeriodic — and logs each
+	// re-creation once, at warn. It only ever inserts: a definition that exists —
+	// deactivated with SetPeriodicActive, edited by hand — is left exactly as it is
+	// until the next start, and one this host does not declare is never touched. A
+	// re-created definition fires next at its first fire time after the
+	// re-creation; the fires it missed while gone are not backfilled.
+	//
+	// Retire a declared definition by removing it here first, on every host that
+	// declares it, and deleting its row second: a row deleted while it is still
+	// declared comes back.
+	//
+	// Every definition is validated, and slugs must be unique, when the Scheduler
+	// is constructed. A PeriodicSpec's zero Active is inactive, so a definition
+	// meant to fire says Active: true. Nil (the default) declares nothing, and the
+	// Scheduler then reads and writes job_periodics exactly as without the field.
+	Periodics []PeriodicSpec
+	// ReconcileInterval is the cadence at which missing declared periodics are
+	// re-created. Zero selects one minute — a pass with nothing missing is one
+	// indexed read and writes nothing; a negative value disables the pass. It has
+	// no effect without Periodics.
+	//
+	// Disabling the pass does not disable the start-up apply's retry: declarations
+	// Run could not apply — the database was unreachable, or refused one — are
+	// retried every minute until they land, and the activity then stops. With the
+	// pass on, a declaration still waiting on that retry is left out of it, so one
+	// that keeps failing holds back only itself.
+	ReconcileInterval time.Duration
 }
 
 // NewScheduler returns a Scheduler over db and the producer client with the
@@ -259,6 +310,9 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 	if s.retentionMaxAge > 0 && s.retentionInterval <= 0 {
 		s.retentionInterval = defaultRetentionInterval
 	}
+	if err := s.configurePeriodics(cfg); err != nil {
+		return nil, err
+	}
 	if err := s.configureStats(cfg); err != nil {
 		return nil, err
 	}
@@ -295,9 +349,16 @@ type activity struct {
 	// One skip is a slow pass; a climbing count is a cadence the deployment has
 	// to widen, and only a consecutive count distinguishes the two.
 	skips atomic.Int64
+	// done, when set, is asked after every tick and ends the loop once it
+	// reports true. It is for an activity whose work can run out — the reconcile
+	// with its pass off, once the start-up apply's retry has landed — so its
+	// goroutine exits instead of ticking into an early return for the rest of
+	// Run. Nil runs the activity until ctx is cancelled.
+	done func() bool
 }
 
-// loop runs the activity until ctx is cancelled.
+// loop runs the activity until ctx is cancelled, or until its done hook reports
+// that it has no work left.
 func (a *activity) loop(ctx context.Context, logger *slog.Logger) {
 	ticker := time.NewTicker(a.interval)
 	defer ticker.Stop()
@@ -307,6 +368,9 @@ func (a *activity) loop(ctx context.Context, logger *slog.Logger) {
 			return
 		case <-ticker.C:
 			a.tick(ctx, logger)
+			if a.done != nil && a.done() {
+				return
+			}
 		}
 	}
 }
@@ -333,6 +397,13 @@ func (a *activity) tick(ctx context.Context, logger *slog.Logger) {
 // retention sweep on its own cadence, and when HealthSampleInterval is set it
 // logs a queue-health pulse on that cadence.
 //
+// With Periodics declared, Run first applies them, before any activity starts, so
+// the first tick already sees them; then the reconcile activity keeps them
+// present (see SchedulerConfig.Periodics). A declaration Run cannot apply because
+// the database is unreachable does not stop it, for the same reason an
+// unreachable database does not fail the schema check: the failure is logged, and
+// the reconcile activity retries what did not land.
+//
 // Each activity runs on its own goroutine, so none can delay another, and none
 // can overlap itself: a tick arriving while its predecessor is still running is
 // skipped and logged at warn rather than queued behind it.
@@ -350,6 +421,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	if err := s.checkSchema(ctx); err != nil {
 		return err
 	}
+	// The apply runs before activities() so the reconcile activity is built for a
+	// retry the apply left pending.
+	s.applyDeclaredPeriodics(ctx)
 	s.runActivities(ctx, s.activities())
 	return fmt.Errorf("jobs: scheduler stopped: %w", ctx.Err())
 }
@@ -377,7 +451,10 @@ func (s *Scheduler) runActivities(ctx context.Context, activities []*activity) {
 //
 // Retention and the health heartbeat stay opt-in structurally rather than by a
 // disabled ticker: no interval, no goroutine. A capability that is off should
-// cost nothing, not tick into a branch that returns early.
+// cost nothing, not tick into a branch that returns early. The reconcile
+// activity follows the same rule: it runs only with Periodics declared, and with
+// the pass disabled only while a start-up apply that failed is waiting to be
+// retried — its goroutine exits once the retry lands.
 func (s *Scheduler) activities() []*activity {
 	acts := []*activity{
 		{name: "periodic", interval: s.tickInterval, run: s.tickOnce},
@@ -396,6 +473,12 @@ func (s *Scheduler) activities() []*activity {
 	if s.statsInterval > 0 {
 		acts = append(acts, &activity{
 			name: "stats", interval: s.statsInterval, run: s.rollupOnce,
+		})
+	}
+	if s.reconcileEnabled() {
+		acts = append(acts, &activity{
+			name: "reconcile", interval: s.reconcileCadence(), run: s.reconcileOnce,
+			done: s.reconcileFinished,
 		})
 	}
 	return acts
@@ -435,19 +518,19 @@ func (s *Scheduler) pruneOnce(ctx context.Context) {
 	}
 }
 
-// logMaintenanceError logs a maintenance failure, suppressing the ones that
-// are just the shutdown arriving.
+// logMaintenanceError logs a maintenance failure, with any extra attrs after the
+// error, suppressing the ones that are just the shutdown arriving.
 //
 // A cancelled sweep or prune is what a clean drain looks like from inside the
 // activity: the batched implementations report partial progress plus the
 // context error, which is correct for a caller and noise in a log. Without this
 // every ordinary shutdown would gain an error line the unbounded implementation
 // never produced — a new alert for a non-event.
-func (s *Scheduler) logMaintenanceError(ctx context.Context, msg string, err error) {
+func (s *Scheduler) logMaintenanceError(ctx context.Context, msg string, err error, attrs ...any) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return
 	}
-	s.logger.ErrorContext(ctx, msg, "error", err)
+	s.logger.ErrorContext(ctx, msg, append([]any{"error", err}, attrs...)...)
 }
 
 // SampleHealth reads a QueueHealth gauge snapshot through the Scheduler's

@@ -16,8 +16,9 @@ import (
 
 // PeriodicSpec declares a periodic (cron or fixed-interval) job. It is the
 // exported, host-facing form of a job_periodics row: UpsertPeriodic reconciles it
-// by slug, and the Scheduler fires the matching kind on each due tick. Exactly one
-// of Cron or Every must be set.
+// by slug, SchedulerConfig.Periodics declares a host's set of them, and the
+// Scheduler fires the matching kind on each due tick. Exactly one of Cron or Every
+// must be set.
 type PeriodicSpec struct {
 	// Slug is the stable identity of the schedule; re-upserting the same slug
 	// updates the existing definition rather than creating a duplicate.
@@ -112,8 +113,10 @@ func nextFireAfter(spec PeriodicSpec, now time.Time) (time.Time, error) {
 // updates it, so concurrent upserts end exactly where the same calls made one
 // after the other would: the last writer's spec wins.
 //
-// It is the exported writer for job_periodics, which the CLI and a host's startup
-// reconciliation use to declare schedules in code.
+// It is the exported writer for job_periodics, behind `flywheel schedule add`. A
+// host declaring its schedules in code will usually rather set
+// SchedulerConfig.Periodics, which applies them this way when the Scheduler starts
+// and re-creates any that go missing while it runs.
 func UpsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) error {
 	if err := spec.validate(); err != nil {
 		return err

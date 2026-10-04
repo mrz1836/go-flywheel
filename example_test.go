@@ -155,7 +155,9 @@ func ExampleNewNode() {
 
 // ExampleUpsertPeriodic declares a periodic job in code: run "send_email" every
 // day at 02:00. Reconciling the same slug on startup is idempotent, so it is safe
-// to call on every boot.
+// to call on every boot. A host running a Scheduler will usually declare its
+// schedules in SchedulerConfig.Periodics instead, which applies them the same way
+// on start and re-creates any that go missing while it runs.
 func ExampleUpsertPeriodic() {
 	db, _ := gorm.Open(sqlite.Open("flywheel.db"), &gorm.Config{})
 	_ = flywheel.Migrate(db)
@@ -169,4 +171,45 @@ func ExampleUpsertPeriodic() {
 	if err != nil {
 		panic(err)
 	}
+}
+
+// ExampleSchedulerConfig_periodics declares a host's periodic jobs on its
+// Scheduler. Run applies them on start — an unchanged schedule keeps its cadence
+// across restarts — and re-creates any whose row goes missing while it runs, such
+// as after a database restore, logging each re-creation once at warn. To retire
+// one, remove it from Periodics first, then delete its row.
+func ExampleSchedulerConfig_periodics() {
+	db, _ := gorm.Open(sqlite.Open("flywheel.db"), &gorm.Config{})
+	_ = flywheel.Migrate(db)
+
+	reg := flywheel.NewRegistry()
+	flywheel.Register(reg, EmailWorker{})
+	driver := flywheel.NewSQLiteDriver(db)
+
+	node, err := flywheel.NewNode(flywheel.NodeConfig{
+		Runners: []flywheel.RunnerConfig{{
+			DB: db, Driver: driver, Registry: reg,
+			Queues: []string{"default", "periodic"}, Concurrency: 1, ClaimAnyClass: true,
+		}},
+		Scheduler: &flywheel.SchedulerConfig{
+			DB: db, Client: flywheel.NewClient(db), Driver: driver,
+			Periodics: []flywheel.PeriodicSpec{{
+				Slug:         "nightly-report",
+				Kind:         "send_email",
+				Cron:         "0 2 * * *",
+				ArgsTemplate: []byte(`{"to":"ops@example.com","subject":"nightly report"}`),
+				Active:       true, // the zero value declares the schedule inactive
+			}},
+			// How often a missing schedule is re-created. Zero selects one minute;
+			// a negative value turns it off, leaving only the apply on start.
+			ReconcileInterval: 5 * time.Minute,
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	_ = node.Run(ctx)
 }

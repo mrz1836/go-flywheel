@@ -97,8 +97,9 @@ in any worker whose duration you need bounded.
 
 **The scheduler is a singleton by deployment, not by election.** The runtime holds no lock guaranteeing
 only one scheduler runs. Running two doubles the sweep and retention load (periodic ticks collapse
-harmlessly on the bucketed unique key, and the stats rollup replaces whole hours idempotently). Enforce
-one scheduler in your deployment — see [`RUNBOOK.md`](RUNBOOK.md).
+harmlessly on the bucketed unique key, the stats rollup replaces whole hours idempotently, and the
+declared-periodic reconcile inserts a missing slug once). Enforce one scheduler in your deployment — see
+[`RUNBOOK.md`](RUNBOOK.md).
 
 <br>
 
