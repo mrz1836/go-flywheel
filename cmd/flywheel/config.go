@@ -95,6 +95,12 @@ type RuntimeConfig struct {
 	// disables it. With it on, serve also logs the onset of a duration regression
 	// or failure spike once, at warn.
 	StatsRollup Duration `yaml:"stats_rollup"`
+	// ScheduleReconcile is how often `serve` re-creates a declared schedule whose
+	// row was deleted while it runs — by `flywheel schedule rm`, a restore, or a
+	// rebuilt database. Unset (zero) selects one minute; a negative value (e.g.
+	// -1s) disables it. Serve applies the whole schedules list on every start
+	// either way.
+	ScheduleReconcile Duration `yaml:"schedule_reconcile"`
 	// EnvAllowlist names the host environment variables exec jobs inherit. Nil
 	// uses the ExecWorker default (PATH, HOME, SHELL, LANG, TMPDIR).
 	EnvAllowlist []string `yaml:"env_allowlist"`
@@ -139,6 +145,26 @@ func (r RuntimeConfig) effectiveStatsRollup() (time.Duration, string) {
 			"raise it, or set runtime.stats_rollup explicitly", r.Retention.Std(), rollupMinRetention)
 	default:
 		return defaultStatsRollup, ""
+	}
+}
+
+// defaultScheduleReconcile is the cadence serve re-creates missing declared
+// schedules at when runtime.schedule_reconcile is unset. Serve passes the unset
+// value through and the scheduler applies its own one-minute default; this names
+// the same value so doctor and the start log can report it.
+const defaultScheduleReconcile = time.Minute
+
+// scheduleReconcileInterval resolves runtime.schedule_reconcile to the cadence
+// serve re-creates missing declared schedules at: the default when unset, zero
+// (off) when negative.
+func (r RuntimeConfig) scheduleReconcileInterval() time.Duration {
+	switch {
+	case r.ScheduleReconcile < 0:
+		return 0
+	case r.ScheduleReconcile > 0:
+		return r.ScheduleReconcile.Std()
+	default:
+		return defaultScheduleReconcile
 	}
 }
 

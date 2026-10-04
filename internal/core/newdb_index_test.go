@@ -154,7 +154,7 @@ func newJobPeriodicRow(id, slug string) jobPeriodicRow {
 		Queue:           "periodic",
 		IntervalSeconds: &every,
 		NextRunAt:       now,
-		IsActive:        true,
+		IsActive:        new(true),
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}

@@ -23,21 +23,21 @@ func TestRunServeFailsToMigrateOnClosedDB(t *testing.T) {
 	assert.Contains(t, err.Error(), "migrate")
 }
 
-func TestRunServeFailsToReconcileOnClosedDB(t *testing.T) {
+func TestRunServeFailsToDisableOrphansOnAListFailure(t *testing.T) {
 	t.Parallel()
-	// Migrate the DB first so Migrate succeeds, then close it so the reconcile step
-	// (the next database touch) is the failure point.
+	// Migrate and the Node build succeed against a live DB; a read of
+	// job_periodics that fails makes the orphan-disable — serve's first write to
+	// the schedules — the failure point.
 	db := newCLITestDB(t)
+	failPeriodicReads(t, db)
 	cfg := &Config{
 		Runtime:   defaultConfig().Runtime,
 		Schedules: []ScheduleEntry{{Slug: "x", Worker: "exec", Every: Duration(time.Minute), Exec: &execSpec{Command: "true"}}},
 	}
-	sqlDB, err := db.DB()
-	require.NoError(t, err)
-	require.NoError(t, sqlDB.Close())
 
-	err = runServe(context.Background(), cfg, db, flywheel.NewSQLiteDriver(db))
-	require.Error(t, err, "serve fails when it cannot reconcile schedules")
+	err := runServe(context.Background(), cfg, db, flywheel.NewSQLiteDriver(db))
+	require.Error(t, err, "serve fails when it cannot disable the orphaned schedules")
+	assert.Contains(t, err.Error(), "reconcile schedules: ")
 }
 
 func TestRunServeFailsToBuildNodeWithNoQueues(t *testing.T) {
@@ -65,7 +65,8 @@ func TestRunDoctorReportsUnreachableDatabase(t *testing.T) {
 	require.NoError(t, sqlDB.Close())
 
 	var buf bytes.Buffer
-	err = runDoctor(context.Background(), &buf, "cfg.yaml", &Config{DB: DBConfig{SQLite: "x"}}, db)
+	cfg := &Config{DB: DBConfig{SQLite: "x"}, Runtime: defaultConfig().Runtime}
+	err = runDoctor(context.Background(), &buf, "cfg.yaml", cfg, db, cliTestDriver(t, db))
 	require.Error(t, err, "a closed database is reported as unreachable")
 	assert.Contains(t, err.Error(), "database unreachable")
 }
@@ -82,7 +83,7 @@ func TestRunDoctorHappyPathReportsOK(t *testing.T) {
 			{Slug: "ping", Worker: "http", Every: Duration(time.Minute), HTTP: &httpSpec{URL: "https://x.test"}},
 		},
 	}
-	require.NoError(t, runDoctor(context.Background(), &buf, "cfg.yaml", cfg, db))
+	require.NoError(t, runDoctor(context.Background(), &buf, "cfg.yaml", cfg, db, cliTestDriver(t, db)))
 	out := buf.String()
 	assert.Contains(t, out, "status:       OK")
 	assert.Contains(t, out, "sqlite:", "the sqlite hardening line is printed for a sqlite config")

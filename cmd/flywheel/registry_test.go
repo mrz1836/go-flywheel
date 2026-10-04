@@ -44,41 +44,63 @@ func TestScheduleWorkerKindAndArgsTemplate(t *testing.T) {
 	assert.JSONEq(t, `{"targets":["test"],"binary":"magex"}`, string(tmpl))
 }
 
-func TestReconcileSchedulesUpsertsAndIsIdempotent(t *testing.T) {
+// TestScheduleSpecsDeclareEveryEntryActive proves the YAML becomes one active
+// PeriodicSpec per entry, carrying the worker's kind, the queue, the schedule,
+// and the worker spec as the args template — the declarations serve hands the
+// scheduler and doctor compares with the database.
+func TestScheduleSpecsDeclareEveryEntryActive(t *testing.T) {
 	t.Parallel()
-	db := newCLITestDB(t)
 	cfg := &Config{Schedules: []ScheduleEntry{
 		{Slug: "a", Worker: "exec", Every: Duration(time.Minute), Exec: &execSpec{Command: "true"}},
-		{Slug: "b", Worker: "http", Cron: "0 * * * *", HTTP: &httpSpec{URL: "https://x.test"}},
+		{Slug: "b", Worker: "http", Cron: "0 * * * *", Queue: "hooks", HTTP: &httpSpec{URL: "https://x.test"}},
 	}}
-	ctx := context.Background()
 
-	require.NoError(t, reconcileSchedules(ctx, db, cfg))
-	views, err := flywheel.ListPeriodics(ctx, db)
+	specs, err := scheduleSpecs(cfg)
 	require.NoError(t, err)
-	require.Len(t, views, 2)
+	require.Len(t, specs, 2)
 
-	// Reconciling the same config again updates in place, not duplicates.
-	require.NoError(t, reconcileSchedules(ctx, db, cfg))
-	views, err = flywheel.ListPeriodics(ctx, db)
+	assert.Equal(t, "a", specs[0].Slug)
+	assert.Equal(t, workers.ExecKind, specs[0].Kind)
+	assert.Equal(t, time.Minute, specs[0].Every)
+	assert.Empty(t, specs[0].Cron)
+	assert.Empty(t, specs[0].Queue, "an unset queue is left to the runtime's default")
+	assert.JSONEq(t, `{"command":"true"}`, string(specs[0].ArgsTemplate))
+
+	assert.Equal(t, "b", specs[1].Slug)
+	assert.Equal(t, workers.HTTPKind, specs[1].Kind)
+	assert.Equal(t, "0 * * * *", specs[1].Cron)
+	assert.Zero(t, specs[1].Every)
+	assert.Equal(t, "hooks", specs[1].Queue)
+	assert.JSONEq(t, `{"url":"https://x.test"}`, string(specs[1].ArgsTemplate))
+
+	for _, spec := range specs {
+		assert.True(t, spec.Active, "%s: a declared schedule fires", spec.Slug)
+	}
+
+	none, err := scheduleSpecs(&Config{})
 	require.NoError(t, err)
-	assert.Len(t, views, 2)
+	assert.Empty(t, none)
 }
 
-func TestReconcileSchedulesDisablesOrphans(t *testing.T) {
+// TestDisableOrphanSchedulesDisablesUndeclared proves the orphan-disable is the
+// file's say over which schedules fire: an active row the config no longer names
+// is deactivated (and kept), a declared one is left alone, and nothing is
+// created — applying the declarations is the scheduler's job.
+func TestDisableOrphanSchedulesDisablesUndeclared(t *testing.T) {
 	t.Parallel()
 	db := newCLITestDB(t)
 	ctx := context.Background()
-
-	both := &Config{Schedules: []ScheduleEntry{
+	for _, slug := range []string{"a", "b", "c"} {
+		require.NoError(t, flywheel.UpsertPeriodic(ctx, db, flywheel.PeriodicSpec{
+			Slug: slug, Kind: workers.ExecKind, Every: time.Minute, Active: slug != "c",
+		}))
+	}
+	cfg := &Config{Schedules: []ScheduleEntry{
 		{Slug: "a", Worker: "exec", Every: Duration(time.Minute), Exec: &execSpec{Command: "true"}},
-		{Slug: "b", Worker: "exec", Every: Duration(time.Minute), Exec: &execSpec{Command: "true"}},
+		{Slug: "d", Worker: "exec", Every: Duration(time.Minute), Exec: &execSpec{Command: "true"}},
 	}}
-	require.NoError(t, reconcileSchedules(ctx, db, both))
 
-	// Drop b from the config; a declarative reconcile must deactivate it.
-	onlyA := &Config{Schedules: []ScheduleEntry{both.Schedules[0]}}
-	require.NoError(t, reconcileSchedules(ctx, db, onlyA))
+	require.NoError(t, disableOrphanSchedules(ctx, db, cfg))
 
 	views, err := flywheel.ListPeriodics(ctx, db)
 	require.NoError(t, err)
@@ -86,8 +108,8 @@ func TestReconcileSchedulesDisablesOrphans(t *testing.T) {
 	for _, v := range views {
 		active[v.Slug] = v.Active
 	}
-	assert.True(t, active["a"], "a stays active")
-	assert.False(t, active["b"], "b is deactivated when removed from the config")
+	assert.Equal(t, map[string]bool{"a": true, "b": false, "c": false}, active,
+		"b is deactivated when removed from the config, and d is not created here")
 }
 
 func TestBuildRegistryRegistersAllWorkers(t *testing.T) {

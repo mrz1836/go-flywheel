@@ -125,6 +125,34 @@ func TestActivityLoopStopsOnContextCancel(t *testing.T) {
 	}
 }
 
+// TestActivityLoopEndsWhenDone proves an activity with a done hook ends its own
+// loop after the pass that leaves the hook true, without its context being
+// cancelled — and that a nil hook (every other activity) does not.
+func TestActivityLoopEndsWhenDone(t *testing.T) {
+	t.Parallel()
+
+	var runs atomic.Int64
+	a := &activity{
+		name:     "finite",
+		interval: time.Millisecond,
+		run:      func(context.Context) { runs.Add(1) },
+		done:     func() bool { return runs.Load() >= 3 },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exited := make(chan struct{})
+	go func() { defer close(exited); a.loop(ctx, slog.New(&captureHandler{})) }()
+
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("the loop did not end once its done hook reported true")
+	}
+	assert.EqualValues(t, 3, runs.Load(), "the loop ends after the pass that finished the work")
+	assert.NoError(t, ctx.Err())
+}
+
 // TestSchedulerRunKeepsMaintenanceActivitiesIndependent proves independence at the level
 // that matters: a retention pass slower than its own interval must not delay the
 // lease sweep.

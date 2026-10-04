@@ -18,6 +18,7 @@ runtime:
   # metrics_addr: ":9090"  # expose /healthz, /readyz, and a Prometheus /metrics endpoint; unset = off
   # health_sample_interval: 30s  # log a queue-health heartbeat (ready/in-flight/lag) on this cadence; unset = off
   # stats_rollup: 1m  # roll finished runs into hourly stats for `flywheel stats`; unset = 1m, negative (-1s) = off
+  # schedule_reconcile: 1m  # re-create declared schedules deleted while serve runs; unset = 1m, negative (-1s) = off
   # env_allowlist: [PATH, HOME, SHELL, LANG, TMPDIR]  # host env exec jobs inherit
 
 log:
@@ -27,6 +28,10 @@ log:
 # Declarative cron replacement. Each entry becomes a durable, retried, audited
 # periodic job — strictly better than crontab (history, backfill, overlap
 # protection). Use exactly one of `cron` or `every`.
+#
+# This list is the source of truth: serve applies it on every start, disables
+# schedules it does not name, and re-creates a listed schedule deleted while it
+# runs. To retire one, remove it here first.
 #
 # Pick the worker that matches what you run locally:
 #   exec    — any binary or command (lowest level)

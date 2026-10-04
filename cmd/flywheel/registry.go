@@ -179,22 +179,19 @@ func buildRegistry(cfg *Config) *flywheel.Registry {
 	return reg
 }
 
-// reconcileSchedules makes flywheel.yaml the declarative source of truth for
-// schedules: it upserts every config schedule into job_periodics, then disables
-// any active definition the config no longer names. Removing a schedule from the
-// file therefore stops it firing on the next serve, while preserving its row (and
-// history) for inspection. It is idempotent: unchanged entries keep their cadence
-// cursor across restarts.
-func reconcileSchedules(ctx context.Context, db *gorm.DB, cfg *Config) error {
-	configured := make(map[string]bool, len(cfg.Schedules))
+// scheduleSpecs turns the config's schedules into the periodic definitions they
+// declare, each active. It is the one place the YAML becomes PeriodicSpecs, so
+// what serve declares and what doctor compares against the database cannot
+// drift apart.
+func scheduleSpecs(cfg *Config) ([]flywheel.PeriodicSpec, error) {
+	specs := make([]flywheel.PeriodicSpec, 0, len(cfg.Schedules))
 	for i := range cfg.Schedules {
 		s := cfg.Schedules[i]
-		configured[s.Slug] = true
 		args, err := s.argsTemplate()
 		if err != nil {
-			return fmt.Errorf("schedule %q: marshal args: %w", s.Slug, err)
+			return nil, fmt.Errorf("schedule %q: marshal args: %w", s.Slug, err)
 		}
-		if err := flywheel.UpsertPeriodic(ctx, db, flywheel.PeriodicSpec{
+		specs = append(specs, flywheel.PeriodicSpec{
 			Slug:         s.Slug,
 			Kind:         s.workerKind(),
 			Queue:        s.Queue,
@@ -202,11 +199,26 @@ func reconcileSchedules(ctx context.Context, db *gorm.DB, cfg *Config) error {
 			Cron:         s.Cron,
 			Every:        s.Every.Std(),
 			Active:       true,
-		}); err != nil {
-			return fmt.Errorf("schedule %q: %w", s.Slug, err)
-		}
+		})
 	}
+	return specs, nil
+}
 
+// disableOrphanSchedules makes flywheel.yaml the declarative source of truth for
+// which schedules fire: it disables every active definition the config does not
+// name. Removing a schedule from the file therefore stops it firing on the next
+// serve, while preserving its row (and history) for inspection.
+//
+// It is the half of the reconcile the scheduler cannot do. Serve hands the
+// declared schedules to the scheduler, which applies them on start — unchanged
+// entries keep their cadence cursor — and re-creates any that go missing while
+// it runs; what the scheduler cannot know is which rows the file no longer
+// names, so serve disables those here, once, on start.
+func disableOrphanSchedules(ctx context.Context, db *gorm.DB, cfg *Config) error {
+	configured := make(map[string]bool, len(cfg.Schedules))
+	for i := range cfg.Schedules {
+		configured[cfg.Schedules[i].Slug] = true
+	}
 	existing, err := flywheel.ListPeriodics(ctx, db)
 	if err != nil {
 		return fmt.Errorf("reconcile schedules: %w", err)
@@ -219,6 +231,16 @@ func reconcileSchedules(ctx context.Context, db *gorm.DB, cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// declaresSchedule reports whether the config declares a schedule with slug.
+func declaresSchedule(cfg *Config, slug string) bool {
+	for i := range cfg.Schedules {
+		if cfg.Schedules[i].Slug == slug {
+			return true
+		}
+	}
+	return false
 }
 
 // newLogger builds the structured logger the daemon and commands log through.

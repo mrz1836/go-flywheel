@@ -138,9 +138,13 @@ type jobPeriodicRow struct {
 	IntervalSeconds *int           `gorm:"column:interval_seconds"`
 	NextRunAt       time.Time      `gorm:"column:next_run_at;not null"`
 	LastEnqueuedAt  *time.Time     `gorm:"column:last_enqueued_at"`
-	IsActive        bool           `gorm:"column:is_active;not null;default:true"`
-	CreatedAt       time.Time      `gorm:"column:created_at;not null"`
-	UpdatedAt       time.Time      `gorm:"column:updated_at;not null"`
+	// IsActive is a pointer, not a bool, so a definition can be inserted inactive:
+	// GORM substitutes a tag's parsed default for a zero value on create, so a bool
+	// with default:true could never be written false. A nil IsActive still takes
+	// the default. The column — NOT NULL DEFAULT true — is unchanged.
+	IsActive  *bool     `gorm:"column:is_active;not null;default:true"`
+	CreatedAt time.Time `gorm:"column:created_at;not null"`
+	UpdatedAt time.Time `gorm:"column:updated_at;not null"`
 }
 
 // TableName binds jobPeriodicRow to the job_periodics table.

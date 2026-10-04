@@ -3,10 +3,12 @@ package core
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mrz1836/go-foundation/models"
+	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -67,6 +69,75 @@ func TestUpsertPeriodicUpdatesExistingBySlug(t *testing.T) {
 	assert.False(t, views[0].Active, "the active flag is updated")
 }
 
+// TestUpsertPeriodicInsertHonorsActive proves a new definition is stored with the
+// Active it was upserted with, and that an inactive one never fires. It fails
+// against a bool IsActive: GORM substitutes a column's tag default for a zero
+// value on create, and is_active defaults to true, so an upsert with Active false
+// inserted an active row.
+func TestUpsertPeriodicInsertHonorsActive(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		active   bool
+		wantJobs int
+	}{
+		"active":   {active: true, wantJobs: 1},
+		"inactive": {active: false, wantJobs: 0},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
+			base := time.Now().UTC().Truncate(time.Second)
+			ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
+
+			require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{
+				Slug: "p-" + name, Kind: "test.honors", Every: time.Minute, Active: tt.active,
+			}))
+
+			views, err := ListPeriodics(ctx, db)
+			require.NoError(t, err)
+			require.Len(t, views, 1)
+			assert.Equal(t, tt.active, views[0].Active, "the row is stored with the Active it was upserted with")
+
+			// Past its first fire time only the active definition enqueues.
+			n, err := newScheduler(t, db).Tick(clockCtx(context.Background(),
+				models.NewFixedClock(base.Add(90*time.Second))))
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantJobs, n)
+			assert.EqualValues(t, tt.wantJobs, jobCount(t, db, "test.honors"))
+		})
+	}
+}
+
+// TestJobPeriodicsIsActiveStillDefaultsTrue guards the column itself: IsActive
+// became a pointer so false can be written, and the column's NOT NULL DEFAULT
+// true must have survived the change for a writer that leaves is_active out —
+// a raw INSERT, or a GORM create with the field unset.
+func TestJobPeriodicsIsActiveStillDefaultsTrue(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	require.NoError(t, db.Exec(
+		`INSERT INTO job_periodics(id, slug, kind, args_template, queue, interval_seconds, next_run_at, created_at, updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?)`,
+		models.NewID(), "raw", "k", "{}", "periodic", 60, now, now, now,
+	).Error)
+	interval := 60
+	require.NoError(t, db.Create(&jobPeriodicRow{
+		Slug: "gorm", Kind: "k", NextRunAt: now, IntervalSeconds: &interval,
+	}).Error)
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	require.Len(t, views, 2)
+	for _, v := range views {
+		assert.True(t, v.Active, "%s: a row written without is_active defaults to active", v.Slug)
+	}
+}
+
 func TestUpsertPeriodicSwitchesScheduleType(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
@@ -92,14 +163,166 @@ func TestUpsertPeriodicRejectsInvalidSpecs(t *testing.T) {
 		"missing kind":     {Slug: "s", Every: time.Minute},
 		"neither schedule": {Slug: "s", Kind: "k"},
 		"both schedules":   {Slug: "s", Kind: "k", Every: time.Minute, Cron: "* * * * *"},
+		"sub-second every": {Slug: "s", Kind: "k", Every: 500 * time.Millisecond},
 		"malformed cron":   {Slug: "s", Kind: "k", Cron: "not a cron"},
+		"malformed args":   {Slug: "s", Kind: "k", Every: time.Minute, ArgsTemplate: []byte("{not json")},
 	}
 	for name, spec := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			require.Error(t, UpsertPeriodic(ctx, db, spec))
+			// Every rejection is a validation failure, so a caller can tell a spec
+			// it must fix from a database it must retry with one errors.Is.
+			require.ErrorIs(t, UpsertPeriodic(ctx, db, spec), ErrValidation)
 		})
 	}
+}
+
+// TestUpsertPeriodicRejectsAnArgsTemplateThatIsNotJSON proves a template that
+// is not JSON is refused up front and nothing is written. Without the check
+// SQLite stored it as given and every fire enqueued args no worker could decode,
+// while PostgreSQL's jsonb column refused it only at the insert, as a database
+// error rather than a validation failure.
+func TestUpsertPeriodicRejectsAnArgsTemplateThatIsNotJSON(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+
+	err := UpsertPeriodic(ctx, db, PeriodicSpec{
+		Slug: "bad-args", Kind: "k", Every: time.Minute, Active: true, ArgsTemplate: []byte("{not json"),
+	})
+	require.ErrorIs(t, err, ErrValidation)
+	assert.EqualError(t, err, "flywheel: args_template must be valid JSON")
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	assert.Empty(t, views, "nothing is written for a rejected spec")
+
+	require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{
+		Slug: "good-args", Kind: "k", Every: time.Minute, Active: true, ArgsTemplate: []byte(`{"n":1}`),
+	}), "a JSON template is accepted")
+}
+
+// TestPeriodicSpecCronErrorKeepsItsText proves wrapping ErrValidation did not
+// change what a malformed cron reports: the text is still the parse error's, which
+// is what an operator searches a log for, and the parser's own error is still
+// reachable beneath it.
+func TestPeriodicSpecCronErrorKeepsItsText(t *testing.T) {
+	t.Parallel()
+	_, parseErr := cron.ParseStandard("not a cron")
+	require.Error(t, parseErr)
+
+	err := PeriodicSpec{Slug: "s", Kind: "k", Cron: "not a cron"}.validate()
+	require.ErrorIs(t, err, ErrValidation)
+	assert.Equal(t, `flywheel: parse cron "not a cron": `+parseErr.Error(), err.Error(),
+		"the message is the parse error's, without the sentinel's text appended")
+	assert.NotContains(t, err.Error(), ErrValidation.Error())
+}
+
+// insertCompetingPeriodic writes a job_periodics row for slug directly, the way a
+// second host's insert would land between this one's lookup and its insert.
+func insertCompetingPeriodic(t *testing.T, db *gorm.DB, slug string) {
+	t.Helper()
+	now := time.Now().UTC()
+	require.NoError(t, db.Exec(
+		`INSERT INTO job_periodics(id, slug, kind, args_template, queue, cron_expr, next_run_at, is_active, created_at, updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		models.NewID(), slug, "test.competitor", "{}", "competitor", "0 3 * * *", now.Add(time.Hour), false, now, now,
+	).Error)
+}
+
+// afterPeriodicLookupMiss runs fn once, right after the first job_periodics read
+// that finds nothing. It is the deterministic form of a race: a second host's
+// insert lands in the window between UpsertPeriodic's lookup and its own insert.
+func afterPeriodicLookupMiss(t *testing.T, db *gorm.DB, fn func()) {
+	t.Helper()
+	var fired atomic.Bool
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register("test:after_periodic_miss", func(tx *gorm.DB) {
+		if tx.Statement.Table == "job_periodics" && errors.Is(tx.Error, gorm.ErrRecordNotFound) && fired.CompareAndSwap(false, true) {
+			fn()
+		}
+	}))
+}
+
+// TestUpsertPeriodicAdoptsARowInsertedConcurrently proves an upsert that loses
+// the insert to a concurrent writer of the same new slug does not fail: it adopts
+// the row that landed and applies its own spec to it, which is where the two calls
+// made one after the other would have ended. It fails against a plain read-then-
+// insert, which surfaced the unique violation as "flywheel: insert periodic".
+func TestUpsertPeriodicAdoptsARowInsertedConcurrently(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	afterPeriodicLookupMiss(t, db, func() { insertCompetingPeriodic(t, db, "p") })
+
+	require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{
+		Slug: "p", Kind: "test.mine", Every: time.Minute, Queue: "mine", Active: true,
+	}))
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	require.Len(t, views, 1, "the losing insert adopted the row rather than duplicating it")
+	assert.Equal(t, "test.mine", views[0].Kind, "the caller's spec is applied to the adopted row")
+	assert.Equal(t, "mine", views[0].Queue)
+	assert.Equal(t, 60, views[0].IntervalSeconds)
+	assert.Empty(t, views[0].Cron, "the competitor's cron is replaced by the caller's interval")
+	assert.True(t, views[0].Active)
+}
+
+// TestUpsertPeriodicReportsARowRemovedMidUpsert covers the narrowest window: the
+// insert lost to a concurrent writer, and the row it lost to was deleted before the
+// upsert could re-read it. There is nothing to adopt, so it says so rather than
+// reporting success for a definition that does not exist.
+func TestUpsertPeriodicReportsARowRemovedMidUpsert(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+
+	var deleteNext atomic.Bool
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:delete_before_reread", func(tx *gorm.DB) {
+		if tx.Statement.Table == "job_periodics" && deleteNext.CompareAndSwap(true, false) {
+			require.NoError(t, db.Exec(`DELETE FROM job_periodics WHERE slug = ?`, "p").Error)
+		}
+	}))
+	afterPeriodicLookupMiss(t, db, func() {
+		insertCompetingPeriodic(t, db, "p")
+		deleteNext.Store(true)
+	})
+
+	err := UpsertPeriodic(ctx, db, PeriodicSpec{Slug: "p", Kind: "test.mine", Every: time.Minute, Active: true})
+	require.ErrorContains(t, err, `flywheel: upsert periodic "p": inserted and removed concurrently`)
+}
+
+// assertInsertPeriodicReportsWhetherItLanded is the body of
+// TestInsertPeriodicReportsWhetherItLanded and its PostgreSQL mirror: the first
+// insert of a slug lands and the second is skipped, and each says which. The
+// fixes that rely on the flag — UpsertPeriodic's adopt path and the reconcile's
+// warn-once — rest on GORM counting a single-struct conflict insert exactly.
+func assertInsertPeriodicReportsWhetherItLanded(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	spec := PeriodicSpec{Slug: "landed", Kind: "test.landed", Every: time.Minute, Active: true}
+
+	first, inserted, err := insertPeriodic(ctx, db, spec, now)
+	require.NoError(t, err)
+	assert.True(t, inserted, "the first insert of a slug lands")
+	assert.NotEmpty(t, first.ID)
+
+	spec.Kind = "test.second"
+	lost, inserted, err := insertPeriodic(ctx, db, spec, now)
+	require.NoError(t, err, "a skipped insert is not an error")
+	assert.False(t, inserted, "the second insert of the slug is skipped and says so")
+	assert.Equal(t, jobPeriodicRow{}, lost, "a skipped insert returns no row: the one it built does not exist")
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	require.Len(t, views, 1)
+	assert.Equal(t, "test.landed", views[0].Kind, "the skipped insert changed nothing")
+}
+
+func TestInsertPeriodicReportsWhetherItLanded(t *testing.T) {
+	t.Parallel()
+	assertInsertPeriodicReportsWhetherItLanded(t, newDB(t))
 }
 
 func TestUpsertPeriodicThenSchedulerFiresWhenDue(t *testing.T) {

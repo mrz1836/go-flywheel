@@ -54,8 +54,10 @@ type NodeConfig struct {
 	// set of queues at a different concurrency for a different executor class. At
 	// least one is required.
 	Runners []core.RunnerConfig
-	// Scheduler, when non-nil, runs periodic ticks plus the stuck-lease sweep.
-	// Leave it nil on a pure worker node where another process owns scheduling.
+	// Scheduler, when non-nil, runs periodic ticks plus the stuck-lease sweep,
+	// and applies the periodic definitions its Periodics declare and keeps them
+	// present. Leave it nil on a pure worker node where another process owns
+	// scheduling.
 	Scheduler *core.SchedulerConfig
 	// Health configures the optional liveness/readiness server.
 	Health HealthConfig

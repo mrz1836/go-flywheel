@@ -1,6 +1,10 @@
 // Command exec-cron shows flywheel replacing cron. It registers the generic
-// ExecWorker and schedules a shell command to run on an interval — durably, with
+// ExecWorker and declares a shell command to run on an interval — durably, with
 // retries and a full per-run audit trail — without writing any job-specific Go.
+//
+// The schedule is declared on the Scheduler, so it is applied on every start and
+// re-created if its row is deleted while the program runs: the code, not the
+// database, is the source of truth.
 //
 //	go run ./examples/exec-cron
 //
@@ -45,16 +49,12 @@ func main() {
 	// Replace a crontab line like:
 	//   */1 * * * * sh -c "date '+%T' && echo healthy"
 	// with a durable, retried, audited periodic job.
-	args := []byte(`{"command":"sh","args":["-c","date '+%T' && echo healthy"]}`)
-	if err := flywheel.UpsertPeriodic(context.Background(), db, flywheel.PeriodicSpec{
+	healthCheck := flywheel.PeriodicSpec{
 		Slug:         "health-check",
 		Kind:         workers.ExecKind,
 		Every:        time.Minute,
-		ArgsTemplate: args,
+		ArgsTemplate: []byte(`{"command":"sh","args":["-c","date '+%T' && echo healthy"]}`),
 		Active:       true,
-	}); err != nil {
-		logger.Error("schedule", "error", err)
-		os.Exit(1)
 	}
 
 	// One driver, shared by the runner and the scheduler, so the lease sweep runs
@@ -66,8 +66,12 @@ func main() {
 			DB: db, Driver: driver, Registry: reg,
 			Queues: []string{"default", "periodic"}, Concurrency: 1, ClaimAnyClass: true, Logger: logger,
 		}},
-		Scheduler: &flywheel.SchedulerConfig{DB: db, Client: flywheel.NewClient(db), Driver: driver},
-		Logger:    logger,
+		Scheduler: &flywheel.SchedulerConfig{
+			DB: db, Client: flywheel.NewClient(db), Driver: driver, Logger: logger,
+			// Applied when the node starts; re-created within a minute if deleted.
+			Periodics: []flywheel.PeriodicSpec{healthCheck},
+		},
+		Logger: logger,
 	})
 	if err != nil {
 		logger.Error("build node", "error", err)

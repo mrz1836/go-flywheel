@@ -124,7 +124,7 @@ The runtime is built from focused, composable pieces:
 - **Typed workers** — generic `Worker[A]` interface, registered by `Kind()` ([registry.go](internal/core/registry.go))
 - **One-call lifecycle** — `Node` runs N runners + the scheduler + an optional health/metrics server and drains cleanly on shutdown ([node.go](internal/node/node.go))
 - **Bounded concurrency** — a runner keeps up to `Concurrency` jobs in flight, each slot refilling independently so one slow job never idles the rest; explicit `Stop`/`Drain` with an in-flight count ([runner.go](internal/core/runner.go))
-- **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `UpsertPeriodic` ([scheduler.go](internal/core/scheduler.go), [schedule.go](internal/core/schedule.go))
+- **Scheduler** — periodic / cron job enqueuing plus stuck-lease recovery; declare schedules in code with `SchedulerConfig.Periodics` (applied on start, re-created if deleted) or `UpsertPeriodic` ([scheduler.go](internal/core/scheduler.go), [schedule.go](internal/core/schedule.go))
 - **Retries with backoff** — exponential backoff with jitter, overridable per worker; consecutive poll failures climb their own ladder so a failing database is not hammered ([runner.go](internal/core/runner.go))
 - **Lease-based recovery** — orphaned, crashed jobs reclaimed via `leased_until` sweeps ([scheduler.go](internal/core/scheduler.go))
 - **Worker timeouts** — per-job or per-kind execution deadlines that classify as a retryable timeout ([runner.go](internal/core/runner.go))
@@ -243,7 +243,8 @@ func callLLM(ctx context.Context, docID string) (summary string, costMicros int6
 That's a durable AI pipeline: enqueue returns instantly, the `Node` summarizes documents
 in the background, a failed model call retries itself with backoff, and every attempt —
 including what it cost — lands in the `job_runs` audit table. Need periodic or cron-style
-runs too? Add a `Scheduler` to the `Node` (see [`examples/`](examples) for the full set).
+runs too? Add a `Scheduler` to the `Node` and declare them in its `Periodics` (see
+[Declared periodics](#declared-periodics), and [`examples/`](examples) for the full set).
 
 `Migrate` above is the right call when the database is the runtime's alone. If flywheel's tables
 will share a database with your own application schema, use the host-owned path instead — see
@@ -1082,9 +1083,10 @@ database; [`examples/dashboard-api`](examples/dashboard-api/main.go) is a read-o
 <summary><strong><code>Retention and scheduler maintenance</code></strong></summary>
 <br/>
 
-The `Scheduler` runs three or four maintenance activities, each on its own goroutine and its own
-cadence: the periodic tick, the lease sweep, and — when you enable them — a retention prune and a
-queue-health heartbeat.
+The `Scheduler` runs up to six maintenance activities, each on its own goroutine and its own
+cadence: the periodic tick, the lease sweep, and — when you enable them — a retention prune, a
+queue-health heartbeat, the hourly stats rollup, and the reconcile that keeps declared periodics
+present.
 
 Independence is the point. A slow retention prune must not delay the lease sweep, because the sweep is
 the only path by which work lost to a crashed process comes back. An activity also never overlaps
@@ -1183,6 +1185,54 @@ is the same value the `flywheel_queue_oldest_ready_seconds` gauge reports, and i
 zero when nothing is ready, so a log-metric filter gets a datapoint each interval and can alarm on lag
 directly.
 
+### Declared periodics
+
+Declare the periodic jobs a host runs in `SchedulerConfig.Periodics`. The scheduler applies them when
+it starts and keeps them present while it runs: a definition whose row goes missing — a database
+restored from an older snapshot, a development database rebuilt from migrations under a running node,
+a `DeletePeriodic` — is re-created by the next reconcile pass and logged once, at warn.
+
+```go
+node, _ := flywheel.NewNode(flywheel.NodeConfig{
+    Runners: []flywheel.RunnerConfig{{DB: db, Driver: driver, Registry: reg, Queues: queues}},
+    Scheduler: &flywheel.SchedulerConfig{
+        DB:     db,
+        Client: flywheel.NewClient(db),
+        Driver: driver,
+        Periodics: []flywheel.PeriodicSpec{
+            {Slug: "nightly-report", Kind: "send_report", Cron: "0 2 * * *", Active: true},
+            {Slug: "inventory-sync", Kind: "sync_inventory", Every: 15 * time.Minute, Active: true},
+        },
+    },
+})
+```
+
+| Field | Default | What it does |
+|---|---|---|
+| `Periodics` | none | The definitions this host declares. Each is validated, and slugs must be unique, when the scheduler is constructed; `Run` applies them on start. |
+| `ReconcileInterval` | `1m` | How often a declared definition whose row is missing is re-created. A pass with nothing missing is one indexed read that writes nothing. Negative turns the pass off. |
+
+**On start, the declaration wins.** Every start applies the whole declaration with `UpsertPeriodic`'s
+semantics: a missing definition is inserted, a changed one updated, and an unchanged one keeps its
+`next_run_at` cursor, so a restart does not reset a cadence. `Active` is applied too, so a declared
+definition an operator deactivated with `SetPeriodicActive` is active again after the next start. A
+`PeriodicSpec`'s zero `Active` is inactive: a definition meant to fire says `Active: true`. When the
+database is unreachable at start, `Run` keeps going — it logs `jobs: declared periodic apply failed`
+and retries the declarations that did not land on the reconcile cadence, every minute when the pass is
+off, until they do. A declaration that keeps failing holds back only itself: the reconcile keeps every
+other declared definition present meanwhile.
+
+**While it runs, the reconcile only inserts.** A definition that exists — deactivated, or edited by
+hand — is left exactly as it is until the next start, and one this host does not declare is never
+touched. A re-created definition fires next at its first fire time after the re-creation; the runs it
+missed while gone are not backfilled. Several schedulers declaring the same definitions is safe: the
+insert does nothing when the slug exists, and only the scheduler whose insert landed logs
+`jobs: declared periodic was missing and has been re-created` (fields `slug`, `kind`, `next_run_at`).
+
+**Retiring a declared definition** takes two steps, in this order: remove it from `Periodics` on every
+host that declares it, then delete its row. A row deleted while a running scheduler still declares it
+comes back — including from a host a rolling deploy has not reached yet.
+
 </details>
 
 <details>
@@ -1237,8 +1287,9 @@ schedules:
       url: https://gateway.internal/healthz
 ```
 
-Every run's stdout, stderr, and exit code are captured to the `job_runs` audit trail — inspect
-them with `flywheel jobs inspect <id>`. Prefer to wire it from Go? The
+The file is the source of truth: `serve` applies it on every start, disables the schedules it does
+not name, and re-creates a declared schedule deleted while it runs. Every run's stdout, stderr, and
+exit code are captured to the `job_runs` audit trail — inspect them with `flywheel jobs inspect <id>`. Prefer to wire it from Go? The
 [examples/local-tasks](examples/local-tasks) program registers the shell, python, and mage
 workers and schedules one of each. See the [CLI README](cmd/flywheel/README.md) for every
 command, the config reference, and the macOS launchd setup.
