@@ -68,6 +68,75 @@ func TestUpsertPeriodicUpdatesExistingBySlug(t *testing.T) {
 	assert.False(t, views[0].Active, "the active flag is updated")
 }
 
+// TestUpsertPeriodicInsertHonorsActive proves a new definition is stored with the
+// Active it was upserted with, and that an inactive one never fires. It fails
+// against a bool IsActive: GORM substitutes a column's tag default for a zero
+// value on create, and is_active defaults to true, so an upsert with Active false
+// inserted an active row.
+func TestUpsertPeriodicInsertHonorsActive(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		active   bool
+		wantJobs int
+	}{
+		"active":   {active: true, wantJobs: 1},
+		"inactive": {active: false, wantJobs: 0},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := newDB(t)
+			base := time.Now().UTC().Truncate(time.Second)
+			ctx := models.WithClock(context.Background(), models.NewFixedClock(base))
+
+			require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{
+				Slug: "p-" + name, Kind: "test.honors", Every: time.Minute, Active: tt.active,
+			}))
+
+			views, err := ListPeriodics(ctx, db)
+			require.NoError(t, err)
+			require.Len(t, views, 1)
+			assert.Equal(t, tt.active, views[0].Active, "the row is stored with the Active it was upserted with")
+
+			// Past its first fire time only the active definition enqueues.
+			n, err := newScheduler(t, db).Tick(clockCtx(context.Background(),
+				models.NewFixedClock(base.Add(90*time.Second))))
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantJobs, n)
+			assert.EqualValues(t, tt.wantJobs, jobCount(t, db, "test.honors"))
+		})
+	}
+}
+
+// TestJobPeriodicsIsActiveStillDefaultsTrue guards the column itself: IsActive
+// became a pointer so false can be written, and the column's NOT NULL DEFAULT
+// true must have survived the change for a writer that leaves is_active out —
+// a raw INSERT, or a GORM create with the field unset.
+func TestJobPeriodicsIsActiveStillDefaultsTrue(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	require.NoError(t, db.Exec(
+		`INSERT INTO job_periodics(id, slug, kind, args_template, queue, interval_seconds, next_run_at, created_at, updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?)`,
+		models.NewID(), "raw", "k", "{}", "periodic", 60, now, now, now,
+	).Error)
+	interval := 60
+	require.NoError(t, db.Create(&jobPeriodicRow{
+		Slug: "gorm", Kind: "k", NextRunAt: now, IntervalSeconds: &interval,
+	}).Error)
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	require.Len(t, views, 2)
+	for _, v := range views {
+		assert.True(t, v.Active, "%s: a row written without is_active defaults to active", v.Slug)
+	}
+}
+
 func TestUpsertPeriodicSwitchesScheduleType(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)

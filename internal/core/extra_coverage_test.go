@@ -557,7 +557,7 @@ func TestSchedulerFireSurfacesAdvanceError(t *testing.T) {
 	def := jobPeriodicRow{
 		ID: models.NewID(), Slug: "due", Kind: "cov.k", Queue: "periodic",
 		ArgsTemplate: datatypes.JSON("{}"), NextRunAt: now.Add(-time.Hour),
-		IntervalSeconds: &secs, IsActive: true,
+		IntervalSeconds: &secs, IsActive: new(true),
 	}
 	_, err := sched.fire(ctx, def, now)
 	require.ErrorContains(t, err, "advance periodic", "a failed periodic advance is surfaced")
@@ -576,7 +576,7 @@ func TestSchedulerFireSurfacesCronBucketError(t *testing.T) {
 	def := jobPeriodicRow{
 		ID: models.NewID(), Slug: "c", Kind: "cov.k", Queue: "periodic",
 		ArgsTemplate: datatypes.JSON("{}"), NextRunAt: now.Add(-time.Hour),
-		CronExpr: &bad, IsActive: true,
+		CronExpr: &bad, IsActive: new(true),
 	}
 	_, err := sched.fire(ctx, def, now)
 	require.ErrorContains(t, err, "parse cron", "a malformed stored cron expression aborts fire")
@@ -601,7 +601,7 @@ func TestSchedulerFireSurfacesEnqueueError(t *testing.T) {
 	def := jobPeriodicRow{
 		ID: models.NewID(), Slug: "due", Kind: "cov.k", Queue: "periodic",
 		ArgsTemplate: datatypes.JSON("{}"), NextRunAt: now.Add(-time.Hour),
-		IntervalSeconds: &secs, IsActive: true,
+		IntervalSeconds: &secs, IsActive: new(true),
 	}
 	_, err = sched.fire(ctx, def, now)
 	require.ErrorContains(t, err, "enqueue periodic job", "a failed bucket enqueue aborts fire")

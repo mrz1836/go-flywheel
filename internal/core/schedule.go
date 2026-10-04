@@ -33,7 +33,8 @@ type PeriodicSpec struct {
 	// Every is a fixed interval between fires. Mutually exclusive with Cron.
 	Every time.Duration
 	// Active toggles the definition. An inactive definition is preserved but never
-	// fires.
+	// fires. The zero value is inactive, so a definition meant to fire sets Active
+	// true.
 	Active bool
 }
 
@@ -102,8 +103,9 @@ func nextFireAfter(spec PeriodicSpec, now time.Time) (time.Time, error) {
 // seeds next_run_at to the next fire after now (so a fresh schedule does not fire
 // immediately). On update it preserves the existing next_run_at cursor unless the
 // schedule itself changed, so reconciling an unchanged config on restart does not
-// reset the cadence. It is the exported writer for job_periodics, which the CLI
-// and a host's startup reconciliation use to declare schedules in code.
+// reset the cadence. Active is written on both paths: a definition upserted
+// inactive is stored inactive. It is the exported writer for job_periodics, which
+// the CLI and a host's startup reconciliation use to declare schedules in code.
 func UpsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) error {
 	if err := spec.validate(); err != nil {
 		return err
@@ -143,7 +145,7 @@ func insertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec, queue s
 		Queue:        queue,
 		ArgsTemplate: datatypes.JSON(args),
 		NextRunAt:    nextRun,
-		IsActive:     spec.Active,
+		IsActive:     new(spec.Active),
 	}
 	if spec.Every > 0 {
 		secs := int(spec.Every.Seconds())
@@ -268,7 +270,7 @@ func periodicViewFromRow(r jobPeriodicRow) PeriodicView {
 		Queue:          r.Queue,
 		NextRunAt:      r.NextRunAt,
 		LastEnqueuedAt: r.LastEnqueuedAt,
-		Active:         r.IsActive,
+		Active:         r.IsActive != nil && *r.IsActive,
 	}
 	if r.CronExpr != nil {
 		v.Cron = *r.CronExpr

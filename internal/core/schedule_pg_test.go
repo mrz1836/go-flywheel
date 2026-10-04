@@ -136,3 +136,25 @@ func TestRetryJobForceOnACallerTransactionLeavesItUsablePostgres(t *testing.T) {
 	t.Parallel()
 	assertRetryForceOnACallerTransactionLeavesItUsable(t, NewPostgresIsolatedDB(t))
 }
+
+// TestUpsertPeriodicInsertHonorsActivePostgres is TestUpsertPeriodicInsertHonorsActive
+// on PostgreSQL, where the INSERT takes the RETURNING path: a definition upserted
+// inactive is stored inactive, and one upserted active is stored active.
+func TestUpsertPeriodicInsertHonorsActivePostgres(t *testing.T) {
+	t.Parallel()
+	db := NewPostgresIsolatedDB(t)
+	ctx := context.Background()
+
+	require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{Slug: "on", Kind: "k", Every: time.Minute, Active: true}))
+	require.NoError(t, UpsertPeriodic(ctx, db, PeriodicSpec{Slug: "off", Kind: "k", Every: time.Minute, Active: false}))
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	require.Len(t, views, 2)
+	active := map[string]bool{}
+	for _, v := range views {
+		active[v.Slug] = v.Active
+	}
+	assert.True(t, active["on"], "an active upsert is stored active")
+	assert.False(t, active["off"], "an inactive upsert is stored inactive")
+}
