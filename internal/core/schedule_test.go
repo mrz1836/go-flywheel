@@ -434,11 +434,12 @@ func TestRetryJobForceRerunsTerminalJob(t *testing.T) {
 // TestRetryJobResetAttemptsRestoresBudgetAsHeadroom is A1: a job discarded at
 // attempt == max_attempts is retried with ResetAttempts, which restores a real
 // budget by raising max_attempts rather than rewinding attempt. Budget 0 (and a
-// negative Budget) restores the original budget — max_attempts becomes
-// attempt + old max_attempts — and a positive Budget grants exactly that many
-// attempts of headroom. attempt is never written, so it stays monotonic and the
-// next job_runs row cannot collide with the recorded failures (see the pg test for
-// that invariant under the real claim path).
+// negative Budget) grants the current max_attempts — max_attempts becomes
+// attempt + old max_attempts, the original budget for this never-snoozed job —
+// and a positive Budget grants exactly that many attempts of headroom. attempt is
+// never written, so it stays monotonic and the next job_runs row cannot collide
+// with the recorded failures (see the pg test for that invariant under the real
+// claim path).
 func TestRetryJobResetAttemptsRestoresBudgetAsHeadroom(t *testing.T) {
 	t.Parallel()
 

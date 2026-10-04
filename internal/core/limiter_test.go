@@ -123,8 +123,9 @@ func failWith(err error) func(string, int) (Grant, error) {
 
 // permitDriver serves one fixed batch, then reports empty. Its Finalize outcome
 // and stub error are configurable, so a test can drive every dispatch exit path —
-// a stub failure, an unknown kind, a normal finish, a superseded finish — through
-// the runner and assert the limiter permit was returned on each.
+// a stub failure, an unknown kind's discard or deferral, a normal finish, a
+// superseded finish — through the runner and assert the limiter permit was
+// returned on each.
 type permitDriver struct {
 	mu        sync.Mutex
 	batch     []RawJob
@@ -132,6 +133,8 @@ type permitDriver struct {
 	stubErr   error
 	outcome   FinalizeOutcome
 	finalized int
+	// results records the Result every Finalize was handed, in call order.
+	results []Result
 }
 
 func (d *permitDriver) Dequeue(
@@ -153,16 +156,24 @@ func (d *permitDriver) InsertRunStub(
 }
 
 func (d *permitDriver) Finalize(
-	context.Context, RawJob, string, Result, error, time.Time,
+	_ context.Context, _ RawJob, _ string, result Result, _ error, _ time.Time,
 ) (FinalizeOutcome, error) {
 	d.mu.Lock()
 	d.finalized++
+	d.results = append(d.results, result)
 	d.mu.Unlock()
 	out := d.outcome
 	if out.State == "" && !out.Superseded {
 		out = FinalizeOutcome{State: StateSucceeded, RunOutcome: OutcomeSuccess}
 	}
 	return out, nil
+}
+
+// finalizedResults returns the Result every Finalize was handed so far.
+func (d *permitDriver) finalizedResults() []Result {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]Result(nil), d.results...)
 }
 
 func (*permitDriver) RenewLease(context.Context, string, string, time.Time) (bool, error) {
@@ -347,11 +358,11 @@ func TestGatedRunnerLimiterErrorDoesNotStopTheRunner(t *testing.T) {
 // --- the permit is released on every dispatch exit ---------------------------
 
 // TestGatedRunnerReleasesPermitOnEveryFinalizePath drives each way a dispatch can
-// end — a stub failure and an unknown kind (both early returns before the
-// heartbeat), a recovered panic, an execution timeout, and a superseded finalize —
-// and asserts the limiter's in-flight count returns to zero for all of them. The
-// early-return cases are what the permit-release defer being dispatch's first
-// statement exists to cover.
+// end — a stub failure and an unknown kind's discard or deferral (early returns
+// before the heartbeat), a recovered panic, an execution timeout, and a
+// superseded finalize — and asserts the limiter's in-flight count returns to zero
+// for all of them. The early-return cases are what the permit-release defer being
+// dispatch's first statement exists to cover.
 func TestGatedRunnerReleasesPermitOnEveryFinalizePath(t *testing.T) {
 	t.Parallel()
 
@@ -366,6 +377,11 @@ func TestGatedRunnerReleasesPermitOnEveryFinalizePath(t *testing.T) {
 		timeout    time.Duration
 		expectErr  bool
 		finalizeGT int
+		// checkSnooze makes the case assert whether its one finalize carried a
+		// snooze (snooze): the unknown-kind cases pin that the deferral is a
+		// deferral and the discard a discard, which the double's fixed outcome
+		// would otherwise hide.
+		checkSnooze, snooze bool
 	}{
 		{
 			name:     "recovered panic",
@@ -390,9 +406,19 @@ func TestGatedRunnerReleasesPermitOnEveryFinalizePath(t *testing.T) {
 			expectErr: true,
 		},
 		{
-			name:     "unknown kind fast-finalize",
-			driver:   &permitDriver{batch: job("test.nope")},
-			register: func(*Registry) {},
+			// A RawJob with no CreatedAt gets no grace, so this is the discard.
+			name:        "unknown kind discard (no enqueue time)",
+			driver:      &permitDriver{batch: job("test.nope")},
+			register:    func(*Registry) {},
+			checkSnooze: true,
+		},
+		{
+			// A job enqueued just now is inside the grace, so this is the deferral.
+			name:        "unknown kind deferral",
+			driver:      &permitDriver{batch: []RawJob{youngOrphan("j")}},
+			register:    func(*Registry) {},
+			checkSnooze: true,
+			snooze:      true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -414,6 +440,11 @@ func TestGatedRunnerReleasesPermitOnEveryFinalizePath(t *testing.T) {
 
 			assert.Positive(t, lim.grantedCount(), "a permit was taken for the job")
 			assert.Zero(t, lim.inFlight(), "the permit is released on this dispatch path")
+			if tc.checkSnooze {
+				results := tc.driver.finalizedResults()
+				require.Len(t, results, 1)
+				assert.Equal(t, tc.snooze, results[0].Snooze != nil, "whether the finalize carried a snooze")
+			}
 		})
 	}
 }

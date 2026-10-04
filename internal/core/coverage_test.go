@@ -211,6 +211,9 @@ type fakeDriver struct {
 	stubErr     error
 	finalizeErr error
 	finalized   int
+	// results records the Result every Finalize was handed, in call order, so a
+	// test can tell a snooze from a terminal outcome the double does not apply.
+	results []Result
 	// renewed counts RenewLease calls; claimLost and renewErr make it report a
 	// superseded claim or fail outright.
 	renewed   int
@@ -259,6 +262,13 @@ func (f *fakeDriver) dequeueLimits() []int {
 	return append([]int(nil), f.limits...)
 }
 
+// finalizedResults returns the Result every Finalize was handed so far.
+func (f *fakeDriver) finalizedResults() []Result {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]Result(nil), f.results...)
+}
+
 // dequeueCalls reports how many claims were attempted.
 func (f *fakeDriver) dequeueCalls() int {
 	f.mu.Lock()
@@ -271,10 +281,11 @@ func (f *fakeDriver) InsertRunStub(context.Context, string, RawJob, time.Time, E
 }
 
 func (f *fakeDriver) Finalize(
-	context.Context, RawJob, string, Result, error, time.Time,
+	_ context.Context, _ RawJob, _ string, result Result, _ error, _ time.Time,
 ) (FinalizeOutcome, error) {
 	f.mu.Lock()
 	f.finalized++
+	f.results = append(f.results, result)
 	f.mu.Unlock()
 	if f.finalizeErr != nil {
 		return FinalizeOutcome{}, f.finalizeErr

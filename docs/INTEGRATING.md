@@ -298,6 +298,9 @@ with `cached plan must not change result type` (SQLSTATE `0A000`): its driver ca
 before the columns were added. The driver drops the plan and the retry succeeds; the error is a one-off
 per connection, not a sign the migration went wrong.
 
+A deploy that adds a job kind has its own overlap to plan for: a runner of the previous release can claim
+a job of the new kind. See **Rolling deploys and new job kinds** in the [README](../README.md).
+
 ### Verifying
 
 ```bash
@@ -379,7 +382,7 @@ once when it ends (by its finalize, or by the lease sweep if its process died).
 | `queue_wait_ms` | claimable to started; NULL on older rows |
 | `job_state` | the state the finalize applied (`succeeded`, `retryable`, `discarded`, `scheduled`, `cancelled`, or `available` for a crash the lease sweep reclaimed); NULL while running, when superseded, and on a row an older release or `SeedRun` wrote |
 | `superseded` | true when the attempt finished after its claim was gone — its outcome was recorded but never applied, so the work may have run twice. An attempt the lease sweep crashed that then finished late keeps `job_state = 'available'` and its sweep-time `finished_at` beside the late outcome |
-| `error_class`, `error_message` | for a failed attempt |
+| `error_class`, `error_message` | for a failed attempt. A `snooze` may carry an `error_message` with no `error_class`: a worker that returned an error alongside its snooze, or a job deferred because the runner that claimed it does not register its kind (`jobs: unknown job kind`) |
 | `cost_micros`, `enqueued_children`, `output` | what the worker reported |
 
 **`job_run_finishes`** — the finish log: one `(finished_at, run_id)` per finished run, written in the same

@@ -112,6 +112,63 @@ discarded) when it finally returns. Every increment is work that ran twice. Aler
 
 <br>
 
+## Symptom: jobs deferred or discarded as `jobs: unknown job kind`
+
+A runner that claims a job of a kind its `Registry` does not register runs nothing. While the job is
+younger than `RunnerConfig.UnknownKindGrace` (15 minutes from its enqueue by default) it defers the job,
+a snooze that spends none of its retry budget, for a runner that does register the kind; past the window
+it discards the job. Each deferral is due again after one second, doubling per claim up to a minute, so a
+job no runner registers writes at most 21 `job_runs` rows over the default window. The README's
+**Rolling deploys and new job kinds** covers the mechanism and how to ship a new kind.
+
+**Log lines.**
+
+| Line | Level | Meaning |
+|---|---|---|
+| `jobs: deferring jobs of a kind this runner does not register` | warn | this runner handed a job back, logged once per kind per runner, and again if the kind is still being deferred once the grace has passed since — fields `kind`, `job_id`, `queue`, `grace`, and `discard_at`, when that job is discarded if nothing runs it first |
+| `jobs: discarded a job of a kind this runner does not register` | error | a job outlived the window, or the grace is disabled, and was discarded: enqueued work lost — fields `kind`, `job_id`, `queue`, `attempt`, `grace`, `age` |
+
+**The warn during a deploy is expected.** A runner of the old release is handing back work for the new
+one. Nothing is needed unless discards follow.
+
+**Deferrals that persist past the deploy, or any discard, mean no runner registers the kind.** Check
+that the worker is `Register`ed in the release that should run it; that a runner of that release polls
+the job's queue and serves its executor class (or sets `ClaimAnyClass`); and that the release was not
+rolled back. A mistyped kind from `flywheel enqueue` lands here too.
+
+**Find the deferrals in a window.** Go through the finish log, since `job_runs.finished_at` is not
+indexed:
+
+```sql
+SELECT r.kind, r.queue, count(*) AS deferrals, count(DISTINCT r.job_id) AS jobs
+FROM job_run_finishes f JOIN job_runs r ON r.id = f.run_id
+WHERE f.finished_at >= $1 AND f.finished_at < $2
+  AND r.outcome = 'snooze' AND r.error_message = 'jobs: unknown job kind'
+GROUP BY r.kind, r.queue
+ORDER BY deferrals DESC;
+```
+
+A deferral is otherwise an ordinary snooze: it counts in `flywheel_jobs_finished_total{outcome="snooze"}`,
+and the deferred job in `flywheel_queue_jobs{state="scheduled"}`, not as ready work. `CountActiveByKind`
+shows how many jobs of the kind are still waiting. A discarded job shows in `flywheel status` and
+`RecentFailures` with the error `jobs: unknown job kind`.
+
+**Recovery.** Fix the cause, then replay what was discarded. A plain replay is enough: deferrals spend no
+attempts, so a discarded job keeps all of its headroom but the one attempt its discard used, and
+`ResetAttempts` with no `Budget` would add `max_attempts`, which every deferral raised, on top.
+
+```go
+res, err := flywheel.Replay(ctx, db, flywheel.ReplayOpts{
+    Kinds:       []string{"the_kind"},
+    FailedSince: incidentStart,
+})
+```
+
+Replay only once a runner that registers the kind polls its queue. A replayed job keeps its enqueue time,
+so it is already past its window, and a runner without the kind discards it again at once.
+
+<br>
+
 ## Bounded retention
 
 Terminal jobs (and their `job_runs`) accumulate forever unless retention is enabled. Without it the

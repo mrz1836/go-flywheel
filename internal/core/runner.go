@@ -42,6 +42,25 @@ const (
 	// denied while holding in-flight work on the same resource before it warns,
 	// when RunnerConfig.LimiterStarvationInterval is left zero.
 	defaultLimiterStarvationInterval = 30 * time.Second
+	// defaultUnknownKindGrace is how long, from its enqueue, a job of a kind a
+	// Runner does not register is deferred before it is discarded, when
+	// RunnerConfig.UnknownKindGrace is left zero. It is sized for a rolling
+	// deploy: comfortably longer than the minutes two releases typically overlap,
+	// and short enough that a kind no runner registers is noticed within the
+	// quarter-hour.
+	defaultUnknownKindGrace = 15 * time.Minute
+	// unknownKindDeferralBase and maxUnknownKindDeferral are the deferral's own
+	// ladder: one second on the first claim, doubling per claim, capped at a
+	// minute. It is fixed rather than taken from RetryBackoffBase and
+	// MaxRetryBackoff because it prices a job no runner may ever run: each
+	// deferral is a claim, a run row, and a finalize, so a host's short retry
+	// ceiling would multiply the rows an orphaned job writes across the window
+	// (hundreds at a one-second ceiling), and a long one would park a deferred job
+	// for most of the window, which it waits out even once a runner that registers
+	// its kind is up. At the default window the ladder writes at most 21 run rows
+	// per job, the discard included.
+	unknownKindDeferralBase = time.Second
+	maxUnknownKindDeferral  = time.Minute
 )
 
 // nonTerminalStates are the job states that keep RunUntilIdle polling. paused is
@@ -61,6 +80,30 @@ type RunnerConfig struct {
 	Driver Driver
 	// Registry maps job kinds to workers.
 	Registry *Registry
+	// UnknownKindGrace is how long this Runner defers a claimed job whose kind
+	// its Registry does not register before it discards the job, measured from
+	// the job's enqueue (Job.EnqueuedAt). Zero selects fifteen minutes; a
+	// negative value disables the grace, so such a job is discarded on its first
+	// claim.
+	//
+	// It exists for the rolling deploy. While two releases poll the same queues, a
+	// runner of the old one can claim a job of a kind only the new one registers.
+	// Within the window it hands the job back, a snooze that spends none of the
+	// retry budget, for a runner that registers the kind to take; the job is due
+	// again after a delay of its own, one second on the first claim and doubling
+	// per claim up to a minute, whatever the retry settings. Past the window it
+	// discards the job with ErrUnknownKind, as work no runner in the fleet can
+	// run. Size it above the span from the kind's first enqueue to the last old
+	// runner's drain.
+	//
+	// The window is measured from enqueue, not from the first claim, so it covers
+	// work enqueued during the deploy, which is all a new kind's work can be, and
+	// nothing older: a job older than the window that reaches a runner without
+	// its kind (a replay, a kind the new release removed) is discarded on its
+	// first claim. A RawJob with no CreatedAt gets no grace. RunUntilIdle over
+	// a queue holding a job of a kind no runner registers waits out the window
+	// before it returns.
+	UnknownKindGrace time.Duration
 	// Queues are the logical queues this Runner claims from.
 	Queues []string
 	// ExecutorClass is the routing label this Runner serves: it claims jobs whose
@@ -213,6 +256,14 @@ type Runner struct {
 	// schemaChecked records that the startup schema probe ran and found every
 	// column the run path writes, so a Runner reused across invocations probes once.
 	schemaChecked atomic.Bool
+	// unknownKindsWarned maps each kind this Runner has warned it is deferring to
+	// when it last warned (a time.Time), so a deploy's worth of deferrals logs one
+	// line per kind rather than one per claim, and a later episode, a rollback
+	// days after the deploy, warns again once the grace has passed. It holds at
+	// most the kinds this Runner has claimed without registering: the handful a
+	// deploy introduces. Its zero value is ready, which keeps a Runner built as a
+	// bare struct literal working.
+	unknownKindsWarned sync.Map
 }
 
 // NewRunner validates cfg and returns a Runner. It returns ErrSQLiteConcurrency
@@ -624,6 +675,15 @@ func (r *Runner) Run(ctx context.Context) error { return r.run(ctx, false) }
 
 // RunUntilIdle drives the dispatch loop until every job has reached a terminal
 // state, then returns. It is the deterministic test driver.
+//
+// A job of a kind this Runner does not register is not terminal until
+// RunnerConfig.UnknownKindGrace has passed since its enqueue: it is deferred,
+// not discarded, for a runner that does register it. A queue holding one keeps
+// RunUntilIdle polling that long, fifteen minutes at the default. The window is
+// read from the context's clock, so it is only the clock moving that ends it:
+// under a frozen clock (a models.FixedClock) a deferred job never ages, and
+// RunUntilIdle polls until ctx is done. A test that enqueues a kind it
+// deliberately leaves unregistered sets UnknownKindGrace negative.
 func (r *Runner) RunUntilIdle(ctx context.Context) error { return r.run(ctx, true) }
 
 // run is the dispatch loop both entry points share. The untilIdle flag selects
@@ -871,6 +931,44 @@ func (r *Runner) starvationInterval() time.Duration {
 		return r.cfg.LimiterStarvationInterval
 	}
 	return defaultLimiterStarvationInterval
+}
+
+// unknownKindGrace resolves the deferral window for a job of an unregistered
+// kind: an explicit positive value as given, a negative one as disabled, and
+// zero as the default.
+func (r *Runner) unknownKindGrace() time.Duration {
+	switch {
+	case r.cfg.UnknownKindGrace < 0:
+		return 0
+	case r.cfg.UnknownKindGrace > 0:
+		return r.cfg.UnknownKindGrace
+	}
+	return defaultUnknownKindGrace
+}
+
+// unknownKindDeferral decides what a Runner does with a claimed job of a kind it
+// does not register, on the job's attempt-th claim: defer it by the returned
+// delay (true) while it is younger than grace, or discard it (false) once it is
+// not, when the grace is disabled, or when createdAt is zero and there is no
+// anchor to bound the deferral.
+//
+// The delay is the deferral's own ladder for the attempt (unknownKindDeferralBase
+// doubling per attempt, capped at maxUnknownKindDeferral), capped again at the
+// time left in the window, so the last deferral lands on the window's edge and
+// the job is decided on the claim after it rather than a rung later. It takes no
+// host setting and no jitter, so the write cost of a job no runner registers is
+// the same in every deployment. An enqueue time ahead of now (clock skew between
+// the producer and this runner) counts as age zero, so no delay exceeds grace.
+func unknownKindDeferral(createdAt, now time.Time, attempt int, grace time.Duration) (time.Duration, bool) {
+	if grace <= 0 || createdAt.IsZero() {
+		return 0, false
+	}
+	age := max(now.Sub(createdAt), 0)
+	remaining := grace - age
+	if remaining <= 0 {
+		return 0, false
+	}
+	return min(expBackoff(unknownKindDeferralBase, maxUnknownKindDeferral, attempt), remaining), true
 }
 
 // starvationTracker is one dispatch loop's coordinator-deadlock heuristic. It is
@@ -1167,8 +1265,8 @@ func (r *Runner) pollOnce(ctx context.Context) (int, error) {
 // releasePermit returns this job's limiter permit, if it holds one. Its defer is
 // the first statement so it is registered first and therefore runs last (LIFO),
 // after the heartbeat stop and past every exit: the InsertRunStub failure, the
-// unknown-kind fast-finalize, a recovered panic, a timeout, and a superseded
-// finalize all return the permit.
+// unknown-kind deferral or discard, a recovered panic, a timeout, and a
+// superseded finalize all return the permit.
 func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func()) error {
 	defer releasePermit()
 
@@ -1185,15 +1283,7 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 
 	entry, known := r.cfg.Registry.lookup(raw.Kind)
 	if !known {
-		finishedAt := models.ClockFrom(ctx).Now(ctx)
-		unknown := &classifiedError{cause: ErrUnknownKind, class: ErrorPermanent}
-		out, err := r.cfg.Driver.Finalize(ctx, raw, runID, Result{}, unknown, finishedAt)
-		if err != nil {
-			return err
-		}
-		finalizeDuration := models.ClockFrom(ctx).Now(ctx).Sub(finishedAt)
-		r.observe(ctx, raw, jobEv, out, unknown, startedAt, finishedAt, finalizeDuration)
-		return nil
+		return r.finalizeUnknownKind(ctx, raw, runID, jobEv, startedAt)
 	}
 
 	logger := r.cfg.Logger.With("job_id", raw.ID, "kind", raw.Kind, "run_id", runID)
@@ -1252,6 +1342,101 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 	finalizeDuration := models.ClockFrom(ctx).Now(ctx).Sub(finishedAt)
 	r.observe(ctx, raw, jobEv, out, finalErr, startedAt, finishedAt, finalizeDuration)
 	return nil
+}
+
+// finalizeUnknownKind settles a claimed job whose kind this Runner does not
+// register without running anything: no OnStart, no heartbeat, no timeout.
+//
+// Within UnknownKindGrace of the job's enqueue it defers the job, a snooze, so
+// the retry budget is untouched, on the assumption that another runner in the
+// fleet registers the kind and this one is a release behind it. Past the window,
+// or with the grace disabled, it discards the job with a permanent
+// ErrUnknownKind.
+//
+// The deferral carries ErrUnknownKind unclassified, deliberately. A snooze takes
+// precedence over an error in planFinalize, so the error reaches only the audit
+// row's error_message, which is what tells an operator why the job was handed
+// back. A permanent class would be a verdict the state machine does not apply
+// here, and would apply if that precedence ever changed.
+//
+// A finalize error returns as it does for any attempt, with no log line and no
+// observer event: nothing was persisted.
+func (r *Runner) finalizeUnknownKind(
+	ctx context.Context, raw RawJob, runID string, ev JobEvent, startedAt time.Time,
+) error {
+	finishedAt := models.ClockFrom(ctx).Now(ctx)
+	grace := r.unknownKindGrace()
+	delay, deferred := unknownKindDeferral(raw.CreatedAt, finishedAt, raw.Attempt, grace)
+
+	var result Result
+	var finalErr error = &classifiedError{cause: ErrUnknownKind, class: ErrorPermanent}
+	if deferred {
+		result.Snooze = &delay
+		finalErr = ErrUnknownKind
+	}
+	out, err := r.cfg.Driver.Finalize(ctx, raw, runID, result, finalErr, finishedAt)
+	if err != nil {
+		return err
+	}
+	finalizeDuration := models.ClockFrom(ctx).Now(ctx).Sub(finishedAt)
+	r.observe(ctx, raw, ev, out, finalErr, startedAt, finishedAt, finalizeDuration)
+	if !out.Superseded {
+		r.logUnknownKind(ctx, raw, deferred, grace, finishedAt)
+	}
+	return nil
+}
+
+// logUnknownKind reports a settled unknown-kind job: a warning when this Runner
+// defers a kind it has not warned about within the last grace, and an error for
+// every discard, since a discard is enqueued work lost for good. The caller logs
+// only a finalize that was not superseded: a superseded finalize settled nothing.
+func (r *Runner) logUnknownKind(ctx context.Context, raw RawJob, deferred bool, grace time.Duration, now time.Time) {
+	if deferred {
+		if !r.claimUnknownKindWarning(raw.Kind, now, grace) {
+			return
+		}
+		r.cfg.Logger.WarnContext(ctx, "jobs: deferring jobs of a kind this runner does not register",
+			slog.String("kind", raw.Kind),
+			slog.String("job_id", raw.ID),
+			slog.String("queue", raw.Queue),
+			slog.Duration("grace", grace),
+			slog.Time("discard_at", raw.CreatedAt.Add(grace)),
+		)
+		return
+	}
+	attrs := []any{
+		slog.String("kind", raw.Kind),
+		slog.String("job_id", raw.ID),
+		slog.String("queue", raw.Queue),
+		slog.Int("attempt", raw.Attempt),
+		slog.Duration("grace", grace),
+	}
+	if !raw.CreatedAt.IsZero() {
+		attrs = append(attrs, slog.Duration("age", now.Sub(raw.CreatedAt)))
+	}
+	r.cfg.Logger.ErrorContext(ctx, "jobs: discarded a job of a kind this runner does not register", attrs...)
+}
+
+// claimUnknownKindWarning reports whether this deferral of kind is the one to
+// warn about: the first this Runner has made, or the first since grace has
+// passed from the last warning, so an episode warns once and a later episode
+// warns again. The swap is compare-and-swap, so of concurrent deferrals of one
+// kind exactly one wins, and a clock that steps backwards never warns twice in a
+// window.
+func (r *Runner) claimUnknownKindWarning(kind string, now time.Time, grace time.Duration) bool {
+	for {
+		prev, loaded := r.unknownKindsWarned.LoadOrStore(kind, now)
+		if !loaded {
+			return true
+		}
+		last, ok := prev.(time.Time)
+		if ok && now.Sub(last) < grace {
+			return false
+		}
+		if r.unknownKindsWarned.CompareAndSwap(kind, prev, now) {
+			return true
+		}
+	}
 }
 
 // observe reports one finalized attempt: OnSupersede when the driver persisted

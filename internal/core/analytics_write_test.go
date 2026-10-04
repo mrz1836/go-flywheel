@@ -67,13 +67,14 @@ func writePathSuite(t *testing.T, open writePathOpener) {
 	finish := writePathT0.Add(5 * time.Second)
 	snooze := time.Minute
 	cases := []struct {
-		name        string
-		maxAttempts int
-		result      Result
-		workErr     error
-		outcome     RunOutcome
-		jobState    JobState
-		errorClass  string
+		name         string
+		maxAttempts  int
+		result       Result
+		workErr      error
+		outcome      RunOutcome
+		jobState     JobState
+		errorClass   string
+		errorMessage string
 	}{
 		{name: "success", maxAttempts: 5, outcome: OutcomeSuccess, jobState: StateSucceeded},
 		{
@@ -95,6 +96,12 @@ func writePathSuite(t *testing.T, open writePathOpener) {
 			outcome: OutcomeTimeout, jobState: StateRetryable, errorClass: string(ErrorTimeout),
 		},
 		{name: "snooze", maxAttempts: 5, result: Result{Snooze: &snooze}, outcome: OutcomeSnooze, jobState: StateScheduled},
+		{
+			// The snooze takes precedence, so the error reaches only the message: the
+			// row a Runner writes when it defers a job of a kind it does not register.
+			name: "snooze carrying an error", maxAttempts: 5, result: Result{Snooze: &snooze}, workErr: ErrUnknownKind,
+			outcome: OutcomeSnooze, jobState: StateScheduled, errorMessage: "jobs: unknown job kind",
+		},
 		{name: "cancel", maxAttempts: 5, result: Result{Cancel: true}, outcome: OutcomeCancelled, jobState: StateCancelled},
 	}
 	for _, tc := range cases {
@@ -127,6 +134,12 @@ func writePathSuite(t *testing.T, open writePathOpener) {
 			if tc.errorClass != "" {
 				require.NotNil(t, row.ErrorClass)
 				assert.Equal(t, tc.errorClass, *row.ErrorClass)
+			} else {
+				assert.Nil(t, row.ErrorClass, "an attempt that did not fail carries no class")
+			}
+			if tc.errorMessage != "" {
+				require.NotNil(t, row.ErrorMessage)
+				assert.Equal(t, tc.errorMessage, *row.ErrorMessage)
 			}
 		})
 	}
