@@ -22,8 +22,10 @@
 // # Assertions
 //
 //   - [JobState] reads a job's current state column.
-//   - [WaitForJobState] polls until a job reaches an expected state or a timeout
-//     elapses, failing the test with the last observed state on timeout.
+//   - [WaitForJobState] waits until a job reaches an expected state — built on
+//     flywheel.WaitForJobWithOptions — failing at once when the job ends in a
+//     different terminal state or is not found, or the state asked for is not a
+//     job state, and with the last observed state on timeout.
 //
 // # Helpers
 //

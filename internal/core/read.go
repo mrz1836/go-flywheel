@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -20,7 +21,8 @@ var ErrJobNotFound = errors.New("flywheel: job not found")
 //
 // It carries every column a dashboard shows and none it should not: the args
 // payload is deliberately absent (it can be large and may hold data a dashboard
-// must not render — ListActiveByKind is the host-internal seam that carries it).
+// must not render — ListActiveByKind is the host-internal seam that carries it),
+// and the reads that return a JobView never load it.
 type JobView struct {
 	ID          string    `json:"id"`
 	Kind        string    `json:"kind"`
@@ -127,6 +129,28 @@ func nonTerminalStateStrings() []string {
 	return stateStrings(NonTerminalStates())
 }
 
+// liveStatesSQL returns the live states as a parenthesized list of quoted SQL
+// literals — ('available', 'running', 'retryable', 'scheduled', 'paused') —
+// built from nonTerminalStateStrings, in its order.
+//
+// A query meant to be served by the partial index jobs_unique_active_key spells
+// its state condition with this list instead of binding nonTerminalStateStrings.
+// A planner may use a partial index only when it can prove the query's WHERE
+// implies the index's, and neither SQLite, which matches the index's terms one by
+// one against the query's, nor a PostgreSQL generic plan can prove it through
+// bound parameters: with a bound list the read falls back to scanning jobs. The
+// index's DDL lists the same states in the same order, which
+// TestHolderLookupMirrorsTheUniqueIndexes pins. The states are the runtime's own
+// constants, so inlining them carries no injection risk.
+func liveStatesSQL() string {
+	states := nonTerminalStateStrings()
+	quoted := make([]string, len(states))
+	for i, s := range states {
+		quoted[i] = "'" + s + "'"
+	}
+	return "(" + strings.Join(quoted, ", ") + ")"
+}
+
 // TerminalStates returns the job states a job can no longer progress from
 // (succeeded, cancelled, discarded). A host uses it to scope "finished" queries
 // — e.g. retention — without re-deriving the runtime's state vocabulary.
@@ -222,7 +246,7 @@ func ListJobs(ctx context.Context, db *gorm.DB, p ListJobsParams) ([]JobView, er
 		limit = defaultListJobsLimit
 	}
 	var rows []jobRow
-	if err := query.Order("id desc").Limit(limit).Find(&rows).Error; err != nil {
+	if err := query.Select(jobViewColumns()).Order("id desc").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("flywheel: list jobs: %w", err)
 	}
 	views := make([]JobView, len(rows))
@@ -236,15 +260,36 @@ func ListJobs(ctx context.Context, db *gorm.DB, p ListJobsParams) ([]JobView, er
 // soft-deleted job is excluded (gorm scopes deleted_at IS NULL). A miss returns
 // ErrJobNotFound so the caller can map it to a 404.
 func FindJob(ctx context.Context, db *gorm.DB, id string) (JobView, error) {
+	view, err := findJobView(ctx, db, id)
+	if err != nil && !errors.Is(err, ErrJobNotFound) {
+		return JobView{}, fmt.Errorf("flywheel: find job: %w", err)
+	}
+	return view, err
+}
+
+// findJobView reads one job's JobView through db, soft-deleted excluded. A miss
+// returns ErrJobNotFound and any other failure the raw error, so FindJob and
+// WaitForJobWithOptions each wrap a failure in their own words.
+func findJobView(ctx context.Context, db *gorm.DB, id string) (JobView, error) {
 	var row jobRow
-	err := quietMissing(db).WithContext(ctx).Where("id = ?", id).First(&row).Error
+	err := quietMissing(db).WithContext(ctx).Select(jobViewColumns()).Where("id = ?", id).First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return JobView{}, ErrJobNotFound
 	}
 	if err != nil {
-		return JobView{}, fmt.Errorf("flywheel: find job: %w", err)
+		return JobView{}, err
 	}
 	return jobViewFromRow(row), nil
+}
+
+// jobViewColumns is exactly the columns jobViewFromRow reads — every JobView
+// field and nothing else, the args payload in particular — so the reads that
+// return a JobView never load a payload the view deliberately omits.
+func jobViewColumns() []string {
+	return []string{
+		"id", "kind", "queue", "state", "parent_job_id", "created_at", "attempt", "max_attempts",
+		"priority", "executor_class", "scheduled_at", "finalized_at", "updated_at", "tags",
+	}
 }
 
 // ListRuns returns a job's runs newest-first by attempt (attempt desc, id desc),
@@ -287,6 +332,23 @@ func ListRuns(ctx context.Context, db *gorm.DB, jobID string, p ListRunsParams) 
 		views[i] = jobRunViewFromRow(rows[i])
 	}
 	return views, nil
+}
+
+// LatestRun returns a job's newest attempt — the job_runs row with the highest
+// attempt — and true, or false when the job has none yet. It is ListRuns with
+// Limit 1, served by job_runs_job_attempt, and it reads job_runs alone, so a job
+// that does not exist reads like one that has not started. Once WaitForJob
+// reports a job succeeded, LatestRun is the attempt that succeeded, and its Output
+// is what the worker returned.
+func LatestRun(ctx context.Context, db *gorm.DB, jobID string) (JobRunView, bool, error) {
+	runs, err := ListRuns(ctx, db, jobID, ListRunsParams{Limit: 1})
+	if err != nil {
+		return JobRunView{}, false, err
+	}
+	if len(runs) == 0 {
+		return JobRunView{}, false, nil
+	}
+	return runs[0], true, nil
 }
 
 // Overview returns the job count grouped by state, optionally scoped to a single

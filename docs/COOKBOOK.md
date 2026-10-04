@@ -25,14 +25,18 @@ if err != nil {
 }
 ```
 
+The error also names the original job: `errors.As` into a `*flywheel.AlreadyEnqueuedError` and its
+`ExistingID` is the job holding the key, ready to report or inspect.
+
 **The consequence to plan for: this job can never be re-enqueued.** The key collides with the original
 row forever, so a second `Insert` with the same key always returns `ErrAlreadyEnqueued`, even after the
 first job succeeded. To run that unit of work *again*, keep its row and replay it rather than
 re-enqueuing:
 
 ```go
-// Re-run one job by id (resets its attempt budget)...
-err := flywheel.RetryJob(ctx, db, jobID)
+// Re-run one job by id. Force re-runs a terminal job (plain RetryJob refuses one
+// with ErrJobTerminal), and ResetAttempts restores its attempt budget...
+err := flywheel.RetryJobWithOptions(ctx, db, jobID, flywheel.RetryOpts{Force: true, ResetAttempts: true})
 // ...or a whole failed cohort by lineage or failure window.
 _, err = flywheel.ReplayByParent(ctx, db, parentJobID, flywheel.ReplayOpts{})
 ```
@@ -60,7 +64,9 @@ if errors.Is(err, flywheel.ErrAlreadyEnqueued) {
 ```
 
 That is the whole check. The unique index answers "is there already an active job for this subject?" in
-the insert itself.
+the insert itself, and the error answers "which one?": `errors.As` into a
+`*flywheel.AlreadyEnqueuedError` and its `ExistingID` is the in-flight job — which a caller that needs
+the result can join and wait on, as recipe 3 shows.
 
 **The anti-pattern it replaces — don't do this:**
 
@@ -90,7 +96,84 @@ resolved atomically by the database.
 
 <br>
 
-## 3. One job per time bucket — the bucketed key
+## 3. Enqueue or join the in-flight job, then wait — `AlreadyEnqueuedError` + `WaitForJob`
+
+"Rebuild the cache unless a rebuild is already running, then tell me when it is done." Recipe 2 stops a
+second job from starting; this recipe also hands the second caller the first job, so it can wait on
+the run already in flight instead of dropping its request or starting a duplicate. The collision names
+the job holding the key, and `WaitForJob` blocks until a job reaches a terminal state.
+
+```go
+// enqueueOrJoin starts a rebuild for repoID, or joins the one already in
+// flight, and returns the id of the job doing the work.
+func enqueueOrJoin(ctx context.Context, client *flywheel.Client, repoID string) (string, error) {
+    for range 2 {
+        id, err := flywheel.Insert(ctx, client, RebuildCache{RepoID: repoID}, flywheel.InsertOpts{
+            UniqueActiveKey: "rebuild:" + repoID,
+        })
+        var dup *flywheel.AlreadyEnqueuedError
+        switch {
+        case err == nil:
+            return id, nil // this caller started the rebuild
+        case !errors.As(err, &dup):
+            return "", err
+        case dup.ExistingID != "":
+            return dup.ExistingID, nil // a rebuild is in flight: join it
+        }
+        // The holder finished between the collision and the read, which freed
+        // the key: the next insert lands, or names whoever took the key.
+    }
+    return "", errors.New("rebuild key kept changing hands")
+}
+
+id, err := enqueueOrJoin(ctx, client, repoID)
+if err != nil {
+    return err
+}
+waitCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+defer cancel()
+job, err := flywheel.WaitForJob(waitCtx, db, id) // err names the state it was still in at the deadline
+if err != nil {
+    return err
+}
+if job.State != string(flywheel.StateSucceeded) {
+    return fmt.Errorf("rebuild %s ended %s", id, job.State)
+}
+run, _, err := flywheel.LatestRun(ctx, db, id) // the attempt that succeeded
+if err != nil {
+    return err
+}
+var summary RebuildSummary
+return json.Unmarshal(run.Output, &summary) // what the worker returned in Result.Output
+```
+
+Every caller that arrives while the job is live — whichever one started it — waits on the same id and
+reads the same output, so the work runs once for all of them. A caller that arrives after the job
+finished starts the next run: the key freed when the job did.
+
+- **`ctx` is the only bound.** `WaitForJob` waits until the job is terminal, so give it a deadline: a
+  paused job, or one whose queue no runner serves, would otherwise be waited on forever. At the deadline
+  it returns the last view it read and an error wrapping `ctx.Err()` that says what state the job was
+  still in.
+- **Wait after an outbox commit.** A job inserted on `InsertOpts.Tx` is invisible to `db` until your
+  transaction commits, and waiting on it before then returns `ErrJobNotFound`.
+- **Wait on the primary.** Pass `WaitForJob` the database the job was written through, not a read
+  replica: a lagging replica has not seen a job enqueued — or named by a collision — a moment ago, so
+  the wait returns `ErrJobNotFound` for work that exists, and the join falls apart.
+- **A job that is gone returns `ErrJobNotFound` at once.** That includes one retention deleted mid-wait,
+  and a soft-deleted holder: it still holds its key, so a collision can name it, but no read finds it.
+- **Polling is cheap and backs off.** One primary-key read at once, then every 500 ms doubling to a 5 s
+  ceiling. `WaitForJobWithOptions` takes `WaitOpts` to change the cadence, or to return early on a live
+  state — `States: []flywheel.JobState{flywheel.StateRunning}` returns once a runner has claimed the job.
+
+**The anti-pattern it replaces:** `ListActiveByKind` plus an args decode to find the job already running
+for this subject (recipe 2's anti-pattern, with its race), then a `FindJob` loop with a fixed sleep and no
+deadline. The collision names the job atomically, and `WaitForJob` is the loop — with backoff, the
+context honored, and a pruned job reported rather than polled forever.
+
+<br>
+
+## 4. One job per time bucket — the bucketed key
 
 Enqueue at most one job per subject per time window: one digest email per user per day, one rollup per
 account per hour. This is `UniqueKey` (or `UniqueActiveKey`) with the time bucket folded into the key,
@@ -115,7 +198,7 @@ job per bucket is created no matter how many times the code runs.
 
 <br>
 
-## 4. Correlate a side effect to the attempt that produced it — `Job.RunID`
+## 5. Correlate a side effect to the attempt that produced it — `Job.RunID`
 
 A worker that writes to another table (or an external system) needs to record *which attempt* produced
 each write, so a retry after a crash does not double it and so you can trace an effect back to its run.
@@ -149,15 +232,16 @@ job. The runtime already keeps `job_runs`: one audit row per attempt, with the o
 
 <br>
 
-## 5. Choosing between them — the decision table
+## 6. Choosing between them — the decision table
 
 | You want | Key | Collides with | Frees when | Re-enqueuable? |
 |---|---|---|---|---|
 | At most once, ever | `UniqueKey` | any job that ever bore the key | never | No — replay the row instead |
 | At most one active per subject | `UniqueActiveKey` | a still-live job with the key | the job reaches a terminal state | Yes, once the active one finishes |
+| Join the in-flight job and wait for its result | `UniqueActiveKey` + `AlreadyEnqueuedError` + `WaitForJob` | a still-live job with the key | the job reaches a terminal state | Yes, once the active one finishes |
 | At most one per time window | either, with the bucket in the key | same-bucket job | per the key type above | per the key type above |
 | Correlate an effect to an attempt | *(not a unique key)* — use `Job.RunID` | — | — | — |
-| Enqueue atomically with your own write | *(any key)* + `InsertOpts.Tx` | per the key | per the key | the job exists iff your transaction commits |
+| Enqueue atomically with your own write | *(any key)* + `InsertOpts.Tx` | per the key | per the key | the job exists iff your transaction commits; a collision leaves the transaction usable |
 
 The distinction that trips people up: **`UniqueKey` colliding with a terminal job is a feature, not a
 bug.** It is what "at most once, ever" means. If you find yourself wanting the key to free up after the

@@ -2,15 +2,18 @@ package flywheel_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	flywheel "github.com/mrz1836/go-flywheel"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // EmailArgs is a job's typed arguments. Its Kind method names the worker that
@@ -56,6 +59,62 @@ func ExampleInsert() {
 	}
 	fmt.Println(id != "")
 	// Output: true
+}
+
+// ExampleAlreadyEnqueuedError finds the job an insert collided with: a second
+// insert under the same UniqueActiveKey collides, and the error names the job
+// holding the key, so the caller can join that job instead of dropping the
+// request. (The silent logger keeps GORM's duplicate-key log line out of the
+// example's output.)
+func ExampleAlreadyEnqueuedError() {
+	db, _ := gorm.Open(sqlite.Open("file:example-already-enqueued?mode=memory&cache=shared"),
+		&gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	_ = flywheel.Migrate(db)
+	ctx, client := context.Background(), flywheel.NewClient(db)
+	opts := flywheel.InsertOpts{UniqueActiveKey: "report:acct-42"}
+
+	first, err := flywheel.Insert(ctx, client, EmailArgs{To: "a@example.com"}, opts)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = flywheel.Insert(ctx, client, EmailArgs{To: "a@example.com"}, opts)
+	var dup *flywheel.AlreadyEnqueuedError
+	if errors.As(err, &dup) {
+		fmt.Println(dup.ExistingID == first, dup.Key, errors.Is(err, flywheel.ErrAlreadyEnqueued))
+	}
+	// Output: true report:acct-42 true
+}
+
+// ExampleWaitForJob is enqueue-or-join, then wait: start the report unless one
+// for this account is already in flight, join whichever job is, and block until
+// it finishes — at most two minutes — before reading what it produced. It needs a
+// running Node to work the job, so it has no checked output.
+func ExampleWaitForJob() {
+	db, _ := gorm.Open(sqlite.Open("flywheel.db"), &gorm.Config{})
+	ctx, client := context.Background(), flywheel.NewClient(db)
+
+	id, err := flywheel.Insert(ctx, client, EmailArgs{To: "ops@example.com", Subject: "report"},
+		flywheel.InsertOpts{UniqueActiveKey: "report:acct-42"})
+	var dup *flywheel.AlreadyEnqueuedError
+	switch {
+	case errors.As(err, &dup) && dup.ExistingID != "":
+		id = dup.ExistingID // a report is already in flight: join it
+	case err != nil:
+		panic(err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	job, err := flywheel.WaitForJob(waitCtx, db, id)
+	if err != nil {
+		panic(err) // still running at the deadline, or the job is gone
+	}
+	if job.State != string(flywheel.StateSucceeded) {
+		panic("report " + job.State)
+	}
+	run, _, _ := flywheel.LatestRun(ctx, db, id)
+	fmt.Println(string(run.Output))
 }
 
 // ExampleNewNode wires a complete job-runtime daemon — a runner, the periodic

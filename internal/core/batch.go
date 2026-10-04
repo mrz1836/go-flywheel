@@ -46,7 +46,10 @@ type BatchItem struct {
 	Opts InsertOpts
 }
 
-// BatchOpts configures one bulk enqueue.
+// BatchOpts configures one bulk enqueue. The zero value writes dialect-default
+// chunks, each committed on its own, and reports every unique-key collision: it is
+// counted in BatchResult.Skipped and the job holding the key is named in
+// BatchResult.ExistingIDs.
 type BatchOpts struct {
 	// ChunkSize is the number of rows per INSERT statement. Zero selects the
 	// dialect default, chosen so a chunk stays well inside the driver's
@@ -56,20 +59,38 @@ type BatchOpts struct {
 	ChunkSize int
 	// Tx, when set, writes every chunk on the caller's transaction (outbox). The
 	// batch opens no transaction of its own, so the caller's commit is the only
-	// durability boundary — all rows land, or none do.
+	// durability boundary — all rows land, or none do. A collision leaves the
+	// transaction usable at READ COMMITTED, as InsertOpts.Tx describes, including
+	// what REPEATABLE READ and SERIALIZABLE do instead.
+	//
+	// Roll the transaction back after a failed InsertMany. On PostgreSQL the failed
+	// statement has aborted it already; on SQLite a chunk whose read-back failed
+	// may have left its rows in it, while BatchResult.IDs reports them as not
+	// landed. On PostgreSQL a failed holder read — best effort, so not an error
+	// InsertMany returns — also aborts the transaction, and the commit then fails.
 	Tx *gorm.DB
 	// SkipDuplicates, when true, drops rows whose unique key collides with an
-	// existing job without reporting them: BatchResult.Skipped stays zero. The
-	// default (false) counts each collision in BatchResult.Skipped. Either way the
-	// row is skipped, its IDs entry is empty, and the collision is never an error —
-	// the flag governs only whether the skip is reported.
+	// existing job without reporting them: BatchResult.Skipped stays zero and
+	// BatchResult.ExistingIDs stays empty, because the read that names each
+	// holder is not run. The default (false) counts each collision in
+	// BatchResult.Skipped and names its holder. Either way the row is skipped, its
+	// IDs entry is empty, and the collision is never an error — the flag governs
+	// only whether the skip is reported.
 	SkipDuplicates bool
 }
 
 // BatchResult reports what a bulk enqueue did.
 type BatchResult struct {
-	// IDs are the created job ids in input order. A skipped row's entry is empty.
+	// IDs are the created job ids in input order. A skipped row's entry is empty,
+	// and so is every entry from a failed chunk on: those rows did not land.
 	IDs []string
+	// ExistingIDs is aligned with IDs. At each row a unique-key collision skipped,
+	// it holds the id of the job holding that row's key — a job enqueued earlier,
+	// or a sibling earlier in this batch that carried the same key. It is empty at
+	// every row that landed, at a skipped row whose holder could not be identified
+	// (see AlreadyEnqueuedError), and everywhere when BatchOpts.SkipDuplicates is
+	// set, which skips the read along with the report.
+	ExistingIDs []string
 	// Inserted and Skipped partition the input: Inserted counts rows that landed,
 	// Skipped counts rows dropped by a unique-key collision (and only when
 	// BatchOpts.SkipDuplicates is false).
@@ -85,10 +106,12 @@ type BatchResult struct {
 // meaning — applied per row rather than to the call.
 //
 // A unique-key collision is never fatal. The colliding row is skipped, its entry
-// in IDs is left empty, and the batch continues; with BatchOpts.SkipDuplicates
-// false (the default) the skip is counted in BatchResult.Skipped. This matches
-// the single-row contract, where a collision is a successful no-op the caller
-// distinguishes by the returned error.
+// in IDs is left empty, and the batch continues. With BatchOpts.SkipDuplicates
+// false (the default) the skip is counted in BatchResult.Skipped and the job
+// holding the key is named at the row's ExistingIDs entry — one read per chunk
+// that skipped a row, on the handle the chunk ran on, after the chunk is written.
+// This matches the single-row contract, where a collision is a successful no-op
+// the caller distinguishes by the returned error, which names the holder.
 //
 // When opts.Tx is set every chunk runs on that transaction and the batch opens
 // none of its own, so the caller's commit is the only durability boundary — all
@@ -119,7 +142,7 @@ func InsertMany(ctx context.Context, c *Client, items []BatchItem, opts BatchOpt
 		ids[i] = rows[i].ID
 	}
 
-	res := BatchResult{IDs: ids}
+	res := BatchResult{IDs: ids, ExistingIDs: make([]string, len(items))}
 	chunkIdx := 0
 	for start := 0; start < len(rows); start += chunkSize {
 		end := min(start+chunkSize, len(rows))
@@ -127,10 +150,13 @@ func InsertMany(ctx context.Context, c *Client, items []BatchItem, opts BatchOpt
 		if err != nil {
 			// Partial progress: chunks before this one are committed (or, under
 			// opts.Tx, stand or fall with the caller's commit). Report what landed
-			// and name the failing chunk.
+			// and name the failing chunk. The ids minted for this chunk and every
+			// later one name no job, so they are cleared.
+			clear(ids[start:])
 			return res, fmt.Errorf("jobs: insert many: chunk %d: %w", chunkIdx, err)
 		}
 		res.Chunks++
+		var skipped []int
 		for i := start; i < end; i++ {
 			if _, ok := landed[ids[i]]; ok {
 				res.Inserted++
@@ -141,11 +167,53 @@ func InsertMany(ctx context.Context, c *Client, items []BatchItem, opts BatchOpt
 			ids[i] = ""
 			if !opts.SkipDuplicates {
 				res.Skipped++
+				skipped = append(skipped, i)
 			}
+		}
+		if len(skipped) > 0 {
+			nameHolders(ctx, handle, rows, skipped, res.ExistingIDs)
 		}
 		chunkIdx++
 	}
 	return res, nil
+}
+
+// nameHolders fills existing[i], for each skipped row i, with the id of the job
+// holding that row's key, in one read on handle.
+//
+// It runs after the chunk is written — after the chunk's own transaction commits
+// when the batch has no caller transaction — so a failed read, which on
+// PostgreSQL aborts the transaction it runs in, can never roll back rows the
+// chunk landed. A failed read leaves those entries empty: the rows were skipped
+// either way, and naming their holders is best effort. On a caller's transaction
+// there is no other handle to read on: a holder written earlier in it is visible
+// only there.
+func nameHolders(ctx context.Context, handle *gorm.DB, rows []jobRow, skipped []int, existing []string) {
+	keys := make([]string, 0, len(skipped))
+	activeKeys := make([]string, 0, len(skipped))
+	for _, i := range skipped {
+		if rows[i].UniqueKey != nil {
+			keys = append(keys, *rows[i].UniqueKey)
+		}
+		if rows[i].UniqueActiveKey != nil {
+			activeKeys = append(activeKeys, *rows[i].UniqueActiveKey)
+		}
+	}
+	holders, err := readKeyHolders(ctx, handle, keys, activeKeys)
+	if err != nil {
+		return
+	}
+	for _, i := range skipped {
+		existing[i], _ = holders.holderOf(derefString(rows[i].UniqueKey), derefString(rows[i].UniqueActiveKey))
+	}
+}
+
+// derefString returns *p, or "" for a nil p.
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // InsertManyTyped is the generic form of InsertMany: it marshals each args value
@@ -197,8 +265,12 @@ func (c *Client) insertChunk(
 
 // conflictInsertChunk inserts one chunk of pre-built job rows on db with
 // ON CONFLICT DO NOTHING, then reports which rows actually landed. It is the one
-// batching primitive both InsertMany and the finalize follow-up fan-out share;
-// the chunk-iteration and transaction policy wrap it per caller.
+// conflict-insert primitive InsertMany and the finalize follow-up fan-out share,
+// and a keyed single insert on InsertOpts.Tx runs its two halves
+// (insertSkippingConflicts, then landedRows) with its own error wording; the
+// chunk-iteration and transaction policy wrap it per caller. Because a skipped
+// row raises no error, a collision never aborts the transaction the chunk runs
+// in.
 //
 // The insert is targetless (clause.OnConflict{DoNothing: true}) because both
 // unique indexes are partial — jobs_unique_key and jobs_unique_active_key each
@@ -226,12 +298,29 @@ func conflictInsertChunk(ctx context.Context, db *gorm.DB, rows []jobRow) (map[s
 	if len(rows) == 0 {
 		return map[string]struct{}{}, nil
 	}
-	if err := db.WithContext(ctx).
-		Clauses(clause.OnConflict{DoNothing: true}).
-		Create(&rows).Error; err != nil {
+	if err := insertSkippingConflicts(ctx, db, rows); err != nil {
 		return nil, err
 	}
+	landed, err := landedRows(ctx, db, rows)
+	if err != nil {
+		return nil, fmt.Errorf("jobs: batch: read back landed ids: %w", err)
+	}
+	return landed, nil
+}
 
+// insertSkippingConflicts is conflictInsertChunk's write: one multi-row INSERT
+// with a targetless ON CONFLICT DO NOTHING, which skips a row that collides on
+// any unique index without raising an error.
+func insertSkippingConflicts(ctx context.Context, db *gorm.DB, rows []jobRow) error {
+	return db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&rows).Error
+}
+
+// landedRows is conflictInsertChunk's read-back: the ids of rows that landed,
+// read on db. Rows with no unique key cannot have been skipped, so a set without
+// one is reported landed with no read at all; otherwise the ids are read back by
+// primary key. It returns the read's error unwrapped, so each caller names the
+// failure in its own words.
+func landedRows(ctx context.Context, db *gorm.DB, rows []jobRow) (map[string]struct{}, error) {
 	landed := make(map[string]struct{}, len(rows))
 	if !chunkHasUniqueKey(rows) {
 		for i := range rows {
@@ -247,7 +336,7 @@ func conflictInsertChunk(ctx context.Context, db *gorm.DB, rows []jobRow) (map[s
 	var got []string
 	if err := db.WithContext(ctx).Model(&jobRow{}).
 		Where("id IN ?", ids).Pluck("id", &got).Error; err != nil {
-		return nil, fmt.Errorf("jobs: batch: read back landed ids: %w", err)
+		return nil, err
 	}
 	for _, id := range got {
 		landed[id] = struct{}{}

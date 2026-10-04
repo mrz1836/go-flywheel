@@ -95,7 +95,7 @@ flywheel serve                        # run the runtime until Ctrl+C
 |---|---|
 | `flywheel serve` | Migrate (concurrent index builds on PostgreSQL; an up-to-date schema issues no DDL), then run the runner + scheduler until SIGINT/SIGTERM (drains in-flight work) |
 | `flywheel migrate` | Create or upgrade the schema, reporting what it added (`--concurrently --lock-timeout 5s` for a live PostgreSQL database) |
-| `flywheel enqueue <kind> <json>` | Enqueue one job (`--queue --unique --priority --at`) |
+| `flywheel enqueue <kind> <json>` | Enqueue one job and print its id (`--queue --unique --priority --at`); a `--unique` collision fails with the id of the job holding the key |
 | `flywheel jobs ls` | List recent jobs, newest first (`--state --kind --queue --before <id> --limit --json`) |
 | `flywheel jobs running` | List running jobs, longest-running first, flagging any far slower than their kind's baseline (`--kind --queue --limit --json`) |
 | `flywheel jobs inspect <id>` | Show a job and its run history |

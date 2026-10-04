@@ -2,7 +2,9 @@ package flywheeltest
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -67,17 +69,36 @@ func JobState(t testing.TB, db *gorm.DB, jobID string) string {
 	return s
 }
 
-// WaitForJobState polls until jobID reaches state or the deadline elapses.
+// waitPollInterval is WaitForJobState's fixed read cadence: a test waits on jobs
+// that finish in milliseconds, often many in a row, so it never backs off.
+const waitPollInterval = 5 * time.Millisecond
+
+// WaitForJobState waits until jobID is in state, failing the test at once when
+// the job ends in a different terminal state or does not exist, or when state is
+// not a job state at all, and with the last observed state when timeout elapses
+// first. It is flywheel's
+// WaitForJobWithOptions with timeout as the deadline, reading every 5ms; a
+// non-terminal state is waited for as one of WaitOpts.States.
 func WaitForJobState(t testing.TB, db *gorm.DB, jobID, state string, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if JobState(t, db, jobID) == state {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	opts := core.WaitOpts{PollInterval: waitPollInterval, MaxPollInterval: waitPollInterval}
+	if !slices.Contains(core.TerminalStates(), core.JobState(state)) {
+		opts.States = []core.JobState{core.JobState(state)}
 	}
-	t.Fatalf("job %s did not reach state %q within %s (last: %q)", jobID, state, timeout, JobState(t, db, jobID))
+	view, err := core.WaitForJobWithOptions(ctx, db, jobID, opts)
+	switch {
+	case errors.Is(err, core.ErrJobNotFound):
+		t.Fatalf("job %s not found while waiting for state %q", jobID, state)
+	case errors.Is(err, context.DeadlineExceeded):
+		t.Fatalf("job %s did not reach state %q within %s (last: %q)", jobID, state, timeout, view.State)
+	case err != nil:
+		t.Fatalf("job %s: waiting for state %q: %v", jobID, state, err)
+	case view.State != state:
+		t.Fatalf("job %s reached terminal state %q while waiting for %q", jobID, view.State, state)
+	}
 }
 
 // FreeAddr reserves and releases an ephemeral loopback port for a server to

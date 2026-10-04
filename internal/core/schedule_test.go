@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -328,6 +329,111 @@ func TestRetryJobSoftDeletedReturnsErrJobNotFound(t *testing.T) {
 	// count alike, so it reads as missing rather than terminal — even under Force.
 	require.ErrorIs(t, RetryJob(ctx, db, "j-gone"), ErrJobNotFound)
 	require.ErrorIs(t, RetryJobWithOptions(ctx, db, "j-gone", RetryOpts{Force: true}), ErrJobNotFound)
+}
+
+// assertRetryForceOnAHeldActiveKeyNamesTheHolder proves a forced retry that
+// cannot go live — a newer live job holds its UniqueActiveKey, and the index
+// allows one live holder — reports the collision as already enqueued, names the
+// holder, and leaves the job as it was. It is shared by the SQLite and
+// (integration) PostgreSQL suites.
+func assertRetryForceOnAHeldActiveKeyNamesTheHolder(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	ctx := context.Background()
+	c := NewClient(db)
+
+	first, err := Enqueue(ctx, c, "k", []byte(`{}`), InsertOpts{UniqueActiveKey: "subject"})
+	require.NoError(t, err)
+	require.NoError(t, CancelJob(ctx, db, first))
+	holder, err := Enqueue(ctx, c, "k", []byte(`{}`), InsertOpts{UniqueActiveKey: "subject"})
+	require.NoError(t, err, "a terminal job no longer holds the active key")
+
+	err = RetryJobWithOptions(ctx, db, first, RetryOpts{Force: true})
+	require.ErrorIs(t, err, ErrAlreadyEnqueued, "the live holder blocks the retry as a collision, not a driver error")
+	assert.EqualError(t, err, `flywheel: retry job "`+first+`": jobs: already enqueued`)
+	var dup *AlreadyEnqueuedError
+	require.ErrorAs(t, err, &dup)
+	assert.Equal(t, holder, dup.ExistingID, "the error names the live job holding the key")
+	assert.Equal(t, "subject", dup.Key)
+
+	assert.Equal(t, string(StateCancelled), jobState(t, db, first), "the refused retry leaves the job as it was")
+	assert.Equal(t, string(StateAvailable), jobState(t, db, holder), "the holder is untouched")
+}
+
+func TestRetryJobForceOnAHeldActiveKeyNamesTheHolder(t *testing.T) {
+	t.Parallel()
+	assertRetryForceOnAHeldActiveKeyNamesTheHolder(t, newDB(t))
+}
+
+// assertRetryForceOnACallerTransactionLeavesItUsable proves a forced retry
+// refused on a caller's transaction names the holder and leaves the transaction
+// usable: the caller's next write and its commit succeed. On PostgreSQL a failed
+// UPDATE aborts the transaction it runs in, so without a savepoint around it the
+// holder read and everything after it fail with 25P02.
+func assertRetryForceOnACallerTransactionLeavesItUsable(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	ctx := context.Background()
+	c := NewClient(db)
+
+	first, err := Enqueue(ctx, c, "k", []byte(`{}`), InsertOpts{UniqueActiveKey: "subject"})
+	require.NoError(t, err)
+	require.NoError(t, CancelJob(ctx, db, first))
+	holder, err := Enqueue(ctx, c, "k", []byte(`{}`), InsertOpts{UniqueActiveKey: "subject"})
+	require.NoError(t, err)
+
+	var retryErr error
+	err = db.Transaction(func(tx *gorm.DB) error {
+		retryErr = RetryJobWithOptions(ctx, tx, first, RetryOpts{Force: true})
+		_, e := Enqueue(ctx, c, "after", []byte(`{}`), InsertOpts{Tx: tx})
+		return e
+	})
+	requireHolder(t, retryErr, holder, "subject")
+	require.NoError(t, err, "the caller's transaction stays usable and commits")
+
+	var after int64
+	require.NoError(t, db.Model(&jobRow{}).Where("kind = ?", "after").Count(&after).Error)
+	assert.EqualValues(t, 1, after, "the caller's write after the refused retry committed")
+	assert.Equal(t, string(StateCancelled), jobState(t, db, first), "the refused retry left the job as it was")
+}
+
+func TestRetryJobForceOnACallerTransactionLeavesItUsable(t *testing.T) {
+	t.Parallel()
+	assertRetryForceOnACallerTransactionLeavesItUsable(t, newDB(t))
+}
+
+// TestRetryJobForceCollisionLookupFailureStillReportsTheCollision proves a failed
+// holder read never masks the forced retry's collision: the error still matches
+// ErrAlreadyEnqueued, with no holder named. Both reads behind it fail here — the
+// retried job's key, and the holder — since every read fails.
+func TestRetryJobForceCollisionLookupFailureStillReportsTheCollision(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	c := NewClient(db)
+
+	first, err := Enqueue(ctx, c, "k", []byte(`{}`), InsertOpts{UniqueActiveKey: "subject"})
+	require.NoError(t, err)
+	require.NoError(t, CancelJob(ctx, db, first))
+	_, err = Enqueue(ctx, c, "k", []byte(`{}`), InsertOpts{UniqueActiveKey: "subject"})
+	require.NoError(t, err)
+
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:fail_reads",
+		func(tx *gorm.DB) { _ = tx.AddError(errors.New("read failed")) }))
+
+	err = RetryJobWithOptions(ctx, db, first, RetryOpts{Force: true})
+	require.ErrorIs(t, err, ErrAlreadyEnqueued)
+	var dup *AlreadyEnqueuedError
+	require.ErrorAs(t, err, &dup)
+	assert.Empty(t, dup.ExistingID)
+	assert.Equal(t, string(StateCancelled), rawJobState(t, db, first))
+}
+
+// rawJobState reads a job's state with a raw query, which runs through the
+// Row callbacks rather than the Query callbacks a test may have failed.
+func rawJobState(t *testing.T, db *gorm.DB, id string) string {
+	t.Helper()
+	var state string
+	require.NoError(t, db.Raw("SELECT state FROM jobs WHERE id = ?", id).Row().Scan(&state))
+	return state
 }
 
 func TestCancelJobMovesToCancelled(t *testing.T) {

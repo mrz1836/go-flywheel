@@ -309,17 +309,17 @@ func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
 // sequence stays continuous. Delay schedules the re-run into the future instead of
 // making the job immediately available. It returns ErrJobNotFound when no live job
 // has the id. See RetryOpts.
+//
+// Under Force, a terminal job whose UniqueActiveKey a newer live job now holds
+// cannot return to a live state: the index allows one live holder per key. The
+// call then returns an error wrapping an *AlreadyEnqueuedError that names that
+// job, and leaves the retried job as it was. The UPDATE runs in a transaction of
+// its own — a savepoint when db is a caller's transaction, unless the host turned
+// off GORM's nested transactions — so that refusal leaves a caller's PostgreSQL
+// transaction usable, for the read that names the holder and for the caller's
+// own writes after it.
 func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts RetryOpts) error {
 	now := models.ClockFrom(ctx).Now(ctx)
-	q := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id)
-	if !opts.Force {
-		// Scope the write to the states a job can still be retried from, naming the
-		// allowed states rather than excluding the terminal ones — the same guard
-		// CancelJob uses, and for the same reason: a row in a state this runtime does
-		// not recognize is refused rather than clobbered, so the guard can never be
-		// defeated by a state added to the vocabulary but missed here.
-		q = q.Where("state IN ?", nonTerminalStateStrings())
-	}
 	upd := map[string]any{
 		"state":        string(StateAvailable),
 		"leased_until": nil,
@@ -334,14 +334,54 @@ func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts Retry
 		"updated_at":   now,
 	}
 	applyRetryBudget(upd, opts)
-	res := q.Updates(upd)
-	if res.Error != nil {
-		return fmt.Errorf("flywheel: retry job %q: %w", id, res.Error)
+
+	// A refused UPDATE aborts the PostgreSQL transaction it runs in. Running it in
+	// a transaction of its own — GORM makes that a savepoint on a caller's
+	// transaction handle — confines the abort to the UPDATE, so the holder read
+	// below and the caller's own work after this call still run. Retry is an
+	// operator action, so the extra statements cost nothing that matters.
+	var affected int64
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		q := tx.Model(&jobRow{}).Where("id = ?", id)
+		if !opts.Force {
+			// Scope the write to the states a job can still be retried from, naming
+			// the allowed states rather than excluding the terminal ones — the same
+			// guard CancelJob uses, and for the same reason: a row in a state this
+			// runtime does not recognize is refused rather than clobbered, so the
+			// guard can never be defeated by a state added to the vocabulary but
+			// missed here.
+			q = q.Where("state IN ?", nonTerminalStateStrings())
+		}
+		res := q.Updates(upd)
+		affected = res.RowsAffected
+		return res.Error
+	})
+	if err != nil {
+		if isDuplicateKey(err) {
+			return fmt.Errorf("flywheel: retry job %q: %w", id, retryHolder(ctx, db, id))
+		}
+		return fmt.Errorf("flywheel: retry job %q: %w", id, err)
 	}
-	if res.RowsAffected == 0 {
+	if affected == 0 {
 		return classifyRetryMiss(ctx, db, id)
 	}
 	return nil
+}
+
+// retryHolder builds the collision error for a retry whose UPDATE hit a unique
+// index. Only jobs_unique_active_key can reject it — the retry writes no
+// unique_key — and only when the job was terminal and a newer live job holds its
+// UniqueActiveKey, so the holder is read through the same predicate an insert's
+// collision uses; the retried job, still terminal, cannot match it. Either read
+// failing leaves the holder unnamed rather than masking the collision.
+func retryHolder(ctx context.Context, db *gorm.DB, id string) *AlreadyEnqueuedError {
+	var rows []jobRow
+	err := db.WithContext(ctx).Model(&jobRow{}).Select("unique_active_key").
+		Where("id = ?", id).Limit(1).Find(&rows).Error
+	if err != nil || len(rows) == 0 || rows[0].UniqueActiveKey == nil {
+		return &AlreadyEnqueuedError{}
+	}
+	return alreadyEnqueued(ctx, db, "", *rows[0].UniqueActiveKey)
 }
 
 // applyRetryBudget adds the max_attempts reset to a retry's column map when

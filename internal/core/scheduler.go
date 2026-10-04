@@ -624,25 +624,24 @@ func (s *Scheduler) fire(ctx context.Context, def jobPeriodicRow, now time.Time)
 // The bucketed unique_key makes a redundant tick idempotent: a tick that fires
 // twice — a restart, a clock adjustment, a backfill overlapping the live
 // schedule — computes the same key for the same bucket, so the second insert
-// collides and is a successful no-op rather than a duplicate run.
+// collides and is a successful no-op rather than a duplicate run. It inserts
+// through the Client's core rather than Enqueue, so a collision costs no read of
+// the job holding the key: a tick has no use for the holder's id.
 func (s *Scheduler) enqueueBucket(ctx context.Context, def jobPeriodicRow, bucket time.Time) (bool, error) {
 	payload := []byte(def.ArgsTemplate)
 	if len(payload) == 0 {
 		payload = []byte("{}")
 	}
 	scheduleAt := bucket
-	_, err := s.client.insert(ctx, def.Kind, payload, InsertOpts{
+	_, collided, err := s.client.insert(ctx, def.Kind, payload, InsertOpts{
 		Queue:      def.Queue,
 		UniqueKey:  fmt.Sprintf("%s@%d", def.Slug, bucket.Unix()),
 		ScheduleAt: &scheduleAt,
 	})
-	if errors.Is(err, ErrAlreadyEnqueued) {
-		return false, nil
-	}
 	if err != nil {
 		return false, fmt.Errorf("jobs: enqueue periodic job: %w", err)
 	}
-	return true, nil
+	return !collided, nil
 }
 
 // intervalBuckets returns the missed fire times of a fixed-interval schedule

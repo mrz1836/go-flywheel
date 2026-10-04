@@ -316,6 +316,23 @@ type InsertOpts struct {
 	// the runner's DefaultTimeout.
 	Timeout time.Duration
 	// Tx, when set, writes the job row on the caller's transaction (outbox).
+	//
+	// A keyed insert on Tx is ON CONFLICT DO NOTHING followed by one primary-key
+	// read-back of its own row, which is how it learns whether the row landed; an
+	// unkeyed insert on Tx is a plain INSERT. At READ COMMITTED, PostgreSQL's
+	// default, a unique-key collision therefore leaves the transaction usable: it
+	// comes back as an *AlreadyEnqueuedError while the caller's later writes and
+	// its commit still succeed — on PostgreSQL, where a failed INSERT would abort
+	// the transaction, as on SQLite.
+	//
+	// Under REPEATABLE READ or SERIALIZABLE, a collision with a holder that
+	// committed after the transaction took its snapshot cannot be skipped: it
+	// surfaces as PostgreSQL's serialization failure (SQLSTATE 40001), which such
+	// a caller already has to retry, and the retried transaction sees the holder
+	// and gets the *AlreadyEnqueuedError. And on PostgreSQL, a failure of the read
+	// that names the holder — a cancelled ctx, a statement timeout — aborts the
+	// transaction like any failed statement; the collision is still reported, and
+	// the caller's next statement or its commit fails.
 	Tx *gorm.DB
 	// RequestID, when non-empty, is stamped on the job's metadata so the
 	// Runner can thread it through ctx + slog on dequeue. Falls back to

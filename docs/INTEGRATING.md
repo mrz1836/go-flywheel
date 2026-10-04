@@ -44,6 +44,8 @@ until it is done.
 | Is anything regressing? | `Anomalies` | `job_stats_hourly` | 21 ms |
 | What were the slowest runs today? | `SlowRuns` | `job_run_finishes` + `job_runs` PK | 71 ms |
 | One job's attempts | `ListRuns` | `job_runs_job_attempt` | sub-ms |
+| One job's latest attempt and its output | `LatestRun` | `job_runs_job_attempt` | sub-ms |
+| Has this job finished yet? | `WaitForJob` | `jobs` primary key | sub-ms per poll |
 
 The [measured latencies](#measured-cost) are at the end. Everything above is bounded — by a window, a
 `LIMIT`, or both — so no read's cost grows with the history the database holds.
@@ -433,8 +435,8 @@ refused for day buckets.
 
 ## The read APIs
 
-Every read takes a `context.Context` and the `*gorm.DB` to read through — a replica is fine — and returns
-JSON-tagged values. None writes.
+Every read takes a `context.Context` and the `*gorm.DB` to read through — a replica is fine, except for
+`WaitForJob` — and returns JSON-tagged values. None writes.
 
 ### Live: what is happening now
 
@@ -452,6 +454,14 @@ job's age (the lag). The same access paths as `SampleQueueHealth`.
 **`CountActiveByKind(ctx, db)`** — in-flight jobs per (kind, queue, state), non-terminal states only, on
 `jobs_state`. This, not a `GROUP BY kind` over all of `jobs`, is the per-kind backlog read.
 
+**`WaitForJob(ctx, db, id)`** — blocks until one job reaches a terminal state and returns its `JobView`:
+one primary-key read at once, then every 500 ms doubling to 5 s. `ctx` is the only bound; at the deadline
+it returns the last view and an error naming the state the job was still in. A missing job returns
+`ErrJobNotFound` at once. `WaitForJobWithOptions` takes `WaitOpts{PollInterval, MaxPollInterval, States}`.
+Wait on the primary, or the handle the job was written through: a lagging replica reads a job enqueued
+(or named by a collision) a moment ago as missing, and the wait returns `ErrJobNotFound` for work that
+exists — which breaks enqueue-or-join.
+
 ### Recent: what just happened
 
 **`ListFinished(ctx, db, ListFinishedParams{States, Kind, Queue, Since, Before, Limit})`** — the most
@@ -468,6 +478,10 @@ Ids are UUIDv7, so id order is insertion order and the primary key serves the pa
 **`ListRuns(ctx, db, jobID, ListRunsParams{BeforeAttempt, Before, Limit})`** — one job's attempts with
 every column above, newest attempt first. Page with `BeforeAttempt` set to the previous page's last
 `Attempt`; `Before` (a `created_at` cursor) also works, and is zone-proof on SQLite.
+
+**`LatestRun(ctx, db, jobID)`** — one job's newest attempt and `true`, or `false` when it has none yet:
+`ListRuns` with `Limit: 1`. After `WaitForJob` reports a job succeeded, it is the attempt that succeeded,
+with the worker's `Output`.
 
 **`SlowRuns(ctx, db, SlowRunsParams{Kind, Since, MinDuration, Limit})`** — the slowest finished runs in a
 short window (24 hours by default), any outcome — a timeout is a slow run. A range of `job_run_finishes`;
@@ -519,6 +533,7 @@ their own baseline at an hour; see [What the anomaly detector catches](#what-the
 | Panel | API | Suggested interval | Database cost per poll |
 |---|---|---|---|
 | Running now | `ListRunning(WithBaseline)` | 5–10 s | one indexed read of the running set + one rollup read |
+| One job, until it finishes | `WaitForJob` | 0.5 s doubling to 5 s (built in) | one primary-key read |
 | Queue depth | `QueueDepths` | 10–30 s | three grouped index reads + one ordered read per queue with ready work |
 | Recently finished | `ListFinished` | 10–30 s | three `LIMIT n` index range scans |
 | Today's stats | `Stats` (24 h) | 30–60 s | 24 × kinds rollup rows by primary key + the open hour raw |
