@@ -530,6 +530,7 @@ func TestObserverUnknownKindDeferralIsASnoozeWithNoStart(t *testing.T) {
 	assert.Equal(t, OutcomeSnooze, finishes[0].Outcome)
 	assert.Empty(t, string(finishes[0].ErrorClass), "a snooze carries no error class")
 	require.ErrorIs(t, finishes[0].Err, ErrUnknownKind, "the event says why the job was handed back")
+	assert.Equal(t, StateScheduled, finishes[0].State, "a deferral leaves the job scheduled, not failed")
 	assert.Empty(t, retries, "a snooze is not a retry")
 	assert.Empty(t, obs.snapshotSupersedes())
 }

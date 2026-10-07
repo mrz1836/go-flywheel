@@ -112,6 +112,17 @@ type FinishEvent struct {
 	// Result.Snooze, or a job of a kind the Runner does not register, deferred
 	// with ErrUnknownKind.
 	Err error
+	// State is the job's state as this attempt's finalize left it: succeeded,
+	// retryable (a failed attempt the job will retry), discarded (a failure
+	// that ended the job: a permanent or validation error, or the attempt
+	// budget spent), cancelled, or scheduled (a snooze). It is the state the
+	// driver persisted, so an observer can tell a failure that will retry from
+	// one that lost the job's work without waiting for OnRetry.
+	State JobState
+	// MaxAttempts is the attempt budget the job was claimed with, so Attempt
+	// reads against it ("attempt 3 of 5"). A snooze raises the persisted budget
+	// by one so it spends no retry; this is the budget before that.
+	MaxAttempts int
 	// Duration is the wall time the worker body took.
 	Duration time.Duration
 	// FinalizeDuration is how long persisting the outcome took, distinct from

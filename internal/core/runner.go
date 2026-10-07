@@ -1469,6 +1469,8 @@ func (r *Runner) observe(
 		Outcome:          out.RunOutcome,
 		ErrorClass:       out.ErrorClass,
 		Err:              finalErr,
+		State:            out.State,
+		MaxAttempts:      raw.MaxAttempts,
 		Duration:         duration,
 		FinalizeDuration: finalizeDuration,
 	})
