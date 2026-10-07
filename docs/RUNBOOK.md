@@ -112,6 +112,35 @@ discarded) when it finally returns. Every increment is work that ran twice. Aler
 
 <br>
 
+## Symptom: jobs fail or are discarded
+
+A worker that returns an error fails its attempt. A transient or timeout error retries on the backoff
+ladder until the job's `MaxAttempts` is spent; a permanent or validation error, or a failure on the
+last attempt, discards the job, and its work is lost until it is replayed (`flywheel.Replay`).
+`flywheel.RecentFailures` and `flywheel status` list what was discarded recently and why, and
+`job_runs.error_message` holds every attempt's error.
+
+**Log lines.** With `observers.NewSlog` wired as the runner's observer, a failure never waits for
+debug logging:
+
+| Line | Level | Meaning |
+|---|---|---|
+| `flywheel: job attempt failed` | warn | an attempt failed and the job will retry — fields `job_id`, `run_id`, `kind`, `queue`, `outcome` (`error`, `timeout`, or `crashed`), `attempt`, `max_attempts`, `job_state` (`retryable`), `error_class`, `error`, `duration` |
+| `flywheel: job failed and was discarded` | error | the failure ended the job: its work is lost until it is replayed — the same fields, with `job_state` `discarded` |
+
+**A warn now and then is the retry ladder doing its job.** Repeated warns for one `kind` with the same
+`error` mean the downstream keeps refusing, and each of those jobs ends in a discard once its budget is
+spent: fix the cause while they are still retrying.
+
+**Every error line is lost work.** Read its `error` and `error_class`, fix the cause, then replay the
+job. A job of a kind no runner registers is discarded the same way and also logs the runner's own line
+(next section).
+
+**The error text is logged as the worker returned it.** Keep secrets and personal data out of worker
+errors, or wrap them before returning.
+
+<br>
+
 ## Symptom: jobs deferred or discarded as `jobs: unknown job kind`
 
 A runner that claims a job of a kind its `Registry` does not register runs nothing. While the job is

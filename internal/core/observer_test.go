@@ -151,6 +151,8 @@ func TestObserverReceivesClaimStartFinishOnSuccess(t *testing.T) {
 	assert.Equal(t, OutcomeSuccess, finishes[0].Outcome)
 	assert.NoError(t, finishes[0].Err)
 	assert.Empty(t, string(finishes[0].ErrorClass), "success carries no error class")
+	assert.Equal(t, StateSucceeded, finishes[0].State, "the finish reports the state the driver persisted")
+	assert.Equal(t, defaultMaxAttempts, finishes[0].MaxAttempts, "the finish reports the budget the job was claimed with")
 
 	assert.Empty(t, retries, "a successful job triggers no retry event")
 }
@@ -180,7 +182,38 @@ func TestObserverOnRetryFiresForTransientError(t *testing.T) {
 	// Two finishes: the first an error (retryable), the second a success.
 	require.Len(t, finishes, 2)
 	assert.Equal(t, OutcomeError, finishes[0].Outcome)
+	assert.Equal(t, StateRetryable, finishes[0].State, "the failed attempt left the job to retry")
 	assert.Equal(t, OutcomeSuccess, finishes[1].Outcome)
+	assert.Equal(t, StateSucceeded, finishes[1].State)
+}
+
+// TestObserverOnFinishReportsADiscardWhenTheBudgetIsSpent: the attempt that
+// spends the last of the budget finishes with the job discarded, and no retry.
+func TestObserverOnFinishReportsADiscardWhenTheBudgetIsSpent(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	reg := NewRegistry()
+	Register(reg, &retryWorker{failuresBefore: 5})
+	obs := &recordingObserver{}
+	r := rwRunner(t, db, reg, func(c *RunnerConfig) { c.Observer = obs })
+	ctx := context.Background()
+
+	id, err := Insert(ctx, NewClient(db), retryArgs{V: "x"}, InsertOpts{MaxAttempts: 2})
+	require.NoError(t, err)
+
+	runToIdle(t, ctx, r)
+
+	_, _, finishes, retries := obs.snapshot()
+	require.Len(t, finishes, 2, "two attempts, both failed")
+	require.Len(t, retries, 1, "only the first failure retries")
+	assert.Equal(t, StateRetryable, finishes[0].State)
+	last := finishes[1]
+	assert.Equal(t, id, last.JobID)
+	assert.Equal(t, OutcomeError, last.Outcome)
+	assert.Equal(t, StateDiscarded, last.State, "the last attempt's failure discarded the job")
+	assert.Equal(t, 2, last.Attempt)
+	assert.Equal(t, 2, last.MaxAttempts)
+	assert.Error(t, last.Err)
 }
 
 // TestObserverOnFinishForADiscardedUnknownKindHasNoStart pins what an observer
@@ -212,6 +245,7 @@ func TestObserverOnFinishForADiscardedUnknownKindHasNoStart(t *testing.T) {
 	assert.Equal(t, OutcomeError, finishes[0].Outcome)
 	assert.Equal(t, ErrorPermanent, finishes[0].ErrorClass, "an unknown kind is a permanent error")
 	require.ErrorIs(t, finishes[0].Err, ErrUnknownKind)
+	assert.Equal(t, StateDiscarded, finishes[0].State)
 	assert.Empty(t, retries, "a permanent error does not retry")
 }
 

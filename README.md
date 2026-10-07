@@ -596,7 +596,8 @@ the job, not the record of the work.
 When that happens the runtime says so, loudly and exactly once:
 
 - `Observer.OnSupersede` fires **in place of** `OnFinish`, carrying the outcome that was discarded.
-- `observers.NewSlog` logs it at **warn** — the one lifecycle event it does not log at debug.
+- `observers.NewSlog` logs it at **warn**, as it does a failed attempt, rather than at the debug level of
+  routine events.
 - `observers.NewMetrics` counts `flywheel_jobs_superseded_total`.
 
 A nonzero supersede rate means work is being executed twice: the lease is too short for the workload,
@@ -1149,8 +1150,10 @@ and the [`observers/`](observers) package ships ready adapters that plug straigh
 
 - `observers.NewMetrics(rec)` translates events into a `MetricsRecorder` — a small four-method sink you back
   with Prometheus, OpenTelemetry, statsd, or CloudWatch (the core imports none of them).
-- `observers.NewSlog(logger)` logs each event at debug level; `observers.NewMulti(...)` fans events
-  out to several observers at once.
+- `observers.NewSlog(logger)` logs routine events at debug level and failures above it: a failed attempt
+  at warn and a job a failure discarded at error, each with the worker's error, the attempt against its
+  budget, and the job's resulting state ([RUNBOOK](docs/RUNBOOK.md#symptom-jobs-fail-or-are-discarded)).
+  `observers.NewMulti(...)` fans events out to several observers at once.
 
 `SampleQueueHealth` ([health.go](internal/core/health.go)) reads a point-in-time gauge snapshot — depth by state,
 ready / in-flight counts, and the **oldest-ready age (lag)**, the canonical "are the runners falling
