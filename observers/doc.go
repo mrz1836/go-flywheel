@@ -14,9 +14,11 @@
 //
 //   - MetricsObserver translates lifecycle events into MetricsRecorder calls (the
 //     metric taxonomy lives on MetricsObserver).
-//   - SlogObserver logs each event at debug level for `--log debug` diagnosis —
-//     except a supersede, which is logged at warn because it means work was
-//     executed and its outcome thrown away.
+//   - SlogObserver logs routine events at debug level for `--log debug`
+//     diagnosis, and what an operator must see without it above: a failed
+//     attempt at warn and a job a failure discarded at error, each with the
+//     worker's error, and a supersede at warn because it means work was executed
+//     and its outcome thrown away.
 //   - Multi fans one event out to several observers, so a Node can run metrics and
 //     logging side by side: NewMulti(NewSlog(logger), NewMetrics(rec)).
 //
