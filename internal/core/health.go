@@ -16,9 +16,10 @@ import (
 // read by SampleQueueHealth, surfaced by the Scheduler heartbeat, the `/metrics`
 // gauges, and `flywheel status`.
 type QueueHealth struct {
-	// CountsByState is the job count per state, soft-deleted jobs excluded (the
-	// same scope as Overview). Every present state maps to its count; absent
-	// states are zero.
+	// CountsByState is the job count per state, soft-deleted jobs excluded, for
+	// every state but succeeded. Every present state maps to its count; absent
+	// states are zero. Succeeded jobs are not counted, so the map never has a
+	// succeeded key (see SampleQueueHealth); Overview counts every state.
 	CountsByState map[string]int64 `json:"counts_by_state"`
 	// Ready is the number of jobs claimable right now: a claimable state
 	// (available, retryable, scheduled) whose scheduled_at is at or before the
@@ -43,13 +44,25 @@ type QueueHealth struct {
 // from the context Clock (models.ClockFrom), so a test drives it deterministically with
 // a models.FixedClock and production uses the wall clock.
 //
-// It runs four index-backed reads, none of which mutate: a GROUP BY state count
-// (soft-deleted excluded), a ready count and a scheduled-ahead count over the
-// claimable states (both served by the jobs_ready partial index), and an ordered
+// It runs four index-backed reads, none of which mutate: a count per state over
+// every state but succeeded (soft-deleted excluded; one range of the jobs_state
+// index per state), a ready count and a scheduled-ahead count over the claimable
+// states (both served by the jobs_ready partial index), and an ordered
 // single-row read for the oldest ready scheduled_at. The lag is read by ordering
 // rather than MIN(scheduled_at) because SQLite returns a bare aggregate as text
 // and drops the column's datetime affinity, which would fail the time scan; an
 // ordered read of the real typed column round-trips on both dialects.
+//
+// # Succeeded jobs are not counted
+//
+// Succeeded jobs are most of a retained table: every job that ever ran, until
+// retention removes it, and every job forever with retention off. Counting them
+// made each sample read that whole history, on every Scheduler health interval
+// and every /metrics scrape, and no gauge or alarm reads the figure: the backlog
+// is the live states, and lost work is discarded. So the sample reads only the
+// other states, whose ranges stay as small as the live queue and the failures.
+// Overview still counts every state, succeeded included, at the cost of reading
+// them all.
 //
 // The snapshot is a sample, not a transaction: the reads are not serialized
 // against concurrent claims, so a busy queue's numbers may not be mutually
@@ -59,14 +72,16 @@ func SampleQueueHealth(ctx context.Context, db *gorm.DB) (QueueHealth, error) {
 	now := models.ClockFrom(ctx).Now(ctx)
 	qh := QueueHealth{CountsByState: map[string]int64{}, SampledAt: now}
 
-	// Counts by state (soft-deleted excluded via the gorm DeletedAt scope). The
-	// running count doubles as InFlight, so no separate query is needed.
+	// Counts by state, succeeded aside (soft-deleted excluded via the gorm
+	// DeletedAt scope). The running count doubles as InFlight, so no separate
+	// query is needed.
 	var stateRows []struct {
 		State string
 		N     int64
 	}
 	if err := db.WithContext(ctx).Model(&jobRow{}).
-		Select("state, count(*) as n").Group("state").Scan(&stateRows).Error; err != nil {
+		Select("state, count(*) as n").Where("state IN ?", queueHealthStates()).
+		Group("state").Scan(&stateRows).Error; err != nil {
 		return QueueHealth{}, fmt.Errorf("flywheel: queue health counts: %w", err)
 	}
 	for _, r := range stateRows {
@@ -107,6 +122,12 @@ func SampleQueueHealth(ctx context.Context, db *gorm.DB) (QueueHealth, error) {
 	}
 
 	return qh, nil
+}
+
+// queueHealthStates is every job state SampleQueueHealth counts: all of them but
+// succeeded.
+func queueHealthStates() []string {
+	return stateStrings(append(NonTerminalStates(), StateCancelled, StateDiscarded))
 }
 
 // FailureView is one recently discarded job paired with the error from its final

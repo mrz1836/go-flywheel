@@ -650,10 +650,11 @@ func runtimeIndexes() []Index {
 		{
 			// Performance: counts by state, the telemetry read.
 			//
-			// Three readers, not two: SampleQueueHealth's GROUP BY state, which the
-			// scheduler heartbeat and a /metrics scrape both sample on a timer;
-			// Overview's identical grouping; and CountActiveJobs, whose
-			// state IN (…) predicate is the same access path.
+			// Three readers, not two: SampleQueueHealth's count per state (every
+			// state but succeeded, one range each), which the scheduler heartbeat
+			// and a /metrics scrape both sample on a timer; Overview's grouping
+			// over every state; and CountActiveJobs, whose state IN (…) predicate
+			// is the same access path.
 			//
 			// The key is (state) alone rather than (state, queue): none of the three
 			// filters by queue, and a second column no reader constrains only widens
