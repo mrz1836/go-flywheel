@@ -24,18 +24,49 @@ const (
 
 // Client is the producer-side handle for enqueuing jobs. It is built lazily by
 // the service container from the write database connection.
+//
+// A Client built with ClientOpts.Registry fills the fields an insert leaves zero
+// from its kind's Defaults, on Insert, Enqueue, InsertMany, InsertManyTyped, and
+// a Scheduler's periodic fires through it. A Client built with NewClient applies
+// no worker defaults: an insert takes the caller's options and the runtime's
+// defaults alone.
 type Client struct {
-	writeDB *gorm.DB
+	writeDB  *gorm.DB
+	registry *Registry
 }
 
-// NewClient returns a Client that enqueues onto writeDB.
+// ClientOpts configures a Client. The zero value applies no worker defaults, so
+// NewClientWithOptions(db, ClientOpts{}) is NewClient(db).
+type ClientOpts struct {
+	// Registry applies each registered kind's Defaults on every insert; nil
+	// applies none. A kind the registry does not register takes the runtime's
+	// defaults. See Defaults for which fields it fills.
+	Registry *Registry
+}
+
+// NewClient returns a Client that enqueues onto writeDB and applies no worker
+// defaults. It is NewClientWithOptions with the zero ClientOpts.
 func NewClient(writeDB *gorm.DB) *Client {
-	return &Client{writeDB: writeDB}
+	return NewClientWithOptions(writeDB, ClientOpts{})
+}
+
+// NewClientWithOptions returns a Client that enqueues onto writeDB, configured
+// by opts. With opts.Registry set, every insert through the Client fills the
+// fields it leaves zero from its kind's Defaults (see Defaults).
+func NewClientWithOptions(writeDB *gorm.DB, opts ClientOpts) *Client {
+	return &Client{writeDB: writeDB, registry: opts.Registry}
 }
 
 // WriteDB returns the client's write connection. The Scheduler reuses it.
 func (c *Client) WriteDB() *gorm.DB {
 	return c.writeDB
+}
+
+// withKindDefaults fills each field of opts the call leaves zero from kind's
+// Defaults in the Client's registry. Without a registry, or for a kind it does
+// not register, opts is returned unchanged.
+func (c *Client) withKindDefaults(kind string, opts InsertOpts) InsertOpts {
+	return c.registry.defaultsFor(kind).applyTo(opts)
 }
 
 // kindNamer is implemented by an args value that names its job kind.
@@ -44,7 +75,8 @@ type kindNamer interface {
 }
 
 // Insert enqueues one job with typed args. The job kind is read from the args
-// value, which must implement Kind() string.
+// value, which must implement Kind() string. On a Client built with
+// ClientOpts.Registry, each field opts leaves zero takes the kind's Defaults.
 //
 // When opts.Tx is set the row is written on that transaction, so enqueuing is
 // atomic with the caller's own writes — the outbox pattern, without an outbox
@@ -68,10 +100,11 @@ func Insert[A Args](ctx context.Context, c *Client, args A, opts InsertOpts) (st
 // Enqueue writes one available job of an arbitrary kind from a pre-marshaled
 // JSON payload, with no registered worker required. It is the host seed seam:
 // fixtures and inspection hosts create real jobs through the same insert core as
-// Insert — honoring opts (UniqueKey/Queue/Priority/…) and the row's lifecycle
-// defaults — without touching flywheel's unexported row structs. A unique-key
-// collision returns an *AlreadyEnqueuedError naming the job that holds the key,
-// exactly as Insert does.
+// Insert — honoring opts (UniqueKey/Queue/Priority/…), then the kind's Defaults
+// when c was built with ClientOpts.Registry, then the row's lifecycle defaults —
+// without touching flywheel's unexported row structs. A unique-key collision
+// returns an *AlreadyEnqueuedError naming the job that holds the key, exactly as
+// Insert does.
 func Enqueue(ctx context.Context, c *Client, kind string, args []byte, opts InsertOpts) (string, error) {
 	return c.enqueue(ctx, kind, args, opts)
 }
@@ -102,10 +135,11 @@ func (c *Client) enqueue(ctx context.Context, kind string, payload []byte, opts 
 }
 
 // insert is the non-generic enqueue core shared by Insert, Enqueue, and the
-// Scheduler. It writes one jobs row, honoring opts, and reports a unique-key
-// collision as collided — never as an error — so each caller decides what a
-// collision is worth: Insert and Enqueue name the job holding the key, while the
-// Scheduler's bucketed tick treats it as the no-op it is and reads nothing more.
+// Scheduler. It writes one jobs row, honoring opts over the kind's Defaults in
+// the Client's registry, and reports a unique-key collision as collided — never
+// as an error — so each caller decides what a collision is worth: Insert and
+// Enqueue name the job holding the key, while the Scheduler's bucketed tick
+// treats it as the no-op it is and reads nothing more.
 //
 // On opts.Tx a keyed row goes through the conflict-insert primitive InsertMany
 // uses — ON CONFLICT DO NOTHING, then the same-handle read-back of its own row —
@@ -118,7 +152,7 @@ func (c *Client) insert(
 	ctx context.Context, kind string, payload []byte, opts InsertOpts,
 ) (id string, collided bool, err error) {
 	db := c.handle(opts)
-	row := buildRow(ctx, kind, payload, opts)
+	row := buildRow(ctx, kind, payload, c.withKindDefaults(kind, opts))
 
 	if opts.Tx != nil && (row.UniqueKey != nil || row.UniqueActiveKey != nil) {
 		rows := []jobRow{row}

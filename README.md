@@ -562,6 +562,58 @@ runs until its context ends. A test that enqueues a kind it deliberately leaves 
 </details>
 
 <details>
+<summary><strong><code>Worker defaults — declare a kind's routing once</code></strong></summary>
+<br>
+
+A worker can declare where its jobs run and how often they retry, so no producer has to repeat it.
+Implement `Defaults`, and `Register` reads five fields from it, once: `Queue`, `Priority`, `MaxAttempts`,
+`Timeout`, and `ExecutorClass`. Every other `InsertOpts` field it returns is ignored.
+
+```go
+func (WelcomeMailer) Defaults() flywheel.InsertOpts {
+    return flywheel.InsertOpts{Queue: "mail", MaxAttempts: 4, Timeout: 30 * time.Second}
+}
+```
+
+**They apply wherever an insert knows the registry.** Each field the call leaves zero takes the kind's
+default, then the runtime's (queue `default`, priority 100, 25 attempts, no timeout, any executor class).
+A field the call sets always wins.
+
+| Insert | Takes the kind's `Defaults` |
+|---|---|
+| `Insert`, `Enqueue`, `InsertMany`, `InsertManyTyped` on a Client built with `ClientOpts.Registry` | yes |
+| A Scheduler's periodic fires through such a Client | yes, on the periodic's queue |
+| A worker's `Result.FollowUps`, inserted by a Runner's finalize | yes, from `RunnerConfig.Registry` |
+| The continuation of a worker's `Result.Barrier` | yes, resolved when the barrier is declared |
+| A Client built with `NewClient`, and `flywheel enqueue` | no |
+| A custom `Driver` that does not finalize through a built-in one | no |
+
+```go
+client := flywheel.NewClientWithOptions(db, flywheel.ClientOpts{Registry: reg})
+
+// Lands on "mail" with 4 attempts and a 30-second timeout.
+_, err := flywheel.Insert(ctx, client, WelcomeMail{UserID: id}, flywheel.InsertOpts{})
+
+// The caller's queue wins; the attempts and the timeout still come from Defaults.
+_, err = flywheel.Insert(ctx, client, WelcomeMail{UserID: id}, flywheel.InsertOpts{Queue: "urgent"})
+```
+
+**Follow-ups and barrier continuations take the Runner's registry.** A follow-up's empty queue,
+priority, and executor class take its kind's defaults, and so do its attempts and timeout, which a
+`FollowUp` does not name. A kind the Runner does not register takes none. A barrier's continuation is
+resolved in the finalize that declares it: each of its queue, executor class, and priority takes the
+`Barrier`'s own value, then the continuation kind's default, then the spawning job's, and its attempts
+and timeout take the kind's default. All of it is stored with the barrier, so a child's finalize, a
+cancel, and the sweep's discard enqueue the same continuation. A continuation kind without `Defaults`
+inherits the spawning job's routing, with 25 attempts and no timeout.
+
+**A timeout from `Defaults` is stored on the job**, like `InsertOpts.Timeout`, so it overrides the
+worker's `Timeouter`. Since a zero field means "unset", a call cannot ask for the any-class wildcard on
+a kind whose `Defaults` name an `ExecutorClass`.
+
+</details>
+
+<details>
 <summary><strong><code>Leases, the heartbeat, and the fence</code></strong></summary>
 <br>
 
@@ -894,6 +946,11 @@ return flywheel.Result{
     Barrier:   &flywheel.Barrier{Kind: "finalize_batch"}, // runs once, when they are all terminal
 }, nil
 ```
+
+The continuation's routing is resolved when the barrier is declared and stored with it: an empty
+`Queue`, `ExecutorClass`, or `Priority` on the `Barrier` takes the continuation kind's `Defaults` in the
+Runner's registry, then the spawning job's, so every path that fires the barrier enqueues the same row
+(see **Worker defaults** above).
 
 The continuation reads what the generation produced through `ChildOutputs` — one entry per terminal
 child, its final state paired with its last attempt's recorded output. A barrier-bearing generation is

@@ -32,13 +32,59 @@ type dispatchFunc func(ctx context.Context, in dispatchInput) (Result, error)
 
 // registryEntry is one registered worker: its dispatch closure plus any
 // optional interfaces it implements, captured once at registration so the
-// Runner need not re-assert.
+// Runner need not re-assert. defaults is nil when the worker implements no
+// Defaults.
 type registryEntry struct {
 	dispatch   dispatchFunc
 	classifier Classifier
 	retryable  Retryable
-	defaults   Defaults
+	defaults   *kindDefaults
 	timeouter  Timeouter
+}
+
+// kindDefaults is the part of a worker's Defaults() an insert applies: read
+// once, at registration, so no insert path calls worker code.
+type kindDefaults struct {
+	queue         string
+	priority      int
+	maxAttempts   int
+	timeout       time.Duration
+	executorClass ExecutorClass
+}
+
+// kindDefaultsOf keeps the fields of opts an insert reads from Defaults.
+func kindDefaultsOf(opts InsertOpts) *kindDefaults {
+	return &kindDefaults{
+		queue:         opts.Queue,
+		priority:      opts.Priority,
+		maxAttempts:   opts.MaxAttempts,
+		timeout:       opts.Timeout,
+		executorClass: opts.ExecutorClass,
+	}
+}
+
+// applyTo fills each field opts leaves zero from d, and returns opts with
+// every other field as it was. A nil d returns opts unchanged.
+func (d *kindDefaults) applyTo(opts InsertOpts) InsertOpts {
+	if d == nil {
+		return opts
+	}
+	if opts.Queue == "" {
+		opts.Queue = d.queue
+	}
+	if opts.Priority == 0 {
+		opts.Priority = d.priority
+	}
+	if opts.MaxAttempts == 0 {
+		opts.MaxAttempts = d.maxAttempts
+	}
+	if opts.Timeout == 0 {
+		opts.Timeout = d.timeout
+	}
+	if opts.ExecutorClass == AnyClass {
+		opts.ExecutorClass = d.executorClass
+	}
+	return opts
 }
 
 // Registry maps a job kind to its registered worker. It is safe for concurrent
@@ -100,7 +146,7 @@ func Register[A Args](reg *Registry, w Worker[A]) {
 		entry.retryable = r
 	}
 	if d, ok := any(w).(Defaults); ok {
-		entry.defaults = d
+		entry.defaults = kindDefaultsOf(d.Defaults())
 	}
 	if to, ok := any(w).(Timeouter); ok {
 		entry.timeouter = to
@@ -114,4 +160,35 @@ func (reg *Registry) lookup(kind string) (registryEntry, bool) {
 	defer reg.mu.RUnlock()
 	e, ok := reg.entries[kind]
 	return e, ok
+}
+
+// defaultsFor returns the defaults kind's worker declares, or nil when reg is
+// nil, the kind is not registered, or its worker declares none.
+func (reg *Registry) defaultsFor(kind string) *kindDefaults {
+	if reg == nil {
+		return nil
+	}
+	e, _ := reg.lookup(kind)
+	return e.defaults
+}
+
+// kindRegistryKey carries a Runner's Registry on the context it finalizes on.
+type kindRegistryKey struct{}
+
+// withKindRegistry returns ctx carrying reg, so the finalize it reaches applies
+// reg's worker defaults to the follow-ups and barrier continuations it inserts.
+// A nil reg returns ctx unchanged.
+func withKindRegistry(ctx context.Context, reg *Registry) context.Context {
+	if reg == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, kindRegistryKey{}, reg)
+}
+
+// kindDefaultsFrom returns the defaults kind's worker declares in the Registry
+// ctx carries, or nil when ctx carries none or that registry does not register
+// the kind.
+func kindDefaultsFrom(ctx context.Context, kind string) *kindDefaults {
+	reg, _ := ctx.Value(kindRegistryKey{}).(*Registry)
+	return reg.defaultsFor(kind)
 }

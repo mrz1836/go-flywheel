@@ -102,7 +102,8 @@ type BatchResult struct {
 }
 
 // InsertMany enqueues many jobs in bounded chunks. It is the bulk counterpart to
-// Enqueue: same row defaults, same unique-key semantics, same ErrAlreadyEnqueued
+// Enqueue: same row defaults (each row's kind's Defaults, on a Client built with
+// ClientOpts.Registry), same unique-key semantics, same ErrAlreadyEnqueued
 // meaning — applied per row rather than to the call.
 //
 // A unique-key collision is never fatal. The colliding row is skipped, its entry
@@ -138,7 +139,7 @@ func InsertMany(ctx context.Context, c *Client, items []BatchItem, opts BatchOpt
 	rows := make([]jobRow, len(items))
 	ids := make([]string, len(items))
 	for i := range items {
-		rows[i] = buildRow(ctx, items[i].Kind, items[i].Args, items[i].Opts)
+		rows[i] = buildRow(ctx, items[i].Kind, items[i].Args, c.withKindDefaults(items[i].Kind, items[i].Opts))
 		ids[i] = rows[i].ID
 	}
 
