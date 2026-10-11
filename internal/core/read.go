@@ -389,6 +389,13 @@ func LatestRun(ctx context.Context, db *gorm.DB, jobID string) (JobRunView, bool
 
 // Overview returns the job count grouped by state, optionally scoped to a single
 // kind, reading through db. Soft-deleted jobs are excluded.
+//
+// It is a full count by contract: it reads every job in scope, succeeded history
+// included, so its cost grows with the table — without bound while retention is
+// off — and its kind filter has no index. It suits an inspection a person runs.
+// For a number polled on a timer, use the bounded reads: QueueDepths (each
+// queue's live depth), CountActiveByKind (in-flight jobs per kind, on
+// jobs_state), or Stats (outcomes over a window, from the hourly rollups).
 func Overview(ctx context.Context, db *gorm.DB, p OverviewParams) (JobsOverview, error) {
 	query := db.WithContext(ctx).Model(&jobRow{})
 	if p.Kind != "" {
@@ -444,6 +451,12 @@ func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsV
 
 // CountRuns returns the total number of recorded job attempts (job_runs rows),
 // reading through db. It is the inspection seam for run-throughput telemetry.
+//
+// It is a full count by contract: it reads every job_runs row, so its cost grows
+// with the run history — without bound while retention is off. For throughput
+// polled on a timer, read Stats, which counts a window's attempts from the
+// hourly rollups; QueueDepths and CountActiveByKind are the bounded reads of
+// the live queue.
 func CountRuns(ctx context.Context, db *gorm.DB) (int64, error) {
 	var n int64
 	if err := db.WithContext(ctx).Model(&jobRunRow{}).Count(&n).Error; err != nil {

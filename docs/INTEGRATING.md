@@ -383,7 +383,8 @@ once when it ends (by its finalize, or by the lease sweep if its process died).
 | `job_state` | the state the finalize applied (`succeeded`, `retryable`, `discarded`, `scheduled`, `cancelled`, or `available` for a crash the lease sweep reclaimed); NULL while running, when superseded, and on a row an older release or `SeedRun` wrote |
 | `superseded` | true when the attempt finished after its claim was gone — its outcome was recorded but never applied, so the work may have run twice. An attempt the lease sweep crashed that then finished late keeps `job_state = 'available'` and its sweep-time `finished_at` beside the late outcome |
 | `error_class`, `error_message` | for a failed attempt. A `snooze` may carry an `error_message` with no `error_class`: a worker that returned an error alongside its snooze, or a job deferred because the runner that claimed it does not register its kind (`jobs: unknown job kind`) |
-| `cost_micros`, `enqueued_children`, `output` | what the worker reported |
+| `cost_micros`, `enqueued_children`, `output` | what the worker reported. An `output` whose JSON was larger than `DriverOpts.MaxOutputBytes` (64 KiB by default) holds the marker `{"$truncated": true, "$bytes": <its marshaled size>, "$head": "<its first 1,024 bytes>"}` instead — exactly those three keys — and `JobRunView.OutputTruncated` is true |
+| `error_payload` | for a failed attempt, `{"message": …}`, the stored message; plus `"truncated": true` and `"message_bytes"` (its length before the cut) when the message was cut at 4,096 bytes (`JobRunView.ErrorTruncated`); plus `"stack"`, at most 16 KiB, when the worker panicked (`JobRunView.ErrorStack`) |
 
 **`job_run_finishes`** — the finish log: one `(finished_at, run_id)` per finished run, written in the same
 transaction that sets `job_runs.finished_at`. It exists because `job_runs.finished_at` is deliberately not
@@ -441,6 +442,11 @@ refused for day buckets.
 Every read takes a `context.Context` and the `*gorm.DB` to read through — a replica is fine, except for
 `WaitForJob` — and returns JSON-tagged values. None writes.
 
+Every list read returns at most `MaxReadLimit` (200) rows: `ListJobs`, `ListFinished`, `ListRunning`,
+`SlowRuns`, `RecentFailures`, and `ListRuns`. A larger `Limit` is clamped rather than refused, so a handler
+can pass a request's limit through; one that asks for a row more than its page, to learn whether another
+follows, keeps its page below 200.
+
 ### Live: what is happening now
 
 **`ListRunning(ctx, db, ListRunningParams{Kind, Queue, Limit, WithBaseline})`** — the jobs running now,
@@ -452,7 +458,9 @@ moment ago whose attempt row has not landed yet is reported as `Starting` rather
 `jobs_running_leased`, joined to each attempt by the `job_runs_job_attempt` unique index.
 
 **`QueueDepths(ctx, db)`** — per queue: ready now, scheduled ahead, running, paused, and the oldest ready
-job's age (the lag). The same access paths as `SampleQueueHealth`.
+job's age (the lag). The same access paths as `SampleQueueHealth`, the whole-queue gauge snapshot behind
+`/metrics`, which counts every state but `succeeded`: succeeded jobs are most of a retained table, and a
+sample that counted them would read it all on every scrape.
 
 **`CountActiveByKind(ctx, db)`** — in-flight jobs per (kind, queue, state), non-terminal states only, on
 `jobs_state`. This, not a `GROUP BY kind` over all of `jobs`, is the per-kind backlog read.
@@ -473,14 +481,16 @@ terminal state on `jobs_finished`, merged in Go. Page with `Before: &FinishedCur
 the previous page's last job. A state listed twice is read once.
 
 **`RecentFailures(ctx, db, RecentFailuresParams{Since, Limit})`** — discarded jobs with the error of the
-attempt that discarded them; also on `jobs_finished`.
+attempt that discarded them; also on `jobs_finished`. It reads only the columns it reports, and only each
+job's own final attempt — no args, outputs, or error payloads.
 
 **`ListJobs(ctx, db, ListJobsParams{State, Kind, Queue, BeforeID, Limit})`** — jobs newest first *by id*.
 Ids are UUIDv7, so id order is insertion order and the primary key serves the page; `BeforeID` pages it.
 
 **`ListRuns(ctx, db, jobID, ListRunsParams{BeforeAttempt, Before, Limit})`** — one job's attempts with
-every column above, newest attempt first. Page with `BeforeAttempt` set to the previous page's last
-`Attempt`; `Before` (a `created_at` cursor) also works, and is zone-proof on SQLite.
+every column above, newest attempt first. A zero `Limit` reads the newest 200 attempts. Page with
+`BeforeAttempt` set to the previous page's last `Attempt`; `Before` (a `created_at` cursor) also works, and
+is zone-proof on SQLite.
 
 **`LatestRun(ctx, db, jobID)`** — one job's newest attempt and `true`, or `false` when it has none yet:
 `ListRuns` with `Limit: 1`. After `WaitForJob` reports a job succeeded, it is the attempt that succeeded,
