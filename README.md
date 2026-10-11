@@ -417,6 +417,14 @@ pair together to stretch the same budget across the outage. With `RetryBackoffBa
 widens the spacing of the later rungs, never the first-attempt delay. Pick the outage length you must ride
 out, then choose the ceiling and `MaxAttempts` so their ladder covers it.
 
+**Args that do not decode are never retried.** When a job's stored args do not fit its worker's args
+type, the worker never runs: the attempt fails with `jobs: decode args for kind "…": …`, which matches
+`ErrDecodeArgs` and `ErrValidation`, and it is classified `validation` without asking the worker's
+`Classifier`, so the job is discarded on that first attempt instead of spending its budget on bytes that
+will never change. Fix the producer or the args type, then replay. A worker that must accept a shape its
+type cannot decode declares `json.RawMessage` args and decodes inside `Work`, where its `Classifier`
+applies.
+
 **Drain is explicit.** `Stop` and `Drain` are safe before `Run`, concurrently with it, and after it
 returns:
 
@@ -555,7 +563,11 @@ runs until its context ends. A test that enqueues a kind it deliberately leaves 
 
 A claimed job carries a **lease**. If its executor dies, the lease expires and the scheduler's sweep
 returns the job to the queue for another runner — which is what makes a crashed process recoverable
-rather than a job lost forever.
+rather than a job lost forever. A crash spends the attempt it interrupted, so when that attempt was the
+job's last (`attempt >= max_attempts`) the sweep discards the job instead: a job whose worker takes its
+process down on every attempt ends after `max_attempts` crashes rather than looping. The sweep reports
+each job it reclaimed in `SweepEvent.Jobs`, and the slog observer logs each crashed attempt as it logs
+any failed one.
 
 **`LeaseDuration` bounds dispatch liveness, not run duration.** It is how long a *crashed* executor's
 job stays stranded before it is reclaimed, not a ceiling on how long a worker may take. Size it to how
@@ -659,7 +671,7 @@ for _, run := range runs {
 |---|---|
 | Before your worker body runs | The row is **committed** with outcome `started`. A side-effect row written during the attempt can reference it immediately, and it survives a rollback of your own work. |
 | Attempt finishes | The same row is updated in place with the outcome, timings, cost, and `Result.Output`. |
-| Process crashes mid-attempt | The lease sweep marks the row `crashed`. It is **not deleted**, so your FK never dangles. |
+| Process crashes mid-attempt | The lease sweep marks the row `crashed`, with the state it left the job in (`available`, or `discarded` when that was the job's last attempt). It is **not deleted**, so your FK never dangles. |
 | Retention runs | The only thing that removes it. `DeleteFinishedJobs` deletes `job_runs` **before** `jobs`, so a host FK onto `job_runs.id` wants **`ON DELETE SET NULL`** — or leave retention disabled. |
 
 Need run history that no worker produced — fixtures, a backfill, an import? `flywheel.SeedRun` writes a
@@ -836,11 +848,24 @@ is returned, so an operator action can never overwrite a recorded outcome. Re-ru
 deliberate — `RetryJobWithOptions` with `Force` — and replaying a whole cohort of failures, with a
 restored retry budget, is its own guide: **Replaying work** below.
 
+**A retry never starts a job while its attempt still runs.** `RetryJob` refuses a running job with
+`ErrJobRunning` and leaves it and its lease alone: re-queueing it would let a runner start a second
+attempt beside the first, and the job's side effects would happen twice at once. `Force` re-runs
+terminal jobs only; it also refuses a job cancelled while its attempt runs, because a cancel fences that
+attempt without stopping its worker. Wait for the attempt to finish, or pass
+`RetryOpts{AllowRunning: true}` to re-queue it anyway: the running attempt keeps going, its result is
+discarded, and the work runs twice. That is also the way past a cancelled job whose process died before
+its attempt returned, whose run stays `started`.
+
 **The fan-in barrier runs a continuation once a generation completes.** A worker returns `Result.Barrier`
 alongside its children, and the runtime enqueues the continuation exactly once, after the last child
 reaches *any* terminal state — a half-failed generation still gets its finalizer. It is keyed so a
-retried, discarded, or superseded child can never enqueue it twice, and it fires inside that last child's
-finalize transaction, so no host writes a retry-unsafe counter.
+retried, discarded, or superseded child can never enqueue it twice, and it fires in the transaction
+that makes the last pending child terminal: its finalize, a cancel, or the sweep's discard, so no host
+writes a retry-unsafe counter. `CancelByParent` over a generation's last pending children therefore
+runs the continuation, and the call ends with the batch that fired it, so it never cancels the
+continuation it just enqueued. A cancelled running child counts as terminal at the cancel, so the
+continuation can start while that child's worker is still running.
 
 ```go
 return flywheel.Result{
@@ -940,6 +965,11 @@ colliding with the recorded failures. It is the same mechanism a snooze uses to 
 work; naming `StateSucceeded` additionally requires `Force`. An unscoped `Replay` with neither `Kinds`
 nor `FailedSince` is refused with `ErrReplayUnbounded` rather than replaying every discarded job in the
 database by accident.
+
+**A replay never touches a job whose attempt still runs.** A `States` that names `running` is refused
+before any write with a `*ValidationError` on `states`, whatever `AllowRunning` says. With `States`
+naming `cancelled`, a job cancelled while its attempt still runs is left cancelled and counted in
+`SkippedRunning`, so the replay never starts a second attempt beside the first.
 
 **A replay never puts two live jobs on one `UniqueActiveKey` at a time.** A replayed job whose key
 another job holds live when its batch runs stays terminal, is counted in `SkippedActiveKey`, and the
@@ -1153,6 +1183,8 @@ and the [`observers/`](observers) package ships ready adapters that plug straigh
 - `observers.NewSlog(logger)` logs routine events at debug level and failures above it: a failed attempt
   at warn and a job a failure discarded at error, each with the worker's error, the attempt against its
   budget, and the job's resulting state ([RUNBOOK](docs/RUNBOOK.md#symptom-jobs-fail-or-are-discarded)).
+  A crashed attempt the lease sweep reclaims logs the same lines, with outcome `crashed`, when the same
+  observer is passed to the scheduler.
   `observers.NewMulti(...)` fans events out to several observers at once.
 
 `SampleQueueHealth` ([health.go](internal/core/health.go)) reads a point-in-time gauge snapshot — depth by state,

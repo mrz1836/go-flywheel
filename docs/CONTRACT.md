@@ -22,7 +22,9 @@ is serialized to the same end. You do not need your own "is anyone else working 
 with an expiry. A live worker renews it on a heartbeat, pushing the expiry ahead for as long as it runs,
 so a legitimately long job is never mistaken for a dead one. If the worker's process dies, the lease
 expires and the stuck-lease sweep returns the job to the queue — the runtime's recovery path for work
-lost to a crash.
+lost to a crash. A crash spends an attempt like a failure does: when the crashed attempt was the job's
+last (`attempt >= max_attempts`), the sweep discards the job instead, so a job that kills its process on
+every attempt ends after `max_attempts` crashes rather than looping.
 
 **A fence bounds a finalize: only the attempt holding the current claim advances the job's state.** Each
 claim mints a lease token, and the finalize's state update is scoped to `id = ? AND lease_token = ?`. If
@@ -31,6 +33,14 @@ matches, the update touches no row, and the attempt's outcome is *discarded* rat
 claim. Whichever attempt holds the lease wins; the other does not silently overwrite it. The discarded
 attempt is still recorded: its `job_runs` row carries its real outcome with `superseded = true`, a
 durable trace of the double execution beyond the `SupersedeEvent` an observer sees.
+
+**A retry or a replay never starts a job while its attempt still runs.** `RetryJob` and
+`RetryJobWithOptions` refuse a running job with `ErrJobRunning`, and with `Force` they also refuse a
+job cancelled while its attempt runs (a cancel fences the attempt without stopping its worker, so its
+run stays `started` until the worker returns). `Replay` and `ReplayByParent` refuse a `States` that names
+`running` and leave such a cancelled job as it is. A single retry with `AllowRunning` is the one way to
+re-queue a job whose attempt still runs, and it says so: that attempt keeps running and its result is
+discarded, so the work runs twice at once.
 
 **Every attempt is audited.** Before the worker body runs, the runtime commits a `job_runs` row with
 outcome `started` — the run stub. Because it is committed first, a crash mid-attempt leaves a record,
@@ -62,8 +72,8 @@ transaction sees the holder and gets the `*AlreadyEnqueuedError`. See [`COOKBOOK
 
 **Exactly-once execution of side effects is not guaranteed, and cannot be.** A worker that makes an
 external call — charges a card, sends an email, writes to another system — and is then killed *after*
-the call returns but *before* its finalize commits will run again on recovery, and make the call a second
-time. This is not a defect to be fixed; it is a fundamental property of any system that survives crashes.
+the call returns but *before* its finalize commits will run again on recovery (unless that was its last
+attempt, which discards the job), and make the call a second time. This is not a defect to be fixed; it is a fundamental property of any system that survives crashes.
 The runtime guarantees exactly-once **state advance** (the job moves forward once), not exactly-once
 **side effect** (the external call happens once). The window is real and it is between "the side effect
 completed" and "the finalize committed."
