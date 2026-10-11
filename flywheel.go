@@ -170,6 +170,7 @@ var (
 	ErrAlreadyEnqueued    = core.ErrAlreadyEnqueued
 	ErrBarrierNoChildren  = core.ErrBarrierNoChildren
 	ErrBarrierTooWide     = core.ErrBarrierTooWide
+	ErrDecodeArgs         = core.ErrDecodeArgs
 	ErrFollowUpLimit      = core.ErrFollowUpLimit
 	ErrIndexDrift         = core.ErrIndexDrift
 	ErrJobNotFound        = core.ErrJobNotFound

@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -75,6 +77,31 @@ func undecodableArgsSuite(t *testing.T, db *gorm.DB) {
 		"the run keeps the decode error's text")
 	require.NotNil(t, runs[0].JobState)
 	assert.Equal(t, string(StateDiscarded), *runs[0].JobState)
+}
+
+// TestDecodeArgsErrorUnwrapsToItsSentinels proves the dispatch's decode failure
+// keeps its text and matches ErrDecodeArgs, ErrValidation, and the JSON
+// decoder's own error, so a caller can branch on any of the three.
+func TestDecodeArgsErrorUnwrapsToItsSentinels(t *testing.T) {
+	t.Parallel()
+	reg := NewRegistry()
+	Register[strictArgs](reg, &strictWorker{})
+	entry, ok := reg.lookup("decode.strict")
+	require.True(t, ok)
+
+	_, err := entry.dispatch(context.Background(), dispatchInput{Kind: "decode.strict", RawArgs: []byte(`{"n":"x"}`)})
+	require.Error(t, err)
+	assert.Equal(t,
+		`jobs: decode args for kind "decode.strict": json: cannot unmarshal string into Go struct field strictArgs.n of type int`,
+		err.Error(), "the text names the kind and the decode error, as it always has")
+	require.ErrorIs(t, err, ErrDecodeArgs)
+	require.ErrorIs(t, err, ErrValidation)
+	var typeErr *json.UnmarshalTypeError
+	require.ErrorAs(t, err, &typeErr, "the decoder's own error stays reachable")
+	assert.Equal(t, "n", typeErr.Field)
+
+	// A worker error that is not a decode failure matches neither sentinel.
+	assert.NotErrorIs(t, errors.New("jobs: something else"), ErrDecodeArgs)
 }
 
 // TestUndecodableArgsDiscardOnTheFirstAttemptWhateverTheClassifierSays proves a

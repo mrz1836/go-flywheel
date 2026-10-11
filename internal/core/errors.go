@@ -117,6 +117,37 @@ var ErrRunAlreadyRecorded = errors.New("flywheel: run already recorded for this 
 // job is discarded with. Match it with errors.Is: the discard wraps it.
 var ErrUnknownKind = errors.New("jobs: unknown job kind")
 
+// ErrDecodeArgs reports that a job's stored args could not be decoded into its
+// worker's args type, so the worker never ran. The stored bytes never change, so
+// no retry can succeed: the Runner classifies the failure ErrorValidation,
+// without consulting the worker's Classifier, and the job is discarded on that
+// attempt. The error a decode failure returns keeps its text — the kind and the
+// decoder's message — and unwraps to ErrDecodeArgs, ErrValidation, and the
+// decoder's own error.
+//
+// A worker that must accept args its type cannot decode declares json.RawMessage
+// args and decodes inside Work, where its Classifier applies.
+var ErrDecodeArgs = errors.New("jobs: decode args")
+
+// decodeArgsError is the error a registered worker's dispatch returns when the
+// job's args do not decode. Its text is the one the runtime has always written to
+// the run row, and it is a type rather than a chain of %w because fmt.Errorf
+// prints every operand it wraps: wrapping the two sentinels that way would append
+// their text to the message.
+type decodeArgsError struct {
+	kind string
+	err  error
+}
+
+// Error names the kind and the decoder's message.
+func (e *decodeArgsError) Error() string {
+	return fmt.Sprintf("jobs: decode args for kind %q: %v", e.kind, e.err)
+}
+
+// Unwrap exposes ErrDecodeArgs, ErrValidation, and the decoder's own error for
+// errors.Is and errors.As.
+func (e *decodeArgsError) Unwrap() []error { return []error{ErrDecodeArgs, ErrValidation, e.err} }
+
 // ErrUnsupportedDialect is returned by Migrate, IndexSet, Indexes, and
 // InstallIndexes for a dialect that cannot express the runtime's partial
 // indexes (anything but postgres and sqlite). It is wrapped with the offending

@@ -72,7 +72,9 @@ func Register[A Args](reg *Registry, w Worker[A]) {
 			var args A
 			if len(in.RawArgs) > 0 {
 				if err := json.Unmarshal(in.RawArgs, &args); err != nil {
-					return Result{}, fmt.Errorf("jobs: decode args for kind %q: %w", kind, err)
+					// Args that do not decode never will: the error is a validation
+					// failure the Runner discards on, not one it retries.
+					return Result{}, &decodeArgsError{kind: kind, err: err}
 				}
 			}
 			job := &Job[A]{
