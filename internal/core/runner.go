@@ -143,6 +143,9 @@ type RunnerConfig struct {
 	// already extended by the time it is called, so refusing to renew afterwards
 	// would strand a job whose worker is still running.
 	OnLeaseRenewed func(ctx context.Context, renewal LeaseRenewal) error
+	// CooperativeCancel, when set, cancels an attempt's context with cause
+	// ErrJobCancelled within one heartbeat of an operator cancelling its job.
+	CooperativeCancel bool
 	// PollInterval is the pause between empty polls.
 	PollInterval time.Duration
 	// MaxPollBackoff caps the delay between polls after consecutive failures.

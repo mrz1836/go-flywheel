@@ -129,6 +129,15 @@ var ErrUnknownKind = errors.New("jobs: unknown job kind")
 // args and decodes inside Work, where its Classifier applies.
 var ErrDecodeArgs = errors.New("jobs: decode args")
 
+// ErrJobCancelled is the cause a Runner with RunnerConfig.CooperativeCancel gives
+// a running attempt's context when an operator cancels its job: read it with
+// context.Cause(ctx). A worker that sees it should stop and return; the job is
+// already cancelled. An attempt whose worker returns an error after it is
+// recorded as cancelled, with that error wrapped in this one, unclassified; one
+// whose worker returns success keeps its success. Either way the attempt's
+// result is not applied to the job.
+var ErrJobCancelled = errors.New("jobs: job cancelled while running")
+
 // decodeArgsError is the error a registered worker's dispatch returns when the
 // job's args do not decode. Its text is the one the runtime has always written to
 // the run row, and it is a type rather than a chain of %w because fmt.Errorf

@@ -175,6 +175,7 @@ var (
 	ErrDecodeArgs         = core.ErrDecodeArgs
 	ErrFollowUpLimit      = core.ErrFollowUpLimit
 	ErrIndexDrift         = core.ErrIndexDrift
+	ErrJobCancelled       = core.ErrJobCancelled
 	ErrJobNotFound        = core.ErrJobNotFound
 	ErrJobRunning         = core.ErrJobRunning
 	ErrJobTerminal        = core.ErrJobTerminal
