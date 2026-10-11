@@ -148,7 +148,11 @@ func discardRun(kind string, finishedAt time.Time) histRun {
 
 // randomHistory builds n runs spread over [from, from+span), across four kinds
 // and two queues, with every outcome, superseded and crashed rows, and legacy
-// rows mixed in — the oracle's input.
+// rows mixed in — the oracle's input. A crashed row records the state the sweep
+// applied, available or discarded, and some crashed rows finished late: their
+// superseded finalize wrote its own outcome beside the state the sweep recorded.
+//
+//nolint:gocognit // one random draw per column, with the combinations each outcome allows
 func randomHistory(rng *rand.Rand, n int, from time.Time, span time.Duration) []histRun {
 	kinds := []string{"alpha", "beta", "gamma", "delta"}
 	queues := []string{"default", "bulk"}
@@ -158,6 +162,7 @@ func randomHistory(rng *rand.Rand, n int, from time.Time, span time.Duration) []
 	}
 	runs := make([]histRun, n)
 	for i := range runs {
+		lateCrash := false
 		o := outcomes[rng.IntN(len(outcomes))]
 		r := histRun{
 			Kind:       kinds[rng.IntN(len(kinds))],
@@ -184,9 +189,22 @@ func randomHistory(rng *rand.Rand, n int, from time.Time, span time.Duration) []
 			r.JobState = StateCancelled
 		case OutcomeCrashed:
 			r.JobState = StateAvailable
+			if rng.IntN(3) == 0 {
+				// The crash spent the job's last attempt, so the sweep discarded it.
+				r.JobState = StateDiscarded
+			}
 			r.DurationMs = -1
+			if rng.IntN(4) == 0 {
+				// The crashed attempt finished after the sweep: its superseded
+				// finalize recorded its own outcome, duration, and cost, and kept
+				// the state the sweep had recorded.
+				lateCrash = true
+				r.Outcome = []RunOutcome{OutcomeSuccess, OutcomeError}[rng.IntN(2)]
+				r.DurationMs = 1 + rng.IntN(5000)
+				r.Superseded, r.Legacy = true, false
+			}
 		}
-		if r.Superseded {
+		if r.Superseded && !lateCrash {
 			r.JobState = ""
 		}
 		if r.Legacy {
