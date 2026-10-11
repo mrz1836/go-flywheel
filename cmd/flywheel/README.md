@@ -101,10 +101,11 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel jobs inspect <id>` | Show a job and its run history |
 | `flywheel jobs retry <id>` | Return a waiting job (available, scheduled, retryable, or paused) to available to run now. A running job is refused (`flywheel: job is running`), so its work never runs twice at once; a terminal job is refused too (`flywheel: job has already reached a terminal state`) |
 | `flywheel jobs cancel <id>` | Move a job to cancelled (refused once a job is terminal) |
-| `flywheel schedule ls` | List periodic schedules |
+| `flywheel schedule ls` | List periodic schedules, with whether each is active and paused (`--json`) |
 | `flywheel schedule add <slug> <kind>` | Add/update a schedule (`--cron \| --every`, `--args`). A `--cron` that names no zone runs in the zone the scheduler evaluates it in: the daemon's local zone, as the database driver returns its times. Prefix it with `CRON_TZ=<zone>` to pin one, for example `--cron "CRON_TZ=UTC 0 9 * * *"` |
 | `flywheel schedule rm <slug>` | Remove a schedule (warns when the config declares it: `serve` re-creates it) |
-| `flywheel schedule enable <slug>` / `disable <slug>` | Reactivate or deactivate a schedule, keeping its row |
+| `flywheel schedule enable <slug>` / `disable <slug>` | Reactivate or deactivate a schedule, keeping its row. This is the config's own switch: for a schedule the file declares, the next `serve` start re-applies the file's setting |
+| `flywheel schedule pause <slug>` / `resume <slug>` | Hold a schedule through every `serve` start until it is resumed; a resume fires it next at its first fire time after now, without running the fires it missed |
 | `flywheel prune` | Delete finished jobs and their runs older than a cutoff, holding for the stats rollup when it is on (`--older-than 14d --ignore-stats-rollup`) |
 | `flywheel status` | Show queue health, schedules, and recent failures (`--json --watch`) |
 | `flywheel stats` | Per-kind outcomes, success rate, duration percentiles, and queue wait (`--since 24h --kind --queue --json`) |
@@ -163,7 +164,9 @@ every worker type ships alongside this README.
 **The file is the source of truth.** Every `serve` start applies the
 `schedules:` list — an unchanged schedule keeps its cadence, a changed one is
 updated, and one an operator disabled is enabled again — and disables any active
-schedule the file does not name, keeping its row and history. While `serve`
+schedule the file does not name, keeping its row and history. A schedule paused
+with `flywheel schedule pause` stays paused: `serve` applies the file's kind,
+args, and cadence to it and logs `jobs: declared periodic is paused`. While `serve`
 runs, a declared schedule whose row is deleted (`flywheel schedule rm`, a
 restore, a rebuilt database) comes back within `runtime.schedule_reconcile`,
 with a `jobs: declared periodic was missing and has been re-created` warning:
@@ -176,7 +179,9 @@ runtime:
 To retire a schedule, remove it from the file first and restart `serve`; delete
 the row afterwards if you want it gone. `flywheel schedule rm` on a slug the
 config still declares warns that `serve` will bring it back, and `flywheel
-schedule disable` holds only until the next start. A schedule `serve` would
+schedule disable` holds only until the next start: to stop a declared schedule
+until further notice, `flywheel schedule pause` it, and `flywheel schedule
+resume` it later. A schedule `serve` would
 refuse — a malformed cron, or an interval under a second — stops `serve`
 before it touches the database, and fails `flywheel doctor` too.
 Otherwise `flywheel doctor` shows which declared schedules are missing, inactive,

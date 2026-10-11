@@ -475,6 +475,14 @@ discard, not a retry); **success rate** = `success / (success + discarded)`. A f
 attempt that does not record the state it applied — one an older release wrote, or one `SeedRun`
 imported — counts as the discard when its job is discarded at that attempt, and as a retry otherwise.
 
+**`job_periodics`** — one row per schedule. Stable for SQL: `slug`, `kind`, `queue`, `cron_expr` and
+`interval_seconds` (exactly one is set), `next_run_at` (the next fire), `last_enqueued_at`, `is_active`,
+and `paused_at`. A schedule fires only when `is_active` is true and `paused_at` is NULL. `is_active` is the
+declaration's switch, which a host declaring the schedule in `SchedulerConfig.Periodics` re-applies on every
+start; `paused_at` is when an operator paused it with `PausePeriodic`, NULL while it is not paused, and
+nothing that declares a schedule writes it. A paused schedule's `next_run_at` stays where the pause found
+it until `ResumePeriodic` moves it to the first fire after now.
+
 ### Time and zones
 
 `job_runs` and `job_run_finishes` timestamps are stored in UTC. On PostgreSQL every timestamp column is
@@ -515,6 +523,10 @@ sample that counted them would read it all on every scrape.
 
 **`CountActiveByKind(ctx, db)`** — in-flight jobs per (kind, queue, state), non-terminal states only, on
 `jobs_state`. This, not a `GROUP BY kind` over all of `jobs`, is the per-kind backlog read.
+
+**`ListPeriodics(ctx, db)`** — every schedule, by slug: its kind, queue, cron or interval, `NextRunAt`,
+`LastEnqueuedAt`, `Active`, and `Paused` with `PausedAt`. A schedule fires only when it is `Active` and not
+`Paused`; see [`job_periodics`](#tables-and-columns) for which switch is whose.
 
 **`WaitForJob(ctx, db, id)`** — blocks until one job reaches a terminal state and returns its `JobView`:
 one primary-key read at once, then every 500 ms doubling to 5 s. `ctx` is the only bound; at the deadline

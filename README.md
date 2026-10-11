@@ -1405,17 +1405,33 @@ with `CRON_TZ=<zone>` to pin it: `CRON_TZ=UTC 0 2 * * *`, or `CRON_TZ=America/Ne
 02:00 New York time across daylight-saving changes. An unknown zone is refused like any malformed
 expression.
 
-**On start, the declaration wins.** Every start applies the whole declaration with `UpsertPeriodic`'s
-semantics: a missing definition is inserted, a changed one updated, and an unchanged one keeps its
-`next_run_at` cursor, so a restart does not reset a cadence. `Active` is applied too, so a declared
-definition an operator deactivated with `SetPeriodicActive` is active again after the next start. A
-`PeriodicSpec`'s zero `Active` is inactive: a definition meant to fire says `Active: true`. When the
+**On start, the declaration wins, except over a pause.** Every start applies the whole declaration with
+`UpsertPeriodic`'s semantics: a missing definition is inserted, a changed one updated, and an unchanged one
+keeps its `next_run_at` cursor, so a restart does not reset a cadence. `Active` is applied too, so a
+declared definition an operator deactivated with `SetPeriodicActive` is active again after the next start.
+A `PeriodicSpec`'s zero `Active` is inactive: a definition meant to fire says `Active: true`. When the
 database is unreachable at start, `Run` keeps going — it logs `jobs: declared periodic apply failed`
 and retries the declarations that did not land on the reconcile cadence, every minute when the pass is
 off, until they do. A declaration that keeps failing holds back only itself: the reconcile keeps every
 other declared definition present meanwhile.
 
-**While it runs, the reconcile only inserts.** A definition that exists — deactivated, or edited by
+**To stop a declared definition at run time, pause it.** `Active` is the declaration's switch; a pause is
+the operator's, and nothing that declares a definition writes it — not a start, not the reconcile, not
+`UpsertPeriodic`. `PausePeriodic(ctx, db, slug)` (`flywheel schedule pause`) holds a definition through
+every restart until `ResumePeriodic` (`flywheel schedule resume`). A start still applies a paused
+definition's kind, queue, args, and cadence, and logs `jobs: declared periodic is paused` (fields `slug`,
+`paused_at`) once, at info. A definition fires only when it is active and not paused, so a pause holds
+whatever the declaration says, and `Active: false` in code turns a definition off whatever the pause says.
+A resume moves `next_run_at` to the first fire after now on the definition's own schedule: the fires the
+pause skipped are not backfilled, and an inactive definition stays inactive. Pausing a paused definition,
+or resuming one that is not paused, changes nothing; an unknown slug is `ErrPeriodicNotFound`.
+`ListPeriodics` reports `Paused` and `PausedAt`. The pause lives on the row, in the nullable
+`job_periodics.paused_at` column, so `DeletePeriodic` removes it with the row. A scheduler refuses to start
+without that column (`ErrSchemaOutdated`): `Migrate` adds it to an existing database, and
+[Upgrading an existing database](docs/INTEGRATING.md#upgrading-an-existing-database) has the statement for
+a host-owned schema on each dialect.
+
+**While it runs, the reconcile only inserts.** A definition that exists — deactivated, paused, or edited by
 hand — is left exactly as it is until the next start, and one this host does not declare is never
 touched. A re-created definition fires next at its first fire time after the re-creation; the runs it
 missed while gone are not backfilled. Several schedulers declaring the same definitions is safe: the
