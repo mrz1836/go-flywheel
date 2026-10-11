@@ -50,12 +50,12 @@ type KindStats struct {
 	Attempts int64         `json:"attempts"`
 	Outcomes OutcomeCounts `json:"outcomes"`
 	// Succeeded and Discarded are job-level outcomes: jobs that finished
-	// successfully, and jobs that failed for good — a permanent error, or a
-	// retryable one on the last attempt.
+	// successfully, and jobs that failed for good — a permanent error, a
+	// retryable one on the last attempt, or a crash on the last attempt.
 	Succeeded int64 `json:"succeeded"`
 	Discarded int64 `json:"discarded"`
-	// Retries counts attempts after which the job ran again: failed attempts that
-	// did not discard it, plus crashed attempts the lease sweep reclaimed.
+	// Retries counts attempts after which the job ran again: failed and crashed
+	// attempts that did not discard it, error + timeout + crashed - discarded.
 	Retries int64 `json:"retries"`
 	// Superseded counts attempts that finished after their claim was gone — a
 	// cancel or a lease reclaim underneath them — so the work may have run twice.
@@ -437,7 +437,7 @@ func kindStatsFromAgg(a *runAgg) KindStats {
 		},
 		Succeeded:    a.Success,
 		Discarded:    a.Discarded,
-		Retries:      max(a.Error+a.Timeout-a.Discarded, 0) + a.Crashed,
+		Retries:      max(a.Error+a.Timeout+a.Crashed-a.Discarded, 0),
 		Superseded:   a.Superseded,
 		Duration:     summarize(a.DurHist, a.DurCount, a.DurSumMs, a.DurMaxMs),
 		QueueWait:    summarize(a.WaitHist, a.WaitCount, a.WaitSumMs, a.WaitMaxMs),
