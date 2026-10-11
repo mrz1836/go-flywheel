@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -66,9 +67,18 @@ type Driver interface {
 	InsertChild(ctx context.Context, tx *gorm.DB, fu FollowUp, parentID string) error
 
 	// Sweep reclaims jobs whose lease has expired (state running, leased_until
-	// in the past), returning them to available and marking each stale run stub
-	// crashed, in bounded batches. It reports how many jobs were reclaimed in
-	// total across every batch.
+	// in the past), in bounded batches, and marks each stale run stub crashed. A
+	// reclaimed job returns to available unless its crashed attempt was its last
+	// (attempt >= max_attempts): that job is discarded and finalized at now, as a
+	// failed last attempt is, so a job whose process dies on every attempt ends
+	// instead of looping. Each crashed stub records the state the reclaim applied.
+	// It reports how many jobs were reclaimed in total across every batch,
+	// returned and discarded alike.
+	//
+	// The built-in drivers also report each reclaimed job on ctx, batch by batch
+	// as each commits, which is how Scheduler.Sweep fills SweepEvent.Jobs. A Driver
+	// that wraps a built-in one keeps that report as long as it passes ctx through
+	// to it; one that never reaches a built-in driver reports the count alone.
 	//
 	// Each batch is its own transaction, so a deep backlog never becomes one
 	// long lock-holding statement — the case that arises exactly when the system
@@ -186,15 +196,65 @@ func (o DriverOpts) barrierMaxChildren() int {
 }
 
 // reclaimFunc is one dialect's expired-lease batch: it selects up to limit jobs
-// whose lease expired before now, returns them to available with their fence
-// token cleared, and reports the ids it reclaimed.
+// whose lease expired before now, discards each one whose crashed attempt was
+// its last and returns the rest to available, clears every fence token, and
+// reports the jobs it reclaimed in reclaim order.
 //
 // The dialect passes this *up* into the shared loop rather than the loop
 // reaching *down* into the dialect, because Go embedding promotes methods
 // without dispatching them: a loop on baseDriver calling d.reclaimExpired would
 // bind to baseDriver's own copy, never the outer type's, and the SKIP LOCKED
 // path would silently never run.
-type reclaimFunc func(ctx context.Context, tx *gorm.DB, now time.Time, limit int) ([]string, error)
+type reclaimFunc func(ctx context.Context, tx *gorm.DB, now time.Time, limit int) ([]reclaimedJob, error)
+
+// reclaimedJob is one job a reclaim batch took from an expired lease: the state
+// the reclaim left it in, and what the sweep needs to crash its run stub, report
+// it, and check its parent's barrier.
+type reclaimedJob struct {
+	ID, State, Kind, Queue string
+	Attempt, MaxAttempts   int
+	ParentJobID            *string
+}
+
+// reclaimRow is one expired lease as a dialect's reclaim reads it, with the
+// lease that orders it. State is the state the reclaim applied.
+type reclaimRow struct {
+	ID          string    `gorm:"column:id"`
+	State       string    `gorm:"column:state"`
+	Kind        string    `gorm:"column:kind"`
+	Queue       string    `gorm:"column:queue"`
+	Attempt     int       `gorm:"column:attempt"`
+	MaxAttempts int       `gorm:"column:max_attempts"`
+	ParentJobID *string   `gorm:"column:parent_job_id"`
+	LeasedUntil time.Time `gorm:"column:leased_until"`
+}
+
+// inReclaimOrder returns rows as reclaimed jobs, oldest expired lease first and
+// then by id. A PostgreSQL UPDATE returns its rows in no particular order, so
+// both dialects sort here and report a batch the same way.
+func inReclaimOrder(rows []reclaimRow) []reclaimedJob {
+	slices.SortStableFunc(rows, func(a, b reclaimRow) int {
+		if c := a.LeasedUntil.Compare(b.LeasedUntil); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	jobs := make([]reclaimedJob, len(rows))
+	for i, r := range rows {
+		jobs[i] = reclaimedJob{
+			ID: r.ID, State: r.State, Kind: r.Kind, Queue: r.Queue,
+			Attempt: r.Attempt, MaxAttempts: r.MaxAttempts, ParentJobID: r.ParentJobID,
+		}
+	}
+	return jobs
+}
+
+// spentAttempts reports whether a reclaimed attempt was the job's last, which is
+// what makes the sweep discard the job rather than return it: the same budget
+// rule a failed attempt's finalize applies (planFinalize).
+func spentAttempts(attempt, maxAttempts int) bool {
+	return attempt >= maxAttempts
+}
 
 // classifiedError is how the Runner hands the driver its verdict on a failed
 // attempt without widening the Driver.Finalize signature: the Runner wraps the
@@ -776,6 +836,9 @@ func (d *baseDriver) InsertChild(
 // cancellation contract are dialect-independent, and only the batch's reclaim
 // statement is not.
 //
+// Each batch's jobs are added to the report on ctx, if there is one, only once
+// the batch has committed, so a batch that rolls back reports nothing.
+//
 // There is deliberately no ceiling on the number of batches, where retention
 // has one. An unreclaimed lease is stalled work — a job no runner will pick up
 // until the sweep releases it — while an unpruned row is only storage. Stopping
@@ -783,6 +846,7 @@ func (d *baseDriver) InsertChild(
 // tidiness.
 func (d *baseDriver) sweep(ctx context.Context, now time.Time, reclaim reclaimFunc) (int, error) {
 	batchSize := d.opts.sweepBatchSize()
+	report := sweepReportFrom(ctx)
 	reclaimed := 0
 	for {
 		// Cancellation is checked between batches only. Interrupting a batch
@@ -791,45 +855,103 @@ func (d *baseDriver) sweep(ctx context.Context, now time.Time, reclaim reclaimFu
 		if err := ctx.Err(); err != nil {
 			return reclaimed, fmt.Errorf("jobs: sweep cancelled after %d reclaimed: %w", reclaimed, err)
 		}
-		n, err := d.sweepBatch(ctx, now, batchSize, reclaim)
-		reclaimed += n
+		swept, err := d.sweepBatch(ctx, now, batchSize, reclaim)
 		if err != nil {
 			return reclaimed, err
 		}
+		reclaimed += len(swept)
+		report.add(swept)
 		// A short batch means the backlog is drained — not that it is empty. Under
 		// SKIP LOCKED it may instead mean a concurrent sweeper holds the rest,
 		// which the next sweep collects.
-		if n < batchSize {
+		if len(swept) < batchSize {
 			return reclaimed, nil
 		}
 	}
 }
 
 // sweepBatch reclaims one bounded batch and crashes its stale run stubs inside a
-// single transaction, so a batch can never leave a job available with its audit
-// row still reading started.
+// single transaction, so a batch can never leave a job available or discarded
+// with its audit row still reading started. It returns the batch's jobs in
+// reclaim order, each with its crashed run and the state the reclaim applied.
 func (d *baseDriver) sweepBatch(
 	ctx context.Context, now time.Time, limit int, reclaim reclaimFunc,
-) (int, error) {
-	reclaimed := 0
+) ([]SweptJob, error) {
+	var swept []SweptJob
 	err := d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		ids, err := reclaim(ctx, tx, now, limit)
+		jobs, err := reclaim(ctx, tx, now, limit)
 		if err != nil {
 			return err
 		}
-		if len(ids) == 0 {
+		if len(jobs) == 0 {
 			return nil
 		}
-		if err := crashStaleStubs(tx, ids, now); err != nil {
+		runs, err := crashStaleStubs(tx, jobs, now)
+		if err != nil {
 			return fmt.Errorf("jobs: crash stale stubs: %w", err)
 		}
-		reclaimed = len(ids)
+		swept = make([]SweptJob, len(jobs))
+		for i, j := range jobs {
+			swept[i] = SweptJob{
+				JobEvent: JobEvent{
+					JobID: j.ID, RunID: runs[j.ID], Kind: j.Kind, Queue: j.Queue, Attempt: j.Attempt,
+				},
+				MaxAttempts: j.MaxAttempts,
+				State:       JobState(j.State),
+			}
+		}
 		return nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("jobs: sweep: %w", err)
+		return nil, fmt.Errorf("jobs: sweep: %w", err)
 	}
-	return reclaimed, nil
+	return swept, nil
+}
+
+// sweepReportKey is the context key a sweep's report travels under.
+type sweepReportKey struct{}
+
+// sweepReport collects the jobs one Scheduler.Sweep reclaimed, as the built-in
+// drivers commit each batch.
+//
+// It travels on the context rather than through the Driver interface. Driver is
+// public and is wrapped (for metrics, tracing, or fault injection), so a new
+// Sweep result would break every implementation, and an optional interface found
+// by type assertion would be lost behind any wrapper. A wrapper that passes its
+// context through, as a wrapper does, carries the report for free.
+type sweepReport struct {
+	mu   sync.Mutex
+	jobs []SweptJob
+}
+
+// withSweepReport returns ctx carrying a fresh report, and the report.
+func withSweepReport(ctx context.Context) (context.Context, *sweepReport) {
+	report := &sweepReport{}
+	return context.WithValue(ctx, sweepReportKey{}, report), report
+}
+
+// sweepReportFrom returns the report ctx carries, or nil when it carries none: a
+// sweep called directly rather than through Scheduler.Sweep.
+func sweepReportFrom(ctx context.Context) *sweepReport {
+	report, _ := ctx.Value(sweepReportKey{}).(*sweepReport)
+	return report
+}
+
+// add appends one committed batch's jobs. A nil report ignores them.
+func (r *sweepReport) add(jobs []SweptJob) {
+	if r == nil || len(jobs) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.jobs = append(r.jobs, jobs...)
+}
+
+// list returns the jobs reported so far, in the order they were reclaimed.
+func (r *sweepReport) list() []SweptJob {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.jobs)
 }
 
 // finishLogInsert is the statement that records a run's finish in
@@ -862,31 +984,91 @@ func finalizeRunRow(tx *gorm.DB, runID string, upd map[string]any) error {
 	return tx.Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND id = ?"), runID).Error
 }
 
+// crashedStub is one run stub the sweep marked crashed.
+type crashedStub struct {
+	ID      string `gorm:"column:id"`
+	JobID   string `gorm:"column:job_id"`
+	Attempt int    `gorm:"column:attempt"`
+}
+
 // crashStaleStubs marks the started stubs of reclaimed jobs crashed and logs
-// each one's finish, in the caller's transaction — one statement on PostgreSQL,
-// two on SQLite, for the reasons finalizeRunRow gives.
+// each one's finish, in the caller's transaction — one statement per state the
+// reclaim applied on PostgreSQL, and a read and two writes on SQLite, for the
+// reasons finalizeRunRow gives. It returns, per job, the run of its crashed
+// attempt: the stub at the job's attempt, or another started stub of the job
+// when that one is missing. A job whose process died before it committed a stub
+// has none.
 //
-// The stub records the reclaim as its job state, so a crashed attempt's effect
-// on the job — back to available — is countable from runs alone, like every
-// finalized attempt's.
-func crashStaleStubs(tx *gorm.DB, jobIDs []string, now time.Time) error {
-	upd := map[string]any{
-		"outcome":     string(OutcomeCrashed),
-		"finished_at": now.UTC(),
-		"job_state":   string(StateAvailable),
+// The stub records the state the reclaim applied to its job, so a crashed
+// attempt's effect on the job — back to available, or discarded when it was the
+// last — is countable from runs alone, like every finalized attempt's.
+func crashStaleStubs(tx *gorm.DB, jobs []reclaimedJob, now time.Time) (map[string]string, error) {
+	ids := make([]string, len(jobs))
+	attempts := make(map[string]int, len(jobs))
+	byState := make(map[string][]string, 2)
+	for i, j := range jobs {
+		ids[i] = j.ID
+		attempts[j.ID] = j.Attempt
+		byState[j.State] = append(byState[j.State], j.ID)
 	}
+	upd := func(state string) map[string]any {
+		return map[string]any{
+			"outcome":     string(OutcomeCrashed),
+			"finished_at": now.UTC(),
+			"job_state":   state,
+		}
+	}
+	states := []string{string(StateAvailable), string(StateDiscarded)}
+
+	var stubs []crashedStub
 	if tx.Name() == "postgres" {
-		set, args := updateSetClause(upd)
-		args = append(args, jobIDs, string(OutcomeStarted))
-		return tx.Exec(`WITH u AS (UPDATE job_runs SET `+set+` WHERE job_id IN ? AND outcome = ? RETURNING id, finished_at) `+
-			fmt.Sprintf(finishLogInsert, "u", ""), args...).Error
+		for _, state := range states {
+			group := byState[state]
+			if len(group) == 0 {
+				continue
+			}
+			set, args := updateSetClause(upd(state))
+			args = append(args, group, string(OutcomeStarted))
+			var crashed []crashedStub
+			if err := tx.Raw(`WITH u AS (UPDATE job_runs SET `+set+
+				` WHERE job_id IN ? AND outcome = ? RETURNING id, job_id, attempt, finished_at), `+
+				`f AS (`+fmt.Sprintf(finishLogInsert, "u", "")+`) SELECT id, job_id, attempt FROM u`,
+				args...).Scan(&crashed).Error; err != nil {
+				return nil, err
+			}
+			stubs = append(stubs, crashed...)
+		}
+	} else {
+		// No data-modifying CTE here: read the stubs this transaction is about to
+		// crash, then crash them. The single writer holds the batch's lock, so the
+		// two cannot diverge.
+		if err := tx.Model(&jobRunRow{}).Select("id", "job_id", "attempt").
+			Where("job_id IN ? AND outcome = ?", ids, string(OutcomeStarted)).Find(&stubs).Error; err != nil {
+			return nil, err
+		}
+		for _, state := range states {
+			group := byState[state]
+			if len(group) == 0 {
+				continue
+			}
+			if err := tx.Model(&jobRunRow{}).
+				Where("job_id IN ? AND outcome = ?", group, string(OutcomeStarted)).Updates(upd(state)).Error; err != nil {
+				return nil, err
+			}
+		}
+		if err := tx.Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND job_id IN ? AND outcome = ? AND finished_at = ?"),
+			ids, string(OutcomeCrashed), now.UTC()).Error; err != nil {
+			return nil, err
+		}
 	}
-	if err := tx.Model(&jobRunRow{}).
-		Where("job_id IN ? AND outcome = ?", jobIDs, string(OutcomeStarted)).Updates(upd).Error; err != nil {
-		return err
+
+	runs := make(map[string]string, len(stubs))
+	for _, s := range stubs {
+		if _, seen := runs[s.JobID]; !seen || s.Attempt == attempts[s.JobID] {
+			runs[s.JobID] = s.ID
+		}
 	}
-	return tx.Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND job_id IN ? AND outcome = ? AND finished_at = ?"),
-		jobIDs, string(OutcomeCrashed), now.UTC()).Error
+	return runs, nil
 }
 
 // updateSetClause renders a column map as an UPDATE's SET list for raw SQL, in
@@ -913,8 +1095,11 @@ func updateSetClause(upd map[string]any) (string, []any) {
 	return strings.Join(parts, ", "), args
 }
 
-// reclaimUpdate is the jobs-row column set for a lease reclaim, shared by both
-// dialects so neither can drift from the other on the columns that matter.
+// reclaimUpdate is the jobs-row column set for a lease reclaim that returns the
+// job to the queue. Only SQLite's reclaim uses it, with reclaimDiscardUpdate for
+// the jobs it discards. PostgreSQL's reclaim is one statement that decides each
+// row's state in place, with a CASE, so it spells the same columns out in its
+// SQL; a change here has to be made there too.
 //
 // Clearing the token is what makes the reclaim final: the attempt whose lease
 // just expired can no longer finalize over the next claim, and it cannot renew
@@ -927,6 +1112,17 @@ func reclaimUpdate(now time.Time) map[string]any {
 		"lease_token":  nil,
 		"updated_at":   now,
 	}
+}
+
+// reclaimDiscardUpdate is the jobs-row column set for a lease reclaim whose
+// crashed attempt was the job's last: reclaimUpdate's columns, with the job
+// discarded and finalized at now, as a finalize discards a job whose last
+// attempt failed.
+func reclaimDiscardUpdate(now time.Time) map[string]any {
+	upd := reclaimUpdate(now)
+	upd["state"] = string(StateDiscarded)
+	upd["finalized_at"] = now
+	return upd
 }
 
 // insertFollowUps inserts a worker's follow-up jobs on tx and reports how many

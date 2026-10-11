@@ -129,6 +129,7 @@ type (
 	StorageParameterDrift = core.StorageParameterDrift
 	SupersedeEvent        = core.SupersedeEvent
 	SweepEvent            = core.SweepEvent
+	SweptJob              = core.SweptJob
 	Timeouter             = core.Timeouter
 	TokenBucket           = core.TokenBucket
 	TokenBucketConfig     = core.TokenBucketConfig

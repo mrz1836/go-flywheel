@@ -107,7 +107,7 @@ func TestSweepCommitsEachBatchIndependently(t *testing.T) {
 
 	// A reclaim that succeeds twice and then fails leaves two batches committed.
 	calls := 0
-	failing := func(ctx context.Context, tx *gorm.DB, at time.Time, limit int) ([]string, error) {
+	failing := func(ctx context.Context, tx *gorm.DB, at time.Time, limit int) ([]reclaimedJob, error) {
 		calls++
 		if calls > 2 {
 			return nil, errors.New("reclaim exploded")
@@ -206,7 +206,7 @@ func TestSweepCancelledReportsPartialProgress(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	batches := 0
-	counting := func(rctx context.Context, tx *gorm.DB, at time.Time, limit int) ([]string, error) {
+	counting := func(rctx context.Context, tx *gorm.DB, at time.Time, limit int) ([]reclaimedJob, error) {
 		batches++
 		if batches == 2 {
 			cancel()
@@ -246,7 +246,7 @@ func TestSweepWithACancelledContextDoesNoWork(t *testing.T) {
 	cancel()
 
 	batches := 0
-	counting := func(rctx context.Context, tx *gorm.DB, at time.Time, limit int) ([]string, error) {
+	counting := func(rctx context.Context, tx *gorm.DB, at time.Time, limit int) ([]reclaimedJob, error) {
 		batches++
 		lite := &sqliteDriver{baseDriver{db: db}}
 		return lite.reclaimExpired(rctx, tx, at, limit)
@@ -272,7 +272,7 @@ func TestSweepOnAnEmptyQueueRunsExactlyOneBatch(t *testing.T) {
 	db := newDB(t)
 
 	batches := 0
-	counting := func(ctx context.Context, tx *gorm.DB, at time.Time, limit int) ([]string, error) {
+	counting := func(ctx context.Context, tx *gorm.DB, at time.Time, limit int) ([]reclaimedJob, error) {
 		batches++
 		lite := &sqliteDriver{baseDriver{db: db}}
 		return lite.reclaimExpired(ctx, tx, at, limit)

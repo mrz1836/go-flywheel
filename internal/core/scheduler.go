@@ -604,21 +604,34 @@ func (s *Scheduler) Tick(ctx context.Context) (int, error) {
 
 // Sweep reclaims jobs whose lease has expired — state running with leased_until
 // in the past, which is what a job looks like when its executor died mid-attempt
-// — returning them to available and marking each stale run stub crashed. It is
-// the runtime's only recovery path for work lost to a crashed process.
+// — and marks each stale run stub crashed. A reclaimed job returns to available
+// unless its crashed attempt was its last, which discards it, so a job whose
+// process dies on every attempt ends after max_attempts crashes instead of
+// looping. It is the runtime's only recovery path for work lost to a crashed
+// process.
 //
 // It runs through the configured Driver, so a host that wrapped its Driver
 // observes the sweep exactly as it observes a claim or a finalize.
 //
 // The pass is timed and reported through the configured Observer: OnSweep fires
-// after every pass, carrying the duration and the reclaimed count, whether the
-// pass succeeded or a partial batch failed. That keeps sweep timing in the same
-// telemetry stream as claim and finalize timing.
+// after every pass, carrying the duration, the reclaimed and discarded counts,
+// and each reclaimed job, whether the pass succeeded or a partial batch failed.
+// That keeps sweep timing in the same telemetry stream as claim and finalize
+// timing. The jobs reach the event on the context this passes to Driver.Sweep
+// (see SweepEvent.Jobs).
 func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
 	start := models.ClockFrom(ctx).Now(ctx)
-	n, err := s.driver.Sweep(ctx, start)
+	reportCtx, report := withSweepReport(ctx)
+	n, err := s.driver.Sweep(reportCtx, start)
 	duration := models.ClockFrom(ctx).Now(ctx).Sub(start)
-	s.observer.OnSweep(ctx, SweepEvent{Duration: duration, Reclaimed: n})
+	jobs := report.list()
+	discarded := 0
+	for i := range jobs {
+		if jobs[i].State == StateDiscarded {
+			discarded++
+		}
+	}
+	s.observer.OnSweep(ctx, SweepEvent{Duration: duration, Reclaimed: n, Discarded: discarded, Jobs: jobs})
 	return n, err
 }
 
