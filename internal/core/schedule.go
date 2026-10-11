@@ -711,7 +711,9 @@ type ScopeResult struct {
 	SkippedTerminal int64
 	// SkippedRunning is the number of children left in flight. None of the three
 	// operations interrupts a running attempt: it finalizes normally, and the pause
-	// or cancel applies to its next claim.
+	// or cancel applies to its next claim. A replay that targets cancelled jobs
+	// also counts here each one whose attempt is still running, which it leaves
+	// cancelled.
 	SkippedRunning int64
 	// SkippedActiveKey is set by a replay alone; the batch controls leave it zero. It
 	// is the number of targeted jobs left terminal because another job held their

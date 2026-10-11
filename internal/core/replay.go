@@ -16,6 +16,12 @@ import (
 // restoration and delay a single retry offers apply to every job in the cohort —
 // ResetAttempts is what makes a replay grant a real second life rather than the
 // one-more-try a plain retry gives (see RetryOpts).
+//
+// A replay never touches a job whose attempt is still running, so it never runs a
+// job's work twice at once: a running job, and a cancelled one whose attempt has
+// not returned (a cancel fences a running attempt without stopping it). It
+// ignores RetryOpts.AllowRunning; a single RetryJobWithOptions is the way to
+// re-queue such a job deliberately.
 type ReplayOpts struct {
 	RetryOpts
 
@@ -23,6 +29,10 @@ type ReplayOpts struct {
 	// the overwhelmingly common intent, and the safe default: a bulk replay must
 	// never re-run work that succeeded by accident. Naming StateSucceeded here
 	// additionally requires RetryOpts.Force, or the call returns ErrJobTerminal.
+	// Naming StateRunning is refused, before any write, with a *ValidationError on
+	// "states". Naming StateCancelled replays the cancelled jobs whose attempt has
+	// returned and leaves a cancelled job whose attempt is still running as it is,
+	// counted in ScopeResult.SkippedRunning.
 	//
 	// The states named here should be terminal ones — a replay reasons about
 	// finished work. The accounting in ScopeResult is stated over the terminal
@@ -89,9 +99,12 @@ func (o ReplayOpts) replayStates() []JobState {
 // It is state-guarded exactly like the scoped controls: a running child is left to
 // finalize (SkippedRunning), and a terminal child in a state the replay does not
 // target is left alone (SkippedTerminal) — a succeeded child is never replayed
-// unless States names its state and Force is set. It replays the discarded children
-// by default. Kinds, when set, further narrows the cohort to those kinds, and
-// FailedSince to jobs finalized within an incident window.
+// unless States names its state and Force is set. A States that names running is
+// refused before any write, and a cancelled child whose attempt is still running
+// is left cancelled (SkippedRunning), so a replay never starts a child's work
+// beside an attempt still running. It replays the discarded children by default.
+// Kinds, when set, further narrows the cohort to those kinds, and FailedSince to
+// jobs finalized within an incident window.
 //
 // It never puts a child live while another job holds its UniqueActiveKey, which the
 // unique index would reject: a targeted child whose key another job holds live
@@ -123,8 +136,9 @@ func ReplayByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts R
 // ErrReplayUnbounded rather than doing something enormous by accident — use
 // ReplayByParent to bound a replay by lineage instead.
 //
-// It carries the same state guards, UniqueActiveKey rule, batching, and
-// cancellation contract as ReplayByParent.
+// It carries the same state guards (a running job, or a cancelled one whose
+// attempt is still running, is never replayed), UniqueActiveKey rule, batching,
+// and cancellation contract as ReplayByParent.
 func Replay(ctx context.Context, db *gorm.DB, opts ReplayOpts) (ScopeResult, error) {
 	if len(opts.Kinds) == 0 && opts.FailedSince.IsZero() {
 		return ScopeResult{}, ErrReplayUnbounded
@@ -160,11 +174,12 @@ func applyKindFilter(q *gorm.DB, kinds []string) *gorm.DB {
 // began: each targeted terminal job is either replayed (Changed) or left terminal
 // because its UniqueActiveKey was held (SkippedActiveKey), the terminal jobs in an
 // untargeted state are left alone (SkippedTerminal), and the running attempts are
-// never interrupted (SkippedRunning). Jobs that were merely available or scheduled
-// are neither — a replay reasons about finished work, not pending work. A
-// FailedSince window narrows Changed and SkippedActiveKey to the jobs finalized
-// within it, deliberately leaving older targeted jobs untouched and out of the
-// accounting.
+// never interrupted (SkippedRunning) — including the attempt of a targeted
+// cancelled job that is still running, which is left cancelled. Jobs that were
+// merely available or scheduled are neither — a replay reasons about finished
+// work, not pending work. A FailedSince window narrows Changed, SkippedActiveKey,
+// and those cancelled jobs to the jobs finalized within it, deliberately leaving
+// older targeted jobs untouched and out of the accounting.
 //
 // The sum is exact for a replay nothing else races. A job a concurrent operation
 // moves, or whose key a concurrent write takes, between its batch's SELECT and
@@ -177,9 +192,15 @@ func replay(
 		return ScopeResult{}, fmt.Errorf("flywheel: %s: db is nil", label)
 	}
 	states := opts.replayStates()
-	// Guard: re-running succeeded work is the destructive case here, so naming
-	// StateSucceeded requires Force explicitly. Refuse the whole call before any
-	// write — a rejected replay changes nothing.
+	// Guards, each refusing the whole call before any write — a rejected replay
+	// changes nothing. A running job's attempt is never interrupted, and re-queueing
+	// it would start a second attempt beside the first, so a States that names
+	// running is a caller's mistake to show rather than a cohort to narrow quietly.
+	// Re-running succeeded work is the destructive case, so naming StateSucceeded
+	// requires Force explicitly.
+	if slices.Contains(states, StateRunning) {
+		return ScopeResult{}, newValidationError("states", "must not name running")
+	}
 	if !opts.Force && slices.Contains(states, StateSucceeded) {
 		return ScopeResult{}, ErrJobTerminal
 	}
@@ -213,6 +234,19 @@ func replay(
 		Count(&result.SkippedTerminal).Error; err != nil {
 		return ScopeResult{}, fmt.Errorf("flywheel: %s: count terminal: %w", label, err)
 	}
+	// A targeted cancelled job whose attempt is still running is left as it is, and
+	// counted with the running attempts the replay never interrupts.
+	if namesCancelled(stateStrs) {
+		q := scope(db.WithContext(ctx).Model(&jobRow{})).Where(cancelledAttemptStillRuns("jobs"))
+		if !opts.FailedSince.IsZero() {
+			q = q.Where("finalized_at >= ?", opts.FailedSince)
+		}
+		var running int64
+		if err := q.Count(&running).Error; err != nil {
+			return ScopeResult{}, fmt.Errorf("flywheel: %s: count cancelled attempts still running: %w", label, err)
+		}
+		result.SkippedRunning += running
+	}
 
 	// The stagger denominator: the size of the changeable set, counted once so job i
 	// of n lands at base + Stagger*i/n across the whole cohort rather than restarting
@@ -220,6 +254,7 @@ func replay(
 	total := 0
 	if opts.Stagger > 0 {
 		q := scope(db.WithContext(ctx).Model(&jobRow{})).Where("state IN ?", stateStrs)
+		q = skipAttemptsStillRunning(q, stateStrs)
 		if !opts.FailedSince.IsZero() {
 			q = q.Where("finalized_at >= ?", opts.FailedSince)
 		}
@@ -269,6 +304,24 @@ func replay(
 		}
 		cursor = b.last
 	}
+}
+
+// namesCancelled reports whether a replay's target states include cancelled, the
+// one terminal state a job can hold while its attempt is still running.
+func namesCancelled(stateStrs []string) bool {
+	return slices.Contains(stateStrs, string(StateCancelled))
+}
+
+// skipAttemptsStillRunning narrows a replay's query over jobs to the jobs whose
+// attempt is not still running, when the replay targets cancelled jobs: a cancel
+// fences a running attempt without stopping it, and replaying the job then would
+// start a second attempt beside the first. A replay that targets no cancelled job
+// gets q back unchanged and pays nothing for the probe.
+func skipAttemptsStillRunning(q *gorm.DB, stateStrs []string) *gorm.DB {
+	if !namesCancelled(stateStrs) {
+		return q
+	}
+	return q.Where("NOT " + cancelledAttemptStillRuns("jobs"))
 }
 
 // replayBatchRetries bounds how many times in a row a replay reruns a batch that
@@ -354,7 +407,7 @@ func replayBatch(
 	opts ReplayOpts, cursor string, batchSize int, now, base time.Time, total, placed int,
 ) (b replayBatchResult, err error) {
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		q := scope(tx.Model(&jobRow{})).Where("state IN ?", stateStrs)
+		q := skipAttemptsStillRunning(scope(tx.Model(&jobRow{})).Where("state IN ?", stateStrs), stateStrs)
 		if !opts.FailedSince.IsZero() {
 			q = q.Where("finalized_at >= ?", opts.FailedSince)
 		}
@@ -400,8 +453,8 @@ func replayBatch(
 		}
 		applyRetryBudget(upd, opts.RetryOpts)
 
-		res := tx.Model(&jobRow{}).
-			Where("id IN ? AND state IN ? AND NOT "+activeKeyHeld("jobs"), live, stateStrs).
+		res := skipAttemptsStillRunning(tx.Model(&jobRow{}).
+			Where("id IN ? AND state IN ? AND NOT "+activeKeyHeld("jobs"), live, stateStrs), stateStrs).
 			Updates(upd)
 		if res.Error != nil {
 			return res.Error

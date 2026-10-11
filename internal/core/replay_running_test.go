@@ -134,3 +134,21 @@ func TestReplayNeverRequeuesAJobWhoseAttemptStillRuns(t *testing.T) {
 	t.Parallel()
 	replayRunningSuite(t, sqliteOpener)
 }
+
+// TestReplayLeavesARunningJobAloneEvenWithAllowRunning proves a replay ignores
+// AllowRunning: a States naming running is refused before any write.
+func TestReplayLeavesARunningJobAloneEvenWithAllowRunning(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	d := NewSQLiteDriver(db)
+	raw, _ := runningJob(t, ctx, d, db, "replay-allowed")
+
+	_, err := Replay(ctx, db, ReplayOpts{
+		RetryOpts: RetryOpts{AllowRunning: true, Force: true},
+		Kinds:     []string{"crash.loop"},
+		States:    []JobState{StateRunning},
+	})
+	requireStatesRefusal(t, err)
+	assertStillRunning(t, db, raw)
+}
