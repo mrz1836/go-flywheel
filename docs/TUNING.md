@@ -29,6 +29,9 @@ never reclaimed, because each renewal pushes `leased_until` ahead of the sweep's
   lease is too short for the workload, or the heartbeat is disabled (`HeartbeatInterval < 0`) or failing.
   The mass-lease-expiry load test reclaimed 44 leases and superseded exactly 44 attempts — supersede
   count tracks reclaim count one-for-one.
+- **With `RunnerConfig.CooperativeCancel`, `HeartbeatInterval` is also how long a cancel takes to reach a
+  running worker.** It adds no statement while nothing is cancelled: the state read runs only after a
+  renewal finds its claim gone.
 
 <br>
 

@@ -382,7 +382,7 @@ once when it ends (by its finalize, or by the lease sweep if its process died).
 | `queue_wait_ms` | claimable to started; NULL on older rows |
 | `job_state` | the state the finalize applied (`succeeded`, `retryable`, `discarded`, `scheduled`, `cancelled`), or, for a crash the lease sweep reclaimed, the state the sweep applied: `available`, or `discarded` when the crashed attempt was the job's last; NULL while running, when superseded, and on a row an older release or `SeedRun` wrote |
 | `superseded` | true when the attempt finished after its claim was gone — its outcome was recorded but never applied, so the work may have run twice. An attempt the lease sweep crashed that then finished late keeps the `job_state` the sweep recorded and its sweep-time `finished_at` beside the late outcome |
-| `error_class`, `error_message` | for a failed attempt. A `snooze` may carry an `error_message` with no `error_class`: a worker that returned an error alongside its snooze, or a job deferred because the runner that claimed it does not register its kind (`jobs: unknown job kind`) |
+| `error_class`, `error_message` | for a failed attempt. A `snooze` may carry an `error_message` with no `error_class`: a worker that returned an error alongside its snooze, or a job deferred because the runner that claimed it does not register its kind (`jobs: unknown job kind`). So may a superseded `cancelled` run: a worker that returned an error after its runner's cooperative cancel (`RunnerConfig.CooperativeCancel`) stopped it, recorded as `jobs: job cancelled while running: <its error>` |
 | `cost_micros`, `enqueued_children`, `output` | what the worker reported. An `output` whose JSON was larger than `DriverOpts.MaxOutputBytes` (64 KiB by default) holds the marker `{"$truncated": true, "$bytes": <its marshaled size>, "$head": "<its first 1,024 bytes>"}` instead — exactly those three keys — and `JobRunView.OutputTruncated` is true |
 | `error_payload` | for a failed attempt, `{"message": …}`, the stored message; plus `"truncated": true` and `"message_bytes"` (its length before the cut) when the message was cut at 4,096 bytes (`JobRunView.ErrorTruncated`); plus `"stack"`, at most 16 KiB, when the worker panicked (`JobRunView.ErrorStack`) |
 
@@ -495,7 +495,8 @@ is zone-proof on SQLite.
 
 **`LatestRun(ctx, db, jobID)`** — one job's newest attempt and `true`, or `false` when it has none yet:
 `ListRuns` with `Limit: 1`. After `WaitForJob` reports a job succeeded, it is the attempt that succeeded,
-with the worker's `Output`.
+with the worker's `Output`. A job that `FindJob` reads `cancelled` while its run at the job's `Attempt` still
+reads outcome `started` is a cancel still waiting on a running attempt: the worker has not returned yet.
 
 **`SlowRuns(ctx, db, SlowRunsParams{Kind, Since, MinDuration, Limit})`** — the slowest finished runs in a
 short window (24 hours by default), any outcome — a timeout is a slow run. A range of `job_run_finishes`;

@@ -169,12 +169,32 @@ flywheel.ErrDecodeArgs)`.
 
 <br>
 
+## Symptom: a cancelled job is still running
+
+`CancelJob` (and `flywheel jobs cancel`) makes a job `cancelled` at once, but by default a worker already
+running keeps going until it returns: the cancel fences the attempt's result and leaves its worker running.
+Until it returns, the job reads `cancelled` while its run at the job's attempt still reads outcome `started`
+(`flywheel jobs inspect <id>`, or `FindJob` with `LatestRun`). That is a cancel still waiting on its attempt.
+
+- **To have a cancel stop such workers, set `RunnerConfig.CooperativeCancel`** on the runners that run them.
+  The first renewal after a cancel then cancels the attempt's context with the cause `ErrJobCancelled`, and
+  logs `jobs: job cancelled; cancelling its running attempt` at info. A worker that returns on it is recorded
+  as a `cancelled`, superseded attempt with no error class.
+- **With the setting on, a run still `started` long after the cancel** belongs to a worker that ignores its
+  context: make it return once `ctx` is done. A runner logging `jobs: job state read failed after a lost
+  claim; retrying at the next heartbeat` cannot read the job's state, and keeps trying at every heartbeat.
+- **A run that never finishes** belongs to a process that died before its attempt returned: the lease sweep
+  reclaims only running jobs, so nothing will finish that run. Check the run's `executor_id` against your
+  live processes. The job stays cancelled; to run it again, see the next section.
+
+<br>
+
 ## Symptom: a retry is refused with `flywheel: job is running`
 
 `RetryJob` (and `flywheel jobs retry`) refuses a job whose attempt is still running, with
 `ErrJobRunning`, and leaves it as it is: re-queueing it would start a second copy beside the first. With
 `RetryOpts.Force`, the same refusal covers a job cancelled while its attempt was running, because a
-cancel fences the attempt without stopping its worker, and the attempt's run reads `started` until the
+cancel fences the attempt without awaiting its worker, and the attempt's run reads `started` until the
 worker returns. Wait for the attempt to finish (`flywheel jobs inspect <id>` shows its run). If the process
 that ran it is gone — a cancelled job's process died before its attempt returned, so nothing will ever
 finish that run — retry it with `RetryOpts{Force: true, AllowRunning: true}`, which re-queues it

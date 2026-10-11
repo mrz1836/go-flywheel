@@ -679,6 +679,82 @@ outcome is ever recorded, not that only one attempt ever executes.
 </details>
 
 <details>
+<summary><strong><code>Cancelling a running job</code></strong></summary>
+<br>
+
+`CancelJob` (and `flywheel jobs cancel`) moves a job to `cancelled` at once. A job that was waiting never
+runs. A job whose attempt is **running** is fenced: the cancel takes its claim, so the attempt's result is
+discarded when its worker returns, and the job is never retried or re-claimed. Whether the worker itself
+stops is the runner's choice.
+
+**By default the worker runs on.** The heartbeat notices the lost claim within one interval and stops
+renewing, and the worker keeps going until it returns or reaches its timeout. Interrupting a worker
+mid-side-effect is a failure mode of its own, and the fence discards its result either way, so this is the
+right default for a worker that cannot stop cleanly mid-step.
+
+**With `RunnerConfig.CooperativeCancel`, the worker is asked to stop.** The renewal that finds the claim gone
+reads the job's state, one primary-key read, and when the job is `cancelled` it cancels the attempt's context
+with the cause `flywheel.ErrJobCancelled`, within one heartbeat of the cancel:
+
+```go
+flywheel.RunnerConfig{
+    // ...
+    CooperativeCancel: true, // needs the heartbeat: a negative HeartbeatInterval is refused
+}
+
+func (w ExportWorker) Work(ctx context.Context, job *flywheel.Job[ExportArgs]) (flywheel.Result, error) {
+    for page := range w.pages(job.Args) {
+        if err := ctx.Err(); err != nil {
+            if errors.Is(context.Cause(ctx), flywheel.ErrJobCancelled) {
+                w.discardPartialExport(ctx, job.Args) // the job was cancelled: clean up and stop
+            }
+            return flywheel.Result{}, err
+        }
+        if err := w.write(ctx, page); err != nil {
+            return flywheel.Result{}, err
+        }
+    }
+    return flywheel.Result{}, nil
+}
+```
+
+Only a cancel stops a worker. A claim lost any other way (the lease sweep's reclaim or crash discard, a claim
+under another token, a retry with `RetryOpts.AllowRunning`) leaves it running, as it does without the
+setting. A state read that fails is retried at the next heartbeat; renewal never resumes. The read goes
+through `RunnerConfig.DB`, so point that at the primary: a lagging replica can read the job as still running
+and miss the cancel.
+
+**What the attempt records.** A worker that returns an error after the cancel, `ctx.Err()` or any other, is
+recorded as the cancel it was: outcome `cancelled`, `superseded`, its error wrapped in `ErrJobCancelled`
+(`jobs: job cancelled while running: context canceled`), and no error class, so it never counts as a failure.
+A worker that finishes anyway keeps its `success`, also superseded. Either way nothing is applied to the job,
+which is already terminal: no follow-ups, and a parent's barrier fires at the cancel, never again at the late
+finalize.
+
+**What it cannot stop.** A worker that ignores its context runs on, exactly as without the setting; the cancel
+reaches a worker only through `ctx`. Its latency is the heartbeat interval. A `Driver` that issues no lease
+token runs no heartbeat, so under one nothing is cancelled.
+
+**Seeing a cancel that is still waiting.** From the cancel until the attempt returns, the job reads
+`cancelled` while its run at the job's attempt still reads outcome `started`:
+
+```go
+job, err := flywheel.FindJob(ctx, db, id)
+// ...
+run, ok, err := flywheel.LatestRun(ctx, db, id) // ListRuns reads the same attempt first
+// ...
+waiting := job.State == string(flywheel.StateCancelled) &&
+    ok && run.Attempt == job.Attempt && run.Outcome == string(flywheel.OutcomeStarted)
+```
+
+Once the attempt returns, its run is finished and `superseded`. A run that stays `started` long after the
+cancel belongs to a worker that ignores its context, or to a process that died before its attempt returned:
+the sweep reclaims only running jobs, so nothing will finish that run. The
+[runbook](docs/RUNBOOK.md#symptom-a-cancelled-job-is-still-running) covers both.
+
+</details>
+
+<details>
 <summary><strong><code>Recording what an attempt did</code></strong></summary>
 <br>
 
@@ -925,7 +1001,7 @@ restored retry budget, is its own guide: **Replaying work** below.
 `ErrJobRunning` and leaves it and its lease alone: re-queueing it would let a runner start a second
 attempt beside the first, and the job's side effects would happen twice at once. `Force` re-runs
 terminal jobs only; it also refuses a job cancelled while its attempt runs, because a cancel fences that
-attempt without stopping its worker. Wait for the attempt to finish, or pass
+attempt without awaiting its worker. Wait for the attempt to finish, or pass
 `RetryOpts{AllowRunning: true}` to re-queue it anyway: the running attempt keeps going, its result is
 discarded, and the work runs twice. That is also the way past a cancelled job whose process died before
 its attempt returned, whose run stays `started`.

@@ -36,7 +36,7 @@ durable trace of the double execution beyond the `SupersedeEvent` an observer se
 
 **A retry or a replay never starts a job while its attempt still runs.** `RetryJob` and
 `RetryJobWithOptions` refuse a running job with `ErrJobRunning`, and with `Force` they also refuse a
-job cancelled while its attempt runs (a cancel fences the attempt without stopping its worker, so its
+job cancelled while its attempt runs (a cancel fences the attempt without awaiting its worker, so its
 run stays `started` until the worker returns). `Replay` and `ReplayByParent` refuse a `States` that names
 `running` and leave such a cancelled job as it is. A single retry with `AllowRunning` is the one way to
 re-queue a job whose attempt still runs, and it says so: that attempt keeps running and its result is
@@ -106,6 +106,13 @@ a shared external resource.
 worker's context when a lease or execution timeout elapses, but it cannot stop a worker that does not
 check `ctx.Done()`. A goroutine ignoring cancellation runs until it returns on its own. Honor the context
 in any worker whose duration you need bounded.
+
+**A cancel stops a running worker only when its runner opts in, and only a worker that listens.** By
+default a cancel fences a running attempt's result and its worker runs on. With
+`RunnerConfig.CooperativeCancel`, the first renewal after the cancel cancels the worker's context with the
+cause `ErrJobCancelled`, as long as the database answers the state read that follows it; the fence still
+discards whatever the worker returns. A claim lost to anything but a cancel (the sweep's reclaim, a retry)
+never cancels a worker.
 
 **The scheduler is a singleton by deployment, not by election.** The runtime holds no lock guaranteeing
 only one scheduler runs. Running two doubles the sweep and retention load (periodic ticks collapse
