@@ -224,6 +224,10 @@ func statsReads(now, typicalHour, denseHour time.Time, sched *flywheel.Scheduler
 			_, err := flywheel.QueueDepths(ctx, db)
 			return err
 		}},
+		{"SampleQueueHealth", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.SampleQueueHealth(ctx, db)
+			return err
+		}},
 		{"CountActiveByKind", func(ctx context.Context, db *gorm.DB) error {
 			_, err := flywheel.CountActiveByKind(ctx, db)
 			return err
