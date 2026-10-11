@@ -79,7 +79,9 @@ type RunnerConfig struct {
 	DB *gorm.DB
 	// Driver claims and finalizes jobs.
 	Driver Driver
-	// Registry maps job kinds to workers.
+	// Registry maps job kinds to workers. Its workers' Defaults also fill the
+	// zero fields of the follow-ups this Runner's finalizes insert and of the
+	// barrier continuations they declare; see Defaults.
 	Registry *Registry
 	// UnknownKindGrace is how long this Runner defers a claimed job whose kind
 	// its Registry does not register before it discards the job, measured from
@@ -1337,8 +1339,10 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 	// reported as a success it never had.
 	//
 	// Finalize runs on the parent ctx, not the (possibly expired) workCtx, so a
-	// timed-out attempt still records its outcome.
-	out, err := r.cfg.Driver.Finalize(ctx, raw, runID, result, finalErr, finishedAt)
+	// timed-out attempt still records its outcome. The ctx carries the Registry,
+	// so the follow-ups and barrier continuations it declares take their kinds'
+	// Defaults without a change to the Driver interface.
+	out, err := r.cfg.Driver.Finalize(withKindRegistry(ctx, r.cfg.Registry), raw, runID, result, finalErr, finishedAt)
 	if err != nil {
 		// Nothing was persisted, so there is nothing to report. Emitting an event
 		// here would describe an outcome the database does not hold.

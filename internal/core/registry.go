@@ -184,3 +184,11 @@ func withKindRegistry(ctx context.Context, reg *Registry) context.Context {
 	}
 	return context.WithValue(ctx, kindRegistryKey{}, reg)
 }
+
+// kindDefaultsFrom returns the defaults kind's worker declares in the Registry
+// ctx carries, or nil when ctx carries none or that registry does not register
+// the kind.
+func kindDefaultsFrom(ctx context.Context, kind string) *kindDefaults {
+	reg, _ := ctx.Value(kindRegistryKey{}).(*Registry)
+	return reg.defaultsFor(kind)
+}
