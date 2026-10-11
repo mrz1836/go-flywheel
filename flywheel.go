@@ -292,8 +292,13 @@ func LatestRun(ctx context.Context, db *gorm.DB, jobID string) (JobRunView, bool
 	return core.LatestRun(ctx, db, jobID)
 }
 
+// ListActiveByKind returns the non-terminal jobs of a kind, each with its args.
+//
+// Deprecated: ListActiveByKind is unbounded by contract and returns args; use
+// InsertOpts.UniqueActiveKey, which answers the same question with one index
+// probe.
 func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsView, error) {
-	return core.ListActiveByKind(ctx, db, kind)
+	return core.ListActiveByKind(ctx, db, kind) //nolint:staticcheck // forwards a deprecated function under its own deprecation
 }
 
 func ListFinished(ctx context.Context, db *gorm.DB, p ListFinishedParams) ([]JobView, error) {

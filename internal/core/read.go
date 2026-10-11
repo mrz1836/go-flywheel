@@ -401,6 +401,15 @@ func Overview(ctx context.Context, db *gorm.DB, p OverviewParams) (JobsOverview,
 // its raw args payload, reading through db. Soft-deleted jobs are excluded. A
 // host uses it to answer "is there already an in-flight job of this kind for
 // some subject?" by inspecting the returned args.
+//
+// It has no limit, by contract: it loads every in-flight job of the kind with
+// its args, so its cost grows with the kind's backlog. A page would make it
+// cheaper and wrong, since a job past the page is one the caller never sees, and
+// a truncated "is there already a job?" answer is worse than a slow one.
+//
+// Deprecated: ListActiveByKind is unbounded by contract and returns args; use
+// InsertOpts.UniqueActiveKey, which answers the same question with one index
+// probe.
 func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsView, error) {
 	var rows []jobRow
 	err := db.WithContext(ctx).
