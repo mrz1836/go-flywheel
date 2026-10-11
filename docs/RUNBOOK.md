@@ -378,10 +378,15 @@ runs it missed while gone are not backfilled.
 
 `flywheel schedule rm` warns when the slug is still declared in the config it loaded.
 
-**Pausing a declared schedule.** `SetPeriodicActive(false)` (`flywheel schedule disable`) holds while the
-scheduler runs — the reconcile only inserts, and never re-activates — but the next start re-applies the
-declaration, `Active` included. To keep a schedule off across restarts, declare it with `Active: false`,
-or remove it from the CLI's file.
+**Stopping a declared schedule.** Pause it: `PausePeriodic` (`flywheel schedule pause <slug>`) holds it
+through every restart, because no start, reconcile, or `UpsertPeriodic` writes the pause. Each start still
+applies the declaration's kind, queue, args, and cadence to it, and says it found the schedule paused.
+`ResumePeriodic` (`flywheel schedule resume <slug>`) releases it at its first fire time after now; the
+fires it missed while paused are not run. `SetPeriodicActive(false)` (`flywheel schedule disable`) is the
+declaration's switch instead: it holds while the scheduler runs — the reconcile only inserts, and never
+re-activates — but the next start re-applies the declaration, `Active` included. To turn a schedule off
+in code, declare it with `Active: false`, or remove it from the CLI's file. A schedule fires only when it
+is active and not paused; `flywheel schedule ls` shows both.
 
 **`flywheel doctor`** compares the file with the database and reports, without failing the check:
 
@@ -401,6 +406,7 @@ or remove it from the CLI's file.
 | `jobs: declared periodic was missing and has been re-created` | warn | a declared definition's row was gone and this scheduler re-created it — fields `slug`, `kind`, `next_run_at` |
 | `jobs: declared periodic apply failed` | error | `Run` could not apply some declarations at start (`pending` says how many); they are retried every `retry_in` until they land — the reconcile cadence, or a minute with the pass off. Meanwhile the reconcile keeps every other declared definition present |
 | `jobs: declared periodics applied` | info | the retry landed every declaration |
+| `jobs: declared periodic is paused` | info | a start applied a declaration to a schedule an operator paused; it stays paused, and fires nothing, until `ResumePeriodic` — fields `slug`, `paused_at`. Logged once per start for each |
 | `jobs: periodic reconcile failed` | error | a reconcile pass hit a database error; the next pass retries |
 
 **A host-owned schema without `idx_job_periodics_slug`.** The re-creation inserts once because the slug

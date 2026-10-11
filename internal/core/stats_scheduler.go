@@ -90,12 +90,14 @@ func runPathModels() []any {
 
 // checkSchema is the Scheduler's startup schema probe. Its lease sweep writes
 // the run path's tables, so they must carry every column it names, or each
-// sweep would fail and a crashed worker's jobs would stay running for good;
-// with the rollup enabled, so must the two rollup tables. A gap fails Run before
-// any activity starts, rather than logging the same failure every tick. See
-// probeSchema for why an unreachable database is not a failure here.
+// sweep would fail and a crashed worker's jobs would stay running for good; its
+// tick reads job_periodics, filtering on paused_at, so that table must carry
+// every column too; and with the rollup enabled, so must the two rollup tables.
+// A gap fails Run before any activity starts, rather than logging the same
+// failure every tick. See probeSchema for why an unreachable database is not a
+// failure here.
 func (s *Scheduler) checkSchema(ctx context.Context) error {
-	models := runPathModels()
+	models := append(runPathModels(), &jobPeriodicRow{})
 	if s.statsInterval > 0 {
 		models = append(models, &jobStatsHourlyRow{}, &jobStatsProgressRow{})
 	}

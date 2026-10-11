@@ -355,8 +355,9 @@ var (
 // cron expression nor an interval.
 var errPeriodicNoSchedule = errors.New("jobs: periodic has no schedule")
 
-// ErrPeriodicNotFound is returned by SetPeriodicActive and DeletePeriodic when
-// no periodic definition has the requested slug.
+// ErrPeriodicNotFound is returned by SetPeriodicActive, DeletePeriodic,
+// PausePeriodic, and ResumePeriodic when no periodic definition has the
+// requested slug.
 var ErrPeriodicNotFound = errors.New("flywheel: periodic not found")
 
 // ErrJobTerminal is returned when an operator action targets a job that has

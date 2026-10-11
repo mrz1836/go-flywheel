@@ -48,7 +48,8 @@ type PeriodicSpec struct {
 	Every time.Duration
 	// Active toggles the definition. An inactive definition is preserved but never
 	// fires. The zero value is inactive, so a definition meant to fire sets Active
-	// true.
+	// true. It is the declaration's switch, applied on every upsert; an operator's
+	// PausePeriodic is held apart from it and never written by an upsert.
 	Active bool
 }
 
@@ -120,6 +121,10 @@ func nextFireAfter(spec PeriodicSpec, now time.Time) (time.Time, error) {
 // reset the cadence. Active is written on both paths: a definition upserted
 // inactive is stored inactive.
 //
+// It never writes the pause. A definition paused with PausePeriodic stays paused
+// through an upsert, which still applies the spec's kind, queue, args, cadence,
+// and Active to it; only ResumePeriodic lifts the pause.
+//
 // It is safe to call concurrently for one slug — two hosts declaring the same new
 // schedule at once. The call whose insert loses adopts the row that landed and
 // updates it, so concurrent upserts end exactly where the same calls made one
@@ -130,32 +135,40 @@ func nextFireAfter(spec PeriodicSpec, now time.Time) (time.Time, error) {
 // SchedulerConfig.Periodics, which applies them this way when the Scheduler starts
 // and re-creates any that go missing while it runs.
 func UpsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) error {
+	_, err := upsertPeriodic(ctx, db, spec)
+	return err
+}
+
+// upsertPeriodic is UpsertPeriodic, also returning the paused_at of the row it
+// updated: nil for a row it inserted or one that is not paused. The Scheduler's
+// start-up apply reads it to log a declaration it finds paused.
+func upsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) (*time.Time, error) {
 	if err := spec.validate(); err != nil {
-		return err
+		return nil, err
 	}
 	now := models.ClockFrom(ctx).Now(ctx)
 
 	existing, found, err := loadPeriodic(ctx, db, spec.Slug)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !found {
 		_, inserted, ierr := insertPeriodic(ctx, db, spec, now)
 		if ierr != nil || inserted {
-			return ierr
+			return nil, ierr
 		}
 		// A concurrent writer inserted the slug between the lookup and the insert.
 		// Treating that as success could leave its spec in place rather than this
 		// one — a rolling deploy that changes a cron would keep the old one — so
 		// adopt the row that landed and apply this spec to it.
 		if existing, found, err = loadPeriodic(ctx, db, spec.Slug); err != nil {
-			return err
+			return nil, err
 		}
 		if !found {
-			return fmt.Errorf("flywheel: upsert periodic %q: inserted and removed concurrently", spec.Slug)
+			return nil, fmt.Errorf("flywheel: upsert periodic %q: inserted and removed concurrently", spec.Slug)
 		}
 	}
-	return updatePeriodic(ctx, db, existing, spec, now)
+	return existing.PausedAt, updatePeriodic(ctx, db, existing, spec, now)
 }
 
 // loadPeriodic reads the periodic definition for slug, reporting a missing one as
@@ -247,7 +260,9 @@ func insertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec, now tim
 	return row, true, nil
 }
 
-// updatePeriodic reconciles an existing periodic row in place.
+// updatePeriodic reconciles an existing periodic row in place. It writes the
+// spec's definition and Active, and never paused_at: the pause belongs to
+// PausePeriodic and ResumePeriodic alone.
 func updatePeriodic(ctx context.Context, db *gorm.DB, existing jobPeriodicRow, spec PeriodicSpec, now time.Time) error {
 	queue, args := periodicQueueAndArgs(spec)
 	updates := map[string]any{
@@ -293,6 +308,13 @@ func scheduleChanged(existing jobPeriodicRow, spec PeriodicSpec) bool {
 // existing cadence. It is the writer behind a declarative reconcile's
 // orphan-disable and the CLI's enable/disable, and returns ErrPeriodicNotFound
 // when no definition has the slug.
+//
+// The active flag is the declaration's own switch: PeriodicSpec.Active writes
+// it too, so a host that declares the definition in SchedulerConfig.Periodics
+// re-applies its declared Active on its next start, undoing this call. To stop
+// a declared definition at run time, through every restart, use PausePeriodic.
+// The two are separate, and the definition fires only when it is active and not
+// paused; this call neither pauses nor resumes it.
 func SetPeriodicActive(ctx context.Context, db *gorm.DB, slug string, active bool) error {
 	now := models.ClockFrom(ctx).Now(ctx)
 	res := db.WithContext(ctx).Model(&jobPeriodicRow{}).Where("slug = ?", slug).Updates(map[string]any{
@@ -323,7 +345,8 @@ func DeletePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
 	return nil
 }
 
-// PeriodicView is the public read projection of a periodic definition.
+// PeriodicView is the public read projection of a periodic definition. A
+// definition fires only when it is Active and not Paused.
 type PeriodicView struct {
 	Slug            string     `json:"slug"`
 	Kind            string     `json:"kind"`
@@ -333,6 +356,11 @@ type PeriodicView struct {
 	NextRunAt       time.Time  `json:"next_run_at"`
 	LastEnqueuedAt  *time.Time `json:"last_enqueued_at,omitempty"`
 	Active          bool       `json:"active"`
+	// Paused reports an operator's PausePeriodic, which holds through every
+	// restart that re-declares the definition until ResumePeriodic.
+	Paused bool `json:"paused"`
+	// PausedAt is when the definition was paused; nil while it is not.
+	PausedAt *time.Time `json:"paused_at,omitempty"`
 }
 
 // ListPeriodics returns every periodic definition, ordered by slug.
@@ -357,6 +385,8 @@ func periodicViewFromRow(r jobPeriodicRow) PeriodicView {
 		NextRunAt:      r.NextRunAt,
 		LastEnqueuedAt: r.LastEnqueuedAt,
 		Active:         r.IsActive != nil && *r.IsActive,
+		Paused:         r.PausedAt != nil,
+		PausedAt:       r.PausedAt,
 	}
 	if r.CronExpr != nil {
 		v.Cron = *r.CronExpr

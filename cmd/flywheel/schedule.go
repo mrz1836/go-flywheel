@@ -12,7 +12,8 @@ import (
 	"gorm.io/gorm"
 )
 
-// newScheduleCmd builds the `flywheel schedule` group: ls, add, rm, enable, disable.
+// newScheduleCmd builds the `flywheel schedule` group: ls, add, rm, enable,
+// disable, pause, resume.
 func newScheduleCmd(configPath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "schedule", Short: "Inspect and manage periodic schedules"}
 	cmd.AddCommand(
@@ -21,6 +22,8 @@ func newScheduleCmd(configPath *string) *cobra.Command {
 		newScheduleRmCmd(configPath),
 		newScheduleEnableCmd(configPath),
 		newScheduleDisableCmd(configPath),
+		newSchedulePauseCmd(configPath),
+		newScheduleResumeCmd(configPath),
 	)
 	return cmd
 }
@@ -47,13 +50,18 @@ func newScheduleLsCmd(configPath *string) *cobra.Command {
 				return writeJSON(cmd.OutOrStdout(), views)
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
-			_, _ = fmt.Fprintln(tw, "SLUG\tKIND\tSCHEDULE\tACTIVE\tNEXT RUN")
+			_, _ = fmt.Fprintln(tw, "SLUG\tKIND\tSCHEDULE\tACTIVE\tPAUSED\tNEXT RUN")
 			for _, v := range views {
 				schedule := v.Cron
 				if schedule == "" {
 					schedule = fmt.Sprintf("every %ds", v.IntervalSeconds)
 				}
-				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%t\t%s\n", v.Slug, v.Kind, schedule, v.Active, v.NextRunAt.Format("2006-01-02 15:04:05"))
+				paused := "-"
+				if v.Paused {
+					paused = "yes"
+				}
+				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%t\t%s\t%s\n",
+					v.Slug, v.Kind, schedule, v.Active, paused, v.NextRunAt.Format("2006-01-02 15:04:05"))
 			}
 			return tw.Flush()
 		},
@@ -140,11 +148,19 @@ func newScheduleRmCmd(configPath *string) *cobra.Command {
 	}
 }
 
+// activeSwitchHelp is the part of enable's and disable's help that says whose
+// switch they flip: the config's, which serve re-applies, unlike a pause.
+const activeSwitchHelp = "This is the config's own on/off switch: for a schedule the config file\n" +
+	"declares, the next `flywheel serve` start re-applies the file's setting.\n" +
+	"To stop a schedule through every restart, use `flywheel schedule pause`;\n" +
+	"a pause is separate, and a schedule fires only when enabled and not paused."
+
 // newScheduleEnableCmd reactivates a periodic schedule by slug.
 func newScheduleEnableCmd(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "enable <slug>",
 		Short: "Reactivate a periodic schedule",
+		Long:  "Reactivate a periodic schedule on its existing cadence.\n\n" + activeSwitchHelp,
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := mutateSchedule(cmd, *configPath, args[0], setPeriodicActive(true), "enabled")
@@ -159,9 +175,43 @@ func newScheduleDisableCmd(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "disable <slug>",
 		Short: "Deactivate a periodic schedule (preserved, but stops firing)",
+		Long:  "Deactivate a periodic schedule: its row is kept, but it stops firing.\n\n" + activeSwitchHelp,
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := mutateSchedule(cmd, *configPath, args[0], setPeriodicActive(false), "disabled")
+			return err
+		},
+	}
+}
+
+// newSchedulePauseCmd holds a periodic schedule by slug until it is resumed.
+func newSchedulePauseCmd(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "pause <slug>",
+		Short: "Hold a schedule until it is resumed, through every restart",
+		Long: "Pause a periodic schedule: it stops firing and stays paused through every\n" +
+			"`flywheel serve` start until `flywheel schedule resume`. A start still applies\n" +
+			"the config's kind, args, and cadence to a schedule it declares, and logs that\n" +
+			"it is paused. Pausing a paused schedule changes nothing.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := mutateSchedule(cmd, *configPath, args[0], flywheel.PausePeriodic, "paused")
+			return err
+		},
+	}
+}
+
+// newScheduleResumeCmd releases a paused periodic schedule by slug.
+func newScheduleResumeCmd(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "resume <slug>",
+		Short: "Resume a paused schedule at its next fire time",
+		Long: "Resume a paused schedule. It fires next at its first fire time after now;\n" +
+			"the fires it missed while paused are not run. A disabled schedule stays\n" +
+			"disabled. Resuming a schedule that is not paused changes nothing.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := mutateSchedule(cmd, *configPath, args[0], flywheel.ResumePeriodic, "resumed")
 			return err
 		},
 	}
@@ -175,7 +225,7 @@ func setPeriodicActive(active bool) func(context.Context, *gorm.DB, string) erro
 	}
 }
 
-// mutateSchedule runs a schedule mutator (rm/enable/disable) on slug and reports
+// mutateSchedule runs a schedule mutator (rm/enable/disable/pause/resume) on slug and reports
 // the result, mirroring jobs.go's mutateJob. It returns the loaded config, so a
 // caller can relate the slug to what the config declares.
 func mutateSchedule(

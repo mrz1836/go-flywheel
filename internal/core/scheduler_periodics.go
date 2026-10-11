@@ -142,7 +142,11 @@ func (s *Scheduler) applyDeclaredPeriodics(ctx context.Context) {
 // insert-only reconcile pass, which never touches an existing row.
 //
 // A failure is logged at error with how many declarations are still pending, and
-// the success that follows one is logged at info. A clean start logs nothing.
+// the success that follows one is logged at info. A declaration that lands on a
+// definition an operator paused is logged at info, with its slug and when it was
+// paused: the apply updated its definition and left the pause, so the schedule
+// does not fire. Each declaration lands once per start, so each paused one is
+// logged once per start. A clean start with nothing paused logs nothing.
 func (s *Scheduler) applyPendingPeriodics(ctx context.Context) map[string]struct{} {
 	s.periodicsMu.Lock()
 	defer s.periodicsMu.Unlock()
@@ -161,9 +165,15 @@ func (s *Scheduler) applyPendingPeriodics(ctx context.Context) map[string]struct
 			failed = append(failed, s.pendingPeriodics[i:]...)
 			break
 		}
-		if err := UpsertPeriodic(ctx, s.db, spec); err != nil {
+		pausedAt, err := upsertPeriodic(ctx, s.db, spec)
+		if err != nil {
 			failed = append(failed, spec)
 			errs = append(errs, err)
+			continue
+		}
+		if pausedAt != nil {
+			s.logger.InfoContext(ctx, "jobs: declared periodic is paused",
+				"slug", spec.Slug, "paused_at", *pausedAt)
 		}
 	}
 	s.pendingPeriodics = failed
@@ -203,10 +213,10 @@ func (s *Scheduler) reconcileOnce(ctx context.Context) {
 
 // ReconcilePeriodics re-creates every declared periodic whose row is missing and
 // reports how many it re-created. It only ever inserts: a declared definition that
-// exists — active or not, edited by hand or not — is left exactly as it is. A
-// re-created definition is written from its declaration with next_run_at at its
-// first fire time after now, so it neither fires at once nor backfills what it
-// missed, and each is logged once, at warn.
+// exists — active or not, paused or not, edited by hand or not — is left exactly
+// as it is. A re-created definition is written from its declaration with
+// next_run_at at its first fire time after now, so it neither fires at once nor
+// backfills what it missed, and each is logged once, at warn.
 //
 // It is safe beside other Schedulers declaring the same periodics: the insert does
 // nothing when the slug exists (job_periodics' slug index is unique), and only the

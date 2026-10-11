@@ -12,9 +12,9 @@ import (
 // ErrSchemaOutdated is returned when the database lacks a table or column this
 // binary writes — the schema is older than the code. A Runner returns it from
 // Run before claiming anything, a Scheduler from Run before starting any
-// activity — its lease sweep writes the run tables, and its stats rollup the
-// rollup tables — and so a Node from Run. The wrapping error names every
-// missing table and column.
+// activity — its lease sweep writes the run tables, its tick reads
+// job_periodics, and its stats rollup writes the rollup tables — and so a Node
+// from Run. The wrapping error names every missing table and column.
 //
 // The fix is to migrate before deploying: run Migrate (the `flywheel migrate`
 // command) on a library-owned install, or apply the upgrade DDL from

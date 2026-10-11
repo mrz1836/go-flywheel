@@ -54,34 +54,31 @@ The [measured latencies](#measured-cost) are at the end. Everything above is bou
 
 ## Upgrading an existing database
 
-This release adds to the schema; it changes and removes nothing. Every addition is either a new table or a
-column that is nullable or carries a default, so:
+A release that changes the schema only adds to it — a new table, or a column that is nullable or carries a
+default — and changes and removes nothing, so:
 
-- **a database migrated for this release keeps working with the previous release's binaries**, which never
-  read or write the new columns — the safe direction of a rolling deploy;
-- **this release's binaries refuse to start against a database that has not been migrated.** A Runner,
-  a Scheduler, and a Node each stop at startup with `ErrSchemaOutdated`, naming every missing column and
-  table and the fix — rather than claiming work whose audit row they cannot write, or sweeping into a
-  finish log that is not there.
+- **a database migrated for a release keeps working with the previous release's binaries**, which never
+  read or write what was added — the safe direction of a rolling deploy;
+- **a release's binaries refuse to start against a database that has not been migrated.** A Runner, a
+  Scheduler, and a Node each check the tables they use at startup and stop with `ErrSchemaOutdated`,
+  naming every missing column and table and the fix — rather than claiming work whose audit row they
+  cannot write, or ticking schedules on a column that is not there.
 
 **So the order is always: migrate the database, then deploy the binaries.**
+
+This section is the upgrade from the previous release. A database older than that, one a release before
+the stats tables installed, needs [their upgrade](#from-a-release-before-the-stats-tables) as well;
+`InspectSchema` names every gap, whichever release left it.
 
 ### What the release adds
 
 | Object | Kind | Purpose |
 |---|---|---|
-| `job_runs.kind`, `job_runs.queue` | column, `text NOT NULL DEFAULT ''` | per-kind and per-queue stats without a join |
-| `job_runs.queue_wait_ms` | column, nullable | how long each attempt waited for a worker |
-| `job_runs.job_state` | column, nullable | the state each attempt's finalize applied — splits a retried failure from a final one |
-| `job_runs.superseded` | column, `boolean NOT NULL DEFAULT false` | a durable record that an attempt finished after its claim was gone |
-| `job_run_finishes` | table | the finish log: `(finished_at, run_id)`, which makes runs searchable by finish time |
-| `job_stats_hourly` | table | the hourly rollups trends and baselines read |
-| `job_stats_progress` | table | one row: the hours the rollups cover, so a missing hour is known to be empty |
-| `jobs_finished` | index on `jobs` | "recently finished", newest first, per terminal state |
+| `job_periodics.paused_at` | column, nullable `timestamptz` | when an operator paused the schedule with `PausePeriodic`; NULL while it is not paused |
 
-None of it is backfilled at migration time: old rows keep the column defaults, and the read path resolves
-what it needs from `jobs`. The finish log is backfilled by the runtime itself, after the deploy — see
-[After the deploy](#after-the-deploy).
+Nothing is backfilled and no index is added: every existing schedule reads `paused_at` as NULL, so it fires
+on its cadence as it did before the migration. A Scheduler of this release refuses to start without the
+column, since its tick filters on it; a Runner does not read `job_periodics` and starts either way.
 
 ### Library-owned install (`Migrate`, `flywheel migrate`)
 
@@ -100,11 +97,10 @@ err := flywheel.MigrateWithOptions(db, flywheel.MigrateOpts{
 })
 ```
 
-`flywheel migrate` prints what it added (`added: job_runs.kind, …, job_stats_progress (table)`), and a
-re-run prints nothing new — an up-to-date schema issues no DDL at all. Both options are no-ops on
-SQLite. Each step commits on its own, so a lock timeout fails only the statement that could not get its
-lock: everything before it is applied, and a re-run completes the rest. Two migrations of one schema run
-one after the other.
+`flywheel migrate` prints what it added (`added: job_periodics.paused_at`), and a re-run prints nothing
+new — an up-to-date schema issues no DDL at all. Both options are no-ops on SQLite. Each step commits on
+its own, so a lock timeout fails only the statement that could not get its lock: everything before it is
+applied, and a re-run completes the rest. Two migrations of one schema run one after the other.
 
 `flywheel serve` and `flywheel doctor` migrate too, with concurrent index builds, so either can be the
 first thing to touch a live database without blocking the queue's writers; both also repair an index an
@@ -118,13 +114,109 @@ is a migration you add, then the same deploy step you already run.
 
 **1. Add the migration.** With Atlas (or any loader that reads `Models()`), regenerate: the diff is
 exactly the statements below. To write it by hand, use these — they are the statements GORM emits from
-`Models()`, and a test runs this file's blocks against a pre-upgrade schema to prove they produce one with
-no drift.
+`Models()`, and a test runs this file's blocks against the previous release's schema to prove they produce
+one with no drift.
+
+PostgreSQL — adding a nullable column with no default is a catalog-only change, but it takes a brief
+`ACCESS EXCLUSIVE` lock on `job_periodics`, so run it with a lock timeout:
+
+<!-- upgrade-ddl:postgres -->
+```sql
+SET lock_timeout = '5s';
+ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS paused_at timestamptz;
+```
+
+SQLite — `ADD COLUMN` has no `IF NOT EXISTS` there, so this block is for a migration tool that runs it once:
+
+<!-- upgrade-ddl:sqlite -->
+```sql
+ALTER TABLE job_periodics ADD COLUMN paused_at datetime;
+```
+
+**2. Install the indexes at deploy, the way you already do.** This release adds none, so against indexes
+that are already in sync the call changes nothing. On a live PostgreSQL database, build any missing one
+concurrently:
+
+```go
+err := flywheel.InstallIndexesWithOptions(ctx, db, flywheel.IndexOpts{
+	Concurrently: true,            // no lock on the table's writers while an index builds
+	LockTimeout:  5 * time.Second, // bounds the plain (non-concurrent) path if you leave Concurrently off
+})
+```
+
+A concurrent build waits for the transactions already open when it starts — it blocks no one, but it
+cannot finish before a long-running transaction does. If a concurrent build is interrupted it leaves an
+*invalid* index behind; `InspectIndexes` reports it (`IndexDrift.Invalid`), and re-running
+`InstallIndexesWithOptions` with `Concurrently` replaces it. `InstallStorageParameters` has nothing new to
+apply this release.
+
+**3. Keep the parity check in CI.** Both reports are empty for a schema that matches this release:
+
+```go
+schemaGaps, _ := flywheel.InspectSchema(ctx, db)  // missing tables and columns
+indexDrift, _ := flywheel.InspectIndexes(ctx, db) // missing, drifted, or invalid indexes
+```
+
+### After the deploy
+
+Nothing remains to do. Every schedule written before the migration is not paused and keeps firing on its
+cadence. Pause one with `PausePeriodic` (`flywheel schedule pause`) once the Scheduler runs this release.
+
+### Rolling deploys
+
+During a rolling deploy both releases run against the migrated database. A Scheduler of the previous
+release does not read `paused_at`, so it fires a paused schedule: pause schedules only once no Scheduler of
+the previous release is running. One Scheduler runs per database (see [`CONTRACT.md`](CONTRACT.md)), so
+that is once the deploy has replaced it.
+
+Right after the migration, a previous-release process on PostgreSQL may fail one statement on the table
+the migration changed with `cached plan must not change result type` (SQLSTATE `0A000`): its driver cached
+a `SELECT *` plan before the column was added. The driver drops the plan and the retry succeeds; the error
+is a one-off per connection, not a sign the migration went wrong.
+
+A deploy that adds a job kind has its own overlap to plan for: a runner of the previous release can claim
+a job of the new kind. See **Rolling deploys and new job kinds** in the [README](../README.md).
+
+### Verifying
+
+```bash
+flywheel doctor        # schema: up to date · indexes: in sync · stats: rolled up through … (lag …)
+flywheel schedule ls   # every schedule, with PAUSED "-" until an operator pauses one
+```
+
+### Rolling back
+
+Deploy the previous release's binaries: they run unchanged against the migrated schema. They do not read
+the pause, so a schedule paused under this release fires again under them; deactivate one that must stay
+off (`SetPeriodicActive`, or `Active: false` in its declaration) before you roll back. Nothing needs to be
+dropped. If you want the schema back as it was, drop `job_periodics.paused_at` — but only after no
+Scheduler of this release is running, since it refuses to start without the column.
+
+### From a release before the stats tables
+
+A database a release before the stats tables installed lacks more than this release's column: the
+analytics columns on `job_runs`, the three stats tables, and one index. `Migrate` adds all of it, with this
+release's column, in one call. A hand-written migration applies the statements below first, then
+[this release's](#host-owned-install-your-migration-tool).
+
+| Object | Kind | Purpose |
+|---|---|---|
+| `job_runs.kind`, `job_runs.queue` | column, `text NOT NULL DEFAULT ''` | per-kind and per-queue stats without a join |
+| `job_runs.queue_wait_ms` | column, nullable | how long each attempt waited for a worker |
+| `job_runs.job_state` | column, nullable | the state each attempt's finalize applied — splits a retried failure from a final one |
+| `job_runs.superseded` | column, `boolean NOT NULL DEFAULT false` | a durable record that an attempt finished after its claim was gone |
+| `job_run_finishes` | table | the finish log: `(finished_at, run_id)`, which makes runs searchable by finish time |
+| `job_stats_hourly` | table | the hourly rollups trends and baselines read |
+| `job_stats_progress` | table | one row: the hours the rollups cover, so a missing hour is known to be empty |
+| `jobs_finished` | index on `jobs` | "recently finished", newest first, per terminal state |
+
+None of it is backfilled at migration time: old rows keep the column defaults, and the read path resolves
+what it needs from `jobs`. The finish log is backfilled by the runtime itself, after the deploy, as below.
 
 PostgreSQL — the `ADD COLUMN`s are catalog-only changes on PostgreSQL 11+ (a constant default rewrites no
 rows), but each takes a brief `ACCESS EXCLUSIVE` lock on `job_runs`, so run them with a lock timeout:
 
-<!-- upgrade-ddl:postgres -->
+<!-- upgrade-ddl:postgres:stats -->
 ```sql
 SET lock_timeout = '5s';
 ALTER TABLE job_runs ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT '';
@@ -182,9 +274,9 @@ CREATE TABLE IF NOT EXISTS job_stats_progress (
 If your schema declares `job_runs.id` as `uuid` rather than `text`, declare `job_run_finishes.run_id` as
 `uuid` too: the stats reads join the two.
 
-SQLite — `ADD COLUMN` has no `IF NOT EXISTS` there, so this block is for a migration tool that runs it once:
+SQLite:
 
-<!-- upgrade-ddl:sqlite -->
+<!-- upgrade-ddl:sqlite:stats -->
 ```sql
 ALTER TABLE job_runs ADD COLUMN kind text NOT NULL DEFAULT '';
 ALTER TABLE job_runs ADD COLUMN queue text NOT NULL DEFAULT '';
@@ -238,38 +330,16 @@ CREATE TABLE IF NOT EXISTS job_stats_progress (
 );
 ```
 
-**2. Install the index at deploy, the way you already install the others.** The one new index,
-`jobs_finished`, is on `jobs` — the hottest table — so on a live PostgreSQL database build it concurrently:
+The one new index, `jobs_finished`, is on `jobs` — the hottest table — so on a live PostgreSQL database
+build it concurrently, as step 2 of the host-owned install does.
 
-```go
-err := flywheel.InstallIndexesWithOptions(ctx, db, flywheel.IndexOpts{
-	Concurrently: true,            // no lock on jobs' writers while it builds
-	LockTimeout:  5 * time.Second, // bounds the plain (non-concurrent) path if you leave Concurrently off
-})
-```
+**After the deploy**, the runtime does the rest on its own once a Scheduler with `StatsRollupInterval` set
+(or `flywheel serve`) is running:
 
-A concurrent build waits for the transactions already open when it starts — it blocks no one, but it
-cannot finish before a long-running transaction does. If a concurrent build is interrupted it leaves an
-*invalid* index behind; `InspectIndexes` reports it (`IndexDrift.Invalid`), and re-running
-`InstallIndexesWithOptions` with `Concurrently` replaces it. `InstallStorageParameters` has nothing new to
-apply this release.
-
-**3. Keep the parity check in CI.** Both reports are empty for a schema that matches this release:
-
-```go
-schemaGaps, _ := flywheel.InspectSchema(ctx, db)  // missing tables and columns
-indexDrift, _ := flywheel.InspectIndexes(ctx, db) // missing, drifted, or invalid indexes
-```
-
-### After the deploy
-
-The deploy itself needs nothing more. What remains, the runtime does on its own once a Scheduler with
-`StatsRollupInterval` set (or `flywheel serve`) is running:
-
-1. **Its first rollup pass backfills the finish log** for every run the previous release finalized
+1. **Its first rollup pass backfills the finish log** for every run the older release finalized
    (`BackfillRunFinishes`) — one pass over `job_runs` in primary-key batches, writing an entry only for the
    pre-upgrade rows. On SQLite it first re-stamps those rows' timestamps in UTC
-   (`NormalizeRunTimestamps`), because the previous release wrote them in the clock's local zone. Every
+   (`NormalizeRunTimestamps`), because the older release wrote them in the clock's local zone. Every
    later backfill starts with one statement that asks whether any run still lacks its entry, and stops
    there when none does — so once the upgrade is done, a restart does not walk `job_runs` again.
 2. **The rollup then works through history** a bounded number of hours per pass (`StatsMaxHoursPerPass`,
@@ -280,40 +350,20 @@ The deploy itself needs nothing more. What remains, the runtime does on its own 
    a million runs rolls up from scratch in under ten seconds. A rebuild of only the recent hours is safe
    too: the rollups never cover a range with a gap in it, so it rolls the hours between the rollup's
    progress and the ones you asked for as well (only those with runs cost a recompute).
-3. **Old rows are read through `jobs`.** A run the previous release wrote has `kind = ''`; the stats
+3. **Old rows are read through `jobs`.** A run the older release wrote has `kind = ''`; the stats
    resolve its kind, queue, and — for a failed attempt — whether it discarded its job, through the job row.
    Nothing rewrites history.
 
-### Rolling deploys
+**During a rolling deploy** the older release's runners write runs without the new columns and without
+finish-log entries; this release's Scheduler backfills those on its first pass and once more ten minutes
+later, which covers a deploy that overlaps for minutes. A backfilled run whose hour the rollup already
+closed is counted by re-rolling that hour. If your deploy overlaps for longer, run `flywheel stats rebuild`
+over the deploy window afterwards — a rebuild backfills before it recomputes.
 
-During a rolling deploy both releases run against the migrated database. The previous release's runners
-write runs without the new columns and without finish-log entries; this release's Scheduler backfills
-those on its first pass and once more ten minutes later, which covers a deploy that overlaps for minutes.
-A backfilled run whose hour the rollup already closed is counted by re-rolling that hour. If your deploy
-overlaps for longer, run `flywheel stats rebuild` over the deploy window afterwards — a rebuild backfills
-before it recomputes.
-
-Right after the migration, a previous-release process on PostgreSQL may fail one statement on `job_runs`
-with `cached plan must not change result type` (SQLSTATE `0A000`): its driver cached a `SELECT *` plan
-before the columns were added. The driver drops the plan and the retry succeeds; the error is a one-off
-per connection, not a sign the migration went wrong.
-
-A deploy that adds a job kind has its own overlap to plan for: a runner of the previous release can claim
-a job of the new kind. See **Rolling deploys and new job kinds** in the [README](../README.md).
-
-### Verifying
-
-```bash
-flywheel doctor    # schema: up to date · indexes: in sync · stats: rolled up through … (lag …)
-flywheel stats     # per-kind stats for the last 24 hours, and how they were served
-```
-
-### Rolling back
-
-Deploy the previous release's binaries: they run unchanged against the migrated schema. Nothing needs to
-be dropped. If you want the schema back as it was, drop `job_stats_progress`, `job_stats_hourly`,
-`job_run_finishes`, the `jobs_finished` index, and the five `job_runs` columns — but only after no binary
-of this release is running, since it refuses to start without them.
+**To roll back** to the older release, deploy its binaries: they run unchanged against the migrated
+schema. To restore its schema as well, drop `job_stats_progress`, `job_stats_hourly`, `job_run_finishes`,
+the `jobs_finished` index, the five `job_runs` columns, and `job_periodics.paused_at` — but only after no
+binary of a newer release is running.
 
 <br>
 
@@ -425,6 +475,14 @@ discard, not a retry); **success rate** = `success / (success + discarded)`. A f
 attempt that does not record the state it applied — one an older release wrote, or one `SeedRun`
 imported — counts as the discard when its job is discarded at that attempt, and as a retry otherwise.
 
+**`job_periodics`** — one row per schedule. Stable for SQL: `slug`, `kind`, `queue`, `cron_expr` and
+`interval_seconds` (exactly one is set), `next_run_at` (the next fire), `last_enqueued_at`, `is_active`,
+and `paused_at`. A schedule fires only when `is_active` is true and `paused_at` is NULL. `is_active` is the
+declaration's switch, which a host declaring the schedule in `SchedulerConfig.Periodics` re-applies on every
+start; `paused_at` is when an operator paused it with `PausePeriodic`, NULL while it is not paused, and
+nothing that declares a schedule writes it. A paused schedule's `next_run_at` stays where the pause found
+it until `ResumePeriodic` moves it to the first fire after now.
+
 ### Time and zones
 
 `job_runs` and `job_run_finishes` timestamps are stored in UTC. On PostgreSQL every timestamp column is
@@ -465,6 +523,10 @@ sample that counted them would read it all on every scrape.
 
 **`CountActiveByKind(ctx, db)`** — in-flight jobs per (kind, queue, state), non-terminal states only, on
 `jobs_state`. This, not a `GROUP BY kind` over all of `jobs`, is the per-kind backlog read.
+
+**`ListPeriodics(ctx, db)`** — every schedule, by slug: its kind, queue, cron or interval, `NextRunAt`,
+`LastEnqueuedAt`, `Active`, and `Paused` with `PausedAt`. A schedule fires only when it is `Active` and not
+`Paused`; see [`job_periodics`](#tables-and-columns) for which switch is whose.
 
 **`WaitForJob(ctx, db, id)`** — blocks until one job reaches a terminal state and returns its `JobView`:
 one primary-key read at once, then every 500 ms doubling to 5 s. `ctx` is the only bound; at the deadline

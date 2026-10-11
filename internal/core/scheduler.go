@@ -83,8 +83,9 @@ type SchedulerConfig struct {
 	// clause and needs none), so a Scheduler that picked its own implementation
 	// would be choosing a dialect it was never told.
 	Driver Driver
-	// Logger logs tick and sweep failures, and the re-creation of a declared
-	// periodic that went missing. Optional; defaults to slog.Default().
+	// Logger logs tick and sweep failures, the re-creation of a declared
+	// periodic that went missing, and a declared periodic a start finds paused.
+	// Optional; defaults to slog.Default().
 	Logger *slog.Logger
 	// Observer receives a SweepEvent after each stuck-lease reclaim pass, so sweep
 	// timing joins the same telemetry stream as claims and finalizes. Optional;
@@ -179,16 +180,26 @@ type SchedulerConfig struct {
 	// Periodics are the periodic definitions this host declares. Run applies them
 	// on start with UpsertPeriodic's semantics — a missing definition is inserted, a
 	// changed one updated, an unchanged one keeps its next_run_at cursor — so every
-	// restart re-applies the whole declaration, Active included: a declared
-	// definition an operator deactivated is active again after the next start.
+	// restart re-applies the whole declaration, Active included, and never the
+	// pause.
+	//
+	// The declaration's Active and an operator's pause are two switches, and a
+	// definition fires only when it is active and not paused. A declared definition
+	// deactivated with SetPeriodicActive is active again after the next start:
+	// Active is the declaration's switch. One paused with PausePeriodic stays
+	// paused through every start until ResumePeriodic, while the start still
+	// applies its kind, queue, args, and cadence, and logs it once at info
+	// ("jobs: declared periodic is paused", with slug and paused_at). So a pause
+	// holds whatever the declaration says, and Active: false in code still turns
+	// a definition off whatever the pause says.
 	//
 	// While Run runs, the reconcile activity re-creates any declared definition
 	// whose row has gone missing — a database restored from an older snapshot, one
 	// rebuilt from migrations under a running node, a DeletePeriodic — and logs each
 	// re-creation once, at warn. It only ever inserts: a definition that exists —
-	// deactivated with SetPeriodicActive, edited by hand — is left exactly as it is
-	// until the next start, and one this host does not declare is never touched. A
-	// re-created definition fires next at its first fire time after the
+	// deactivated with SetPeriodicActive, paused, edited by hand — is left exactly
+	// as it is until the next start, and one this host does not declare is never
+	// touched. A re-created definition fires next at its first fire time after the
 	// re-creation; the fires it missed while gone are not backfilled.
 	//
 	// Retire a declared definition by removing it here first, on every host that
@@ -416,9 +427,9 @@ func (a *activity) tick(ctx context.Context, logger *slog.Logger) {
 // is what makes a Node's DrainTimeout a meaningful bound on shutdown.
 //
 // The one early return is a schema older than the binary: before starting any
-// activity, Run checks that the tables its sweep writes (and, with the stats
-// rollup on, the rollup's tables) carry every column, and returns
-// ErrSchemaOutdated naming what is missing.
+// activity, Run checks that the tables its sweep writes, job_periodics (which its
+// tick reads), and, with the stats rollup on, the rollup's tables carry every
+// column, and returns ErrSchemaOutdated naming what is missing.
 func (s *Scheduler) Run(ctx context.Context) error {
 	if err := s.checkSchema(ctx); err != nil {
 		return err
@@ -576,14 +587,16 @@ func (s *Scheduler) logHealth(ctx context.Context) {
 	s.logger.InfoContext(ctx, "jobs: queue health", attrs...)
 }
 
-// Tick processes every due, active periodic definition once and reports how
-// many jobs were enqueued.
+// Tick processes every due periodic definition that is active and not paused
+// once, and reports how many jobs were enqueued. A paused definition is passed
+// over and its next_run_at left where the pause found it; ResumePeriodic moves
+// it past now.
 func (s *Scheduler) Tick(ctx context.Context) (int, error) {
 	now := models.ClockFrom(ctx).Now(ctx)
 
 	var defs []jobPeriodicRow
 	if err := s.db.WithContext(ctx).
-		Where("is_active = ? AND next_run_at <= ?", true, now).
+		Where("is_active = ? AND paused_at IS NULL AND next_run_at <= ?", true, now).
 		Find(&defs).Error; err != nil {
 		return 0, fmt.Errorf("jobs: load due periodics: %w", err)
 	}
