@@ -1287,7 +1287,11 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 		return r.finalizeUnknownKind(ctx, raw, runID, jobEv, startedAt)
 	}
 
-	logger := r.cfg.Logger.With("job_id", raw.ID, "kind", raw.Kind, "run_id", runID)
+	// The attempt's fields, under the keys the slog observer's own lines use, so
+	// a worker's lines filter by queue or attempt and line up with the runtime's.
+	logger := r.cfg.Logger.With(
+		"job_id", raw.ID, "kind", raw.Kind, "queue", raw.Queue, "run_id", runID, "attempt", raw.Attempt,
+	)
 	if reqID := ctxutil.RequestIDFromMetadata(raw.Metadata); reqID != "" {
 		ctx = ctxutil.WithRequestID(ctx, reqID)
 		logger = logger.With("request_id", reqID)
