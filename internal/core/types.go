@@ -180,7 +180,12 @@ type Job[A Args] struct {
 	// snooze, or an InsertOpts.ScheduleAt moves when the job runs, not this.
 	EnqueuedAt time.Time
 	Tags       []string
-	Logger     *slog.Logger
+	// Logger is RunnerConfig.Logger (slog.Default when unset) carrying the
+	// attempt's fields under the keys the slog observer's lines use: job_id,
+	// kind, queue, run_id, and attempt, plus request_id when the job was enqueued
+	// with one. A worker's lines can then be filtered by queue or by attempt, and
+	// read beside the runtime's own lines for the same attempt.
+	Logger *slog.Logger
 	// RunID is the pre-allocated job_runs.id for this attempt. A side-effect
 	// row may set its job_run_id to RunID safely — the run row already exists.
 	RunID string
@@ -228,7 +233,9 @@ type RawJob struct {
 
 // Result is what a worker returns on success.
 type Result struct {
-	// Output is the worker's structured output, stored on the JobRun.
+	// Output is the worker's structured output, stored on the JobRun. One whose
+	// JSON is larger than DriverOpts.MaxOutputBytes (64 KiB by default) is stored
+	// as a TruncatedOutput: its size and its first kilobyte.
 	Output any
 	// Snooze, when non-nil, reschedules the job for the given delay without
 	// consuming an attempt.

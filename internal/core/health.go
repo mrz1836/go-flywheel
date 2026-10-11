@@ -16,9 +16,10 @@ import (
 // read by SampleQueueHealth, surfaced by the Scheduler heartbeat, the `/metrics`
 // gauges, and `flywheel status`.
 type QueueHealth struct {
-	// CountsByState is the job count per state, soft-deleted jobs excluded (the
-	// same scope as Overview). Every present state maps to its count; absent
-	// states are zero.
+	// CountsByState is the job count per state, soft-deleted jobs excluded, for
+	// every state but succeeded. Every present state maps to its count; absent
+	// states are zero. Succeeded jobs are not counted, so the map never has a
+	// succeeded key (see SampleQueueHealth); Overview counts every state.
 	CountsByState map[string]int64 `json:"counts_by_state"`
 	// Ready is the number of jobs claimable right now: a claimable state
 	// (available, retryable, scheduled) whose scheduled_at is at or before the
@@ -43,13 +44,25 @@ type QueueHealth struct {
 // from the context Clock (models.ClockFrom), so a test drives it deterministically with
 // a models.FixedClock and production uses the wall clock.
 //
-// It runs four index-backed reads, none of which mutate: a GROUP BY state count
-// (soft-deleted excluded), a ready count and a scheduled-ahead count over the
-// claimable states (both served by the jobs_ready partial index), and an ordered
+// It runs four index-backed reads, none of which mutate: a count per state over
+// every state but succeeded (soft-deleted excluded; one range of the jobs_state
+// index per state), a ready count and a scheduled-ahead count over the claimable
+// states (both served by the jobs_ready partial index), and an ordered
 // single-row read for the oldest ready scheduled_at. The lag is read by ordering
 // rather than MIN(scheduled_at) because SQLite returns a bare aggregate as text
 // and drops the column's datetime affinity, which would fail the time scan; an
 // ordered read of the real typed column round-trips on both dialects.
+//
+// # Succeeded jobs are not counted
+//
+// Succeeded jobs are most of a retained table: every job that ever ran, until
+// retention removes it, and every job forever with retention off. Counting them
+// made each sample read that whole history, on every Scheduler health interval
+// and every /metrics scrape, and no gauge or alarm reads the figure: the backlog
+// is the live states, and lost work is discarded. So the sample reads only the
+// other states, whose ranges stay as small as the live queue and the failures.
+// Overview still counts every state, succeeded included, at the cost of reading
+// them all.
 //
 // The snapshot is a sample, not a transaction: the reads are not serialized
 // against concurrent claims, so a busy queue's numbers may not be mutually
@@ -59,14 +72,16 @@ func SampleQueueHealth(ctx context.Context, db *gorm.DB) (QueueHealth, error) {
 	now := models.ClockFrom(ctx).Now(ctx)
 	qh := QueueHealth{CountsByState: map[string]int64{}, SampledAt: now}
 
-	// Counts by state (soft-deleted excluded via the gorm DeletedAt scope). The
-	// running count doubles as InFlight, so no separate query is needed.
+	// Counts by state, succeeded aside (soft-deleted excluded via the gorm
+	// DeletedAt scope). The running count doubles as InFlight, so no separate
+	// query is needed.
 	var stateRows []struct {
 		State string
 		N     int64
 	}
 	if err := db.WithContext(ctx).Model(&jobRow{}).
-		Select("state, count(*) as n").Group("state").Scan(&stateRows).Error; err != nil {
+		Select("state, count(*) as n").Where("state IN ?", queueHealthStates()).
+		Group("state").Scan(&stateRows).Error; err != nil {
 		return QueueHealth{}, fmt.Errorf("flywheel: queue health counts: %w", err)
 	}
 	for _, r := range stateRows {
@@ -109,6 +124,12 @@ func SampleQueueHealth(ctx context.Context, db *gorm.DB) (QueueHealth, error) {
 	return qh, nil
 }
 
+// queueHealthStates is every job state SampleQueueHealth counts: all of them but
+// succeeded.
+func queueHealthStates() []string {
+	return stateStrings(append(NonTerminalStates(), StateCancelled, StateDiscarded))
+}
+
 // FailureView is one recently discarded job paired with the error from its final
 // recorded attempt. It is the "what is failing, and why" diagnosis surface behind
 // `flywheel status` and an operator dashboard: a discarded job is one that
@@ -126,7 +147,8 @@ type FailureView struct {
 
 // RecentFailuresParams scopes a RecentFailures query. Since bounds the window —
 // only jobs finalized at or after it are returned; a zero Since means no lower
-// bound. Limit caps the rows (default 20 when not positive).
+// bound. Limit caps the rows (default 20 when not positive, at most
+// MaxReadLimit).
 type RecentFailuresParams struct {
 	Since time.Time
 	Limit int
@@ -136,26 +158,35 @@ type RecentFailuresParams struct {
 // positive limit.
 const defaultRecentFailuresLimit = 20
 
+// failureRun is the part of a job's final attempt a FailureView reports.
+type failureRun struct {
+	JobID        string
+	Attempt      int
+	ErrorClass   *string
+	ErrorMessage *string
+}
+
 // RecentFailures returns the most recently discarded jobs (newest finalized
-// first) within the window, each joined to the error on its latest attempt,
+// first) within the window, each joined to the error on its final attempt,
 // reading through db. Soft-deleted jobs are excluded. It powers the failures
-// section of `flywheel status` so an operator can glance and see what broke.
+// section of `flywheel status` so an operator can glance and see what broke. It
+// returns at most MaxReadLimit jobs, whatever p.Limit asks for.
 //
 // The page is one range scan of the jobs_finished index — (state, finalized_at,
 // id) with state = 'discarded' — which hands back rows already in page order, so
 // the read stops at Limit instead of sorting every discarded job.
 //
-// The errors come from a second read keyed by the page's job ids rather than a
-// SQL join, so the page size bounds both queries and the dialects stay identical:
-// the runs for the page are loaded ordered by attempt, and the last row seen per
-// job — the highest attempt — wins, which is the attempt that discarded it.
+// The errors come from a second read keyed by the page's job ids, so the page
+// size bounds both queries. It joins each job to its own final attempt
+// (r.attempt = j.attempt) through the job_runs_job_attempt unique index — the
+// attempt that discarded it — so it reads one run per job, not every attempt.
+// Both reads select only the columns a FailureView reports: no args, no outputs,
+// and no error payloads.
 func RecentFailures(ctx context.Context, db *gorm.DB, p RecentFailuresParams) ([]FailureView, error) {
-	limit := p.Limit
-	if limit <= 0 {
-		limit = defaultRecentFailuresLimit
-	}
+	limit := readLimit(p.Limit, defaultRecentFailuresLimit)
 
 	query := db.WithContext(ctx).Model(&jobRow{}).
+		Select("id, kind, queue, attempt, finalized_at").
 		Where("state = ? AND finalized_at IS NOT NULL", string(StateDiscarded))
 	if !p.Since.IsZero() {
 		query = query.Where("finalized_at >= ?", p.Since)
@@ -172,14 +203,16 @@ func RecentFailures(ctx context.Context, db *gorm.DB, p RecentFailuresParams) ([
 	for i := range jobs {
 		ids[i] = jobs[i].ID
 	}
-	var runs []jobRunRow
-	if err := db.WithContext(ctx).Model(&jobRunRow{}).
-		Where("job_id IN ?", ids).
-		Order("attempt asc").Find(&runs).Error; err != nil {
+	var runs []failureRun
+	if err := db.WithContext(ctx).Table("job_runs AS r").
+		Select("r.job_id, r.attempt, r.error_class, r.error_message").
+		Joins("JOIN jobs j ON r.job_id = j.id AND r.attempt = j.attempt").
+		Where("j.id IN ?", ids).
+		Scan(&runs).Error; err != nil {
 		return nil, fmt.Errorf("flywheel: recent failures runs: %w", err)
 	}
-	// attempt asc means the last write per job is the highest (final) attempt.
-	latest := make(map[string]jobRunRow, len(runs))
+	// (job_id, attempt) is unique, so each job has at most one final attempt.
+	latest := make(map[string]failureRun, len(runs))
 	for i := range runs {
 		latest[runs[i].JobID] = runs[i]
 	}

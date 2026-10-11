@@ -39,15 +39,21 @@ func sqlitePlan(t testing.TB, db *gorm.DB, sql string, args ...any) string {
 // behind the queue-health heartbeat uses jobs_state rather than scanning.
 //
 // It asserts against the statement SampleQueueHealth actually issues, built the
-// same way — Model(&jobRow{}) with a Group("state") — so the plan under test is
-// the plan the runtime produces, soft-delete scope included.
+// same way — Model(&jobRow{}) with its state list and a Group("state") — so the
+// plan under test is the plan the runtime produces, soft-delete scope included.
 func TestQueueHealthCountsReachTheStateIndexSQLite(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	seedStateMix(t, db)
 
+	states := queueHealthStates()
+	args := make([]any, len(states))
+	for i, s := range states {
+		args[i] = s
+	}
 	plan := sqlitePlan(t, db,
-		`SELECT state, count(*) AS n FROM jobs WHERE jobs.deleted_at IS NULL GROUP BY state`)
+		`SELECT state, count(*) AS n FROM jobs WHERE state IN (?`+strings.Repeat(",?", len(states)-1)+
+			`) AND jobs.deleted_at IS NULL GROUP BY state`, args...)
 
 	assert.Contains(t, plan, "jobs_state",
 		"the counts-by-state read must reach the telemetry index")
@@ -108,7 +114,8 @@ func TestQueueHealthCountsAreCorrectWithTheStateIndex(t *testing.T) {
 
 	assert.EqualValues(t, 2, qh.CountsByState[string(StateAvailable)])
 	assert.EqualValues(t, 1, qh.CountsByState[string(StateRunning)])
-	assert.EqualValues(t, 1, qh.CountsByState[string(StateSucceeded)])
+	assert.NotContains(t, qh.CountsByState, string(StateSucceeded), "succeeded jobs are not counted")
+	assert.EqualValues(t, 1, qh.CountsByState[string(StateDiscarded)])
 	assert.EqualValues(t, 1, qh.InFlight)
 	assert.NotContains(t, qh.CountsByState, "",
 		"a soft-deleted job contributes to no state's count")

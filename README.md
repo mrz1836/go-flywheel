@@ -653,6 +653,23 @@ for _, run := range runs {
 }
 ```
 
+**What a run keeps is bounded.** Every read of a job's runs returns each row whole, so what one attempt
+can store is capped, and a cut record says so:
+
+- **Output.** `Result.Output` is stored as JSON up to the driver's `DriverOpts.MaxOutputBytes` (64 KiB
+  by default). A larger output is not stored: the attempt finalizes as it would have, and its row holds a
+  `TruncatedOutput` marker instead, `{"$truncated": true, "$bytes": …, "$head": "…"}`, with the output's
+  marshaled size and its first 1,024 bytes. `JobRunView.OutputTruncated` reports it. Keep a large result
+  in a table of your own and return its id. The bundled command workers capture up to 64 KiB of each
+  stream, so an `ExecOutput` with both streams near that cap is over the default: raise the driver's cap
+  if you keep full captures.
+- **Errors.** The error message is stored up to 4,096 bytes. A cut message's `error_payload` carries
+  `"truncated": true` and `"message_bytes"`, its length before the cut, and `JobRunView.ErrorTruncated`
+  is true.
+- **Panics.** A worker that panics fails its attempt with `jobs: worker panicked: <value>`, and the run's
+  `error_payload` keeps the goroutine's stack at the panic (`"stack"`, up to 16 KiB), which
+  `JobRunView.ErrorStack` reports.
+
 **The lifetime of `job_runs.id`, so you can decide your FK's `ON DELETE`:**
 
 | Moment | What happens to the row |
@@ -1155,7 +1172,8 @@ and the [`observers/`](observers) package ships ready adapters that plug straigh
   budget, and the job's resulting state ([RUNBOOK](docs/RUNBOOK.md#symptom-jobs-fail-or-are-discarded)).
   `observers.NewMulti(...)` fans events out to several observers at once.
 
-`SampleQueueHealth` ([health.go](internal/core/health.go)) reads a point-in-time gauge snapshot — depth by state,
+`SampleQueueHealth` ([health.go](internal/core/health.go)) reads a point-in-time gauge snapshot — depth by state
+for every state but `succeeded` (most of a retained table, which each sample would otherwise read in full),
 ready / in-flight counts, and the **oldest-ready age (lag)**, the canonical "are the runners falling
 behind?" signal — and `RecentFailures` lists what was discarded recently and why. Give a `Node` a
 metrics handler and its health server also serves Prometheus text at `/metrics` (recorder counters
@@ -1245,6 +1263,13 @@ unpruned row is only storage, while an unreclaimed lease is stalled work.
 
 A cancelled pass reports the rows it committed alongside the context error — the completed batches are
 not rolled back — so treat a non-nil error as "partial progress", not "nothing happened".
+
+The reads are bounded the same way. Every list read — `ListJobs`, `ListFinished`, `ListRunning`,
+`SlowRuns`, `RecentFailures`, and `ListRuns` — returns at most `flywheel.MaxReadLimit` (200) rows: a
+larger `Limit` is clamped, so a handler can pass a request's limit straight through. `ListRuns` with no
+`Limit` reads a job's newest 200 attempts; page past them with `BeforeAttempt`. `ChildOutputs` is the
+one exception: with no `Limit` it reads every terminal child, the fold a barrier continuation needs, and
+`DriverOpts.BarrierMaxChildren` bounds that generation.
 
 ### Retention
 

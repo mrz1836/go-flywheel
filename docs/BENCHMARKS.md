@@ -770,6 +770,31 @@ up one hour got faster — **−70% on SQLite** (2.59 → 0.77 ms) and **−27% 
 because the empty-hour marker rows, and the delete that cleared stale ones by scanning every older rollup
 row, are gone. The finalize path is unchanged by it, so the write-cost numbers above stand.
 
+**Bounded reads, measured.** `SampleQueueHealth` and `RecentFailures` were measured at the same million
+runs before and after they were narrowed, back to back, in two interleaved pairs, on one machine: an
+**Apple M1 Max, 10 cores, 32 GB, macOS 15.7**, with **PostgreSQL 17.10 in Docker Desktop** (10 CPUs, 8 GB,
+the image's default server parameters) and Go 1.27.2. That is neither machine above, so compare these
+numbers with each other, not with the table. Reports of the first pair:
+[`bounded-reads-1m-before.txt`](benchmarks/bounded-reads-1m-before.txt),
+[`bounded-reads-1m-after.txt`](benchmarks/bounded-reads-1m-after.txt).
+
+| Read | Before (pair 1, pair 2) | After (pair 1, pair 2) |
+|---|---|---|
+| `SampleQueueHealth` | 52.5 ms, 49.4 ms | **4.4 ms, 4.6 ms** |
+| `RecentFailures` | 2.1 ms, 1.7 ms | **1.1 ms, 1.1 ms** |
+
+- **`SampleQueueHealth`** counted jobs in every state, so its first statement read all of `jobs_state` on
+  every sample: a parallel index-only scan of 1.1 million entries, nearly all of them succeeded, over 876
+  buffers. It counts every state but `succeeded` now, one range per state over the 27,200 live and failed
+  jobs: 25 buffers, 3.2 ms. The sample's cost follows the queue and the failures retention keeps, not the
+  history.
+- **`RecentFailures`** read whole `jobs` rows and every attempt of each job on its page, outputs and
+  error payloads included. It reads five columns of the page now, and each job's own final attempt through
+  `job_runs_job_attempt`. Every discarded job in this fixture has one attempt, so the runs read returns the
+  same 20 rows as before, an estimated 61 bytes wide instead of 232, at the price of a primary-key probe
+  of `jobs` each (105 buffers against 26); the time saved is the columns not transferred or decoded. A
+  job retried `n` times returned `n` runs with their outputs, and returns one.
+
 ### The retention prune, with `jobs_finished` in place
 
 `jobs_finished` carries `finalized_at`, so it was worth checking whether the planner would now prefer it
@@ -785,6 +810,11 @@ export FLYWHEEL_LOADTEST_DATABASE_URL="postgres://localhost:5432/flywheel_test?s
 # Reads at 1M.
 go run -tags=loadtest ./loadtest/cmd/explain -query stats -jobs 1000000 \
   -out docs/benchmarks/stats-plans-1m.txt
+
+# Bounded reads: the same command in a worktree of the previous release (with SampleQueueHealth added to
+# the read list) and in this one, back to back.
+go run -tags=loadtest ./loadtest/cmd/explain -query stats -jobs 1000000 \
+  -out docs/benchmarks/bounded-reads-1m-after.txt
 
 # Write cost: the same commands in a worktree of the previous release and in this one, interleaved,
 # with a CHECKPOINT before each.

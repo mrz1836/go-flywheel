@@ -86,10 +86,15 @@ func TestBugHuntB1TruncateIsRuneAware(t *testing.T) {
 	var rawRun jobRunRow
 	require.NoError(t, db.Table("job_runs").Where("job_id = ?", id).First(&rawRun).Error)
 	require.NotEmpty(t, rawRun.ErrorPayload, "error_payload is written alongside error_message")
-	var payload map[string]string
+	// The payload holds a boolean and a number beside the message once the
+	// message was cut, so it decodes into map[string]any.
+	var payload map[string]any
 	require.NoError(t, json.Unmarshal(rawRun.ErrorPayload, &payload), "error_payload must be valid JSON")
-	assert.Equal(t, stored, payload["message"], "error_payload.message matches the stored error_message")
-	assert.True(t, utf8.ValidString(payload["message"]), "the payload message is valid UTF-8")
+	message, ok := payload["message"].(string)
+	require.True(t, ok, "error_payload.message is a string")
+	assert.Equal(t, stored, message, "error_payload.message matches the stored error_message")
+	assert.True(t, utf8.ValidString(message), "the payload message is valid UTF-8")
+	assert.Equal(t, true, payload["truncated"], "the payload flags the cut")
 }
 
 // TestBugHuntB1TruncateUnitRuneBoundary exercises truncate directly across rune
@@ -322,7 +327,12 @@ func TestBugHuntB6LargeArgsAndOutputRoundTrip(t *testing.T) {
 	w := &b6Worker{}
 	reg := NewRegistry()
 	Register(reg, w)
-	r := newRunner(t, db, reg)
+	// The output marshals to about 110 KB, over the default 64 KiB output cap,
+	// so the driver is given room for it: what this probes is that a large
+	// output round-trips faithfully where the cap allows it.
+	driver, err := NewSQLiteDriverWithOptions(db, SQLiteOpts{DriverOpts: DriverOpts{MaxOutputBytes: 1 << 20}})
+	require.NoError(t, err)
+	r := rwRunner(t, db, reg, func(cfg *RunnerConfig) { cfg.Driver = driver })
 
 	id, err := Insert(context.Background(), NewClient(db), args, InsertOpts{})
 	require.NoError(t, err)

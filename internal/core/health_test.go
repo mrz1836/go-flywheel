@@ -59,7 +59,8 @@ func assertQueueHealthSnapshot(t *testing.T, db *gorm.DB) {
 	seedJob(t, db, jobRow{ID: "qh-ahead", Kind: "k", State: string(StateScheduled), ScheduledAt: now.Add(30 * time.Minute)})
 	// In flight: running.
 	seedJob(t, db, jobRow{ID: "qh-running", Kind: "k", State: string(StateRunning), ScheduledAt: now.Add(-5 * time.Minute)})
-	// Terminal: counted in CountsByState only.
+	// Terminal: cancelled and discarded are counted in CountsByState only, and
+	// succeeded is not counted at all.
 	seedJob(t, db, jobRow{ID: "qh-done", Kind: "k", State: string(StateSucceeded), ScheduledAt: now.Add(-time.Hour)})
 	seedJob(t, db, jobRow{ID: "qh-discarded", Kind: "k", State: string(StateDiscarded), ScheduledAt: now.Add(-time.Hour)})
 	// Soft-deleted but otherwise the oldest ready job: must be excluded everywhere.
@@ -79,14 +80,14 @@ func assertQueueHealthSnapshot(t *testing.T, db *gorm.DB) {
 	assert.EqualValues(t, 1, qh.CountsByState[string(StateRetryable)])
 	assert.EqualValues(t, 1, qh.CountsByState[string(StateScheduled)])
 	assert.EqualValues(t, 1, qh.CountsByState[string(StateRunning)])
-	assert.EqualValues(t, 1, qh.CountsByState[string(StateSucceeded)])
+	assert.NotContains(t, qh.CountsByState, string(StateSucceeded), "succeeded jobs are not counted")
 	assert.EqualValues(t, 1, qh.CountsByState[string(StateDiscarded)])
 
 	var total int64
 	for _, n := range qh.CountsByState {
 		total += n
 	}
-	assert.EqualValues(t, 6, total, "the soft-deleted job is excluded from the counts")
+	assert.EqualValues(t, 5, total, "the soft-deleted and succeeded jobs are excluded from the counts")
 }
 
 // assertQueueHealthEmpty asserts the zero-value snapshot of an empty queue.

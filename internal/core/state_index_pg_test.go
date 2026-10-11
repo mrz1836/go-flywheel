@@ -65,7 +65,8 @@ func TestQueueHealthCountsReachTheStateIndexPostgres(t *testing.T) {
 	seedStateMixPG(t, db, 5_000)
 
 	plan := forcedIndexPlan(t, db,
-		`SELECT state, count(*) AS n FROM jobs WHERE jobs.deleted_at IS NULL GROUP BY state`)
+		`SELECT state, count(*) AS n FROM jobs WHERE state IN `+queueHealthStatesSQL()+
+			` AND jobs.deleted_at IS NULL GROUP BY state`)
 
 	assert.Contains(t, plan, "jobs_state",
 		"with the sequential scan disabled, the counts read reaches the telemetry index")
@@ -146,4 +147,15 @@ func seedStateMixPG(t *testing.T, db *gorm.DB, n int) {
 	// default row estimate and the forced-plan assertion would prove nothing
 	// about the real table.
 	require.NoError(t, db.Exec(`ANALYZE jobs`).Error)
+}
+
+// queueHealthStatesSQL renders the states SampleQueueHealth counts as a
+// parenthesized list of SQL literals, for a statement explained as written.
+func queueHealthStatesSQL() string {
+	states := queueHealthStates()
+	quoted := make([]string, len(states))
+	for i, s := range states {
+		quoted[i] = "'" + s + "'"
+	}
+	return "(" + strings.Join(quoted, ", ") + ")"
 }

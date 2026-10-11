@@ -20,7 +20,7 @@ timing lands in one recorder), then serve `observers.MetricsHandler(rec, sample)
 | `flywheel_queue_ready` | gauge | How many jobs are claimable right now? |
 | `flywheel_queue_inflight` | gauge | How many jobs are running? |
 | `flywheel_queue_oldest_ready_seconds` | gauge | How long has the oldest ready job waited? (lag) |
-| `flywheel_queue_jobs{state}` | gauge | How many jobs sit in each state? |
+| `flywheel_queue_jobs{state}` | gauge | How many jobs sit in each state? Every state but `succeeded`, which is history rather than queue (`Overview` counts it). |
 | `flywheel_jobs_claimed_total` | counter | Total jobs claimed. |
 | `flywheel_jobs_finished_total{outcome}` | counter | State-advancing finalizations by outcome. |
 | `flywheel_jobs_retried_total` | counter | Scheduled retries. |
@@ -227,6 +227,30 @@ terminal job and its `job_runs` is safe. But if *your* schema declares a foreign
 your constraint. Either exclude those rows from retention by keeping the window longer than your
 correlation records live, or make your FK `ON DELETE SET NULL`. On SQLite specifically, a host FK is
 enforced only when `foreign_keys` is on — which the pragma check warns about (see below).
+
+<br>
+
+## A truncated output
+
+A run whose `output` reads `{"$truncated": true, "$bytes": …, "$head": "…"}` is an attempt whose worker
+returned a `Result.Output` larger than the driver's `DriverOpts.MaxOutputBytes` (64 KiB of JSON by
+default). The attempt finalized as it would have; only its record was cut. `$bytes` is the output's
+marshaled size, and `$head` its first 1,024 bytes, a preview that usually ends mid-value.
+`JobRunView.OutputTruncated` (`output_truncated`) is true for such a run, and `ChildOutputs` hands the
+marker to a barrier continuation as that child's output.
+
+- **A reader needs the result whole** (a continuation folds it, a dashboard shows it): raise
+  `MaxOutputBytes` on the driver every runner and the scheduler share, or store the result in a table of
+  your own and return its id. A raised cap applies to attempts finalized after it; an earlier attempt
+  keeps its marker.
+- **A command worker's captures.** The bundled command workers capture up to 64 KiB of stdout and of
+  stderr, so an `ExecOutput` with both streams near that cap is over the default. Lower the worker's own
+  `MaxOutputBytes`, or raise the driver's.
+
+The error side has the same signals. `error_payload.truncated` (`JobRunView.ErrorTruncated`) means the
+message was longer than 4,096 bytes, and `error_payload.message_bytes` says how long. A worker panic's
+run keeps `error_payload.stack` (`JobRunView.ErrorStack`), the stack at the panic, while its
+`error_message` stays `jobs: worker panicked: <value>`.
 
 <br>
 

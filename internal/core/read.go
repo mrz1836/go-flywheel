@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -74,7 +75,8 @@ type JobRunView struct {
 	// ErrorClass classifies a failed attempt's error (transient, permanent,
 	// validation, timeout); empty when the attempt carried none.
 	ErrorClass string `json:"error_class,omitempty"`
-	// Error is the worker error recorded for a failed attempt, if any.
+	// Error is the worker error recorded for a failed attempt, if any, cut at
+	// 4,096 bytes; ErrorTruncated reports a cut.
 	Error *string `json:"error,omitempty"`
 	// CostMicros is the attempt's accumulated external-call cost, as the worker
 	// reported it in Result.CostMicros.
@@ -91,8 +93,19 @@ type JobRunView struct {
 	Superseded bool `json:"superseded"`
 	// Output is the worker's structured Result.Output as stored in job_runs.output
 	// (for the command workers, an ExecOutput with exit code and captured streams).
-	// It is empty when the attempt produced no output.
+	// It is empty when the attempt produced no output, and a TruncatedOutput when
+	// the output's JSON was larger than DriverOpts.MaxOutputBytes.
 	Output json.RawMessage `json:"output,omitempty"`
+	// OutputTruncated reports that Output holds a TruncatedOutput — exactly its
+	// three keys, $truncated true — rather than what the worker returned.
+	OutputTruncated bool `json:"output_truncated,omitempty"`
+	// ErrorTruncated reports that Error was cut at 4,096 bytes. The run's
+	// error_payload keeps the message's length before the cut (message_bytes).
+	ErrorTruncated bool `json:"error_truncated,omitempty"`
+	// ErrorStack is the stack of a worker panic the runner recovered, at most
+	// 16 KiB, where Error is the short panic message. It is empty for any other
+	// failure.
+	ErrorStack string `json:"error_stack,omitempty"`
 }
 
 // JobsOverview is the aggregate job-state report: a count per state plus the
@@ -173,9 +186,32 @@ func stateStrings(states []JobState) []string {
 	return out
 }
 
+// MaxReadLimit is the most rows any list read returns: ListJobs, ListFinished,
+// ListRunning, SlowRuns, RecentFailures, and ListRuns. A larger Limit is
+// clamped to it rather than refused, so a host that passes a request's limit
+// straight through gets a full page, never a whole table. A host that asks for
+// one row more than its page, to learn whether another page follows, keeps its
+// page below MaxReadLimit, or the extra row is clamped away.
+//
+// ChildOutputs is the one exception: at a zero Limit it reads every terminal
+// child, because a barrier continuation folds its whole generation, which
+// DriverOpts.BarrierMaxChildren bounds.
+const MaxReadLimit = 200
+
+// readLimit resolves a list read's page size: def when limit is not positive,
+// and never more than MaxReadLimit.
+func readLimit(limit, def int) int {
+	if limit <= 0 {
+		return def
+	}
+	return min(limit, MaxReadLimit)
+}
+
 // ListRunsParams configures a ListRuns (or ChildOutputs) page. Limit caps the
 // rows returned; a host that wants a has-more sentinel passes Limit+1 and trims
-// the extra row itself. The zero value is the newest page, uncapped.
+// the extra row itself. The zero value is the newest page of at most
+// MaxReadLimit runs for ListRuns; ChildOutputs reads every terminal child at a
+// zero Limit.
 type ListRunsParams struct {
 	// Before is a created_at cursor: only rows created strictly before it are
 	// returned. Zero means newest.
@@ -185,7 +221,10 @@ type ListRunsParams struct {
 	// last run. It is exact on every dialect and is the cursor to prefer;
 	// ChildOutputs, which pages jobs rather than attempts, ignores it.
 	BeforeAttempt int
-	Limit         int
+	// Limit caps the page. ListRuns reads MaxReadLimit runs when it is not
+	// positive and clamps a larger value to MaxReadLimit; ChildOutputs applies a
+	// positive Limit as given.
+	Limit int
 }
 
 // OverviewParams configures an Overview query. Kind, when non-empty, scopes the
@@ -205,7 +244,7 @@ type ListJobsParams struct {
 	// before it are returned. Pass the last id of the previous page to fetch the
 	// next one.
 	BeforeID string
-	// Limit caps the page (default 50 when not positive).
+	// Limit caps the page (default 50 when not positive, at most MaxReadLimit).
 	Limit int
 }
 
@@ -214,7 +253,8 @@ const defaultListJobsLimit = 50
 
 // ListJobs returns jobs newest-first by id, reading through db and optionally
 // filtered by exact state, kind, and queue. Soft-deleted jobs are excluded. It is
-// the inspection seam behind a "list jobs" CLI or dashboard.
+// the inspection seam behind a "list jobs" CLI or dashboard. It returns at most
+// MaxReadLimit jobs, whatever p.Limit asks for.
 //
 // # Ordered by id, not created_at
 //
@@ -241,10 +281,7 @@ func ListJobs(ctx context.Context, db *gorm.DB, p ListJobsParams) ([]JobView, er
 	if p.BeforeID != "" {
 		query = query.Where("id < ?", p.BeforeID)
 	}
-	limit := p.Limit
-	if limit <= 0 {
-		limit = defaultListJobsLimit
-	}
+	limit := readLimit(p.Limit, defaultListJobsLimit)
 	var rows []jobRow
 	if err := query.Select(jobViewColumns()).Order("id desc").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("flywheel: list jobs: %w", err)
@@ -295,7 +332,9 @@ func jobViewColumns() []string {
 // ListRuns returns a job's runs newest-first by attempt (attempt desc, id desc),
 // reading through db; the job_runs_job_attempt unique index serves the order. A
 // positive p.BeforeAttempt returns only earlier attempts, a non-zero p.Before only
-// runs created strictly before it, and a positive p.Limit caps the page.
+// runs created strictly before it, and p.Limit caps the page: a zero or negative
+// Limit reads the newest MaxReadLimit runs, and a larger one is clamped to it.
+// Page past them with BeforeAttempt.
 //
 // # Zone-proof on SQLite
 //
@@ -320,11 +359,8 @@ func ListRuns(ctx context.Context, db *gorm.DB, jobID string, p ListRunsParams) 
 			query = query.Where("created_at < ?", before)
 		}
 	}
-	if p.Limit > 0 {
-		query = query.Limit(p.Limit)
-	}
 	var rows []jobRunRow
-	if err := query.Order("attempt desc, id desc").Find(&rows).Error; err != nil {
+	if err := query.Order("attempt desc, id desc").Limit(readLimit(p.Limit, MaxReadLimit)).Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("flywheel: list runs: %w", err)
 	}
 	views := make([]JobRunView, len(rows))
@@ -353,6 +389,13 @@ func LatestRun(ctx context.Context, db *gorm.DB, jobID string) (JobRunView, bool
 
 // Overview returns the job count grouped by state, optionally scoped to a single
 // kind, reading through db. Soft-deleted jobs are excluded.
+//
+// It is a full count by contract: it reads every job in scope, succeeded history
+// included, so its cost grows with the table — without bound while retention is
+// off — and its kind filter has no index. It suits an inspection a person runs.
+// For a number polled on a timer, use the bounded reads: QueueDepths (each
+// queue's live depth), CountActiveByKind (in-flight jobs per kind, on
+// jobs_state), or Stats (outcomes over a window, from the hourly rollups).
 func Overview(ctx context.Context, db *gorm.DB, p OverviewParams) (JobsOverview, error) {
 	query := db.WithContext(ctx).Model(&jobRow{})
 	if p.Kind != "" {
@@ -378,6 +421,15 @@ func Overview(ctx context.Context, db *gorm.DB, p OverviewParams) (JobsOverview,
 // its raw args payload, reading through db. Soft-deleted jobs are excluded. A
 // host uses it to answer "is there already an in-flight job of this kind for
 // some subject?" by inspecting the returned args.
+//
+// It has no limit, by contract: it loads every in-flight job of the kind with
+// its args, so its cost grows with the kind's backlog. A page would make it
+// cheaper and wrong, since a job past the page is one the caller never sees, and
+// a truncated "is there already a job?" answer is worse than a slow one.
+//
+// Deprecated: ListActiveByKind is unbounded by contract and returns args; use
+// InsertOpts.UniqueActiveKey, which answers the same question with one index
+// probe.
 func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsView, error) {
 	var rows []jobRow
 	err := db.WithContext(ctx).
@@ -399,6 +451,12 @@ func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsV
 
 // CountRuns returns the total number of recorded job attempts (job_runs rows),
 // reading through db. It is the inspection seam for run-throughput telemetry.
+//
+// It is a full count by contract: it reads every job_runs row, so its cost grows
+// with the run history — without bound while retention is off. For throughput
+// polled on a timer, read Stats, which counts a window's attempts from the
+// hourly rollups; QueueDepths and CountActiveByKind are the bounded reads of
+// the live queue.
 func CountRuns(ctx context.Context, db *gorm.DB) (int64, error) {
 	var n int64
 	if err := db.WithContext(ctx).Model(&jobRunRow{}).Count(&n).Error; err != nil {
@@ -481,6 +539,42 @@ func jobRunViewFromRow(r jobRunRow) JobRunView {
 	}
 	if len(r.Output) > 0 {
 		v.Output = json.RawMessage(r.Output)
+		v.OutputTruncated = isTruncatedOutput(r.Output)
+	}
+	if len(r.ErrorPayload) > 0 {
+		// Best-effort, like a JobView's tags: a payload that does not decode is a
+		// hand-written row, and it reads as unflagged rather than failing the page.
+		var payload struct {
+			Truncated bool   `json:"truncated"`
+			Stack     string `json:"stack"`
+		}
+		if err := json.Unmarshal(r.ErrorPayload, &payload); err == nil {
+			v.ErrorTruncated = payload.Truncated
+			v.ErrorStack = payload.Stack
+		}
 	}
 	return v
+}
+
+// isTruncatedOutput reports whether a stored output is a TruncatedOutput: an
+// object of exactly $truncated (true), $bytes (a number), and $head (a string).
+// An output of the worker's own that shares a key is not one. The byte probe
+// keeps a page of ordinary outputs from being decoded twice.
+func isTruncatedOutput(raw []byte) bool {
+	if !bytes.Contains(raw, []byte(`"$truncated"`)) {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || len(fields) != 3 {
+		return false
+	}
+	var marker struct {
+		Truncated *bool   `json:"$truncated"`
+		Bytes     *int    `json:"$bytes"`
+		Head      *string `json:"$head"`
+	}
+	if err := json.Unmarshal(raw, &marker); err != nil {
+		return false
+	}
+	return marker.Truncated != nil && *marker.Truncated && marker.Bytes != nil && marker.Head != nil
 }
