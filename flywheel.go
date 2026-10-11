@@ -405,6 +405,10 @@ func PauseByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts Sc
 	return core.PauseByParent(ctx, db, parentJobID, opts)
 }
 
+func PausePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
+	return core.PausePeriodic(ctx, db, slug)
+}
+
 func Progress(ctx context.Context, db *gorm.DB, parentJobID string) (BatchProgress, error) {
 	return core.Progress(ctx, db, parentJobID)
 }
@@ -439,6 +443,10 @@ func ReplayByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts R
 
 func ResumeByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
 	return core.ResumeByParent(ctx, db, parentJobID, opts)
+}
+
+func ResumePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
+	return core.ResumePeriodic(ctx, db, slug)
 }
 
 func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
