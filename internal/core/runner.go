@@ -75,7 +75,8 @@ var nonTerminalStates = []string{ //nolint:gochecknoglobals // intentional share
 
 // RunnerConfig configures a Runner.
 type RunnerConfig struct {
-	// DB is the database the Runner reads queue state from (RunUntilIdle).
+	// DB is the database the Runner reads queue state from (RunUntilIdle), and,
+	// with CooperativeCancel, the state of a job whose claim an attempt lost.
 	DB *gorm.DB
 	// Driver claims and finalizes jobs.
 	Driver Driver
@@ -145,6 +146,29 @@ type RunnerConfig struct {
 	OnLeaseRenewed func(ctx context.Context, renewal LeaseRenewal) error
 	// CooperativeCancel, when set, cancels an attempt's context with cause
 	// ErrJobCancelled within one heartbeat of an operator cancelling its job.
+	//
+	// The cancel is noticed by the first renewal after it commits: a renewal that
+	// finds the attempt's claim gone reads the job's state through DB, one
+	// primary-key read, and only a cancelled job has its attempt's context
+	// cancelled. A claim lost any other way cancels nothing: the lease sweep's
+	// reclaim or crash discard, a claim under another token, a retry with
+	// RetryOpts.AllowRunning, a deleted job. A read that fails is retried at each
+	// following heartbeat until one answers; renewal never resumes after a lost
+	// claim. Point DB at the primary, since a lagging replica can read the job as
+	// still running and miss the cancel.
+	//
+	// It needs the heartbeat. NewRunner refuses it with a negative
+	// HeartbeatInterval, and a Driver that issues no lease token runs no heartbeat,
+	// so under one nothing is cancelled.
+	//
+	// A worker that reads context.Cause(ctx) and sees ErrJobCancelled should stop
+	// and return. When it returns an error, the attempt is recorded as cancelled:
+	// outcome cancelled, superseded, its error wrapped in ErrJobCancelled, no error
+	// class. When it returns success, the attempt keeps its success, superseded. A
+	// worker that ignores its context runs on as it does without the setting, and
+	// its result is discarded. Off by default: then a cancel fences a running
+	// attempt's result and leaves its worker running until it returns, which suits
+	// a worker that cannot stop safely mid-step.
 	CooperativeCancel bool
 	// PollInterval is the pause between empty polls.
 	PollInterval time.Duration
@@ -291,6 +315,9 @@ func NewRunner(cfg RunnerConfig) (*Runner, error) {
 	}
 	if cfg.Limiter != nil && cfg.Resource == "" {
 		return nil, errRunnerNeedsResource
+	}
+	if cfg.CooperativeCancel && cfg.HeartbeatInterval < 0 {
+		return nil, errRunnerCooperativeCancelNeedsHeartbeat
 	}
 	if _, isSQLite := cfg.Driver.(*sqliteDriver); isSQLite && cfg.Concurrency > 1 {
 		return nil, ErrSQLiteConcurrency
@@ -1316,15 +1343,25 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 
 	r.cfg.Observer.OnStart(ctx, jobEv)
 
+	// With CooperativeCancel the attempt's context carries a cancel of its own,
+	// which the heartbeat fires with the cause ErrJobCancelled when it finds the
+	// job cancelled. The execution timeout derives from it, so context.Cause
+	// reports the cancel through both.
+	workCtx := ctx
+	var cancelWork context.CancelCauseFunc
+	if r.cfg.CooperativeCancel {
+		workCtx, cancelWork = context.WithCancelCause(ctx)
+		defer cancelWork(nil)
+	}
+
 	// Renewal runs for the whole attempt, finalize included. The deferred stop is
 	// what stops renewal on every exit path — normal return, recovered panic,
 	// and execution timeout alike.
-	defer r.startHeartbeat(ctx, raw, runID)()
+	defer r.startHeartbeat(ctx, raw, runID, cancelWork)()
 
-	workCtx := ctx
 	if d := r.resolveTimeout(entry, raw); d > 0 {
 		var cancel context.CancelFunc
-		workCtx, cancel = context.WithTimeout(ctx, d)
+		workCtx, cancel = context.WithTimeout(workCtx, d)
 		defer cancel()
 	}
 
@@ -1332,7 +1369,16 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 	finishedAt := models.ClockFrom(ctx).Now(ctx)
 
 	var finalErr error
-	if workErr != nil {
+	switch {
+	case workErr != nil && errors.Is(context.Cause(workCtx), ErrJobCancelled):
+		// The job was cancelled under the attempt and its worker stopped for it.
+		// Record the cancel it was rather than a failure: the error stays
+		// unclassified, so the run reads outcome cancelled with no error class,
+		// as its job does. The cancel already took the claim, so the finalize is
+		// superseded and applies nothing to the job.
+		result.Cancel = true
+		finalErr = fmt.Errorf("%w: %w", ErrJobCancelled, workErr)
+	case workErr != nil:
 		finalErr = r.classify(entry, workErr, raw)
 	}
 	// Finalize first, then report what was actually persisted. Emitting the

@@ -379,7 +379,7 @@ type RetryOpts struct {
 	// deliberate.
 	//
 	// Force never retries a running job, nor a cancelled one whose attempt is still
-	// running: a cancel fences a running attempt without stopping it, so the
+	// running: a cancel fences a running attempt without awaiting it, so the
 	// attempt's run stays started until its worker returns, and re-queueing the job
 	// would start a second attempt beside the first. Both are refused with
 	// ErrJobRunning unless AllowRunning is set too.
@@ -522,7 +522,7 @@ func retryStateStrings(opts RetryOpts) []string {
 // cancelledAttemptStillRuns is a correlated SQL predicate over the jobs row the
 // query names outer: true when the job is cancelled while the attempt it was
 // cancelled under is still running. A cancel fences a running attempt without
-// stopping it, and the attempt's run is recorded only when its worker returns, so
+// awaiting it, and the attempt's run is recorded only when its worker returns, so
 // until then the run at the job's attempt still reads started. It is one probe of
 // job_runs_job_attempt. The retry under Force and the replay share it, so neither
 // can start a second attempt beside one still running. The states are the
@@ -610,9 +610,14 @@ func classifyRetryMiss(ctx context.Context, db *gorm.DB, id string, opts RetryOp
 	return ErrJobTerminal
 }
 
-// CancelJob moves a still-in-flight job to the terminal cancelled state. An
-// attempt already running is not interrupted, but the job will not be retried or
-// re-claimed.
+// CancelJob moves a still-in-flight job to the terminal cancelled state. The job
+// will not be retried or re-claimed, and an attempt already running is fenced:
+// its result is discarded when it returns. That attempt is not interrupted
+// unless its Runner sets RunnerConfig.CooperativeCancel, in which case its
+// context is cancelled with the cause ErrJobCancelled within one heartbeat, for
+// its worker to stop on. Until the attempt returns, the job reads cancelled
+// (FindJob) while its run at the job's attempt still reads outcome started
+// (LatestRun, ListRuns): that is a cancel still waiting on a running attempt.
 //
 // When the job is a child whose parent declared a Barrier and it was the last of
 // its generation still pending, the cancel enqueues the barrier's continuation, in
@@ -620,7 +625,7 @@ func classifyRetryMiss(ctx context.Context, db *gorm.DB, id string, opts RetryOp
 // child's cancel fires it at once: the child is terminal, and its attempt's late
 // finalize is superseded and fires nothing. The continuation can therefore start
 // while the cancelled attempt's worker is still running, since a cancel fences an
-// attempt's result rather than stopping its worker.
+// attempt's result and does not wait for its worker to stop.
 //
 // A job that has already reached a terminal state (succeeded, cancelled, or
 // discarded) is left exactly as it is and ErrJobTerminal is returned: cancelling
@@ -644,8 +649,9 @@ func CancelJob(ctx context.Context, db *gorm.DB, id string) error {
 			Updates(map[string]any{
 				"state":        string(StateCancelled),
 				"leased_until": nil,
-				// The running attempt is not interrupted, but its claim is: clearing
-				// the token is what keeps its finalize from overwriting the cancel.
+				// The running attempt is not interrupted here, but its claim is:
+				// clearing the token is what keeps its finalize from overwriting the
+				// cancel, and what a cooperative Runner's heartbeat notices.
 				"lease_token":  nil,
 				"finalized_at": now,
 				"updated_at":   now,

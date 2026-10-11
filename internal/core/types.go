@@ -264,7 +264,7 @@ type Result struct {
 // state — succeeded, cancelled, or discarded — because a partly-failed generation
 // still needs its finalizer. A cancelled running child counts as terminal at the
 // cancel, so the continuation can start while that child's worker is still
-// running: a cancel fences an attempt's result, it does not stop the worker. The
+// running: a cancel fences an attempt's result, it does not await the worker. The
 // continuation reads its children's recorded outputs through ChildOutputs.
 //
 // A barrier-bearing generation is bounded by DriverOpts.BarrierMaxChildren

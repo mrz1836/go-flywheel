@@ -305,6 +305,13 @@ var (
 	// Resource. The gate runs before the claim, so the resource must be knowable
 	// without inspecting a job — it is a property of the Runner, not the work.
 	errRunnerNeedsResource = errors.New("jobs: runner config requires Resource when Limiter is set")
+	// errRunnerCooperativeCancelNeedsHeartbeat is returned when CooperativeCancel
+	// is set with renewal disabled. A cancel is noticed by the renewal after it,
+	// so with no renewal nothing would ever notice one, and the setting would
+	// silently do nothing.
+	errRunnerCooperativeCancelNeedsHeartbeat = errors.New(
+		"jobs: runner config: CooperativeCancel needs the lease heartbeat, and HeartbeatInterval is negative",
+	)
 )
 
 // errWorkerPanicked wraps a recovered worker panic.
@@ -361,7 +368,7 @@ var ErrJobTerminal = errors.New("flywheel: job has already reached a terminal st
 
 // ErrJobRunning is returned when a retry targets a job whose attempt is still
 // running: a running job, or, with RetryOpts.Force, a cancelled job whose
-// attempt has not returned (a cancel fences a running attempt without stopping
+// attempt has not returned (a cancel fences a running attempt without awaiting
 // it). Re-queueing it would let a runner start a second attempt while the first
 // still runs, so the job's work would run twice at once. The runtime refuses the
 // write and leaves the job and its lease as they were: wait for the attempt to

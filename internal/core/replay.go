@@ -19,7 +19,7 @@ import (
 //
 // A replay never touches a job whose attempt is still running, so it never runs a
 // job's work twice at once: a running job, and a cancelled one whose attempt has
-// not returned (a cancel fences a running attempt without stopping it). It
+// not returned (a cancel fences a running attempt without awaiting it). It
 // ignores RetryOpts.AllowRunning; a single RetryJobWithOptions is the way to
 // re-queue such a job deliberately.
 type ReplayOpts struct {
@@ -314,7 +314,7 @@ func namesCancelled(stateStrs []string) bool {
 
 // skipAttemptsStillRunning narrows a replay's query over jobs to the jobs whose
 // attempt is not still running, when the replay targets cancelled jobs: a cancel
-// fences a running attempt without stopping it, and replaying the job then would
+// fences a running attempt without awaiting it, and replaying the job then would
 // start a second attempt beside the first. A replay that targets no cancelled job
 // gets q back unchanged and pays nothing for the probe.
 func skipAttemptsStillRunning(q *gorm.DB, stateStrs []string) *gorm.DB {
