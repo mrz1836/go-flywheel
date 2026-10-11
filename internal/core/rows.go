@@ -127,8 +127,8 @@ type jobRunRow struct {
 func (jobRunRow) TableName() string { return "job_runs" }
 
 // jobPeriodicRow is the runtime's own mapping of the job_periodics table. It has
-// an explicit IsActive operator toggle in place of soft-delete, so it carries no
-// DeletedAt column — the deactivated row stays inspectable.
+// an explicit IsActive toggle and a PausedAt hold in place of soft-delete, so it
+// carries no DeletedAt column — a deactivated or paused row stays inspectable.
 type jobPeriodicRow struct {
 	ID              string         `gorm:"column:id;primaryKey"`
 	Slug            string         `gorm:"column:slug;not null"`
@@ -143,9 +143,16 @@ type jobPeriodicRow struct {
 	// GORM substitutes a tag's parsed default for a zero value on create, so a bool
 	// with default:true could never be written false. A nil IsActive still takes
 	// the default. The column — NOT NULL DEFAULT true — is unchanged.
-	IsActive  *bool     `gorm:"column:is_active;not null;default:true"`
-	CreatedAt time.Time `gorm:"column:created_at;not null"`
-	UpdatedAt time.Time `gorm:"column:updated_at;not null"`
+	IsActive *bool `gorm:"column:is_active;not null;default:true"`
+	// PausedAt is when an operator paused the definition with PausePeriodic, and
+	// nil while it is not paused. A definition fires only when it is active and
+	// not paused. Only PausePeriodic and ResumePeriodic write it: UpsertPeriodic,
+	// the Scheduler's start-up apply, and its reconcile never do, so a pause holds
+	// through every restart that re-declares the definition. Nullable, so a row an
+	// older binary inserts is valid and not paused.
+	PausedAt  *time.Time `gorm:"column:paused_at"`
+	CreatedAt time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt time.Time  `gorm:"column:updated_at;not null"`
 }
 
 // TableName binds jobPeriodicRow to the job_periodics table.
