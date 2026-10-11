@@ -44,19 +44,42 @@ type legacyJobRunRow struct {
 // TableName binds legacyJobRunRow to the job_runs table.
 func (legacyJobRunRow) TableName() string { return "job_runs" }
 
+// legacyJobPeriodicRow is job_periodics exactly as every release before the
+// pause declared it: no paused_at. Like legacyJobRunRow it stands in for both a
+// database an older release installed and that release's binary still writing
+// to it after the migration.
+type legacyJobPeriodicRow struct {
+	ID              string         `gorm:"column:id;primaryKey"`
+	Slug            string         `gorm:"column:slug;not null"`
+	Kind            string         `gorm:"column:kind;not null"`
+	ArgsTemplate    datatypes.JSON `gorm:"column:args_template;type:jsonb;not null;default:'{}'"`
+	Queue           string         `gorm:"column:queue;not null;default:'periodic'"`
+	CronExpr        *string        `gorm:"column:cron_expr"`
+	IntervalSeconds *int           `gorm:"column:interval_seconds"`
+	NextRunAt       time.Time      `gorm:"column:next_run_at;not null"`
+	LastEnqueuedAt  *time.Time     `gorm:"column:last_enqueued_at"`
+	IsActive        *bool          `gorm:"column:is_active;not null;default:true"`
+	CreatedAt       time.Time      `gorm:"column:created_at;not null"`
+	UpdatedAt       time.Time      `gorm:"column:updated_at;not null"`
+}
+
+// TableName binds legacyJobPeriodicRow to the job_periodics table.
+func (legacyJobPeriodicRow) TableName() string { return "job_periodics" }
+
 // legacyIndexNames are the indexes the analytics release added. A legacy
 // schema is the current IndexSet minus these — derived, never hand-written.
 //
 //nolint:gochecknoglobals // shared fixture
 var legacyIndexNames = []string{"jobs_finished"}
 
-// installLegacySchema builds, on a bare database, the schema the previous
-// release installed: its tables (no job_run_finishes or job_stats_hourly,
-// job_runs without the analytics columns) and its indexes.
+// installLegacySchema builds, on a bare database, the schema a release before
+// the stats tables installed: its tables (no job_run_finishes or
+// job_stats_hourly, job_runs without the analytics columns, job_periodics
+// without paused_at) and its indexes.
 func installLegacySchema(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	require.NoError(t, db.AutoMigrate(
-		&jobRow{}, &legacyJobRunRow{}, &jobPeriodicRow{}, &limiterBucketRow{}, &limiterHoldRow{},
+		&jobRow{}, &legacyJobRunRow{}, &legacyJobPeriodicRow{}, &limiterBucketRow{}, &limiterHoldRow{},
 	))
 	set, err := IndexSet(db.Name())
 	require.NoError(t, err)
@@ -66,6 +89,38 @@ func installLegacySchema(t *testing.T, db *gorm.DB) {
 		}
 		require.NoError(t, db.Exec(idx.DDL).Error, "legacy index %s", idx.Name)
 	}
+}
+
+// installPreviousReleaseSchema builds, on a bare database, the schema the
+// previous release installed: every table Models returns, with job_periodics
+// as legacyJobPeriodicRow declares it, and every index in IndexSet.
+func installPreviousReleaseSchema(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	tables := Models()
+	for i, model := range tables {
+		if _, periodics := model.(*jobPeriodicRow); periodics {
+			tables[i] = &legacyJobPeriodicRow{}
+		}
+	}
+	require.NoError(t, db.AutoMigrate(tables...))
+	set, err := IndexSet(db.Name())
+	require.NoError(t, err)
+	for _, idx := range set {
+		require.NoError(t, db.Exec(idx.DDL).Error, "previous-release index %s", idx.Name)
+	}
+}
+
+// writeLegacyPeriodic writes a schedule the way an older binary does: through
+// legacyJobPeriodicRow, which names no paused_at. It is an active every-minute
+// schedule due at nextRunAt.
+func writeLegacyPeriodic(t testing.TB, db *gorm.DB, slug, kind string, nextRunAt time.Time) {
+	t.Helper()
+	secs := 60
+	at := nextRunAt.Add(-time.Hour)
+	require.NoError(t, db.Create(&legacyJobPeriodicRow{
+		ID: models.NewID(), Slug: slug, Kind: kind, ArgsTemplate: datatypes.JSON("{}"), Queue: "periodic",
+		IntervalSeconds: &secs, NextRunAt: nextRunAt, IsActive: new(true), CreatedAt: at, UpdatedAt: at,
+	}).Error)
 }
 
 // writeLegacyHistory writes what an old binary leaves behind: a finished job
@@ -102,8 +157,9 @@ func schemaDriftNames(drift []SchemaDrift) []string {
 }
 
 // TestInspectSchemaReportsWhatAnOlderSchemaLacks proves the parity check names
-// exactly the columns and table the analytics release added, and nothing on a
-// current schema.
+// exactly the columns and tables added since a release before the stats
+// tables — the analytics release's and the pause's — and nothing on a current
+// schema.
 func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -114,8 +170,8 @@ func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{
 		"job_runs.kind", "job_runs.queue", "job_runs.queue_wait_ms", "job_runs.job_state",
-		"job_runs.superseded", "job_run_finishes (table)", "job_stats_hourly (table)",
-		"job_stats_progress (table)",
+		"job_runs.superseded", "job_periodics.paused_at", "job_run_finishes (table)",
+		"job_stats_hourly (table)", "job_stats_progress (table)",
 	}, schemaDriftNames(drift))
 
 	current, err := InspectSchema(ctx, newDB(t))
@@ -279,17 +335,23 @@ func driverForTest(t *testing.T, db *gorm.DB) Driver {
 
 // TestOldRowsAreAcceptedByTheNewSchemaDefaults pins the column defaults the
 // rolling-deploy guarantee rests on, read from the GORM tags the schema is
-// generated from: each analytics column is nullable or defaulted, so an INSERT
+// generated from: each added column is nullable or defaulted, so an INSERT
 // that names none of them is valid.
 func TestOldRowsAreAcceptedByTheNewSchemaDefaults(t *testing.T) {
 	t.Parallel()
-	stmt := &gorm.Statement{DB: newDB(t)}
-	require.NoError(t, stmt.Parse(&jobRunRow{}))
-	for _, col := range []string{"kind", "queue", "queue_wait_ms", "job_state", "superseded"} {
-		f := stmt.Schema.LookUpField(col)
-		require.NotNil(t, f, col)
-		assert.True(t, !f.NotNull || f.HasDefaultValue,
-			"%s must be nullable or defaulted, or an older binary's insert fails against the new schema", col)
+	db := newDB(t)
+	for model, columns := range map[any][]string{
+		&jobRunRow{}:      {"kind", "queue", "queue_wait_ms", "job_state", "superseded"},
+		&jobPeriodicRow{}: {"paused_at"},
+	} {
+		stmt := &gorm.Statement{DB: db}
+		require.NoError(t, stmt.Parse(model))
+		for _, col := range columns {
+			f := stmt.Schema.LookUpField(col)
+			require.NotNil(t, f, col)
+			assert.True(t, !f.NotNull || f.HasDefaultValue,
+				"%s must be nullable or defaulted, or an older binary's insert fails against the new schema", col)
+		}
 	}
 }
 
