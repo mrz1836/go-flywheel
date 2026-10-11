@@ -28,7 +28,9 @@ const (
 //
 // What an operator must see without turning debug on logs above that: a failed
 // attempt at warn, a job a failure discarded at error, a superseded attempt at
-// warn, and a sweep that reclaimed leases at info.
+// warn, and a sweep that reclaimed leases at info. A crashed attempt the sweep
+// reclaimed is a failed attempt too, logged by OnSweep at warn, or at error when
+// the crash discarded its job.
 type SlogObserver struct {
 	logger *slog.Logger
 	level  slog.Level
@@ -140,11 +142,24 @@ func (s *SlogObserver) OnSupersede(ctx context.Context, ev flywheel.SupersedeEve
 	)
 }
 
-// OnSweep logs a completed stuck-lease reclaim pass. It logs at the configured
-// level (debug) when the pass reclaimed nothing — routine maintenance — and at
-// info when it reclaimed leases, because a nonzero reclaim means an executor died
-// mid-attempt and an operator scanning info-level logs should see that.
+// OnSweep logs a completed stuck-lease reclaim pass.
+//
+// Each reclaimed job (ev.Jobs) is a crashed attempt: its process died before a
+// worker could return, so no OnFinish reports it. OnSweep logs it as OnFinish
+// logs any failed attempt — "flywheel: job failed and was discarded" at error
+// when the crash spent the job's last attempt, or "flywheel: job attempt failed"
+// at warn when the job runs again — with outcome crashed, the job's fields, and
+// the state the sweep left it in. A crash carries no error text, error class, or
+// duration.
+//
+// Then it logs the pass itself: at the configured level (debug) when the pass
+// reclaimed nothing — routine maintenance — and at info when it reclaimed leases,
+// because a nonzero reclaim means an executor died mid-attempt and an operator
+// scanning info-level logs should see that.
 func (s *SlogObserver) OnSweep(ctx context.Context, ev flywheel.SweepEvent) {
+	for i := range ev.Jobs {
+		s.logSweptJob(ctx, ev.Jobs[i])
+	}
 	level := s.level
 	if ev.Reclaimed > 0 {
 		level = slog.LevelInfo
@@ -153,6 +168,26 @@ func (s *SlogObserver) OnSweep(ctx context.Context, ev flywheel.SweepEvent) {
 		ctx, level, "flywheel: lease sweep completed",
 		slog.Int("reclaimed", ev.Reclaimed),
 		slog.Duration("duration", ev.Duration),
+	)
+}
+
+// logSweptJob logs one crashed attempt the sweep reclaimed, at the level and with
+// the message a failed attempt's finish line uses.
+func (s *SlogObserver) logSweptJob(ctx context.Context, job flywheel.SweptJob) {
+	level, msg := slog.LevelWarn, msgJobAttemptFailed
+	if job.State == flywheel.StateDiscarded {
+		level, msg = slog.LevelError, msgJobDiscarded
+	}
+	s.logger.LogAttrs(
+		ctx, level, msg,
+		slog.String("job_id", job.JobID),
+		slog.String("run_id", job.RunID),
+		slog.String("kind", job.Kind),
+		slog.String("queue", job.Queue),
+		slog.String("outcome", string(flywheel.OutcomeCrashed)),
+		slog.Int("attempt", job.Attempt),
+		slog.Int("max_attempts", job.MaxAttempts),
+		slog.String("job_state", string(job.State)),
 	)
 }
 
