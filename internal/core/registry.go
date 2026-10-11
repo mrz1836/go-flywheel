@@ -115,3 +115,16 @@ func (reg *Registry) lookup(kind string) (registryEntry, bool) {
 	e, ok := reg.entries[kind]
 	return e, ok
 }
+
+// kindRegistryKey carries a Runner's Registry on the context it finalizes on.
+type kindRegistryKey struct{}
+
+// withKindRegistry returns ctx carrying reg, so the finalize it reaches applies
+// reg's worker defaults to the follow-ups and barrier continuations it inserts.
+// A nil reg returns ctx unchanged.
+func withKindRegistry(ctx context.Context, reg *Registry) context.Context {
+	if reg == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, kindRegistryKey{}, reg)
+}

@@ -48,6 +48,7 @@ type (
 	ClaimEvent            = core.ClaimEvent
 	Classifier            = core.Classifier
 	Client                = core.Client
+	ClientOpts            = core.ClientOpts
 	DBLimiter             = core.DBLimiter
 	DBLimiterConfig       = core.DBLimiterConfig
 	Defaults              = core.Defaults
@@ -339,6 +340,10 @@ func Models() []any {
 
 func NewClient(writeDB *gorm.DB) *Client {
 	return core.NewClient(writeDB)
+}
+
+func NewClientWithOptions(writeDB *gorm.DB, opts ClientOpts) *Client {
+	return core.NewClientWithOptions(writeDB, opts)
 }
 
 func NewDBLimiter(db *gorm.DB, cfg DBLimiterConfig) (*DBLimiter, error) {

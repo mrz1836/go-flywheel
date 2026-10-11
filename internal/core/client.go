@@ -25,12 +25,30 @@ const (
 // Client is the producer-side handle for enqueuing jobs. It is built lazily by
 // the service container from the write database connection.
 type Client struct {
-	writeDB *gorm.DB
+	writeDB  *gorm.DB
+	registry *Registry
 }
 
-// NewClient returns a Client that enqueues onto writeDB.
+// ClientOpts configures a Client. The zero value applies no worker defaults, so
+// NewClientWithOptions(db, ClientOpts{}) is NewClient(db).
+type ClientOpts struct {
+	// Registry applies each registered kind's Defaults on every insert; nil
+	// applies none. A kind the registry does not register takes the runtime's
+	// defaults. See Defaults for which fields it fills.
+	Registry *Registry
+}
+
+// NewClient returns a Client that enqueues onto writeDB and applies no worker
+// defaults. It is NewClientWithOptions with the zero ClientOpts.
 func NewClient(writeDB *gorm.DB) *Client {
-	return &Client{writeDB: writeDB}
+	return NewClientWithOptions(writeDB, ClientOpts{})
+}
+
+// NewClientWithOptions returns a Client that enqueues onto writeDB, configured
+// by opts. With opts.Registry set, every insert through the Client fills the
+// fields it leaves zero from its kind's Defaults (see Defaults).
+func NewClientWithOptions(writeDB *gorm.DB, opts ClientOpts) *Client {
+	return &Client{writeDB: writeDB, registry: opts.Registry}
 }
 
 // WriteDB returns the client's write connection. The Scheduler reuses it.
