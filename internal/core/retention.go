@@ -63,6 +63,9 @@ func (o RetentionOpts) batchSize() int {
 // It is the retention primitive behind `flywheel prune` and the Scheduler's
 // optional retention sweep: a forever-running daemon needs a way to keep jobs
 // and job_runs from growing unbounded.
+//
+// Deleting a job frees its InsertOpts.UniqueKey: the key collides only with a
+// job whose row exists, so an insert with it afterwards runs the work again.
 func DeleteFinishedJobs(ctx context.Context, db *gorm.DB, olderThan time.Time) (int64, error) {
 	return DeleteFinishedJobsWithOptions(ctx, db, olderThan, RetentionOpts{})
 }

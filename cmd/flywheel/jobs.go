@@ -206,12 +206,21 @@ func newJobsInspectCmd(configPath *string) *cobra.Command {
 	return cmd
 }
 
-// newJobsRetryCmd forces a job back to available.
+// newJobsRetryCmd returns a waiting job to available through RetryJob, which
+// refuses a running job and a terminal one.
 func newJobsRetryCmd(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "retry <job-id>",
-		Short: "Force a job back to available so it is re-claimed",
-		Args:  cobra.ExactArgs(1),
+		Short: "Make a waiting, retrying, or paused job available to run now",
+		Long: `Return a job to available so a runner claims it on its next poll.
+
+Only a job that is still waiting is retried: available, scheduled, retryable,
+or paused. A running job is refused with "flywheel: job is running", so its work
+never runs twice at once; wait for the attempt to finish. A terminal job
+(succeeded, cancelled, or discarded) is refused with "flywheel: job has already
+reached a terminal state"; re-running finished work takes RetryJobWithOptions
+with Force, which this command does not offer.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return mutateJob(cmd, *configPath, args[0], flywheel.RetryJob, "retried")
 		},

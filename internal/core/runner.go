@@ -1530,17 +1530,27 @@ func (r *Runner) runWork(
 // classify wraps a worker error with the Runner's verdict — the error class
 // (worker Classifier or transient) and the retry delay (worker Retryable or
 // the exponential backoff) — for the Driver to apply.
+//
+// Args that failed to decode are a validation error whatever the worker's
+// Classifier would say: the worker never ran, so it has nothing to decide, and a
+// Classifier that reads every unknown error as transient would otherwise retry
+// bytes that can never decode until the attempt budget is spent.
 func (r *Runner) classify(entry registryEntry, workErr error, raw RawJob) error {
 	class := ErrorTransient
-	if entry.classifier != nil {
-		if c := entry.classifier.Classify(workErr); c != "" {
-			class = c
+	if errors.Is(workErr, ErrDecodeArgs) {
+		class = ErrorValidation
+	} else {
+		if entry.classifier != nil {
+			if c := entry.classifier.Classify(workErr); c != "" {
+				class = c
+			}
 		}
-	}
-	// An execution-timeout deadline always classifies as timeout, overriding any
-	// worker classifier, so a hung attempt is distinguishable in the audit trail.
-	if errors.Is(workErr, context.DeadlineExceeded) {
-		class = ErrorTimeout
+		// An execution-timeout deadline always classifies as timeout, overriding
+		// any worker classifier, so a hung attempt is distinguishable in the audit
+		// trail.
+		if errors.Is(workErr, context.DeadlineExceeded) {
+			class = ErrorTimeout
+		}
 	}
 	var delay time.Duration
 	if entry.retryable != nil {

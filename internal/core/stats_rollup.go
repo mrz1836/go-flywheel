@@ -261,17 +261,19 @@ func aggregateRuns(ctx context.Context, db *gorm.DB, from, to time.Time, f stats
 // only.
 //
 // A run the lease sweep reclaimed is counted as the crash it was when it
-// finished — job state available, which only the sweep writes — whatever its
-// row says now. The attempt may still finish after the reclaim, and its late,
+// finished, whatever its row says now: outcome crashed, or a superseded row that
+// carries a job state — a superseded finalize writes none, so only the sweep can
+// have recorded it. The attempt may still finish after the reclaim, and its late,
 // superseded finalize then records its real outcome, duration, and cost on the
 // row; but it keeps the row's finished_at, job state, and queue wait. Counting
-// by those keeps the run where the sweep put it — one crashed attempt, one
-// retry, its wait, and nothing else — so an hour rolled up before the late
-// finalize equals the same hour aggregated after it.
+// by those keeps the run where the sweep put it — one crashed attempt, its wait,
+// and either a retry (job state available) or a discard (discarded, when the
+// crash spent the job's last attempt), and nothing else — so an hour rolled up
+// before the late finalize equals the same hour aggregated after it.
 func (a *runAgg) observe(
 	id string, outcome RunOutcome, superseded bool, jobState *string, duration, wait, cost *int64,
 ) {
-	if jobState != nil && *jobState == string(StateAvailable) {
+	if outcome == OutcomeCrashed || (superseded && jobState != nil) {
 		outcome, superseded, duration, cost = OutcomeCrashed, false, nil, nil
 	}
 	if superseded {

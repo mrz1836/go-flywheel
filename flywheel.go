@@ -129,6 +129,7 @@ type (
 	StorageParameterDrift = core.StorageParameterDrift
 	SupersedeEvent        = core.SupersedeEvent
 	SweepEvent            = core.SweepEvent
+	SweptJob              = core.SweptJob
 	Timeouter             = core.Timeouter
 	TokenBucket           = core.TokenBucket
 	TokenBucketConfig     = core.TokenBucketConfig
@@ -171,9 +172,11 @@ var (
 	ErrAlreadyEnqueued    = core.ErrAlreadyEnqueued
 	ErrBarrierNoChildren  = core.ErrBarrierNoChildren
 	ErrBarrierTooWide     = core.ErrBarrierTooWide
+	ErrDecodeArgs         = core.ErrDecodeArgs
 	ErrFollowUpLimit      = core.ErrFollowUpLimit
 	ErrIndexDrift         = core.ErrIndexDrift
 	ErrJobNotFound        = core.ErrJobNotFound
+	ErrJobRunning         = core.ErrJobRunning
 	ErrJobTerminal        = core.ErrJobTerminal
 	ErrMissingKind        = core.ErrMissingKind
 	ErrPeriodicNotFound   = core.ErrPeriodicNotFound

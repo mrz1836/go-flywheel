@@ -135,36 +135,63 @@ func (d *sqliteDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
 	return d.sweep(ctx, now, d.reclaimExpired)
 }
 
-// reclaimExpired takes one batch of expired leases and returns them to
-// available, reporting the ids it reclaimed.
+// reclaimExpired takes one batch of expired leases, discards each job whose
+// crashed attempt was its last, returns the rest to available, and reports the
+// jobs it reclaimed in reclaim order.
 //
-// It is a SELECT of the oldest expired leases followed by an UPDATE of their
-// ids, both inside the caller's transaction — structurally the same shape as
-// this dialect's Dequeue, for the same reason: without a RETURNING-capable
-// UPDATE the ids have to be read before they are written.
+// It is a SELECT of the oldest expired leases followed by an UPDATE per state
+// the reclaim applies, all inside the caller's transaction — structurally the
+// same shape as this dialect's Dequeue, for the same reason: without a
+// RETURNING-capable UPDATE the rows have to be read before they are written.
+// The SELECT reads each job's attempt against its budget (attempt >=
+// max_attempts, the rule a failed attempt's finalize applies), which splits the
+// batch into the jobs to discard (reclaimDiscardUpdate) and the jobs to return
+// (reclaimUpdate).
 //
 // It runs through Model(&jobRow{}), so GORM's soft-delete scope applies and a
 // soft-deleted running job is left alone. The PostgreSQL path spells that same
 // condition out by hand, because a raw statement inherits no scope.
 func (d *sqliteDriver) reclaimExpired(
 	ctx context.Context, tx *gorm.DB, now time.Time, limit int,
-) ([]string, error) {
-	var ids []string
+) ([]reclaimedJob, error) {
+	var rows []reclaimRow
 	if err := tx.WithContext(ctx).Model(&jobRow{}).
+		Select("id", "kind", "queue", "attempt", "max_attempts", "parent_job_id", "leased_until").
 		Where("state = ? AND leased_until < ?", string(StateRunning), now).
 		Order("leased_until").
 		Limit(limit).
-		Pluck("id", &ids).Error; err != nil {
+		Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("jobs: find expired leases: %w", err)
 	}
-	if len(ids) == 0 {
+	if len(rows) == 0 {
 		return nil, nil
 	}
-	if err := tx.WithContext(ctx).Model(&jobRow{}).
-		Where("id IN ?", ids).Updates(reclaimUpdate(now)).Error; err != nil {
-		return nil, fmt.Errorf("jobs: reclaim jobs: %w", err)
+	var discard, available []string
+	for i := range rows {
+		if spentAttempts(rows[i].Attempt, rows[i].MaxAttempts) {
+			rows[i].State = string(StateDiscarded)
+			discard = append(discard, rows[i].ID)
+			continue
+		}
+		rows[i].State = string(StateAvailable)
+		available = append(available, rows[i].ID)
 	}
-	return ids, nil
+	for _, group := range []struct {
+		ids []string
+		upd map[string]any
+	}{
+		{discard, reclaimDiscardUpdate(now)},
+		{available, reclaimUpdate(now)},
+	} {
+		if len(group.ids) == 0 {
+			continue
+		}
+		if err := tx.WithContext(ctx).Model(&jobRow{}).
+			Where("id IN ?", group.ids).Updates(group.upd).Error; err != nil {
+			return nil, fmt.Errorf("jobs: reclaim jobs: %w", err)
+		}
+	}
+	return inReclaimOrder(rows), nil
 }
 
 // Dequeue claims up to limit ready jobs. SQLite has no SKIP LOCKED, so the

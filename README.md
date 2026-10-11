@@ -260,24 +260,26 @@ Each section below is self-contained; open the ones you need.
 <summary><strong><code>Schema setup — pick exactly one install path</code></strong></summary>
 <br>
 
-`go-flywheel` owns five tables — `jobs`, `job_runs`, and `job_periodics`, plus `limiter_buckets` and
-`limiter_holds` for the shared database-backed limiter (additive: empty unless you construct a
-`DBLimiter`) — and there are **two ways to install them. Pick exactly one.** They are not layers; running
-both means two migration authorities against one database.
+`go-flywheel` owns eight tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
+`limiter_buckets` and `limiter_holds` for the shared database-backed limiter (additive: empty unless you
+construct a `DBLimiter`); and `job_run_finishes`, `job_stats_hourly`, and `job_stats_progress`, the
+finish log every finalize writes and the stats rollup's tables — and there are **two ways to install
+them. Pick exactly one.** They are not layers; running both means two migration authorities against one
+database.
 
 | Question | **Library-owned** | **Host-owned** |
 |---|---|---|
-| Who creates the five tables? | `Migrate(db)` | your loader, from `Models()` |
+| Who creates the tables? | `Migrate(db)` | your loader, from `Models()` |
 | Who creates the indexes? | `Migrate(db)` | you, from `IndexSet(dialect)` / `InstallIndexes` |
 | Who sets the storage parameters? | `Migrate(db)` | you, from `InstallStorageParameters` |
 | Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
 | Does the runtime run DDL at startup? | yes, every start | no |
-| Is a co-located host schema safe? | only if the host's tooling excludes the five tables | yes — the tables are in your loader |
+| Is a co-located host schema safe? | only if the host's tooling excludes all eight tables | yes — the tables are in your loader |
 | **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
 
 **The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
-same database, your migration tool must know about all five — a tool that cannot see them will happily
-propose dropping them.
+same database, your migration tool must know about all eight — a tool that cannot see them will happily
+propose dropping them. A tool told to leave the runtime's tables alone by name needs every name above.
 
 **Library-owned** — one call, no external tooling:
 
@@ -297,7 +299,7 @@ up-to-date schema — a re-run creates nothing and changes nothing — so it is 
 
 ```go
 // 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
-//    so your migration tool knows all five tables exist and never proposes dropping them.
+//    so your migration tool knows all eight tables exist and never proposes dropping them.
 stmts, err := gormschema.New("postgres").Load(
     append(myapp.AllModels(), flywheel.Models()...)...,
 )
@@ -313,9 +315,11 @@ if err := flywheel.InstallStorageParameters(ctx, db); err != nil {
 
 Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
 it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
-GORM struct tag cannot express. Four of the eleven are correctness-bearing — without `jobs_unique_key`
-and `jobs_unique_active_key` the database accepts duplicate enqueues and **`ErrAlreadyEnqueued` is never
-returned.** Use `flywheel.IndexSet(dialect)` when you want them classified:
+GORM struct tag cannot express. `IndexSet` declares twelve indexes, and four of them are
+correctness-bearing: `jobs_unique_key`, `jobs_unique_active_key`, `job_runs_job_attempt`, and
+`idx_job_periodics_slug`. Without `jobs_unique_key` and `jobs_unique_active_key` the database accepts
+duplicate enqueues and **`ErrAlreadyEnqueued` is never returned.** Use `flywheel.IndexSet(dialect)` when
+you want them classified:
 
 ```go
 for _, idx := range must(flywheel.IndexSet("postgres")) {
@@ -416,6 +420,14 @@ pair together to stretch the same budget across the outage. With `RetryBackoffBa
 `MaxAttempts: 8` spans about an hour and `MaxAttempts: 20` spans most of a workday (~7h). The cap only
 widens the spacing of the later rungs, never the first-attempt delay. Pick the outage length you must ride
 out, then choose the ceiling and `MaxAttempts` so their ladder covers it.
+
+**Args that do not decode are never retried.** When a job's stored args do not fit its worker's args
+type, the worker never runs: the attempt fails with `jobs: decode args for kind "…": …`, which matches
+`ErrDecodeArgs` and `ErrValidation`, and it is classified `validation` without asking the worker's
+`Classifier`, so the job is discarded on that first attempt instead of spending its budget on bytes that
+will never change. Fix the producer or the args type, then replay. A worker that must accept a shape its
+type cannot decode declares `json.RawMessage` args and decodes inside `Work`, where its `Classifier`
+applies.
 
 **Drain is explicit.** `Stop` and `Drain` are safe before `Run`, concurrently with it, and after it
 returns:
@@ -555,7 +567,11 @@ runs until its context ends. A test that enqueues a kind it deliberately leaves 
 
 A claimed job carries a **lease**. If its executor dies, the lease expires and the scheduler's sweep
 returns the job to the queue for another runner — which is what makes a crashed process recoverable
-rather than a job lost forever.
+rather than a job lost forever. A crash spends the attempt it interrupted, so when that attempt was the
+job's last (`attempt >= max_attempts`) the sweep discards the job instead: a job whose worker takes its
+process down on every attempt ends after `max_attempts` crashes rather than looping. The sweep reports
+each job it reclaimed in `SweepEvent.Jobs`, and the slog observer logs each crashed attempt as it logs
+any failed one.
 
 **`LeaseDuration` bounds dispatch liveness, not run duration.** It is how long a *crashed* executor's
 job stays stranded before it is reclaimed, not a ceiling on how long a worker may take. Size it to how
@@ -676,7 +692,7 @@ can store is capped, and a cut record says so:
 |---|---|
 | Before your worker body runs | The row is **committed** with outcome `started`. A side-effect row written during the attempt can reference it immediately, and it survives a rollback of your own work. |
 | Attempt finishes | The same row is updated in place with the outcome, timings, cost, and `Result.Output`. |
-| Process crashes mid-attempt | The lease sweep marks the row `crashed`. It is **not deleted**, so your FK never dangles. |
+| Process crashes mid-attempt | The lease sweep marks the row `crashed`, with the state it left the job in (`available`, or `discarded` when that was the job's last attempt). It is **not deleted**, so your FK never dangles. |
 | Retention runs | The only thing that removes it. `DeleteFinishedJobs` deletes `job_runs` **before** `jobs`, so a host FK onto `job_runs.id` wants **`ON DELETE SET NULL`** — or leave retention disabled. |
 
 Need run history that no worker produced — fixtures, a backfill, an import? `flywheel.SeedRun` writes a
@@ -853,11 +869,24 @@ is returned, so an operator action can never overwrite a recorded outcome. Re-ru
 deliberate — `RetryJobWithOptions` with `Force` — and replaying a whole cohort of failures, with a
 restored retry budget, is its own guide: **Replaying work** below.
 
+**A retry never starts a job while its attempt still runs.** `RetryJob` refuses a running job with
+`ErrJobRunning` and leaves it and its lease alone: re-queueing it would let a runner start a second
+attempt beside the first, and the job's side effects would happen twice at once. `Force` re-runs
+terminal jobs only; it also refuses a job cancelled while its attempt runs, because a cancel fences that
+attempt without stopping its worker. Wait for the attempt to finish, or pass
+`RetryOpts{AllowRunning: true}` to re-queue it anyway: the running attempt keeps going, its result is
+discarded, and the work runs twice. That is also the way past a cancelled job whose process died before
+its attempt returned, whose run stays `started`.
+
 **The fan-in barrier runs a continuation once a generation completes.** A worker returns `Result.Barrier`
 alongside its children, and the runtime enqueues the continuation exactly once, after the last child
 reaches *any* terminal state — a half-failed generation still gets its finalizer. It is keyed so a
-retried, discarded, or superseded child can never enqueue it twice, and it fires inside that last child's
-finalize transaction, so no host writes a retry-unsafe counter.
+retried, discarded, or superseded child can never enqueue it twice, and it fires in the transaction
+that makes the last pending child terminal: its finalize, a cancel, or the sweep's discard, so no host
+writes a retry-unsafe counter. `CancelByParent` over a generation's last pending children therefore
+runs the continuation, and the call ends with the batch that fired it, so it never cancels the
+continuation it just enqueued. A cancelled running child counts as terminal at the cancel, so the
+continuation can start while that child's worker is still running.
 
 ```go
 return flywheel.Result{
@@ -958,6 +987,11 @@ work; naming `StateSucceeded` additionally requires `Force`. An unscoped `Replay
 nor `FailedSince` is refused with `ErrReplayUnbounded` rather than replaying every discarded job in the
 database by accident.
 
+**A replay never touches a job whose attempt still runs.** A `States` that names `running` is refused
+before any write with a `*ValidationError` on `states`, whatever `AllowRunning` says. With `States`
+naming `cancelled`, a job cancelled while its attempt still runs is left cancelled and counted in
+`SkippedRunning`, so the replay never starts a second attempt beside the first.
+
 **A replay never puts two live jobs on one `UniqueActiveKey` at a time.** A replayed job whose key
 another job holds live when its batch runs stays terminal, is counted in `SkippedActiveKey`, and the
 replay carries on past it. Of the jobs in one batch that share a key, the first in id order goes live; a
@@ -988,13 +1022,19 @@ work depends on the intent:
 | Intent | Mechanism | Key |
 |---|---|---|
 | Re-run *this job row*, keeping its id, history, and audit trail | `RetryJobWithOptions` / `Replay*` | — |
-| Enqueue a *new* job for the same logical unit, at most once ever | new `Insert` | `UniqueKey` — collides forever, terminal or not |
+| Enqueue a *new* job for the same logical unit, at most once | new `Insert` | `UniqueKey` — collides with the job that bears it, terminal or not, until retention deletes that job |
 | Enqueue a *new* job for a subject that may run again later | new `Insert` | `UniqueActiveKey` — frees on a terminal state |
 
-> A job enqueued with `UniqueKey` can never be re-enqueued: the key collides with the original row
-> forever, terminal or not. That is the guarantee `UniqueKey` exists to provide. To run that unit of work
-> again, retry the original job — its id, lineage, and audit trail are preserved. If the unit is expected
-> to run again later, `UniqueActiveKey` is the key you want.
+> A job enqueued with `UniqueKey` cannot be re-enqueued while its row exists: the key collides with the
+> original row, terminal or not. That is the guarantee `UniqueKey` exists to provide. To run that unit of
+> work again, retry the original job — its id, lineage, and audit trail are preserved. If the unit is
+> expected to run again later, `UniqueActiveKey` is the key you want.
+>
+> Retention frees the key: once `DeleteFinishedJobs` (or the scheduler's retention pass) deletes the
+> original job, an `Insert` with its key lands and the work runs again. When "at most once, ever" has to
+> outlive retention, keep the key where retention cannot reach it — leave retention off or its window
+> longer than the key must hold, or record the key in a table of your own under a unique constraint, in
+> the same transaction as the enqueue (`InsertOpts.Tx`).
 
 </details>
 
@@ -1170,6 +1210,8 @@ and the [`observers/`](observers) package ships ready adapters that plug straigh
 - `observers.NewSlog(logger)` logs routine events at debug level and failures above it: a failed attempt
   at warn and a job a failure discarded at error, each with the worker's error, the attempt against its
   budget, and the job's resulting state ([RUNBOOK](docs/RUNBOOK.md#symptom-jobs-fail-or-are-discarded)).
+  A crashed attempt the lease sweep reclaims logs the same lines, with outcome `crashed`, when the same
+  observer is passed to the scheduler.
   `observers.NewMulti(...)` fans events out to several observers at once.
 
 `SampleQueueHealth` ([health.go](internal/core/health.go)) reads a point-in-time gauge snapshot — depth by state
@@ -1311,6 +1353,10 @@ silently.
 Only terminal jobs are ever removed — succeeded, cancelled, discarded, and only those finalized before
 the cutoff. Pending and running work is never touched, whatever its age.
 
+**Retention frees `UniqueKey`s.** A `UniqueKey` collides only with a job whose row exists, so deleting a
+job frees its key, and an `Insert` with that key afterwards runs the work again. If a key must keep
+refusing duplicates for longer than the window, see **Replaying work** above for where to hold it.
+
 ### The queue-health heartbeat
 
 The heartbeat is **off by default**. Set `HealthSampleInterval` and the scheduler samples queue health
@@ -1349,6 +1395,15 @@ node, _ := flywheel.NewNode(flywheel.NodeConfig{
 |---|---|---|
 | `Periodics` | none | The definitions this host declares. Each is validated, and slugs must be unique, when the scheduler is constructed; `Run` applies them on start. |
 | `ReconcileInterval` | `1m` | How often a declared definition whose row is missing is re-created. A pass with nothing missing is one indexed read that writes nothing. Negative turns the pass off. |
+
+**A cron runs in the zone it is evaluated in, unless it names one.** A `Cron` with no zone fires in the
+zone of the Scheduler clock when the definition is created or changed (the default clock reads
+`time.Now()`, the process's local zone), and in the zone of the stored `next_run_at`, as the database
+driver returns it, on every fire after that. Whether `0 2 * * *` means 02:00 UTC or 02:00 local time, and
+whether it follows daylight saving, therefore depends on the host and the driver. Prefix the expression
+with `CRON_TZ=<zone>` to pin it: `CRON_TZ=UTC 0 2 * * *`, or `CRON_TZ=America/New_York 0 2 * * *` for
+02:00 New York time across daylight-saving changes. An unknown zone is refused like any malformed
+expression.
 
 **On start, the declaration wins.** Every start applies the whole declaration with `UpsertPeriodic`'s
 semantics: a missing definition is inserted, a changed one updated, and an unchanged one keeps its

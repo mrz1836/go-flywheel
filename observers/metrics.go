@@ -51,11 +51,12 @@ const (
 	// their claim was lost. It is the double-execution signal: every increment is
 	// work that ran and did not count.
 	MetricJobsSuperseded = "flywheel_jobs_superseded_total"
-	// MetricSweepReclaimed counts the expired leases a sweep pass returned to
-	// available — work a crashed executor left behind that the sweep, not clean
-	// finalization, recovered. It is the crash-recovery signal: a steadily nonzero
-	// rate means executors are dying mid-attempt often enough that recovery leans
-	// on the sweep rather than on jobs finalizing themselves.
+	// MetricSweepReclaimed counts the expired leases a sweep pass took, whether it
+	// returned each job to available or discarded it — work a crashed executor
+	// left behind that the sweep, not clean finalization, recovered. It is the
+	// crash-recovery signal: a steadily nonzero rate means executors are dying
+	// mid-attempt often enough that recovery leans on the sweep rather than on
+	// jobs finalizing themselves.
 	MetricSweepReclaimed = "flywheel_sweep_reclaimed_total"
 )
 
@@ -222,11 +223,11 @@ func (m *MetricsObserver) OnSupersede(_ context.Context, ev flywheel.SupersedeEv
 }
 
 // OnSweep records the stuck-lease reclaim pass: its duration and the count of
-// expired leases it returned to available. Both carry no tags — a deployment runs
-// one scheduler, so each is a single series. The duration's slow tail is the
-// database-load signal; the reclaimed count is the crash-recovery signal, and it
-// is emitted even when zero so the counter series always exists and rate() alerts
-// have a baseline.
+// expired leases it took, returned to available or discarded. Both carry no
+// tags — a deployment runs one scheduler, so each is a single series. The
+// duration's slow tail is the database-load signal; the reclaimed count is the
+// crash-recovery signal, and it is emitted even when zero so the counter series
+// always exists and rate() alerts have a baseline.
 func (m *MetricsObserver) OnSweep(_ context.Context, ev flywheel.SweepEvent) {
 	m.rec.Histogram(MetricSweepDuration, ev.Duration.Seconds(), nil)
 	m.rec.Count(MetricSweepReclaimed, int64(ev.Reclaimed), nil)

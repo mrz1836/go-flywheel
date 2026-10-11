@@ -270,10 +270,11 @@ func TestLeaseHeartbeatStopsOnClaimLoss(t *testing.T) {
 		_, _ = r.pollOnce(ctx)
 	}()
 
-	// Wait for the claim, then take it away the way a sweep does.
+	// Wait for the claim, then take it away the way a sweep does. A retry takes a
+	// running job's claim only when the caller opts in with AllowRunning.
 	require.Eventually(t, func() bool { return worker.entries.Load() == 1 },
 		5*time.Second, 5*time.Millisecond, "the worker must be running before its claim is revoked")
-	require.NoError(t, RetryJob(ctx, db, id))
+	require.NoError(t, RetryJobWithOptions(ctx, db, id, RetryOpts{AllowRunning: true}))
 
 	// A fresh claim, under a fresh token, with its own lease.
 	stolen, err := driver.Dequeue(ctx, []string{"default"}, AnyClass, true, 1, time.Hour)

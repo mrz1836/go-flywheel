@@ -75,6 +75,10 @@ type Observer interface {
 	// RunnerConfig.Observer and SchedulerConfig.Observer. It is the maintenance
 	// counterpart to OnClaim: a rising sweep duration is a database-load signal,
 	// and a nonzero Reclaimed is the count of leases a crashed executor left behind.
+	//
+	// A crashed attempt never reaches OnFinish — no worker returned to finalize
+	// it — so SweepEvent.Jobs is where each one is reported: the job, its crashed
+	// run, and whether the sweep returned it to the queue or discarded it.
 	OnSweep(ctx context.Context, ev SweepEvent)
 }
 
@@ -169,10 +173,36 @@ type SweepEvent struct {
 	// signal — the reclaim's indexed scan is contending — read alongside claim
 	// duration rather than in isolation.
 	Duration time.Duration
-	// Reclaimed is how many expired leases the pass returned to available. A
-	// steadily nonzero value means executors are dying mid-attempt often enough
-	// that the sweep, not clean finalization, is recovering their work.
+	// Reclaimed is how many expired leases the pass took, whether it returned
+	// each job to available or discarded it. A steadily nonzero value means
+	// executors are dying mid-attempt often enough that the sweep, not clean
+	// finalization, is recovering their work.
 	Reclaimed int
+	// Discarded is how many of the reclaimed jobs the pass discarded because the
+	// crashed attempt was the job's last. Each one is work lost until it is
+	// replayed.
+	Discarded int
+	// Jobs names each reclaimed job, in reclaim order: oldest expired lease
+	// first. The built-in drivers report them on the context Scheduler.Sweep
+	// passes to Driver.Sweep, so a Driver that wraps a built-in one reports them
+	// too as long as it passes that context through. A custom Driver that never
+	// reaches a built-in one reports Reclaimed alone, with Jobs empty and
+	// Discarded zero.
+	Jobs []SweptJob
+}
+
+// SweptJob is one job a sweep pass reclaimed from an expired lease: an attempt
+// whose process died before it finished.
+type SweptJob struct {
+	// JobEvent names the job and its crashed attempt. RunID is that attempt's
+	// run, the job_runs row the sweep marked crashed; it is empty when the
+	// process died before committing one.
+	JobEvent
+	// MaxAttempts is the job's attempt budget, so Attempt reads against it.
+	MaxAttempts int
+	// State is the state the sweep left the job in: StateAvailable when it runs
+	// again, or StateDiscarded when the crashed attempt was its last.
+	State JobState
 }
 
 // noopObserver is the default Observer when RunnerConfig.Observer is nil: every

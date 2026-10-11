@@ -117,6 +117,37 @@ var ErrRunAlreadyRecorded = errors.New("flywheel: run already recorded for this 
 // job is discarded with. Match it with errors.Is: the discard wraps it.
 var ErrUnknownKind = errors.New("jobs: unknown job kind")
 
+// ErrDecodeArgs reports that a job's stored args could not be decoded into its
+// worker's args type, so the worker never ran. The stored bytes never change, so
+// no retry can succeed: the Runner classifies the failure ErrorValidation,
+// without consulting the worker's Classifier, and the job is discarded on that
+// attempt. The error a decode failure returns keeps its text — the kind and the
+// decoder's message — and unwraps to ErrDecodeArgs, ErrValidation, and the
+// decoder's own error.
+//
+// A worker that must accept args its type cannot decode declares json.RawMessage
+// args and decodes inside Work, where its Classifier applies.
+var ErrDecodeArgs = errors.New("jobs: decode args")
+
+// decodeArgsError is the error a registered worker's dispatch returns when the
+// job's args do not decode. Its text is the one the runtime has always written to
+// the run row, and it is a type rather than a chain of %w because fmt.Errorf
+// prints every operand it wraps: wrapping the two sentinels that way would append
+// their text to the message.
+type decodeArgsError struct {
+	kind string
+	err  error
+}
+
+// Error names the kind and the decoder's message.
+func (e *decodeArgsError) Error() string {
+	return fmt.Sprintf("jobs: decode args for kind %q: %v", e.kind, e.err)
+}
+
+// Unwrap exposes ErrDecodeArgs, ErrValidation, and the decoder's own error for
+// errors.Is and errors.As.
+func (e *decodeArgsError) Unwrap() []error { return []error{ErrDecodeArgs, ErrValidation, e.err} }
+
 // ErrUnsupportedDialect is returned by Migrate, IndexSet, Indexes, and
 // InstallIndexes for a dialect that cannot express the runtime's partial
 // indexes (anything but postgres and sqlite). It is wrapped with the offending
@@ -318,6 +349,15 @@ var ErrPeriodicNotFound = errors.New("flywheel: periodic not found")
 // finalized_at stamp. A bulk Replay whose States name StateSucceeded without
 // Force is refused with it too: re-running succeeded work must be deliberate.
 var ErrJobTerminal = errors.New("flywheel: job has already reached a terminal state")
+
+// ErrJobRunning is returned when a retry targets a job whose attempt is still
+// running: a running job, or, with RetryOpts.Force, a cancelled job whose
+// attempt has not returned (a cancel fences a running attempt without stopping
+// it). Re-queueing it would let a runner start a second attempt while the first
+// still runs, so the job's work would run twice at once. The runtime refuses the
+// write and leaves the job and its lease as they were: wait for the attempt to
+// finish, or set RetryOpts.AllowRunning to re-queue it anyway.
+var ErrJobRunning = errors.New("flywheel: job is running")
 
 // ErrReplayUnbounded is returned by Replay when neither Kinds nor FailedSince is
 // set. An unscoped replay of every discarded job in the database is almost never

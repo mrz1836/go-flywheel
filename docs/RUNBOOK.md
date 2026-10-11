@@ -79,7 +79,17 @@ process, and it is working as designed when it runs occasionally. It is a proble
 **How the sweep works.** The scheduler reclaims jobs in state `running` whose `leased_until` is in the
 past, in bounded batches, on its sweep cadence (30 seconds by default). Each reclaimed job's stale run
 stub — the `job_runs` row committed before the worker body ran — is marked with outcome `crashed`, so a
-crash leaves an audit record rather than a hole.
+crash leaves an audit record rather than a hole. A crash spends the attempt it interrupted: a job whose
+crashed attempt was its last (`attempt >= max_attempts`) is discarded rather than returned to the queue,
+and its stub records `job_state = 'discarded'` (`available` for a job that runs again).
+
+**A job that keeps killing its worker ends discarded.** A worker that takes its whole process down — out
+of memory, a fatal runtime error, a panic on a goroutine it started, `os.Exit` — crashes every attempt.
+Each one is reclaimed and claimed again until the job's attempts are spent, and the sweep then discards
+it. With `observers.NewSlog` wired into the scheduler, every crashed attempt logs
+`flywheel: job attempt failed` at warn, and the last one `flywheel: job failed and was discarded` at
+error, each with `outcome` `crashed` (next section). A job with a large `MaxAttempts` takes the process
+down that many times first; give a kind that can kill its process a small budget, and fix the worker.
 
 **`crashed` in `job_runs.outcome`** means the attempt's process died between claiming the job and
 finalizing it: the run stub was written, the worker never reported an outcome, and the sweep found the
@@ -125,8 +135,14 @@ debug logging:
 
 | Line | Level | Meaning |
 |---|---|---|
-| `flywheel: job attempt failed` | warn | an attempt failed and the job will retry — fields `job_id`, `run_id`, `kind`, `queue`, `outcome` (`error`, `timeout`, or `crashed`), `attempt`, `max_attempts`, `job_state` (`retryable`), `error_class`, `error`, `duration` |
+| `flywheel: job attempt failed` | warn | an attempt failed and the job will retry — fields `job_id`, `run_id`, `kind`, `queue`, `outcome` (`error`, `timeout`, or `crashed`), `attempt`, `max_attempts`, `job_state` (`retryable`, or `available` for a crash), `error_class`, `error`, `duration` |
 | `flywheel: job failed and was discarded` | error | the failure ended the job: its work is lost until it is replayed — the same fields, with `job_state` `discarded` |
+
+**A crash logs the same two lines, from the sweep.** A crashed attempt never returned, so the scheduler's
+lease sweep logs it when it reclaims the job, just before its `flywheel: lease sweep completed` line, with
+`outcome` `crashed` and no `error_class`, `error`, or `duration`: there was no worker result to report.
+The `run_id` is the crashed run, empty when the process died before writing it. These lines need the
+slog observer passed to the scheduler (`SchedulerConfig.Observer`) as well as the runner.
 
 **A warn now and then is the retry ladder doing its job.** Repeated warns for one `kind` with the same
 `error` mean the downstream keeps refusing, and each of those jobs ends in a discard once its budget is
@@ -138,6 +154,31 @@ job. A job of a kind no runner registers is discarded the same way and also logs
 
 **The error text is logged as the worker returned it.** Keep secrets and personal data out of worker
 errors, or wrap them before returning.
+
+<br>
+
+## Symptom: jobs discarded as `jobs: decode args`
+
+A job whose stored args do not fit its worker's args type fails before the worker runs, with
+`jobs: decode args for kind "<kind>": <decoder error>` and error class `validation`, and it is discarded
+on that first attempt: the bytes never change, so a retry could not help, and the worker's `Classifier`
+is not consulted. The usual causes are a producer bug, a field whose type changed between releases, or a
+hand-written payload passed to `Enqueue`. Fix the producer or the args type, then replay the discarded
+jobs (`flywheel.Replay` with the kind). Callers can match the error with `errors.Is(err,
+flywheel.ErrDecodeArgs)`.
+
+<br>
+
+## Symptom: a retry is refused with `flywheel: job is running`
+
+`RetryJob` (and `flywheel jobs retry`) refuses a job whose attempt is still running, with
+`ErrJobRunning`, and leaves it as it is: re-queueing it would start a second copy beside the first. With
+`RetryOpts.Force`, the same refusal covers a job cancelled while its attempt was running, because a
+cancel fences the attempt without stopping its worker, and the attempt's run reads `started` until the
+worker returns. Wait for the attempt to finish (`flywheel jobs inspect <id>` shows its run). If the process
+that ran it is gone — a cancelled job's process died before its attempt returned, so nothing will ever
+finish that run — retry it with `RetryOpts{Force: true, AllowRunning: true}`, which re-queues it
+regardless.
 
 <br>
 
@@ -210,7 +251,10 @@ asked for them. The prune runs on `RetentionInterval` (one hour by default) in b
 **Choosing the window.** Retention deletes jobs finalized *longer ago than* the window — not jobs
 created that long ago. The window is a function of how long you need the audit trail (`job_runs`) and
 the terminal job rows for debugging, replay, or compliance, not of throughput. A 30-day window keeps a
-month of history; a 2-minute window (used in load tests) keeps almost nothing.
+month of history; a 2-minute window (used in load tests) keeps almost nothing. The window also bounds
+`UniqueKey`: a key collides only with a job whose row exists, so pruning a job frees its key, and a later
+insert with that key runs the work again. A key that must refuse duplicates for longer than the window
+has to be held where retention does not prune (see [`COOKBOOK.md`](COOKBOOK.md), recipe 1).
 
 **Enabling it safely on an old database.** The *first* prune against a long-lived database that has
 never had retention deletes its entire backlog of aged terminal jobs. The batching bounds each

@@ -626,10 +626,10 @@ by the byte should weigh that against the bloat and throughput it buys.
   the two with a mechanism that plainly applies here.
 - **`fillfactor` does not enable HOT updates on this table**, and the common claim that it does is
   false here. A HOT update requires that no index-relevant column change, and `state` sits in the
-  *predicate* of `jobs_ready`, `jobs_unique_active_key`, `jobs_running_leased`, and `jobs_state`. A
-  predicate column is index-relevant, so every state transition is non-HOT whatever the fillfactor
-  is — before these settings, and before `jobs_state` existed. What fillfactor buys is same-page
-  placement for the new tuple version.
+  *predicate* of `jobs_ready`, `jobs_unique_active_key`, and `jobs_running_leased`, and is a key of
+  `jobs_state`, `jobs_finished`, and `jobs_parent_state`. A predicate or key column is index-relevant, so
+  every state transition is non-HOT whatever the fillfactor is — before these settings, and before
+  `jobs_state` existed. What fillfactor buys is same-page placement for the new tuple version.
 - **The two arms drained different amounts of work** (2,596 against 3,947 jobs/s), so absolute sizes
   are not directly comparable between them. The slope over the final third is the comparison that is,
   which is why it is the one reported.

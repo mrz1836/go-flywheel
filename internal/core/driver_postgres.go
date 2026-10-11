@@ -42,13 +42,19 @@ func (d *postgresDriver) Sweep(ctx context.Context, now time.Time) (int, error) 
 	return d.sweep(ctx, now, d.reclaimExpired)
 }
 
-// reclaimExpired takes one batch of expired leases and returns them to
-// available, reporting the ids it reclaimed.
+// reclaimExpired takes one batch of expired leases, discards each job whose
+// crashed attempt was its last, returns the rest to available, and reports the
+// jobs it reclaimed in reclaim order.
 //
 // It is one statement: the CTE selects and row-locks up to limit expired rows
-// with SKIP LOCKED, and the UPDATE reclaims them, RETURNING the ids the caller
-// needs for the run-stub update. Splitting it into a SELECT and an UPDATE would
-// hold the locks across a round trip for no benefit.
+// with SKIP LOCKED and decides, per row, whether the attempt that held the lease
+// spent the job's budget (attempt >= max_attempts, the rule a failed attempt's
+// finalize applies); the UPDATE then applies each row's own state, stamping
+// finalized_at on a discard, and RETURNING hands back what the stub update, the
+// sweep's report, and the barrier check need. Splitting it into a SELECT and an
+// UPDATE would hold the locks across a round trip for no benefit. The columns it
+// writes are reclaimUpdate's and reclaimDiscardUpdate's, which SQLite applies as
+// two updates.
 //
 // The predicate carries deleted_at IS NULL explicitly. A raw statement gets no
 // GORM soft-delete scope, and without it this dialect would reclaim
@@ -57,26 +63,29 @@ func (d *postgresDriver) Sweep(ctx context.Context, now time.Time) (int, error) 
 // make the dialects explicit.
 func (d *postgresDriver) reclaimExpired(
 	ctx context.Context, tx *gorm.DB, now time.Time, limit int,
-) ([]string, error) {
+) ([]reclaimedJob, error) {
 	const sql = `
 WITH expired AS (
-    SELECT id FROM jobs
+    SELECT id, leased_until, attempt >= max_attempts AS spent FROM jobs
     WHERE state = 'running' AND leased_until < ? AND deleted_at IS NULL
     ORDER BY leased_until
     LIMIT ?
     FOR UPDATE SKIP LOCKED
 )
 UPDATE jobs
-SET state = 'available', leased_until = NULL, lease_token = NULL, updated_at = ?
+SET state = CASE WHEN expired.spent THEN 'discarded' ELSE 'available' END,
+    finalized_at = CASE WHEN expired.spent THEN ? ELSE jobs.finalized_at END,
+    leased_until = NULL, lease_token = NULL, updated_at = ?
 FROM expired
 WHERE jobs.id = expired.id
-RETURNING jobs.id`
+RETURNING jobs.id, jobs.state, jobs.kind, jobs.queue, jobs.attempt, jobs.max_attempts, jobs.parent_job_id,
+    expired.leased_until`
 
-	var ids []string
-	if err := tx.WithContext(ctx).Raw(sql, now, limit, now).Scan(&ids).Error; err != nil {
+	var rows []reclaimRow
+	if err := tx.WithContext(ctx).Raw(sql, now, limit, now, now).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("jobs: reclaim jobs: %w", err)
 	}
-	return ids, nil
+	return inReclaimOrder(rows), nil
 }
 
 // Dequeue claims up to limit ready jobs in one round trip: the CTE selects and

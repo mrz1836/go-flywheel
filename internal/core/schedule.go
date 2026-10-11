@@ -31,6 +31,18 @@ type PeriodicSpec struct {
 	// to an empty object; anything else must be valid JSON.
 	ArgsTemplate []byte
 	// Cron is a standard 5-field cron expression. Mutually exclusive with Every.
+	//
+	// An expression that names no zone runs in the zone of the time it is
+	// evaluated against: the Scheduler clock's now when the schedule is created
+	// or changed (the default clock returns time.Now(), the process's local zone),
+	// and on every fire after that the stored next_run_at, as the database driver
+	// returns it. Whether "0 9 * * *" fires at 09:00 UTC or 09:00 local time, and
+	// whether it follows daylight saving, then depends on the host's zone and the
+	// driver. Prefix the expression with CRON_TZ=<IANA zone> to pin it —
+	// "CRON_TZ=UTC 0 9 * * *", or "CRON_TZ=America/New_York 0 9 * * *" for 09:00
+	// New York time across daylight-saving changes — and the schedule runs in that
+	// zone wherever it is evaluated. An unknown zone is refused like any malformed
+	// expression.
 	Cron string
 	// Every is a fixed interval between fires. Mutually exclusive with Cron.
 	Every time.Duration
@@ -356,14 +368,31 @@ func periodicViewFromRow(r jobPeriodicRow) PeriodicView {
 }
 
 // RetryOpts configures a RetryJobWithOptions call. The zero value is a plain,
-// guarded retry: a terminal job is refused with ErrJobTerminal, no retry budget is
-// restored, and the re-run is immediate — exactly what RetryJob issues.
+// guarded retry: a running job is refused with ErrJobRunning and a terminal job
+// with ErrJobTerminal, no retry budget is restored, and the re-run is immediate —
+// exactly what RetryJob issues.
 type RetryOpts struct {
-	// Force retries a job that has already reached a terminal state — including a
-	// succeeded one. Without it a terminal job is refused with ErrJobTerminal, so an
-	// operator "retry now" can never silently re-run finished work. Re-running a
-	// completed job is a legitimate action; it just has to be deliberate.
+	// Force also retries a job that has already reached a terminal state —
+	// including a succeeded one. Without it a terminal job is refused with
+	// ErrJobTerminal, so an operator "retry now" can never silently re-run finished
+	// work. Re-running a completed job is a legitimate action; it just has to be
+	// deliberate.
+	//
+	// Force never retries a running job, nor a cancelled one whose attempt is still
+	// running: a cancel fences a running attempt without stopping it, so the
+	// attempt's run stays started until its worker returns, and re-queueing the job
+	// would start a second attempt beside the first. Both are refused with
+	// ErrJobRunning unless AllowRunning is set too.
 	Force bool
+	// AllowRunning also re-queues a job whose attempt is still running: a running
+	// job, or, with Force, a cancelled one whose attempt has not returned. That
+	// attempt is not stopped. Its claim is cleared, so a runner can claim the job
+	// again while it still runs, and its result is discarded when it returns (a
+	// supersede): the job's work may run twice, at the same time. Set it when the
+	// attempt's process is known to be gone — a cancelled job whose process died
+	// before its attempt returned keeps a started run that nothing else clears — or
+	// when a second, overlapping run is acceptable. Replay ignores it.
+	AllowRunning bool
 	// ResetAttempts restores the job's retry budget by raising max_attempts so the
 	// job has Budget attempts remaining. It never lowers attempt: the attempt counter
 	// is the audit key for job_runs and stays strictly monotonic, so the budget is
@@ -386,16 +415,19 @@ type RetryOpts struct {
 	Delay time.Duration
 }
 
-// RetryJob forces a job back to available so a runner re-claims it on the next
-// poll, clearing any lease and finalization. It is the operator action behind a
-// "retry now".
+// RetryJob returns a waiting job — available, retryable, scheduled, or paused — to
+// available so a runner claims it on the next poll, clearing any lease and
+// finalization. It is the operator action behind a "retry now".
 //
 // It is state-guarded to the same standard as CancelJob: a job that has already
 // reached a terminal state (succeeded, cancelled, discarded) is left exactly as it
 // is and ErrJobTerminal is returned, so a retry can never silently re-run finished
-// work and clear the outcome that recorded it. Use RetryJobWithOptions with Force
-// to re-run a terminal job deliberately. It returns ErrJobNotFound when no live job
-// has the id.
+// work and clear the outcome that recorded it. A running job is left exactly as it
+// is too, with its lease, and ErrJobRunning is returned: re-queueing it would let a
+// runner start a second attempt while the first still runs, so its work would run
+// twice at once. Use RetryJobWithOptions with Force to re-run a terminal job
+// deliberately, and with AllowRunning to re-queue a running one anyway. It returns
+// ErrJobNotFound when no live job has the id.
 //
 // This is a change from the earlier unguarded behavior, which returned any job —
 // including a succeeded one — to available. The guard is the point.
@@ -403,14 +435,16 @@ func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
 	return RetryJobWithOptions(ctx, db, id, RetryOpts{})
 }
 
-// RetryJobWithOptions is RetryJob with explicit options. Force retries a job that
-// has already reached a terminal state; without it a terminal job returns
-// ErrJobTerminal. ResetAttempts restores the job's retry budget by raising
-// max_attempts (see RetryOpts.Budget) rather than rewinding attempt, so a job
-// discarded at attempt == max_attempts gets real headroom and the job_runs audit
-// sequence stays continuous. Delay schedules the re-run into the future instead of
-// making the job immediately available. It returns ErrJobNotFound when no live job
-// has the id. See RetryOpts.
+// RetryJobWithOptions is RetryJob with explicit options. Force also retries a job
+// that has already reached a terminal state; without it a terminal job returns
+// ErrJobTerminal. A running job returns ErrJobRunning, and so, with Force, does a
+// cancelled job whose attempt is still running, unless AllowRunning is set.
+// ResetAttempts restores the job's retry budget by raising max_attempts (see
+// RetryOpts.Budget) rather than rewinding attempt, so a job discarded at attempt
+// == max_attempts gets real headroom and the job_runs audit sequence stays
+// continuous. Delay schedules the re-run into the future instead of making the job
+// immediately available. It returns ErrJobNotFound when no live job has the id.
+// See RetryOpts.
 //
 // Under Force, a terminal job whose UniqueActiveKey a newer live job now holds
 // cannot return to a live state: the index allows one live holder per key. The
@@ -425,9 +459,9 @@ func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts Retry
 	upd := map[string]any{
 		"state":        string(StateAvailable),
 		"leased_until": nil,
-		// An attempt may still be running against this job. Clearing its token is
-		// what stops that attempt finalizing over the re-run the operator just
-		// asked for.
+		// Under AllowRunning an attempt may still be running against this job.
+		// Clearing its token is what stops that attempt finalizing over the re-run
+		// the operator just asked for.
 		"lease_token":  nil,
 		"finalized_at": nil,
 		// Delay 0 makes the job immediately claimable (scheduled_at == now); a
@@ -444,15 +478,16 @@ func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts Retry
 	// operator action, so the extra statements cost nothing that matters.
 	var affected int64
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		q := tx.Model(&jobRow{}).Where("id = ?", id)
-		if !opts.Force {
-			// Scope the write to the states a job can still be retried from, naming
-			// the allowed states rather than excluding the terminal ones — the same
-			// guard CancelJob uses, and for the same reason: a row in a state this
-			// runtime does not recognize is refused rather than clobbered, so the
-			// guard can never be defeated by a state added to the vocabulary but
-			// missed here.
-			q = q.Where("state IN ?", nonTerminalStateStrings())
+		// Scope the write to the states the options allow, naming them rather than
+		// excluding the ones refused — the same guard CancelJob uses, and for the
+		// same reason: a row in a state this runtime does not recognize is refused
+		// rather than clobbered, so the guard can never be defeated by a state added
+		// to the vocabulary but missed here.
+		q := tx.Model(&jobRow{}).Where("id = ? AND state IN ?", id, retryStateStrings(opts))
+		if opts.Force && !opts.AllowRunning {
+			// A cancelled job is terminal by state while its attempt may still be
+			// running; re-queueing it then would run its work twice at once.
+			q = q.Where("NOT " + cancelledAttemptStillRuns("jobs"))
 		}
 		res := q.Updates(upd)
 		affected = res.RowsAffected
@@ -465,9 +500,37 @@ func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts Retry
 		return fmt.Errorf("flywheel: retry job %q: %w", id, err)
 	}
 	if affected == 0 {
-		return classifyRetryMiss(ctx, db, id)
+		return classifyRetryMiss(ctx, db, id, opts)
 	}
 	return nil
+}
+
+// retryStateStrings returns the states a retry with opts may move a job out of:
+// the waiting states (available, retryable, scheduled, paused) always, the
+// terminal states with Force, and running with AllowRunning.
+func retryStateStrings(opts RetryOpts) []string {
+	states := []JobState{StateAvailable, StateRetryable, StateScheduled, StatePaused}
+	if opts.Force {
+		states = append(states, TerminalStates()...)
+	}
+	if opts.AllowRunning {
+		states = append(states, StateRunning)
+	}
+	return stateStrings(states)
+}
+
+// cancelledAttemptStillRuns is a correlated SQL predicate over the jobs row the
+// query names outer: true when the job is cancelled while the attempt it was
+// cancelled under is still running. A cancel fences a running attempt without
+// stopping it, and the attempt's run is recorded only when its worker returns, so
+// until then the run at the job's attempt still reads started. It is one probe of
+// job_runs_job_attempt. The retry under Force and the replay share it, so neither
+// can start a second attempt beside one still running. The states are the
+// runtime's own constants, so inlining them carries no injection risk.
+func cancelledAttemptStillRuns(outer string) string {
+	return "(" + outer + ".state = '" + string(StateCancelled) + "' AND EXISTS (SELECT 1 FROM job_runs AS r" +
+		" WHERE r.job_id = " + outer + ".id AND r.attempt = " + outer + ".attempt" +
+		" AND r.outcome = '" + string(OutcomeStarted) + "'))"
 }
 
 // retryHolder builds the collision error for a retry whose UPDATE hit a unique
@@ -506,25 +569,43 @@ func applyRetryBudget(upd map[string]any, opts RetryOpts) {
 	}
 }
 
-// classifyRetryMiss explains why RetryJobWithOptions's UPDATE matched no row,
-// exactly as classifyCancelMiss does for CancelJob: the job does not exist
-// (ErrJobNotFound), or it exists but is terminal and Force was not set
-// (ErrJobTerminal). Under Force the UPDATE carries no state guard, so a miss can
-// only be a missing (or soft-deleted) job — the count is zero and this returns
-// ErrJobNotFound, which is the right answer.
+// classifyRetryMiss explains why RetryJobWithOptions's UPDATE matched no row, as
+// classifyCancelMiss does for CancelJob: the job does not exist (ErrJobNotFound);
+// its attempt is still running — it is running, or, under Force without
+// AllowRunning, it is cancelled with its attempt's run still started
+// (ErrJobRunning); or it is in a state the options do not allow, which is a
+// terminal one without Force (ErrJobTerminal).
 //
-// The count is scoped exactly like the UPDATE — Model(&jobRow{}) applies gorm's
+// The read is scoped exactly like the UPDATE — Model(&jobRow{}) applies gorm's
 // deleted_at IS NULL — so a soft-deleted job reads as missing rather than terminal.
 // It runs outside a transaction for the same reason classifyCancelMiss does: the
 // miss path writes nothing, and serializing an operator-scale diagnostic read would
 // cost a write lock on SQLite for no correctness gain.
-func classifyRetryMiss(ctx context.Context, db *gorm.DB, id string) error {
-	var count int64
-	if err := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id).Count(&count).Error; err != nil {
+func classifyRetryMiss(ctx context.Context, db *gorm.DB, id string, opts RetryOpts) error {
+	var rows []jobRow
+	if err := db.WithContext(ctx).Model(&jobRow{}).Select("state", "attempt").
+		Where("id = ?", id).Limit(1).Find(&rows).Error; err != nil {
 		return fmt.Errorf("flywheel: retry job %q: %w", id, err)
 	}
-	if count == 0 {
+	if len(rows) == 0 {
 		return ErrJobNotFound
+	}
+	switch JobState(rows[0].State) {
+	case StateRunning:
+		return ErrJobRunning
+	case StateCancelled:
+		if !opts.Force || opts.AllowRunning {
+			break
+		}
+		var started int64
+		if err := db.WithContext(ctx).Model(&jobRunRow{}).
+			Where("job_id = ? AND attempt = ? AND outcome = ?", id, rows[0].Attempt, string(OutcomeStarted)).
+			Count(&started).Error; err != nil {
+			return fmt.Errorf("flywheel: retry job %q: %w", id, err)
+		}
+		if started > 0 {
+			return ErrJobRunning
+		}
 	}
 	return ErrJobTerminal
 }
@@ -533,32 +614,63 @@ func classifyRetryMiss(ctx context.Context, db *gorm.DB, id string) error {
 // attempt already running is not interrupted, but the job will not be retried or
 // re-claimed.
 //
+// When the job is a child whose parent declared a Barrier and it was the last of
+// its generation still pending, the cancel enqueues the barrier's continuation, in
+// the same transaction, as a finalize that ended the child would have. A running
+// child's cancel fires it at once: the child is terminal, and its attempt's late
+// finalize is superseded and fires nothing. The continuation can therefore start
+// while the cancelled attempt's worker is still running, since a cancel fences an
+// attempt's result rather than stopping its worker.
+//
 // A job that has already reached a terminal state (succeeded, cancelled, or
 // discarded) is left exactly as it is and ErrJobTerminal is returned: cancelling
 // must never overwrite a recorded outcome or its finalized_at stamp. It returns
 // ErrJobNotFound when no live job has the id.
+//
+// The update and the barrier check run in a transaction of their own — a
+// savepoint when db is a caller's transaction, unless the host turned off GORM's
+// nested transactions.
 func CancelJob(ctx context.Context, db *gorm.DB, id string) error {
 	now := models.ClockFrom(ctx).Now(ctx)
-	// Scope the write to the states a job can still be cancelled from. Naming the
-	// allowed states rather than excluding the terminal ones is deliberate: a row
-	// in a state this runtime does not recognize is refused rather than clobbered,
-	// so the guard can never be defeated by a state added to the vocabulary but
-	// missed here.
-	res := db.WithContext(ctx).Model(&jobRow{}).
-		Where("id = ? AND state IN ?", id, nonTerminalStateStrings()).
-		Updates(map[string]any{
-			"state":        string(StateCancelled),
-			"leased_until": nil,
-			// The running attempt is not interrupted, but its claim is: clearing
-			// the token is what keeps its finalize from overwriting the cancel.
-			"lease_token":  nil,
-			"finalized_at": now,
-			"updated_at":   now,
-		})
-	if res.Error != nil {
-		return fmt.Errorf("flywheel: cancel job %q: %w", id, res.Error)
+	var affected int64
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Scope the write to the states a job can still be cancelled from. Naming
+		// the allowed states rather than excluding the terminal ones is deliberate:
+		// a row in a state this runtime does not recognize is refused rather than
+		// clobbered, so the guard can never be defeated by a state added to the
+		// vocabulary but missed here.
+		res := tx.Model(&jobRow{}).
+			Where("id = ? AND state IN ?", id, nonTerminalStateStrings()).
+			Updates(map[string]any{
+				"state":        string(StateCancelled),
+				"leased_until": nil,
+				// The running attempt is not interrupted, but its claim is: clearing
+				// the token is what keeps its finalize from overwriting the cancel.
+				"lease_token":  nil,
+				"finalized_at": now,
+				"updated_at":   now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		affected = res.RowsAffected
+		if affected == 0 {
+			return nil
+		}
+		var row jobRow
+		if err := tx.Model(&jobRow{}).Select("parent_job_id").Where("id = ?", id).First(&row).Error; err != nil {
+			return fmt.Errorf("read parent: %w", err)
+		}
+		if row.ParentJobID == nil {
+			return nil
+		}
+		_, err := fireBarrierIfComplete(ctx, tx, *row.ParentJobID)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("flywheel: cancel job %q: %w", id, err)
 	}
-	if res.RowsAffected == 0 {
+	if affected == 0 {
 		return classifyCancelMiss(ctx, db, id)
 	}
 	return nil
@@ -611,7 +723,9 @@ type ScopeResult struct {
 	SkippedTerminal int64
 	// SkippedRunning is the number of children left in flight. None of the three
 	// operations interrupts a running attempt: it finalizes normally, and the pause
-	// or cancel applies to its next claim.
+	// or cancel applies to its next claim. A replay that targets cancelled jobs
+	// also counts here each one whose attempt is still running, which it leaves
+	// cancelled.
 	SkippedRunning int64
 	// SkippedActiveKey is set by a replay alone; the batch controls leave it zero. It
 	// is the number of targeted jobs left terminal because another job held their
@@ -644,12 +758,16 @@ func (o ScopeOpts) batchSize() int {
 }
 
 // scopeTransition is one parent-scoped operation's state machine: the states it
-// moves children out of, and the columns it writes. The three operations differ
-// only in these two things and share scopeByParent's batched, guarded loop.
+// moves children out of, the columns it writes, and whether the move can end the
+// parent's generation. The three operations differ only in these and share
+// scopeByParent's batched, guarded loop.
 type scopeTransition struct {
 	op      string
 	source  []string
 	updates func(now time.Time) map[string]any
+	// fireBarrier runs the parent's barrier check after each batch that changed a
+	// child. Only a transition into a terminal state sets it: the cancel.
+	fireBarrier bool
 }
 
 // PauseByParent holds every claimable child of a parent — available, retryable,
@@ -696,6 +814,14 @@ func ResumeByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts S
 // (SkippedRunning) and a terminal child is left exactly as it is (SkippedTerminal),
 // so a succeeded child's state and finalized_at are never overwritten.
 //
+// When the parent declared a Barrier and a batch leaves no child pending, that
+// batch enqueues the barrier's continuation in its own transaction, as a finalize
+// that ended the last child would have, and the call returns: the continuation is
+// now the parent's one pending child, and the call never cancels the
+// continuation it enqueued. With a child still running, the continuation fires
+// when that child finishes. A later CancelByParent on the same parent cancels a
+// still-pending continuation like any other pending child.
+//
 // It is bounded and cancellable on the same terms as PauseByParent.
 func CancelByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
 	return scopeByParent(ctx, db, parentJobID, opts, scopeTransition{
@@ -709,6 +835,7 @@ func CancelByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts S
 				"leased_until": nil, "lease_token": nil, "updated_at": now,
 			}
 		},
+		fireBarrier: true,
 	})
 }
 
@@ -757,7 +884,7 @@ func scopeByParent(
 				"flywheel: %s by parent cancelled after %d changed: %w", t.op, result.Changed, err,
 			)
 		}
-		selected, changed, err := scopeBatch(ctx, db, parentJobID, t, batchSize, now)
+		selected, changed, fired, err := scopeBatch(ctx, db, parentJobID, t, batchSize, now)
 		if err != nil {
 			return result, fmt.Errorf("flywheel: %s by parent: %w", t.op, err)
 		}
@@ -765,7 +892,10 @@ func scopeByParent(
 		if changed > 0 {
 			result.Batches++
 		}
-		if selected < batchSize {
+		// A batch that fired the parent's barrier left no child pending but the
+		// continuation it enqueued, an available child of this parent. Another
+		// batch, which a full batch would otherwise run, would select and cancel it.
+		if fired || selected < batchSize {
 			return result, nil
 		}
 	}
@@ -773,7 +903,9 @@ func scopeByParent(
 
 // scopeBatch moves one bounded batch of a parent's source-state children to the
 // target inside a single transaction. It returns how many rows it selected (which
-// drives the loop's termination) and how many it actually changed.
+// drives the loop's termination), how many it actually changed, and, for a
+// transition that runs the barrier check, whether the batch fired the parent's
+// barrier.
 //
 // The UPDATE re-guards on the source states — WHERE id IN ? AND state IN ? — rather
 // than trusting the ids the SELECT found: without SKIP LOCKED a concurrent operation
@@ -783,7 +915,7 @@ func scopeByParent(
 // transitions and no terminal row is ever revived.
 func scopeBatch(
 	ctx context.Context, db *gorm.DB, parentJobID string, t scopeTransition, batchSize int, now time.Time,
-) (selected int, changed int64, err error) {
+) (selected int, changed int64, fired bool, err error) {
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var ids []string
 		if e := tx.Model(&jobRow{}).
@@ -802,7 +934,12 @@ func scopeBatch(
 			return res.Error
 		}
 		changed = res.RowsAffected
-		return nil
+		if !t.fireBarrier || changed == 0 {
+			return nil
+		}
+		var e error
+		fired, e = fireBarrierIfComplete(ctx, tx, parentJobID)
+		return e
 	})
-	return selected, changed, err
+	return selected, changed, fired, err
 }
