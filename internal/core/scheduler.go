@@ -65,7 +65,9 @@ type SchedulerConfig struct {
 	// DB is the database the Scheduler reads periodic definitions from and runs
 	// the stuck-lease sweep against.
 	DB *gorm.DB
-	// Client is the producer the Scheduler enqueues periodic jobs through.
+	// Client is the producer the Scheduler enqueues periodic jobs through. One
+	// built with ClientOpts.Registry gives each fire its kind's Defaults under
+	// the periodic's queue.
 	Client *Client
 	// Driver is the seam the lease sweep runs through. Required: a Scheduler
 	// constructs no Driver of its own.

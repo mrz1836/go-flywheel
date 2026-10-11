@@ -61,6 +61,44 @@ func ExampleInsert() {
 	// Output: true
 }
 
+// DigestWorker is an EmailWorker that declares its kind's routing once: every
+// insert through a Client built with its Registry takes it.
+type DigestWorker struct{ EmailWorker }
+
+// Defaults is the queue, attempts, and timeout every digest job gets unless an
+// insert names its own.
+func (DigestWorker) Defaults() flywheel.InsertOpts {
+	return flywheel.InsertOpts{Queue: "mail", MaxAttempts: 4, Timeout: 30 * time.Second}
+}
+
+// ExampleNewClientWithOptions builds a Client with a Registry, so an insert
+// takes its kind's Defaults for every field it leaves zero, and keeps the
+// fields it names.
+func ExampleNewClientWithOptions() {
+	db, _ := gorm.Open(sqlite.Open("file:example-client-registry?mode=memory&cache=shared"), &gorm.Config{})
+	_ = flywheel.Migrate(db)
+
+	reg := flywheel.NewRegistry()
+	flywheel.Register(reg, DigestWorker{})
+	client := flywheel.NewClientWithOptions(db, flywheel.ClientOpts{Registry: reg})
+
+	ctx := context.Background()
+	for _, opts := range []flywheel.InsertOpts{{}, {Queue: "urgent"}} {
+		id, err := flywheel.Insert(ctx, client, EmailArgs{To: "a@example.com", Subject: "digest"}, opts)
+		if err != nil {
+			panic(err)
+		}
+		job, err := flywheel.FindJob(ctx, db, id)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println(job.Queue, job.MaxAttempts)
+	}
+	// Output:
+	// mail 4
+	// urgent 4
+}
+
 // ExampleAlreadyEnqueuedError finds the job an insert collided with: a second
 // insert under the same UniqueActiveKey collides, and the error names the job
 // holding the key, so the caller can join that job instead of dropping the
