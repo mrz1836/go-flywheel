@@ -137,8 +137,16 @@ type RecentFailuresParams struct {
 // positive limit.
 const defaultRecentFailuresLimit = 20
 
+// failureRun is the part of a job's final attempt a FailureView reports.
+type failureRun struct {
+	JobID        string
+	Attempt      int
+	ErrorClass   *string
+	ErrorMessage *string
+}
+
 // RecentFailures returns the most recently discarded jobs (newest finalized
-// first) within the window, each joined to the error on its latest attempt,
+// first) within the window, each joined to the error on its final attempt,
 // reading through db. Soft-deleted jobs are excluded. It powers the failures
 // section of `flywheel status` so an operator can glance and see what broke. It
 // returns at most MaxReadLimit jobs, whatever p.Limit asks for.
@@ -147,14 +155,17 @@ const defaultRecentFailuresLimit = 20
 // id) with state = 'discarded' — which hands back rows already in page order, so
 // the read stops at Limit instead of sorting every discarded job.
 //
-// The errors come from a second read keyed by the page's job ids rather than a
-// SQL join, so the page size bounds both queries and the dialects stay identical:
-// the runs for the page are loaded ordered by attempt, and the last row seen per
-// job — the highest attempt — wins, which is the attempt that discarded it.
+// The errors come from a second read keyed by the page's job ids, so the page
+// size bounds both queries. It joins each job to its own final attempt
+// (r.attempt = j.attempt) through the job_runs_job_attempt unique index — the
+// attempt that discarded it — so it reads one run per job, not every attempt.
+// Both reads select only the columns a FailureView reports: no args, no outputs,
+// and no error payloads.
 func RecentFailures(ctx context.Context, db *gorm.DB, p RecentFailuresParams) ([]FailureView, error) {
 	limit := readLimit(p.Limit, defaultRecentFailuresLimit)
 
 	query := db.WithContext(ctx).Model(&jobRow{}).
+		Select("id, kind, queue, attempt, finalized_at").
 		Where("state = ? AND finalized_at IS NOT NULL", string(StateDiscarded))
 	if !p.Since.IsZero() {
 		query = query.Where("finalized_at >= ?", p.Since)
@@ -171,14 +182,16 @@ func RecentFailures(ctx context.Context, db *gorm.DB, p RecentFailuresParams) ([
 	for i := range jobs {
 		ids[i] = jobs[i].ID
 	}
-	var runs []jobRunRow
-	if err := db.WithContext(ctx).Model(&jobRunRow{}).
-		Where("job_id IN ?", ids).
-		Order("attempt asc").Find(&runs).Error; err != nil {
+	var runs []failureRun
+	if err := db.WithContext(ctx).Table("job_runs AS r").
+		Select("r.job_id, r.attempt, r.error_class, r.error_message").
+		Joins("JOIN jobs j ON r.job_id = j.id AND r.attempt = j.attempt").
+		Where("j.id IN ?", ids).
+		Scan(&runs).Error; err != nil {
 		return nil, fmt.Errorf("flywheel: recent failures runs: %w", err)
 	}
-	// attempt asc means the last write per job is the highest (final) attempt.
-	latest := make(map[string]jobRunRow, len(runs))
+	// (job_id, attempt) is unique, so each job has at most one final attempt.
+	latest := make(map[string]failureRun, len(runs))
 	for i := range runs {
 		latest[runs[i].JobID] = runs[i]
 	}
