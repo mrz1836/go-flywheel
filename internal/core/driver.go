@@ -533,7 +533,12 @@ func runFinalizeUpdate(
 		upd["error_class"] = string(*plan.errorClass)
 	}
 	if workErr != nil {
-		message, payload, err := runErrorFields(workErr.Error())
+		var stack string
+		var panicked *panicError
+		if errors.As(workErr, &panicked) {
+			stack = panicked.stack
+		}
+		message, payload, err := runErrorFields(workErr.Error(), stack)
 		if err != nil {
 			return nil, err
 		}
@@ -559,13 +564,17 @@ func runFinalizeUpdate(
 // The payload holds "message", the stored message. A message cut at the cap
 // also carries "truncated": true and "message_bytes", its length before the
 // cut, so a reader can tell a cut message from a whole one; error_message itself
-// stays a plain prefix of what the worker returned.
-func runErrorFields(message string) (string, datatypes.JSON, error) {
+// stays a plain prefix of what the worker returned. A recovered panic's stack,
+// when given, is kept as "stack", at most 16 KiB.
+func runErrorFields(message, stack string) (string, datatypes.JSON, error) {
 	stored := truncate(message, maxErrorMessage)
 	fields := map[string]any{"message": stored}
 	if len(stored) < len(message) {
 		fields["truncated"] = true
 		fields["message_bytes"] = len(message)
+	}
+	if stack != "" {
+		fields["stack"] = truncate(stack, maxPanicStack)
 	}
 	payload, err := json.Marshal(fields)
 	if err != nil {

@@ -102,6 +102,10 @@ type JobRunView struct {
 	// ErrorTruncated reports that Error was cut at 4,096 bytes. The run's
 	// error_payload keeps the message's length before the cut (message_bytes).
 	ErrorTruncated bool `json:"error_truncated,omitempty"`
+	// ErrorStack is the stack of a worker panic the runner recovered, at most
+	// 16 KiB, where Error is the short panic message. It is empty for any other
+	// failure.
+	ErrorStack string `json:"error_stack,omitempty"`
 }
 
 // JobsOverview is the aggregate job-state report: a count per state plus the
@@ -528,10 +532,12 @@ func jobRunViewFromRow(r jobRunRow) JobRunView {
 		// Best-effort, like a JobView's tags: a payload that does not decode is a
 		// hand-written row, and it reads as unflagged rather than failing the page.
 		var payload struct {
-			Truncated bool `json:"truncated"`
+			Truncated bool   `json:"truncated"`
+			Stack     string `json:"stack"`
 		}
 		if err := json.Unmarshal(r.ErrorPayload, &payload); err == nil {
 			v.ErrorTruncated = payload.Truncated
+			v.ErrorStack = payload.Stack
 		}
 	}
 	return v

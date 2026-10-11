@@ -150,6 +150,10 @@ func assertRecoveredPanicKeepsItsStack(t *testing.T, db *gorm.DB, driver Driver)
 	assert.Contains(t, stack, "recordPanicOuter")
 	assert.LessOrEqual(t, len(stack), 16_384, "the stack is bounded")
 	assert.True(t, utf8.ValidString(stack))
+
+	view := latestRunView(t, db, run.JobID)
+	assert.Equal(t, stack, view.ErrorStack, "the view reports the stack")
+	assert.False(t, view.ErrorTruncated)
 }
 
 // latestRunView reads a job's newest run through the public view.
@@ -244,12 +248,14 @@ func TestJobRunViewReportsTruncationAndStack(t *testing.T) {
 	rows := []struct {
 		output, payload            string
 		outputTruncated, errorFlag bool
+		stack                      string
 	}{
-		{`{"$truncated": true, "$bytes": 100002, "$head": "\"ooo"}`, `{"message": "m", "truncated": true, "message_bytes": 9000}`, true, true},
-		{`{"$truncated": true, "$bytes": 5, "$head": "x", "mine": 1}`, `{"message": "short"}`, false, false},
-		{`{"$truncated": "yes", "$bytes": 5, "$head": "x"}`, `{"message": "m", "truncated": "yes"}`, false, false},
-		{`"a string that mentions $truncated"`, `not json`, false, false},
-		{``, ``, false, false},
+		{`{"$truncated": true, "$bytes": 100002, "$head": "\"ooo"}`, `{"message": "m", "truncated": true, "message_bytes": 9000}`, true, true, ""},
+		{`{"$truncated": true, "$bytes": 5, "$head": "x", "mine": 1}`, `{"message": "short"}`, false, false, ""},
+		{`{"$truncated": "yes", "$bytes": 5, "$head": "x"}`, `{"message": "m", "truncated": "yes"}`, false, false, ""},
+		{`"a string that mentions $truncated"`, `not json`, false, false, ""},
+		{``, ``, false, false, ""},
+		{``, `{"message": "jobs: worker panicked: boom", "stack": "goroutine 7 [running]:\nmain.inner()"}`, false, false, "goroutine 7 [running]:\nmain.inner()"},
 	}
 	for i, r := range rows {
 		run := jobRunRow{
@@ -272,6 +278,7 @@ func TestJobRunViewReportsTruncationAndStack(t *testing.T) {
 		r := rows[v.Attempt-1]
 		assert.Equal(t, r.outputTruncated, v.OutputTruncated, "attempt %d's output flag: %s", v.Attempt, r.output)
 		assert.Equal(t, r.errorFlag, v.ErrorTruncated, "attempt %d's error flag: %s", v.Attempt, r.payload)
+		assert.Equal(t, r.stack, v.ErrorStack, "attempt %d's stack: %s", v.Attempt, r.payload)
 	}
 }
 

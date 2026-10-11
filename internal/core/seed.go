@@ -135,7 +135,7 @@ func SeedRun(ctx context.Context, db *gorm.DB, seed RunSeed) (string, error) {
 		row.DurationMs = &durationMs
 	}
 	if seed.ErrorMessage != "" {
-		message, payload, err := runErrorFields(seed.ErrorMessage)
+		message, payload, err := runErrorFields(seed.ErrorMessage, "")
 		if err != nil {
 			return "", fmt.Errorf("flywheel: SeedRun: %w", err)
 		}

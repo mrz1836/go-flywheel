@@ -270,6 +270,27 @@ var (
 // errWorkerPanicked wraps a recovered worker panic.
 var errWorkerPanicked = errors.New("jobs: worker panicked")
 
+// maxPanicStack is the byte cap on a recovered panic's stack, as carried on its
+// panicError and recorded in its run's error_payload.
+const maxPanicStack = 16 * 1024
+
+// panicError is a recovered worker panic. Its text stays the short panic
+// message, "jobs: worker panicked: <value>", and it unwraps to
+// errWorkerPanicked; it also carries the goroutine's stack at the panic, so the
+// finalize can record where the worker panicked without widening the Driver
+// interface. The finalize finds it with errors.As through the Runner's
+// classification wrapper.
+type panicError struct {
+	value any
+	stack string
+}
+
+// Error returns the panic message without the stack.
+func (e *panicError) Error() string { return fmt.Sprintf("%s: %v", errWorkerPanicked, e.value) }
+
+// Unwrap exposes errWorkerPanicked for errors.Is.
+func (e *panicError) Unwrap() error { return errWorkerPanicked }
+
 // SchedulerConfig validation errors returned by NewScheduler and
 // NewSchedulerWithConfig.
 //

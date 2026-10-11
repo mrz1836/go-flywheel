@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1508,13 +1509,15 @@ func (r *Runner) resolveTimeout(entry registryEntry, raw RawJob) time.Duration {
 // survives it. A panicking worker must cost one attempt, not the whole process:
 // the recovered value becomes an ordinary job error that retries under the
 // normal backoff, and the other in-flight jobs on this runner are unaffected.
+// The error keeps the stack at the panic, cut at 16 KiB, which the finalize
+// records in the run's error_payload; its message stays the short panic text.
 func (r *Runner) runWork(
 	ctx context.Context, entry registryEntry, in dispatchInput,
 ) (result Result, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			result = Result{}
-			err = fmt.Errorf("%w: %v", errWorkerPanicked, rec)
+			err = &panicError{value: rec, stack: truncate(string(debug.Stack()), maxPanicStack)}
 		}
 	}()
 	return entry.dispatch(ctx, in)
