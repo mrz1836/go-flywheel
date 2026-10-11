@@ -37,10 +37,12 @@ type RunSeed struct {
 	// FinishedAt, when set, also fills duration_ms.
 	FinishedAt *time.Time
 	// Output is the structured result payload, stored on job_runs.output — the
-	// same column Result.Output lands in, readable back through ListRuns.
+	// same column Result.Output lands in, readable back through ListRuns. Like a
+	// worker's output, one whose JSON is larger than 65,536 bytes (the default
+	// DriverOpts.MaxOutputBytes) is stored as a TruncatedOutput.
 	Output any
 	// ErrorMessage, when non-empty, is truncated and stored with its JSON
-	// payload, exactly as a failed attempt's error is.
+	// payload, exactly as a failed attempt's error is, flagged when it was cut.
 	ErrorMessage string
 	// Tx, when set, writes the row on the caller's transaction.
 	Tx *gorm.DB
@@ -140,7 +142,7 @@ func SeedRun(ctx context.Context, db *gorm.DB, seed RunSeed) (string, error) {
 		row.ErrorMessage = &message
 		row.ErrorPayload = payload
 	}
-	output, marshalErr := marshalRunOutput(seed.Output)
+	output, marshalErr := marshalRunOutput(seed.Output, defaultMaxOutputBytes)
 	if marshalErr != nil {
 		return "", fmt.Errorf("flywheel: SeedRun: %w", marshalErr)
 	}

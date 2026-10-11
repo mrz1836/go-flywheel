@@ -132,6 +132,7 @@ type (
 	Timeouter             = core.Timeouter
 	TokenBucket           = core.TokenBucket
 	TokenBucketConfig     = core.TokenBucketConfig
+	TruncatedOutput       = core.TruncatedOutput
 	ValidationError       = core.ValidationError
 	WaitOpts              = core.WaitOpts
 )

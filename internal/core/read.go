@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -74,7 +75,8 @@ type JobRunView struct {
 	// ErrorClass classifies a failed attempt's error (transient, permanent,
 	// validation, timeout); empty when the attempt carried none.
 	ErrorClass string `json:"error_class,omitempty"`
-	// Error is the worker error recorded for a failed attempt, if any.
+	// Error is the worker error recorded for a failed attempt, if any, cut at
+	// 4,096 bytes; ErrorTruncated reports a cut.
 	Error *string `json:"error,omitempty"`
 	// CostMicros is the attempt's accumulated external-call cost, as the worker
 	// reported it in Result.CostMicros.
@@ -91,8 +93,15 @@ type JobRunView struct {
 	Superseded bool `json:"superseded"`
 	// Output is the worker's structured Result.Output as stored in job_runs.output
 	// (for the command workers, an ExecOutput with exit code and captured streams).
-	// It is empty when the attempt produced no output.
+	// It is empty when the attempt produced no output, and a TruncatedOutput when
+	// the output's JSON was larger than DriverOpts.MaxOutputBytes.
 	Output json.RawMessage `json:"output,omitempty"`
+	// OutputTruncated reports that Output holds a TruncatedOutput — exactly its
+	// three keys, $truncated true — rather than what the worker returned.
+	OutputTruncated bool `json:"output_truncated,omitempty"`
+	// ErrorTruncated reports that Error was cut at 4,096 bytes. The run's
+	// error_payload keeps the message's length before the cut (message_bytes).
+	ErrorTruncated bool `json:"error_truncated,omitempty"`
 }
 
 // JobsOverview is the aggregate job-state report: a count per state plus the
@@ -513,6 +522,40 @@ func jobRunViewFromRow(r jobRunRow) JobRunView {
 	}
 	if len(r.Output) > 0 {
 		v.Output = json.RawMessage(r.Output)
+		v.OutputTruncated = isTruncatedOutput(r.Output)
+	}
+	if len(r.ErrorPayload) > 0 {
+		// Best-effort, like a JobView's tags: a payload that does not decode is a
+		// hand-written row, and it reads as unflagged rather than failing the page.
+		var payload struct {
+			Truncated bool `json:"truncated"`
+		}
+		if err := json.Unmarshal(r.ErrorPayload, &payload); err == nil {
+			v.ErrorTruncated = payload.Truncated
+		}
 	}
 	return v
+}
+
+// isTruncatedOutput reports whether a stored output is a TruncatedOutput: an
+// object of exactly $truncated (true), $bytes (a number), and $head (a string).
+// An output of the worker's own that shares a key is not one. The byte probe
+// keeps a page of ordinary outputs from being decoded twice.
+func isTruncatedOutput(raw []byte) bool {
+	if !bytes.Contains(raw, []byte(`"$truncated"`)) {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || len(fields) != 3 {
+		return false
+	}
+	var marker struct {
+		Truncated *bool   `json:"$truncated"`
+		Bytes     *int    `json:"$bytes"`
+		Head      *string `json:"$head"`
+	}
+	if err := json.Unmarshal(raw, &marker); err != nil {
+		return false
+	}
+	return marker.Truncated != nil && *marker.Truncated && marker.Bytes != nil && marker.Head != nil
 }

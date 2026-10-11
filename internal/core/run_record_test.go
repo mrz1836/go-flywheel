@@ -101,6 +101,10 @@ func assertOversizedOutputIsStoredAsATruncationMarker(t *testing.T, db *gorm.DB,
 	head, ok := marker["$head"].(string)
 	require.True(t, ok, "the marker keeps the head of the marshaled output")
 	assert.Equal(t, `"`+strings.Repeat("o", 1023), head, "the first 1,024 bytes of the marshaled output")
+
+	view := latestRunView(t, db, id)
+	assert.True(t, view.OutputTruncated, "the view reports the marker")
+	assert.False(t, view.ErrorTruncated)
 }
 
 // assertLongErrorIsFlaggedTruncated runs a worker that fails with a
@@ -118,10 +122,15 @@ func assertLongErrorIsFlaggedTruncated(t *testing.T, db *gorm.DB, driver Driver)
 	assert.Equal(t, true, payload["truncated"], "the payload says the message was cut")
 	assert.EqualValues(t, size, payload["message_bytes"], "and how long it was before the cut")
 
+	view := latestRunView(t, db, run.JobID)
+	assert.True(t, view.ErrorTruncated, "the view reports the cut")
+	assert.False(t, view.OutputTruncated)
+
 	_, short := runRecordJob(t, db, driver, recordArgs{ErrorBytes: 10})
 	whole := decodeObject(t, short.ErrorPayload)
 	assert.NotContains(t, whole, "truncated", "a whole message carries no flag")
 	assert.NotContains(t, whole, "message_bytes")
+	assert.False(t, latestRunView(t, db, short.JobID).ErrorTruncated, "nor does its view")
 }
 
 // assertRecoveredPanicKeepsItsStack runs a worker that panics from three calls
@@ -141,6 +150,129 @@ func assertRecoveredPanicKeepsItsStack(t *testing.T, db *gorm.DB, driver Driver)
 	assert.Contains(t, stack, "recordPanicOuter")
 	assert.LessOrEqual(t, len(stack), 16_384, "the stack is bounded")
 	assert.True(t, utf8.ValidString(stack))
+}
+
+// latestRunView reads a job's newest run through the public view.
+func latestRunView(t *testing.T, db *gorm.DB, jobID string) JobRunView {
+	t.Helper()
+	view, ok, err := LatestRun(context.Background(), db, jobID)
+	require.NoError(t, err)
+	require.True(t, ok, "the job has a run")
+	return view
+}
+
+// assertMaxOutputBytesSetsTheCap runs outputs either side of a configured cap
+// and of the default one, and expects the marker exactly when the marshaled
+// output is larger than the cap in force.
+func assertMaxOutputBytesSetsTheCap(t *testing.T, db *gorm.DB, newDriver func(DriverOpts) Driver) {
+	t.Helper()
+	cases := []struct {
+		name     string
+		opts     DriverOpts
+		bytes    int // the string output's length; it marshals to two more
+		marker   bool
+		capLabel string
+	}{
+		{"under a configured cap", DriverOpts{MaxOutputBytes: 1024}, 1022, false, "1,024"},
+		{"over a configured cap", DriverOpts{MaxOutputBytes: 1024}, 1023, true, "1,024"},
+		{"at the default cap", DriverOpts{}, 65_534, false, "65,536"},
+		{"over the default cap", DriverOpts{}, 65_535, true, "65,536"},
+		{"a negative cap selects the default", DriverOpts{MaxOutputBytes: -1}, 65_534, false, "65,536"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, run := runRecordJob(t, db, newDriver(tc.opts), recordArgs{OutputBytes: tc.bytes})
+			assert.Equal(t, string(StateSucceeded), jobState(t, db, id))
+			view := latestRunView(t, db, id)
+			assert.Equal(t, tc.marker, view.OutputTruncated, "a %d-byte output against a cap of %s", tc.bytes+2, tc.capLabel)
+			if tc.marker {
+				var marker TruncatedOutput
+				require.NoError(t, json.Unmarshal(run.Output, &marker))
+				assert.Equal(t, TruncatedOutput{Truncated: true, Bytes: tc.bytes + 2, Head: marker.Head}, marker)
+				assert.LessOrEqual(t, len(marker.Head), 1024)
+				return
+			}
+			var whole string
+			require.NoError(t, json.Unmarshal(run.Output, &whole), "an output within the cap is stored as returned")
+			assert.Len(t, whole, tc.bytes)
+		})
+	}
+}
+
+func TestMaxOutputBytesSetsTheCap(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	assertMaxOutputBytesSetsTheCap(t, db, func(o DriverOpts) Driver {
+		d, err := NewSQLiteDriverWithOptions(db, SQLiteOpts{DriverOpts: o})
+		require.NoError(t, err)
+		return d
+	})
+}
+
+// TestSeedRunRecordsOutputAndErrorsLikeAFinalize proves SeedRun stores what a
+// finalize would: an output over the default cap as the marker, and a long
+// error cut and flagged.
+func TestSeedRunRecordsOutputAndErrorsLikeAFinalize(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	seedJob(t, db, jobRow{ID: "seeded-record", Kind: "k", State: string(StateDiscarded), ScheduledAt: runRecordAnchor})
+
+	_, err := SeedRun(ctx, db, RunSeed{
+		JobID: "seeded-record", Attempt: 1, ExecutorID: "import", Outcome: OutcomeError,
+		StartedAt: runRecordAnchor, Output: strings.Repeat("s", 70_000), ErrorMessage: strings.Repeat("m", 5_000),
+	})
+	require.NoError(t, err)
+
+	view := latestRunView(t, db, "seeded-record")
+	assert.True(t, view.OutputTruncated, "SeedRun applies the default output cap")
+	assert.True(t, view.ErrorTruncated, "and flags a cut message")
+	require.NotNil(t, view.Error)
+	assert.Len(t, *view.Error, maxErrorMessage)
+}
+
+// TestJobRunViewReportsTruncationAndStack reads hand-written rows through
+// ListRuns: the view flags an output that is exactly the marker and an error
+// payload that says it was cut, and nothing else.
+func TestJobRunViewReportsTruncationAndStack(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	const job = "view-flags"
+	seedJob(t, db, jobRow{ID: job, Kind: "k", State: string(StateRetryable), Attempt: 6, ScheduledAt: runRecordAnchor})
+
+	rows := []struct {
+		output, payload            string
+		outputTruncated, errorFlag bool
+	}{
+		{`{"$truncated": true, "$bytes": 100002, "$head": "\"ooo"}`, `{"message": "m", "truncated": true, "message_bytes": 9000}`, true, true},
+		{`{"$truncated": true, "$bytes": 5, "$head": "x", "mine": 1}`, `{"message": "short"}`, false, false},
+		{`{"$truncated": "yes", "$bytes": 5, "$head": "x"}`, `{"message": "m", "truncated": "yes"}`, false, false},
+		{`"a string that mentions $truncated"`, `not json`, false, false},
+		{``, ``, false, false},
+	}
+	for i, r := range rows {
+		run := jobRunRow{
+			ID: job + "-" + string(rune('a'+i)), JobID: job, Attempt: i + 1, ExecutorID: "h",
+			StartedAt: runRecordAnchor, Outcome: string(OutcomeError), CreatedAt: runRecordAnchor,
+		}
+		if r.output != "" {
+			run.Output = []byte(r.output)
+		}
+		if r.payload != "" {
+			run.ErrorPayload = []byte(r.payload)
+		}
+		seedRun(t, db, run)
+	}
+
+	views, err := ListRuns(ctx, db, job, ListRunsParams{})
+	require.NoError(t, err)
+	require.Len(t, views, len(rows))
+	for _, v := range views {
+		r := rows[v.Attempt-1]
+		assert.Equal(t, r.outputTruncated, v.OutputTruncated, "attempt %d's output flag: %s", v.Attempt, r.output)
+		assert.Equal(t, r.errorFlag, v.ErrorTruncated, "attempt %d's error flag: %s", v.Attempt, r.payload)
+	}
 }
 
 // sqliteRecordDriver is the SQLite driver the run-record tests run on.
@@ -166,3 +298,8 @@ func TestRecoveredPanicKeepsItsStack(t *testing.T) {
 	db := newDB(t)
 	assertRecoveredPanicKeepsItsStack(t, db, sqliteRecordDriver(t, db))
 }
+
+// runRecordAnchor keeps the seeded-row timestamps of the view tests fixed.
+//
+//nolint:gochecknoglobals // shared deterministic test anchor
+var runRecordAnchor = time.Date(2026, 7, 2, 9, 0, 0, 0, time.UTC)

@@ -21,6 +21,18 @@ import (
 // maxErrorMessage is the byte cap on a stored JobRun.error_message.
 const maxErrorMessage = 4096
 
+// Run-output bounds. A Result.Output is stored on its attempt's job_runs row,
+// which every later read of the run returns, so its size is capped like any
+// other per-attempt record.
+const (
+	// defaultMaxOutputBytes caps a stored output, as marshaled JSON, when
+	// DriverOpts leaves MaxOutputBytes zero.
+	defaultMaxOutputBytes = 64 * 1024
+	// truncatedOutputHead is how many bytes of an oversized output's JSON its
+	// TruncatedOutput keeps.
+	truncatedOutputHead = 1024
+)
+
 // Driver is the database seam the Runner and Scheduler reach through. It has
 // two implementations — driver_postgres.go (FOR UPDATE SKIP LOCKED) and
 // driver_sqlite.go (BEGIN IMMEDIATE + serialized claim) — so the runtime code
@@ -140,6 +152,15 @@ type DriverOpts struct {
 	// unbounded lock.
 	FollowUpLimit int
 
+	// MaxOutputBytes caps a stored Result.Output, measured as the JSON it
+	// marshals to. Zero or negative selects 65,536 (64 KiB). An output over the
+	// cap is not stored: the attempt records a TruncatedOutput in its place —
+	// the output's marshaled size and its first 1,024 bytes — and finalizes as it
+	// would have, so a worker that returns megabytes costs its run row about a
+	// kilobyte. JobRunView.OutputTruncated reports the marker. SeedRun applies
+	// the default.
+	MaxOutputBytes int
+
 	// BarrierMaxChildren caps the children of a generation that carries a
 	// Result.Barrier. Zero or negative selects defaultBarrierMaxChildren. A wider
 	// barrier fails the finalize with ErrBarrierTooWide. It is a separate, and often
@@ -174,6 +195,15 @@ func (o DriverOpts) followUpLimit() int {
 		return defaultFollowUpLimit
 	}
 	return o.FollowUpLimit
+}
+
+// maxOutputBytes resolves the stored-output cap, applying the default for a
+// non-positive value.
+func (o DriverOpts) maxOutputBytes() int {
+	if o.MaxOutputBytes <= 0 {
+		return defaultMaxOutputBytes
+	}
+	return o.MaxOutputBytes
 }
 
 // barrierMaxChildren resolves the per-generation barrier ceiling, applying the
@@ -486,6 +516,7 @@ func jobFinalizeUpdate(plan finalizePlan, finishedAt time.Time) map[string]any {
 // changes no hour the rollup has already counted.
 func runFinalizeUpdate(
 	plan finalizePlan, result Result, workErr error, finishedAt time.Time, durationMs, enqueued int, superseded bool,
+	maxOutputBytes int,
 ) (map[string]any, error) {
 	upd := map[string]any{
 		"outcome":           string(plan.runOutcome),
@@ -510,7 +541,7 @@ func runFinalizeUpdate(
 		upd["error_payload"] = payload
 	}
 	if result.Output != nil {
-		out, err := marshalRunOutput(result.Output)
+		out, err := marshalRunOutput(result.Output, maxOutputBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -523,21 +554,47 @@ func runFinalizeUpdate(
 // that record it: the truncated error_message and its error_payload JSON. It is
 // shared by the runtime's own finalize path and SeedRun, so a seeded row's error
 // is byte-identical in shape to one a real failed attempt produced — same cap,
-// same rune-safe cut, same payload key.
+// same rune-safe cut, same payload keys.
+//
+// The payload holds "message", the stored message. A message cut at the cap
+// also carries "truncated": true and "message_bytes", its length before the
+// cut, so a reader can tell a cut message from a whole one; error_message itself
+// stays a plain prefix of what the worker returned.
 func runErrorFields(message string) (string, datatypes.JSON, error) {
-	message = truncate(message, maxErrorMessage)
-	payload, err := json.Marshal(map[string]string{"message": message})
+	stored := truncate(message, maxErrorMessage)
+	fields := map[string]any{"message": stored}
+	if len(stored) < len(message) {
+		fields["truncated"] = true
+		fields["message_bytes"] = len(message)
+	}
+	payload, err := json.Marshal(fields)
 	if err != nil {
 		return "", nil, fmt.Errorf("jobs: marshal error payload: %w", err)
 	}
-	return message, datatypes.JSON(payload), nil
+	return stored, datatypes.JSON(payload), nil
+}
+
+// TruncatedOutput is what a run stores in place of a Result.Output whose JSON
+// is larger than DriverOpts.MaxOutputBytes. The attempt finalizes as it would
+// have; only its record is cut. A reader recognizes the marker by its exact
+// shape — an object of these three keys and no other, with $truncated true — and
+// JobRunView.OutputTruncated reports it.
+type TruncatedOutput struct {
+	// Truncated is always true.
+	Truncated bool `json:"$truncated"`
+	// Bytes is the marshaled size of the output the worker returned.
+	Bytes int `json:"$bytes"`
+	// Head is the first 1,024 bytes of that marshaled JSON, cut on a rune
+	// boundary. It is a preview, not JSON: it usually ends mid-value.
+	Head string `json:"$head"`
 }
 
 // marshalRunOutput renders a worker's structured output into the job_runs.output
-// payload. A nil output stores no value, leaving the column NULL. It is shared
-// by the finalize path and SeedRun so both land the same bytes in the column
-// ListRuns reads back.
-func marshalRunOutput(output any) (datatypes.JSON, error) {
+// payload. A nil output stores no value, leaving the column NULL, and an output
+// whose JSON is larger than maxBytes stores a TruncatedOutput instead. It is
+// shared by the finalize path and SeedRun so both land the same bytes in the
+// column ListRuns reads back.
+func marshalRunOutput(output any, maxBytes int) (datatypes.JSON, error) {
 	if output == nil {
 		return nil, nil
 	}
@@ -545,7 +602,18 @@ func marshalRunOutput(output any) (datatypes.JSON, error) {
 	if err != nil {
 		return nil, fmt.Errorf("jobs: marshal output: %w", err)
 	}
-	return datatypes.JSON(out), nil
+	if len(out) <= maxBytes {
+		return datatypes.JSON(out), nil
+	}
+	marker, err := json.Marshal(TruncatedOutput{
+		Truncated: true,
+		Bytes:     len(out),
+		Head:      truncate(string(out), truncatedOutputHead),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("jobs: marshal truncated output: %w", err)
+	}
+	return datatypes.JSON(marker), nil
 }
 
 // Finalize applies one attempt's outcome — the run-row update, the jobs.state
@@ -662,7 +730,9 @@ func (d *baseDriver) Finalize(
 			}
 		}
 
-		runUpd, err := runFinalizeUpdate(plan, result, workErr, finishedAt, durationMs, enqueued, out.Superseded)
+		runUpd, err := runFinalizeUpdate(
+			plan, result, workErr, finishedAt, durationMs, enqueued, out.Superseded, d.opts.maxOutputBytes(),
+		)
 		if err != nil {
 			return err
 		}

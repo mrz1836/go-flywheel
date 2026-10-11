@@ -21,3 +21,9 @@ func TestRecoveredPanicKeepsItsStackPostgres(t *testing.T) {
 	db := NewPostgresIsolatedDB(t)
 	assertRecoveredPanicKeepsItsStack(t, db, NewPostgresDriver(db))
 }
+
+func TestMaxOutputBytesSetsTheCapPostgres(t *testing.T) {
+	t.Parallel()
+	db := NewPostgresIsolatedDB(t)
+	assertMaxOutputBytesSetsTheCap(t, db, func(o DriverOpts) Driver { return NewPostgresDriverWithOptions(db, o) })
+}

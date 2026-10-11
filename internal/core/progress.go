@@ -270,7 +270,8 @@ type ChildOutput struct {
 	// terminal state but no attempt and no output).
 	Attempt int `json:"attempt"`
 	// Output is the child's last attempt's recorded Result.Output, empty when the
-	// child produced none or never ran.
+	// child produced none or never ran, and a TruncatedOutput when its JSON was
+	// larger than DriverOpts.MaxOutputBytes.
 	Output json.RawMessage `json:"output,omitempty"`
 }
 

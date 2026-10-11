@@ -228,7 +228,9 @@ type RawJob struct {
 
 // Result is what a worker returns on success.
 type Result struct {
-	// Output is the worker's structured output, stored on the JobRun.
+	// Output is the worker's structured output, stored on the JobRun. One whose
+	// JSON is larger than DriverOpts.MaxOutputBytes (64 KiB by default) is stored
+	// as a TruncatedOutput: its size and its first kilobyte.
 	Output any
 	// Snooze, when non-nil, reschedules the job for the given delay without
 	// consuming an attempt.
