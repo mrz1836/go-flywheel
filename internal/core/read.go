@@ -173,9 +173,32 @@ func stateStrings(states []JobState) []string {
 	return out
 }
 
+// MaxReadLimit is the most rows any list read returns: ListJobs, ListFinished,
+// ListRunning, SlowRuns, RecentFailures, and ListRuns. A larger Limit is
+// clamped to it rather than refused, so a host that passes a request's limit
+// straight through gets a full page, never a whole table. A host that asks for
+// one row more than its page, to learn whether another page follows, keeps its
+// page below MaxReadLimit, or the extra row is clamped away.
+//
+// ChildOutputs is the one exception: at a zero Limit it reads every terminal
+// child, because a barrier continuation folds its whole generation, which
+// DriverOpts.BarrierMaxChildren bounds.
+const MaxReadLimit = 200
+
+// readLimit resolves a list read's page size: def when limit is not positive,
+// and never more than MaxReadLimit.
+func readLimit(limit, def int) int {
+	if limit <= 0 {
+		return def
+	}
+	return min(limit, MaxReadLimit)
+}
+
 // ListRunsParams configures a ListRuns (or ChildOutputs) page. Limit caps the
 // rows returned; a host that wants a has-more sentinel passes Limit+1 and trims
-// the extra row itself. The zero value is the newest page, uncapped.
+// the extra row itself. The zero value is the newest page of at most
+// MaxReadLimit runs for ListRuns; ChildOutputs reads every terminal child at a
+// zero Limit.
 type ListRunsParams struct {
 	// Before is a created_at cursor: only rows created strictly before it are
 	// returned. Zero means newest.
@@ -185,7 +208,10 @@ type ListRunsParams struct {
 	// last run. It is exact on every dialect and is the cursor to prefer;
 	// ChildOutputs, which pages jobs rather than attempts, ignores it.
 	BeforeAttempt int
-	Limit         int
+	// Limit caps the page. ListRuns reads MaxReadLimit runs when it is not
+	// positive and clamps a larger value to MaxReadLimit; ChildOutputs applies a
+	// positive Limit as given.
+	Limit int
 }
 
 // OverviewParams configures an Overview query. Kind, when non-empty, scopes the
@@ -205,7 +231,7 @@ type ListJobsParams struct {
 	// before it are returned. Pass the last id of the previous page to fetch the
 	// next one.
 	BeforeID string
-	// Limit caps the page (default 50 when not positive).
+	// Limit caps the page (default 50 when not positive, at most MaxReadLimit).
 	Limit int
 }
 
@@ -214,7 +240,8 @@ const defaultListJobsLimit = 50
 
 // ListJobs returns jobs newest-first by id, reading through db and optionally
 // filtered by exact state, kind, and queue. Soft-deleted jobs are excluded. It is
-// the inspection seam behind a "list jobs" CLI or dashboard.
+// the inspection seam behind a "list jobs" CLI or dashboard. It returns at most
+// MaxReadLimit jobs, whatever p.Limit asks for.
 //
 // # Ordered by id, not created_at
 //
@@ -241,10 +268,7 @@ func ListJobs(ctx context.Context, db *gorm.DB, p ListJobsParams) ([]JobView, er
 	if p.BeforeID != "" {
 		query = query.Where("id < ?", p.BeforeID)
 	}
-	limit := p.Limit
-	if limit <= 0 {
-		limit = defaultListJobsLimit
-	}
+	limit := readLimit(p.Limit, defaultListJobsLimit)
 	var rows []jobRow
 	if err := query.Select(jobViewColumns()).Order("id desc").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("flywheel: list jobs: %w", err)
@@ -295,7 +319,9 @@ func jobViewColumns() []string {
 // ListRuns returns a job's runs newest-first by attempt (attempt desc, id desc),
 // reading through db; the job_runs_job_attempt unique index serves the order. A
 // positive p.BeforeAttempt returns only earlier attempts, a non-zero p.Before only
-// runs created strictly before it, and a positive p.Limit caps the page.
+// runs created strictly before it, and p.Limit caps the page: a zero or negative
+// Limit reads the newest MaxReadLimit runs, and a larger one is clamped to it.
+// Page past them with BeforeAttempt.
 //
 // # Zone-proof on SQLite
 //
@@ -320,11 +346,8 @@ func ListRuns(ctx context.Context, db *gorm.DB, jobID string, p ListRunsParams) 
 			query = query.Where("created_at < ?", before)
 		}
 	}
-	if p.Limit > 0 {
-		query = query.Limit(p.Limit)
-	}
 	var rows []jobRunRow
-	if err := query.Order("attempt desc, id desc").Find(&rows).Error; err != nil {
+	if err := query.Order("attempt desc, id desc").Limit(readLimit(p.Limit, MaxReadLimit)).Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("flywheel: list runs: %w", err)
 	}
 	views := make([]JobRunView, len(rows))

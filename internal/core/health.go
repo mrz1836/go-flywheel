@@ -126,7 +126,8 @@ type FailureView struct {
 
 // RecentFailuresParams scopes a RecentFailures query. Since bounds the window —
 // only jobs finalized at or after it are returned; a zero Since means no lower
-// bound. Limit caps the rows (default 20 when not positive).
+// bound. Limit caps the rows (default 20 when not positive, at most
+// MaxReadLimit).
 type RecentFailuresParams struct {
 	Since time.Time
 	Limit int
@@ -139,7 +140,8 @@ const defaultRecentFailuresLimit = 20
 // RecentFailures returns the most recently discarded jobs (newest finalized
 // first) within the window, each joined to the error on its latest attempt,
 // reading through db. Soft-deleted jobs are excluded. It powers the failures
-// section of `flywheel status` so an operator can glance and see what broke.
+// section of `flywheel status` so an operator can glance and see what broke. It
+// returns at most MaxReadLimit jobs, whatever p.Limit asks for.
 //
 // The page is one range scan of the jobs_finished index — (state, finalized_at,
 // id) with state = 'discarded' — which hands back rows already in page order, so
@@ -150,10 +152,7 @@ const defaultRecentFailuresLimit = 20
 // the runs for the page are loaded ordered by attempt, and the last row seen per
 // job — the highest attempt — wins, which is the attempt that discarded it.
 func RecentFailures(ctx context.Context, db *gorm.DB, p RecentFailuresParams) ([]FailureView, error) {
-	limit := p.Limit
-	if limit <= 0 {
-		limit = defaultRecentFailuresLimit
-	}
+	limit := readLimit(p.Limit, defaultRecentFailuresLimit)
 
 	query := db.WithContext(ctx).Model(&jobRow{}).
 		Where("state = ? AND finalized_at IS NOT NULL", string(StateDiscarded))

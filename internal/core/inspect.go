@@ -70,7 +70,7 @@ type ListRunningParams struct {
 	// Kind and Queue, when set, are exact-match filters.
 	Kind  string
 	Queue string
-	// Limit caps the page (default 100 when not positive).
+	// Limit caps the page (default 100 when not positive, at most MaxReadLimit).
 	Limit int
 	// WithBaseline compares each run to its kind's baseline from the rollups —
 	// one extra read — and sets BaselineP99 and Slow.
@@ -89,6 +89,7 @@ type ListRunningParams struct {
 // because a job is running from its claim, and its audit row lands a moment
 // later: in that gap the job is reported as Starting rather than dropped.
 // Elapsed, LeaseExpired, and Slow are computed in Go against the context clock.
+// It returns at most MaxReadLimit jobs, whatever p.Limit asks for.
 func ListRunning(ctx context.Context, db *gorm.DB, p ListRunningParams) ([]RunningJob, error) {
 	if db == nil {
 		return nil, fmt.Errorf("flywheel: ListRunning: db is nil")
@@ -101,6 +102,7 @@ func ListRunning(ctx context.Context, db *gorm.DB, p ListRunningParams) ([]Runni
 		}
 		baselines = baselineMap(list)
 	}
+	p.Limit = readLimit(p.Limit, defaultListRunningLimit)
 	out, err := listRunning(ctx, db, p, baselines)
 	if err != nil {
 		return nil, fmt.Errorf("flywheel: ListRunning: %w", err)
@@ -120,6 +122,11 @@ func baselineMap(list []Baseline) map[string]Baseline {
 // listRunning is ListRunning against baselines the caller already holds — the
 // Scheduler's heartbeat passes its cached set rather than re-reading rollups on
 // every pulse. A nil map compares nothing.
+//
+// It applies p.Limit as given, without ListRunning's MaxReadLimit clamp: the
+// Scheduler's slow-run check reads a page of its own (slowRunScanLimit) to
+// compare running attempts with their baselines, and returns none of them to a
+// caller, so a smaller page would only hide a slow attempt behind longer ones.
 func listRunning(
 	ctx context.Context, db *gorm.DB, p ListRunningParams, baselines map[string]Baseline,
 ) ([]RunningJob, error) {
@@ -225,12 +232,13 @@ type ListFinishedParams struct {
 	// than the cursor are returned. Pass the FinalizedAt and ID of the last job on
 	// that page.
 	Before *FinishedCursor
-	// Limit caps the page (default 50 when not positive).
+	// Limit caps the page (default 50 when not positive, at most MaxReadLimit).
 	Limit int
 }
 
 // ListFinished returns the most recently finished jobs, newest first by
-// (finalized_at, id) — what completed, and how it ended.
+// (finalized_at, id) — what completed, and how it ended. It returns at most
+// MaxReadLimit jobs, whatever p.Limit asks for.
 //
 // It runs one LIMIT n range scan per requested state on the jobs_finished index,
 // whose (state, finalized_at, id) key hands each scan its rows already in page
@@ -262,10 +270,7 @@ func ListFinished(ctx context.Context, db *gorm.DB, p ListFinishedParams) ([]Job
 		}
 	}
 	states = unique
-	limit := p.Limit
-	if limit <= 0 {
-		limit = defaultListFinishedLimit
-	}
+	limit := readLimit(p.Limit, defaultListFinishedLimit)
 
 	var all []jobRow
 	for _, s := range states {
@@ -328,22 +333,20 @@ type SlowRunsParams struct {
 	Since time.Time
 	// MinDuration, when positive, drops runs faster than it.
 	MinDuration time.Duration
-	// Limit caps the result (default 20 when not positive).
+	// Limit caps the result (default 20 when not positive, at most MaxReadLimit).
 	Limit int
 }
 
 // SlowRuns returns the slowest finished runs in a recent window, slowest first,
 // across every outcome — a timeout is exactly the slow run an operator wants to
 // see. Superseded runs are included and flagged. Crashed runs have no duration
-// and are not ranked.
+// and are not ranked. It returns at most MaxReadLimit runs, whatever p.Limit asks
+// for.
 func SlowRuns(ctx context.Context, db *gorm.DB, p SlowRunsParams) ([]JobRunView, error) {
 	if db == nil {
 		return nil, fmt.Errorf("flywheel: SlowRuns: db is nil")
 	}
-	limit := p.Limit
-	if limit <= 0 {
-		limit = defaultSlowRunsLimit
-	}
+	limit := readLimit(p.Limit, defaultSlowRunsLimit)
 	since := p.Since
 	if since.IsZero() {
 		since = models.ClockFrom(ctx).Now(ctx).Add(-defaultSlowRunsWindow)

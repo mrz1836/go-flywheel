@@ -146,6 +146,7 @@ const (
 	IndexPerformance         = core.IndexPerformance
 	IntervalDay              = core.IntervalDay
 	IntervalHour             = core.IntervalHour
+	MaxReadLimit             = core.MaxReadLimit
 	OutcomeCancelled         = core.OutcomeCancelled
 	OutcomeCrashed           = core.OutcomeCrashed
 	OutcomeError             = core.OutcomeError

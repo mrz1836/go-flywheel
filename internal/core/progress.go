@@ -281,6 +281,13 @@ type ChildOutput struct {
 // p.Limit reads every terminal child, which is the fold a barrier continuation
 // wants over a bounded generation.
 //
+// That zero is the one list read MaxReadLimit does not cap, on purpose: a
+// continuation that folded only the first MaxReadLimit children would act on
+// part of its generation as though it were the whole. The generation is bounded
+// instead, by DriverOpts.BarrierMaxChildren (10,000 by default), so a fold reads
+// at most that many children. A positive p.Limit is applied as given; a caller
+// that pages children for display passes one.
+//
 // The outputs come from a second read keyed by the page's child ids rather than a
 // SQL join, mirroring RecentFailures: the runs are loaded ordered by attempt, and
 // the last row seen per child — the highest attempt — is the one that reached the

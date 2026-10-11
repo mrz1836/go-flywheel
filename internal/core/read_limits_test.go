@@ -13,9 +13,9 @@ import (
 	"gorm.io/gorm"
 )
 
-// readLimitRows is how many rows each list read's fixture holds: more than the
-// most any list read returns, so a read that honors an oversized limit, or reads
-// everything at a zero one, returns more than the bound.
+// readLimitRows is how many rows each list read's fixture holds: more than
+// MaxReadLimit, so a read that honors an oversized limit, or reads everything at
+// a zero one, returns more than the bound.
 const readLimitRows = 250
 
 // readLimitAnchor is the clock instant the read-limit fixtures are written and
@@ -79,10 +79,11 @@ func seedListReadFixture(t *testing.T, db *gorm.DB) string {
 }
 
 // assertEveryListReadReturnsAtMost200 asks each list read for far more rows than
-// it may return, over a fixture holding more than that, and expects exactly the
-// bound back. Shared by the SQLite and PostgreSQL suites.
+// MaxReadLimit (200), over a fixture holding more than that, and expects exactly
+// the bound back. Shared by the SQLite and PostgreSQL suites.
 func assertEveryListReadReturnsAtMost200(t *testing.T, db *gorm.DB) {
 	t.Helper()
+	require.Equal(t, 200, MaxReadLimit, "the documented bound")
 	manyRuns := seedListReadFixture(t, db)
 	ctx := clockCtx(context.Background(), models.NewFixedClock(readLimitAnchor))
 	const oversized = 1_000_000
@@ -120,13 +121,14 @@ func assertEveryListReadReturnsAtMost200(t *testing.T, db *gorm.DB) {
 		t.Run(r.name, func(t *testing.T) {
 			n, err := r.read()
 			require.NoError(t, err)
-			assert.Equal(t, 200, n, "%s returns at most 200 rows however large the limit", r.name)
+			assert.Equal(t, MaxReadLimit, n, "%s returns at most MaxReadLimit rows however large the limit", r.name)
 		})
 	}
 }
 
 // assertListRunsWithoutALimitReadsAtMost200 reads a job with more attempts than
-// the bound at a zero and a negative limit, and expects the newest 200.
+// MaxReadLimit (200) at a zero and a negative limit, and expects the newest page
+// of MaxReadLimit runs.
 func assertListRunsWithoutALimitReadsAtMost200(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	manyRuns := seedListReadFixture(t, db)
@@ -135,14 +137,14 @@ func assertListRunsWithoutALimitReadsAtMost200(t *testing.T, db *gorm.DB) {
 	for _, limit := range []int{0, -1} {
 		runs, err := ListRuns(ctx, db, manyRuns, ListRunsParams{Limit: limit})
 		require.NoError(t, err)
-		require.Equal(t, 200, len(runs), "a limit of %d reads the newest page of 200 runs, not every attempt", limit)
+		require.Equal(t, MaxReadLimit, len(runs), "a limit of %d reads the newest page of MaxReadLimit runs, not every attempt", limit)
 		assert.Equal(t, readLimitRows, runs[0].Attempt, "the page starts at the newest attempt")
-		assert.Equal(t, readLimitRows-199, runs[len(runs)-1].Attempt, "and ends 200 attempts later")
+		assert.Equal(t, readLimitRows-MaxReadLimit+1, runs[len(runs)-1].Attempt, "and ends MaxReadLimit attempts later")
 	}
 
-	next, err := ListRuns(ctx, db, manyRuns, ListRunsParams{BeforeAttempt: readLimitRows - 199})
+	next, err := ListRuns(ctx, db, manyRuns, ListRunsParams{BeforeAttempt: readLimitRows - MaxReadLimit + 1})
 	require.NoError(t, err)
-	assert.Equal(t, readLimitRows-200, len(next), "BeforeAttempt pages past the default page to the rest")
+	assert.Equal(t, readLimitRows-MaxReadLimit, len(next), "BeforeAttempt pages past the default page to the rest")
 }
 
 func TestEveryListReadReturnsAtMost200(t *testing.T) {
