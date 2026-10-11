@@ -715,9 +715,11 @@ func (d *baseDriver) Finalize(
 		// state, its parent's barrier — if it declared one — may now be complete. It
 		// runs for any terminal transition (success, failure, or cancel), so a
 		// half-failed generation still gets its finalizer, but never for a retry or
-		// snooze (the child is still pending) or a superseded finalize.
+		// snooze (the child is still pending) or a superseded finalize: a cancel or a
+		// sweep discard that took the claim ran the check itself, in the transaction
+		// that made the child terminal.
 		if !out.Superseded && raw.ParentJobID != nil && isTerminalStateString(string(plan.jobState)) {
-			if err := d.fireBarrierIfComplete(txCtx, tx, *raw.ParentJobID); err != nil {
+			if _, err := fireBarrierIfComplete(txCtx, tx, *raw.ParentJobID); err != nil {
 				return err
 			}
 		}
@@ -870,10 +872,12 @@ func (d *baseDriver) sweep(ctx context.Context, now time.Time, reclaim reclaimFu
 	}
 }
 
-// sweepBatch reclaims one bounded batch and crashes its stale run stubs inside a
-// single transaction, so a batch can never leave a job available or discarded
-// with its audit row still reading started. It returns the batch's jobs in
-// reclaim order, each with its crashed run and the state the reclaim applied.
+// sweepBatch reclaims one bounded batch, crashes its stale run stubs, and runs
+// the barrier check for the parents of the jobs it discarded, inside a single
+// transaction, so a batch can never leave a job available or discarded with its
+// audit row still reading started, or end a generation without its continuation.
+// It returns the batch's jobs in reclaim order, each with its crashed run and the
+// state the reclaim applied.
 func (d *baseDriver) sweepBatch(
 	ctx context.Context, now time.Time, limit int, reclaim reclaimFunc,
 ) ([]SweptJob, error) {
@@ -889,6 +893,9 @@ func (d *baseDriver) sweepBatch(
 		runs, err := crashStaleStubs(tx, jobs, now)
 		if err != nil {
 			return fmt.Errorf("jobs: crash stale stubs: %w", err)
+		}
+		if err := fireDiscardedParentsBarriers(ctx, tx, jobs); err != nil {
+			return err
 		}
 		swept = make([]SweptJob, len(jobs))
 		for i, j := range jobs {
@@ -1234,17 +1241,24 @@ func resolveBarrierColumns(tx *gorm.DB, raw RawJob, b *Barrier) (string, datatyp
 }
 
 // fireBarrierIfComplete enqueues a parent's barrier continuation when the child
-// whose finalize is running is the last of the generation to reach a terminal
-// state. It runs inside that child's finalize transaction, so the enqueue is atomic
-// with the child's own state advance and inherits its supersede-idempotency.
+// that just became terminal in tx was the last of the generation still pending,
+// and reports whether it did. Every path that makes a child terminal runs it in
+// the transaction that does so — the child's finalize, the lease sweep's discard,
+// CancelJob, and each CancelByParent batch — so the enqueue is atomic with the
+// child's own state change, and the continuation runs whichever way the last
+// child ended.
 //
 // The overwhelmingly common case — a parent that declared no barrier — returns at
 // the fast gate, having taken no lock and issued no completion count. When a barrier
 // is declared it serializes concurrent completion checks on the parent row: without
-// that, two children finalizing at once could each see the other as still pending
-// under READ COMMITTED and neither fire. On SQLite the single-writer model already
-// serializes finalizes, so the row lock is taken on PostgreSQL alone.
-func (d *baseDriver) fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, parentID string) error {
+// that, two children becoming terminal at once could each see the other as still
+// pending under READ COMMITTED and neither fire. On SQLite the single-writer model
+// already serializes those writes, so the row lock is taken on PostgreSQL alone.
+//
+// fired is true only when this call enqueued the continuation and cleared the
+// barrier. A caller that keeps writing the parent's children after a fire must
+// stop: the continuation is now the parent's one pending child.
+func fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, parentID string) (fired bool, err error) {
 	// Fast gate: a plain read of the parent's barrier_kind by primary key. A parent
 	// with no barrier — every parent that did not declare one — returns here, having
 	// touched nothing else.
@@ -1252,12 +1266,12 @@ func (d *baseDriver) fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, par
 	switch err := quietMissing(tx).WithContext(ctx).Model(&jobRow{}).
 		Select("barrier_kind").Where("id = ?", parentID).First(&gate).Error; {
 	case errors.Is(err, gorm.ErrRecordNotFound):
-		return nil // the parent row is gone (pruned); nothing to fire
+		return false, nil // the parent row is gone (pruned); nothing to fire
 	case err != nil:
-		return fmt.Errorf("jobs: read barrier gate: %w", err)
+		return false, fmt.Errorf("jobs: read barrier gate: %w", err)
 	}
 	if gate.BarrierKind == nil {
-		return nil
+		return false, nil
 	}
 
 	// A barrier is declared. Lock the parent row so concurrent completion checks
@@ -1271,12 +1285,12 @@ func (d *baseDriver) fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, par
 	}
 	switch err := locked.First(&parent).Error; {
 	case errors.Is(err, gorm.ErrRecordNotFound):
-		return nil
+		return false, nil
 	case err != nil:
-		return fmt.Errorf("jobs: lock barrier parent: %w", err)
+		return false, fmt.Errorf("jobs: lock barrier parent: %w", err)
 	}
 	if parent.BarrierKind == nil {
-		return nil // a concurrent finalize already fired and cleared it
+		return false, nil // a concurrent write already fired and cleared it
 	}
 
 	// Count the parent's still-pending children, index-only via jobs_parent_state
@@ -1287,28 +1301,49 @@ func (d *baseDriver) fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, par
 	if err := tx.WithContext(ctx).Model(&jobRow{}).
 		Where("parent_job_id = ? AND state NOT IN ?", parentID, terminalStateStrings()).
 		Count(&remaining).Error; err != nil {
-		return fmt.Errorf("jobs: count barrier siblings: %w", err)
+		return false, fmt.Errorf("jobs: count barrier siblings: %w", err)
 	}
 	if remaining > 0 {
-		return nil
+		return false, nil
 	}
 
 	// Last child: enqueue the continuation, keyed so a torn retry can never enqueue it
 	// twice, and clear the barrier so the continuation's own finalize skips the check.
 	fu, err := followUpFromBarrierSpec(*parent.BarrierKind, parent.BarrierSpec, parentID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	row, err := buildChildRow(ctx, fu, parentID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := conflictInsertChunk(ctx, tx, []jobRow{row}); err != nil {
-		return fmt.Errorf("jobs: enqueue barrier continuation: %w", err)
+		return false, fmt.Errorf("jobs: enqueue barrier continuation: %w", err)
 	}
 	if err := tx.WithContext(ctx).Model(&jobRow{}).Where("id = ?", parentID).
 		Updates(map[string]any{"barrier_kind": nil, "barrier_spec": nil}).Error; err != nil {
-		return fmt.Errorf("jobs: clear fired barrier: %w", err)
+		return false, fmt.Errorf("jobs: clear fired barrier: %w", err)
+	}
+	return true, nil
+}
+
+// fireDiscardedParentsBarriers runs the barrier check once for each distinct
+// parent of the jobs a sweep batch discarded, in the batch's transaction: a
+// discard is a terminal transition like a finalize's, so it may complete its
+// parent's generation. The parents are checked in id order, so two sweeps whose
+// batches share parents lock those parent rows in the same order.
+func fireDiscardedParentsBarriers(ctx context.Context, tx *gorm.DB, jobs []reclaimedJob) error {
+	var parents []string
+	for _, j := range jobs {
+		if j.State == string(StateDiscarded) && j.ParentJobID != nil {
+			parents = append(parents, *j.ParentJobID)
+		}
+	}
+	slices.Sort(parents)
+	for _, parentID := range slices.Compact(parents) {
+		if _, err := fireBarrierIfComplete(ctx, tx, parentID); err != nil {
+			return err
+		}
 	}
 	return nil
 }

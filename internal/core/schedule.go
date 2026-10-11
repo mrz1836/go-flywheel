@@ -533,32 +533,63 @@ func classifyRetryMiss(ctx context.Context, db *gorm.DB, id string) error {
 // attempt already running is not interrupted, but the job will not be retried or
 // re-claimed.
 //
+// When the job is a child whose parent declared a Barrier and it was the last of
+// its generation still pending, the cancel enqueues the barrier's continuation, in
+// the same transaction, as a finalize that ended the child would have. A running
+// child's cancel fires it at once: the child is terminal, and its attempt's late
+// finalize is superseded and fires nothing. The continuation can therefore start
+// while the cancelled attempt's worker is still running, since a cancel fences an
+// attempt's result rather than stopping its worker.
+//
 // A job that has already reached a terminal state (succeeded, cancelled, or
 // discarded) is left exactly as it is and ErrJobTerminal is returned: cancelling
 // must never overwrite a recorded outcome or its finalized_at stamp. It returns
 // ErrJobNotFound when no live job has the id.
+//
+// The update and the barrier check run in a transaction of their own — a
+// savepoint when db is a caller's transaction, unless the host turned off GORM's
+// nested transactions.
 func CancelJob(ctx context.Context, db *gorm.DB, id string) error {
 	now := models.ClockFrom(ctx).Now(ctx)
-	// Scope the write to the states a job can still be cancelled from. Naming the
-	// allowed states rather than excluding the terminal ones is deliberate: a row
-	// in a state this runtime does not recognize is refused rather than clobbered,
-	// so the guard can never be defeated by a state added to the vocabulary but
-	// missed here.
-	res := db.WithContext(ctx).Model(&jobRow{}).
-		Where("id = ? AND state IN ?", id, nonTerminalStateStrings()).
-		Updates(map[string]any{
-			"state":        string(StateCancelled),
-			"leased_until": nil,
-			// The running attempt is not interrupted, but its claim is: clearing
-			// the token is what keeps its finalize from overwriting the cancel.
-			"lease_token":  nil,
-			"finalized_at": now,
-			"updated_at":   now,
-		})
-	if res.Error != nil {
-		return fmt.Errorf("flywheel: cancel job %q: %w", id, res.Error)
+	var affected int64
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Scope the write to the states a job can still be cancelled from. Naming
+		// the allowed states rather than excluding the terminal ones is deliberate:
+		// a row in a state this runtime does not recognize is refused rather than
+		// clobbered, so the guard can never be defeated by a state added to the
+		// vocabulary but missed here.
+		res := tx.Model(&jobRow{}).
+			Where("id = ? AND state IN ?", id, nonTerminalStateStrings()).
+			Updates(map[string]any{
+				"state":        string(StateCancelled),
+				"leased_until": nil,
+				// The running attempt is not interrupted, but its claim is: clearing
+				// the token is what keeps its finalize from overwriting the cancel.
+				"lease_token":  nil,
+				"finalized_at": now,
+				"updated_at":   now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		affected = res.RowsAffected
+		if affected == 0 {
+			return nil
+		}
+		var row jobRow
+		if err := tx.Model(&jobRow{}).Select("parent_job_id").Where("id = ?", id).First(&row).Error; err != nil {
+			return fmt.Errorf("read parent: %w", err)
+		}
+		if row.ParentJobID == nil {
+			return nil
+		}
+		_, err := fireBarrierIfComplete(ctx, tx, *row.ParentJobID)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("flywheel: cancel job %q: %w", id, err)
 	}
-	if res.RowsAffected == 0 {
+	if affected == 0 {
 		return classifyCancelMiss(ctx, db, id)
 	}
 	return nil
@@ -644,12 +675,16 @@ func (o ScopeOpts) batchSize() int {
 }
 
 // scopeTransition is one parent-scoped operation's state machine: the states it
-// moves children out of, and the columns it writes. The three operations differ
-// only in these two things and share scopeByParent's batched, guarded loop.
+// moves children out of, the columns it writes, and whether the move can end the
+// parent's generation. The three operations differ only in these and share
+// scopeByParent's batched, guarded loop.
 type scopeTransition struct {
 	op      string
 	source  []string
 	updates func(now time.Time) map[string]any
+	// fireBarrier runs the parent's barrier check after each batch that changed a
+	// child. Only a transition into a terminal state sets it: the cancel.
+	fireBarrier bool
 }
 
 // PauseByParent holds every claimable child of a parent — available, retryable,
@@ -696,6 +731,14 @@ func ResumeByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts S
 // (SkippedRunning) and a terminal child is left exactly as it is (SkippedTerminal),
 // so a succeeded child's state and finalized_at are never overwritten.
 //
+// When the parent declared a Barrier and a batch leaves no child pending, that
+// batch enqueues the barrier's continuation in its own transaction, as a finalize
+// that ended the last child would have, and the call returns: the continuation is
+// now the parent's one pending child, and the call never cancels the
+// continuation it enqueued. With a child still running, the continuation fires
+// when that child finishes. A later CancelByParent on the same parent cancels a
+// still-pending continuation like any other pending child.
+//
 // It is bounded and cancellable on the same terms as PauseByParent.
 func CancelByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
 	return scopeByParent(ctx, db, parentJobID, opts, scopeTransition{
@@ -709,6 +752,7 @@ func CancelByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts S
 				"leased_until": nil, "lease_token": nil, "updated_at": now,
 			}
 		},
+		fireBarrier: true,
 	})
 }
 
@@ -757,7 +801,7 @@ func scopeByParent(
 				"flywheel: %s by parent cancelled after %d changed: %w", t.op, result.Changed, err,
 			)
 		}
-		selected, changed, err := scopeBatch(ctx, db, parentJobID, t, batchSize, now)
+		selected, changed, fired, err := scopeBatch(ctx, db, parentJobID, t, batchSize, now)
 		if err != nil {
 			return result, fmt.Errorf("flywheel: %s by parent: %w", t.op, err)
 		}
@@ -765,7 +809,10 @@ func scopeByParent(
 		if changed > 0 {
 			result.Batches++
 		}
-		if selected < batchSize {
+		// A batch that fired the parent's barrier left no child pending but the
+		// continuation it enqueued, an available child of this parent. Another
+		// batch, which a full batch would otherwise run, would select and cancel it.
+		if fired || selected < batchSize {
 			return result, nil
 		}
 	}
@@ -773,7 +820,9 @@ func scopeByParent(
 
 // scopeBatch moves one bounded batch of a parent's source-state children to the
 // target inside a single transaction. It returns how many rows it selected (which
-// drives the loop's termination) and how many it actually changed.
+// drives the loop's termination), how many it actually changed, and, for a
+// transition that runs the barrier check, whether the batch fired the parent's
+// barrier.
 //
 // The UPDATE re-guards on the source states — WHERE id IN ? AND state IN ? — rather
 // than trusting the ids the SELECT found: without SKIP LOCKED a concurrent operation
@@ -783,7 +832,7 @@ func scopeByParent(
 // transitions and no terminal row is ever revived.
 func scopeBatch(
 	ctx context.Context, db *gorm.DB, parentJobID string, t scopeTransition, batchSize int, now time.Time,
-) (selected int, changed int64, err error) {
+) (selected int, changed int64, fired bool, err error) {
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var ids []string
 		if e := tx.Model(&jobRow{}).
@@ -802,7 +851,12 @@ func scopeBatch(
 			return res.Error
 		}
 		changed = res.RowsAffected
-		return nil
+		if !t.fireBarrier || changed == 0 {
+			return nil
+		}
+		var e error
+		fired, e = fireBarrierIfComplete(ctx, tx, parentJobID)
+		return e
 	})
-	return selected, changed, err
+	return selected, changed, fired, err
 }

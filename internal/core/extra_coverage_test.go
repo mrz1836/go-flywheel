@@ -503,7 +503,9 @@ func TestPeriodicWritersReturnNotFound(t *testing.T) {
 // CancelJob's miss classifier. Closing the DB cannot reach it — the UPDATE
 // fails first — so the read is failed on its own: gorm routes Count through the
 // Query callbacks while Updates goes through the Update callbacks, so a
-// Query-only fault leaves the write path intact.
+// Query-only fault leaves the write path intact. The fault is narrowed to a
+// Count, because a cancel that lands also reads the job's parent (a Query) for
+// the barrier check, and that read must still work.
 func TestCancelJobSurfacesClassificationReadError(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
@@ -513,7 +515,11 @@ func TestCancelJobSurfacesClassificationReadError(t *testing.T) {
 
 	errQuery := errors.New("query callback failed")
 	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:fail_query",
-		func(tx *gorm.DB) { _ = tx.AddError(errQuery) }))
+		func(tx *gorm.DB) {
+			if _, isCount := tx.Statement.Dest.(*int64); isCount {
+				_ = tx.AddError(errQuery)
+			}
+		}))
 
 	// Assert the write still works first, so a passing result cannot come from the
 	// UPDATE failing instead of the classifying read.

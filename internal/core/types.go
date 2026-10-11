@@ -250,11 +250,14 @@ type Result struct {
 // has reached a terminal state. A worker returns it alongside the children
 // themselves (Result.FollowUps with Parent set).
 //
-// The continuation is enqueued by whichever child finishes last, inside that
-// child's finalize transaction, and is keyed ("barrier:<parent id>") so a retried,
-// discarded, cancelled, or superseded child can never enqueue it twice. It runs
-// when the last child reaches any terminal state — succeeded, cancelled, or
-// discarded — because a partly-failed generation still needs its finalizer. The
+// The continuation is enqueued in the transaction that makes the last pending
+// child terminal: its finalize, a cancel, or the sweep's discard. It is keyed
+// ("barrier:<parent id>") so a retried, discarded, cancelled, or superseded child
+// can never enqueue it twice. It runs when the last child reaches any terminal
+// state — succeeded, cancelled, or discarded — because a partly-failed generation
+// still needs its finalizer. A cancelled running child counts as terminal at the
+// cancel, so the continuation can start while that child's worker is still
+// running: a cancel fences an attempt's result, it does not stop the worker. The
 // continuation reads its children's recorded outputs through ChildOutputs.
 //
 // A barrier-bearing generation is bounded by DriverOpts.BarrierMaxChildren
