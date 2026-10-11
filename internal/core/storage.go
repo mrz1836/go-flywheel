@@ -332,8 +332,8 @@ func runtimeStorageParameters() []StorageParameter {
 			// It does *not* enable HOT updates here, and the common claim that
 			// fillfactor "enables HOT" is false for this table: a HOT update
 			// requires that no index-relevant column change, and `state` is in the
-			// predicate of four of the runtime's indexes. Every state transition is
-			// therefore non-HOT whatever the fillfactor is.
+			// predicate of three of the runtime's indexes and a key of three more.
+			// Every state transition is therefore non-HOT whatever the fillfactor is.
 			Table: "jobs",
 			DDL:   `ALTER TABLE jobs SET (fillfactor = 80)`,
 		},

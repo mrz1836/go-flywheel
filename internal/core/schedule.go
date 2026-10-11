@@ -31,6 +31,18 @@ type PeriodicSpec struct {
 	// to an empty object; anything else must be valid JSON.
 	ArgsTemplate []byte
 	// Cron is a standard 5-field cron expression. Mutually exclusive with Every.
+	//
+	// An expression that names no zone runs in the zone of the time it is
+	// evaluated against: the Scheduler clock's now when the schedule is created
+	// or changed (the default clock returns time.Now(), the process's local zone),
+	// and on every fire after that the stored next_run_at, as the database driver
+	// returns it. Whether "0 9 * * *" fires at 09:00 UTC or 09:00 local time, and
+	// whether it follows daylight saving, then depends on the host's zone and the
+	// driver. Prefix the expression with CRON_TZ=<IANA zone> to pin it —
+	// "CRON_TZ=UTC 0 9 * * *", or "CRON_TZ=America/New_York 0 9 * * *" for 09:00
+	// New York time across daylight-saving changes — and the schedule runs in that
+	// zone wherever it is evaluated. An unknown zone is refused like any malformed
+	// expression.
 	Cron string
 	// Every is a fixed interval between fires. Mutually exclusive with Cron.
 	Every time.Duration

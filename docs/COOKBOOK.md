@@ -7,11 +7,12 @@ land. For the guarantees underneath these recipes, see [`CONTRACT.md`](CONTRACT.
 
 <br>
 
-## 1. Enqueue this exact unit of work at most once, ever — `UniqueKey`
+## 1. Enqueue this exact unit of work at most once — `UniqueKey`
 
 Deduplicate a webhook delivery, a one-time migration, an idempotent command: the same logical unit must
-produce at most one job for all time. `UniqueKey` collides with any job that ever bore the key — terminal
-or not — and returns `ErrAlreadyEnqueued`.
+produce at most one job. `UniqueKey` collides with any job that bears the key — terminal or not — for as
+long as that job's row exists, and returns `ErrAlreadyEnqueued`. With retention on, that is until
+retention deletes the job (see the last paragraph of this recipe).
 
 ```go
 _, err := flywheel.Insert(ctx, client, ProcessWebhook{DeliveryID: id}, flywheel.InsertOpts{
@@ -28,8 +29,8 @@ if err != nil {
 The error also names the original job: `errors.As` into a `*flywheel.AlreadyEnqueuedError` and its
 `ExistingID` is the job holding the key, ready to report or inspect.
 
-**The consequence to plan for: this job can never be re-enqueued.** The key collides with the original
-row forever, so a second `Insert` with the same key always returns `ErrAlreadyEnqueued`, even after the
+**The consequence to plan for: this job cannot be re-enqueued while its row exists.** The key collides
+with the original row, so a second `Insert` with the same key returns `ErrAlreadyEnqueued`, even after the
 first job succeeded. To run that unit of work *again*, keep its row and replay it rather than
 re-enqueuing:
 
@@ -43,6 +44,13 @@ _, err = flywheel.ReplayByParent(ctx, db, parentJobID, flywheel.ReplayOpts{})
 
 If a later run is *expected* rather than exceptional, you want recipe 2 instead — `UniqueActiveKey` frees
 on a terminal state.
+
+**Retention frees the key.** `DeleteFinishedJobs` (and the scheduler's retention pass) hard-deletes a
+terminal job once it is older than the window, and with the row goes the key: the next `Insert` with it
+lands and runs the work again. When "at most once" has to outlive retention, hold the key where retention
+cannot reach it. Either keep retention off, or its window longer than the key must hold, or record the key
+in a table of your own under a unique constraint, written in the same transaction as the enqueue
+(`InsertOpts.Tx`), so your table, not the job row, refuses the second submission.
 
 <br>
 
@@ -243,7 +251,7 @@ job. The runtime already keeps `job_runs`: one audit row per attempt, with the o
 
 | You want | Key | Collides with | Frees when | Re-enqueuable? |
 |---|---|---|---|---|
-| At most once, ever | `UniqueKey` | any job that ever bore the key | never | No — replay the row instead |
+| At most once | `UniqueKey` | any job that bears the key, terminal or not | only when retention deletes that job | No while its row exists — replay the row instead |
 | At most one active per subject | `UniqueActiveKey` | a still-live job with the key | the job reaches a terminal state | Yes, once the active one finishes |
 | Join the in-flight job and wait for its result | `UniqueActiveKey` + `AlreadyEnqueuedError` + `WaitForJob` | a still-live job with the key | the job reaches a terminal state | Yes, once the active one finishes |
 | At most one per time window | either, with the bucket in the key | same-bucket job | per the key type above | per the key type above |
@@ -251,8 +259,10 @@ job. The runtime already keeps `job_runs`: one audit row per attempt, with the o
 | Enqueue atomically with your own write | *(any key)* + `InsertOpts.Tx` | per the key | per the key | the job exists iff your transaction commits; a collision leaves the transaction usable |
 
 The distinction that trips people up: **`UniqueKey` colliding with a terminal job is a feature, not a
-bug.** It is what "at most once, ever" means. If you find yourself wanting the key to free up after the
-job finishes, you wanted `UniqueActiveKey` — choose it before working around `UniqueKey`.
+bug.** It is what "at most once" means. If you find yourself wanting the key to free up after the
+job finishes, you wanted `UniqueActiveKey` — choose it before working around `UniqueKey`. The one thing
+that frees a `UniqueKey` is retention deleting its job; recipe 1 says what to do when the guarantee must
+outlast that.
 
 `InsertOpts`' godoc points here; this table is the expanded form of the one-line summaries on the
 `UniqueKey` and `UniqueActiveKey` fields.

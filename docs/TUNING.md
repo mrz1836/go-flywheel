@@ -121,8 +121,9 @@ not keep pace (two passes in two minutes).
   count points at the scale factor, and it is the setting with a mechanism that plainly applies here.
 - **`fillfactor` does not enable HOT updates on this table** — the common belief that it does is false
   here. A HOT update needs no index-relevant column to change, but `state` sits in the *predicate* of
-  four partial indexes, so every state transition is non-HOT whatever the fillfactor is. What fillfactor
-  buys is same-page placement for the new tuple version.
+  three partial indexes (`jobs_ready`, `jobs_unique_active_key`, `jobs_running_leased`) and is a key of
+  three more (`jobs_state`, `jobs_finished`, `jobs_parent_state`), so every state transition is non-HOT
+  whatever the fillfactor is. What fillfactor buys is same-page placement for the new tuple version.
 - **The cost is real: WAL per job rose 54 %** (7.0 → 10.8 KB) under tuning, because vacuuming more often
   writes more WAL and a sub-100 fillfactor puts fewer tuples per page. A deployment paying for
   replication or backup by the byte should weigh that against the bloat and throughput it buys.

@@ -260,24 +260,26 @@ Each section below is self-contained; open the ones you need.
 <summary><strong><code>Schema setup — pick exactly one install path</code></strong></summary>
 <br>
 
-`go-flywheel` owns five tables — `jobs`, `job_runs`, and `job_periodics`, plus `limiter_buckets` and
-`limiter_holds` for the shared database-backed limiter (additive: empty unless you construct a
-`DBLimiter`) — and there are **two ways to install them. Pick exactly one.** They are not layers; running
-both means two migration authorities against one database.
+`go-flywheel` owns eight tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
+`limiter_buckets` and `limiter_holds` for the shared database-backed limiter (additive: empty unless you
+construct a `DBLimiter`); and `job_run_finishes`, `job_stats_hourly`, and `job_stats_progress`, the
+finish log every finalize writes and the stats rollup's tables — and there are **two ways to install
+them. Pick exactly one.** They are not layers; running both means two migration authorities against one
+database.
 
 | Question | **Library-owned** | **Host-owned** |
 |---|---|---|
-| Who creates the five tables? | `Migrate(db)` | your loader, from `Models()` |
+| Who creates the tables? | `Migrate(db)` | your loader, from `Models()` |
 | Who creates the indexes? | `Migrate(db)` | you, from `IndexSet(dialect)` / `InstallIndexes` |
 | Who sets the storage parameters? | `Migrate(db)` | you, from `InstallStorageParameters` |
 | Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
 | Does the runtime run DDL at startup? | yes, every start | no |
-| Is a co-located host schema safe? | only if the host's tooling excludes the five tables | yes — the tables are in your loader |
+| Is a co-located host schema safe? | only if the host's tooling excludes all eight tables | yes — the tables are in your loader |
 | **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
 
 **The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
-same database, your migration tool must know about all five — a tool that cannot see them will happily
-propose dropping them.
+same database, your migration tool must know about all eight — a tool that cannot see them will happily
+propose dropping them. A tool told to leave the runtime's tables alone by name needs every name above.
 
 **Library-owned** — one call, no external tooling:
 
@@ -297,7 +299,7 @@ up-to-date schema — a re-run creates nothing and changes nothing — so it is 
 
 ```go
 // 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
-//    so your migration tool knows all five tables exist and never proposes dropping them.
+//    so your migration tool knows all eight tables exist and never proposes dropping them.
 stmts, err := gormschema.New("postgres").Load(
     append(myapp.AllModels(), flywheel.Models()...)...,
 )
@@ -313,9 +315,11 @@ if err := flywheel.InstallStorageParameters(ctx, db); err != nil {
 
 Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
 it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
-GORM struct tag cannot express. Four of the eleven are correctness-bearing — without `jobs_unique_key`
-and `jobs_unique_active_key` the database accepts duplicate enqueues and **`ErrAlreadyEnqueued` is never
-returned.** Use `flywheel.IndexSet(dialect)` when you want them classified:
+GORM struct tag cannot express. `IndexSet` declares twelve indexes, and four of them are
+correctness-bearing: `jobs_unique_key`, `jobs_unique_active_key`, `job_runs_job_attempt`, and
+`idx_job_periodics_slug`. Without `jobs_unique_key` and `jobs_unique_active_key` the database accepts
+duplicate enqueues and **`ErrAlreadyEnqueued` is never returned.** Use `flywheel.IndexSet(dialect)` when
+you want them classified:
 
 ```go
 for _, idx := range must(flywheel.IndexSet("postgres")) {
@@ -1001,13 +1005,19 @@ work depends on the intent:
 | Intent | Mechanism | Key |
 |---|---|---|
 | Re-run *this job row*, keeping its id, history, and audit trail | `RetryJobWithOptions` / `Replay*` | — |
-| Enqueue a *new* job for the same logical unit, at most once ever | new `Insert` | `UniqueKey` — collides forever, terminal or not |
+| Enqueue a *new* job for the same logical unit, at most once | new `Insert` | `UniqueKey` — collides with the job that bears it, terminal or not, until retention deletes that job |
 | Enqueue a *new* job for a subject that may run again later | new `Insert` | `UniqueActiveKey` — frees on a terminal state |
 
-> A job enqueued with `UniqueKey` can never be re-enqueued: the key collides with the original row
-> forever, terminal or not. That is the guarantee `UniqueKey` exists to provide. To run that unit of work
-> again, retry the original job — its id, lineage, and audit trail are preserved. If the unit is expected
-> to run again later, `UniqueActiveKey` is the key you want.
+> A job enqueued with `UniqueKey` cannot be re-enqueued while its row exists: the key collides with the
+> original row, terminal or not. That is the guarantee `UniqueKey` exists to provide. To run that unit of
+> work again, retry the original job — its id, lineage, and audit trail are preserved. If the unit is
+> expected to run again later, `UniqueActiveKey` is the key you want.
+>
+> Retention frees the key: once `DeleteFinishedJobs` (or the scheduler's retention pass) deletes the
+> original job, an `Insert` with its key lands and the work runs again. When "at most once, ever" has to
+> outlive retention, keep the key where retention cannot reach it — leave retention off or its window
+> longer than the key must hold, or record the key in a table of your own under a unique constraint, in
+> the same transaction as the enqueue (`InsertOpts.Tx`).
 
 </details>
 
@@ -1318,6 +1328,10 @@ silently.
 Only terminal jobs are ever removed — succeeded, cancelled, discarded, and only those finalized before
 the cutoff. Pending and running work is never touched, whatever its age.
 
+**Retention frees `UniqueKey`s.** A `UniqueKey` collides only with a job whose row exists, so deleting a
+job frees its key, and an `Insert` with that key afterwards runs the work again. If a key must keep
+refusing duplicates for longer than the window, see **Replaying work** above for where to hold it.
+
 ### The queue-health heartbeat
 
 The heartbeat is **off by default**. Set `HealthSampleInterval` and the scheduler samples queue health
@@ -1356,6 +1370,15 @@ node, _ := flywheel.NewNode(flywheel.NodeConfig{
 |---|---|---|
 | `Periodics` | none | The definitions this host declares. Each is validated, and slugs must be unique, when the scheduler is constructed; `Run` applies them on start. |
 | `ReconcileInterval` | `1m` | How often a declared definition whose row is missing is re-created. A pass with nothing missing is one indexed read that writes nothing. Negative turns the pass off. |
+
+**A cron runs in the zone it is evaluated in, unless it names one.** A `Cron` with no zone fires in the
+zone of the Scheduler clock when the definition is created or changed (the default clock reads
+`time.Now()`, the process's local zone), and in the zone of the stored `next_run_at`, as the database
+driver returns it, on every fire after that. Whether `0 2 * * *` means 02:00 UTC or 02:00 local time, and
+whether it follows daylight saving, therefore depends on the host and the driver. Prefix the expression
+with `CRON_TZ=<zone>` to pin it: `CRON_TZ=UTC 0 2 * * *`, or `CRON_TZ=America/New_York 0 2 * * *` for
+02:00 New York time across daylight-saving changes. An unknown zone is refused like any malformed
+expression.
 
 **On start, the declaration wins.** Every start applies the whole declaration with `UpsertPeriodic`'s
 semantics: a missing definition is inserted, a changed one updated, and an unchanged one keeps its

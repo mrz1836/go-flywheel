@@ -299,15 +299,23 @@ type FollowUp struct {
 // docs/COOKBOOK.md.
 type InsertOpts struct {
 	Queue string
-	// UniqueKey enforces idempotency forever: an insert collides with any job
-	// that ever carried the same key, terminal or not. Use it for "enqueue this
-	// exact unit of work at most once, ever".
+	// UniqueKey enforces idempotency for as long as the job that carries it
+	// exists: an insert collides with any job carrying the same key, terminal or
+	// not. Use it for "enqueue this exact unit of work at most once".
 	//
-	// A consequence to plan for: a job enqueued with UniqueKey can never be
-	// re-enqueued — the key collides with the original row forever, terminal or not.
-	// To run that unit of work again, keep its row and retry it (RetryJobWithOptions,
-	// or ReplayByParent/Replay for a cohort) rather than re-enqueuing. If a later run
-	// is expected instead, UniqueActiveKey is the key that frees on a terminal state.
+	// A consequence to plan for: a job enqueued with UniqueKey cannot be
+	// re-enqueued while its row exists — the key collides with the original row,
+	// terminal or not. To run that unit of work again, keep its row and retry it
+	// (RetryJobWithOptions, or ReplayByParent/Replay for a cohort) rather than
+	// re-enqueuing. If a later run is expected instead, UniqueActiveKey is the key
+	// that frees on a terminal state.
+	//
+	// Retention frees the key: DeleteFinishedJobs hard-deletes a terminal job
+	// older than its window, and an insert with the key then lands and runs the
+	// work again. When "at most once, ever" must outlive retention, hold the key
+	// where retention cannot reach it: leave retention off or longer than the key
+	// must hold, or insert the key into a table of your own under a unique
+	// constraint, in the same transaction as the enqueue (Tx).
 	UniqueKey string
 	// UniqueActiveKey enforces idempotency only while a job is active (available,
 	// running, retryable, scheduled, or paused): an insert collides only with a
@@ -315,8 +323,8 @@ type InsertOpts struct {
 	// reaches a terminal state. Use it for "at most one in-flight job for this
 	// subject", where a later run is expected once the current one finishes.
 	//
-	// For "at most once ever" — colliding even with a terminal job, and never
-	// re-enqueuable afterward — use UniqueKey instead.
+	// For "at most once" across terminal states — colliding even with a terminal
+	// job, until retention deletes it — use UniqueKey instead.
 	UniqueActiveKey string
 	ScheduleAt      *time.Time
 	Parent          *string

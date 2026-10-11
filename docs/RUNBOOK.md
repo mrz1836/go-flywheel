@@ -251,7 +251,10 @@ asked for them. The prune runs on `RetentionInterval` (one hour by default) in b
 **Choosing the window.** Retention deletes jobs finalized *longer ago than* the window — not jobs
 created that long ago. The window is a function of how long you need the audit trail (`job_runs`) and
 the terminal job rows for debugging, replay, or compliance, not of throughput. A 30-day window keeps a
-month of history; a 2-minute window (used in load tests) keeps almost nothing.
+month of history; a 2-minute window (used in load tests) keeps almost nothing. The window also bounds
+`UniqueKey`: a key collides only with a job whose row exists, so pruning a job frees its key, and a later
+insert with that key runs the work again. A key that must refuse duplicates for longer than the window
+has to be held where retention does not prune (see [`COOKBOOK.md`](COOKBOOK.md), recipe 1).
 
 **Enabling it safely on an old database.** The *first* prune against a long-lived database that has
 never had retention deletes its entire backlog of aged terminal jobs. The batching bounds each

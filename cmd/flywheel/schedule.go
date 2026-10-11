@@ -107,7 +107,7 @@ func newScheduleAddCmd(configPath *string) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&cron, "cron", "", "standard 5-field cron expression")
+	cmd.Flags().StringVar(&cron, "cron", "", "standard 5-field cron expression; prefix CRON_TZ=<zone> to pin its zone")
 	cmd.Flags().DurationVar(&every, "every", 0, "fixed interval (e.g. 5m, 24h)")
 	cmd.Flags().StringVar(&args, "args", "{}", "JSON args template fired on each run")
 	cmd.Flags().StringVar(&queue, "queue", "", "queue (default: periodic)")

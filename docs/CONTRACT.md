@@ -54,9 +54,11 @@ mid-finalize does not roll back the outcome the worker already produced. Once fi
 result, the shutdown that arrives a millisecond later cannot lose it.
 
 **Enqueue is idempotent under a unique key, and enqueue-in-transaction is atomic with your state.** An
-insert carrying `UniqueKey` collides with any job that ever bore that key and returns
+insert carrying `UniqueKey` collides with any job that bears that key, terminal or not, and returns
 `ErrAlreadyEnqueued` instead of creating a duplicate; `UniqueActiveKey` does the same only while a job is
-still live. The error is an `*AlreadyEnqueuedError` that names the job holding the key (`errors.As`), so
+still live. A `UniqueKey` holds for as long as its job's row exists: retention's hard delete frees it, so
+an "at most once, ever" that must outlive retention needs the key kept somewhere retention does not prune
+(see [`COOKBOOK.md`](COOKBOOK.md)). The error is an `*AlreadyEnqueuedError` that names the job holding the key (`errors.As`), so
 a caller can join that job instead of dropping the request. Passing `InsertOpts.Tx` writes the job row
 on your transaction, so the job exists **if and only if** your own state change commits — the
 transactional-outbox pattern, without a separate outbox table. A collision on `InsertOpts.Tx` leaves
