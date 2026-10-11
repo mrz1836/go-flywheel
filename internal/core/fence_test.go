@@ -212,7 +212,8 @@ func TestFenceSweepClearsTheToken(t *testing.T) {
 // TestFenceOperatorActionsClearTheToken covers the other two paths out of the
 // running state. Both already null leased_until; both must null the token for
 // the same reason, or the attempt still running finalizes over the operator's
-// action.
+// action. A retry takes a running job's claim only when the caller opts in with
+// AllowRunning, so that is the retry exercised here.
 func TestFenceOperatorActionsClearTheToken(t *testing.T) {
 	t.Parallel()
 
@@ -221,7 +222,9 @@ func TestFenceOperatorActionsClearTheToken(t *testing.T) {
 		act  func(ctx context.Context, db *gorm.DB, id string) error
 	}{
 		{"cancel", CancelJob},
-		{"retry", RetryJob},
+		{"retry", func(ctx context.Context, db *gorm.DB, id string) error {
+			return RetryJobWithOptions(ctx, db, id, RetryOpts{AllowRunning: true})
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

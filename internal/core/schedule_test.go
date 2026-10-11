@@ -348,9 +348,10 @@ func TestUpsertPeriodicThenSchedulerFiresWhenDue(t *testing.T) {
 func TestRetryJobActiveJobReturnsToAvailable(t *testing.T) {
 	t.Parallel()
 
+	// A running job is refused rather than re-queued under a running attempt;
+	// TestRetryRefusesARunningJob covers it.
 	tests := map[string]JobState{
 		"available": StateAvailable,
-		"running":   StateRunning,
 		"retryable": StateRetryable,
 		"scheduled": StateScheduled,
 		"paused":    StatePaused,

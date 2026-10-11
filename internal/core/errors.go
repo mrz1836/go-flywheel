@@ -329,6 +329,15 @@ var ErrPeriodicNotFound = errors.New("flywheel: periodic not found")
 // Force is refused with it too: re-running succeeded work must be deliberate.
 var ErrJobTerminal = errors.New("flywheel: job has already reached a terminal state")
 
+// ErrJobRunning is returned when a retry targets a job whose attempt is still
+// running: a running job, or, with RetryOpts.Force, a cancelled job whose
+// attempt has not returned (a cancel fences a running attempt without stopping
+// it). Re-queueing it would let a runner start a second attempt while the first
+// still runs, so the job's work would run twice at once. The runtime refuses the
+// write and leaves the job and its lease as they were: wait for the attempt to
+// finish, or set RetryOpts.AllowRunning to re-queue it anyway.
+var ErrJobRunning = errors.New("flywheel: job is running")
+
 // ErrReplayUnbounded is returned by Replay when neither Kinds nor FailedSince is
 // set. An unscoped replay of every discarded job in the database is almost never
 // the intent, so the runtime refuses it rather than doing something enormous by

@@ -174,6 +174,7 @@ var (
 	ErrFollowUpLimit      = core.ErrFollowUpLimit
 	ErrIndexDrift         = core.ErrIndexDrift
 	ErrJobNotFound        = core.ErrJobNotFound
+	ErrJobRunning         = core.ErrJobRunning
 	ErrJobTerminal        = core.ErrJobTerminal
 	ErrMissingKind        = core.ErrMissingKind
 	ErrPeriodicNotFound   = core.ErrPeriodicNotFound
