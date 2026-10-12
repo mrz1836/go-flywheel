@@ -147,7 +147,8 @@ func (s *SlogObserver) OnSupersede(ctx context.Context, ev flywheel.SupersedeEve
 // Each reclaimed job (ev.Jobs) is a crashed attempt: its process died before a
 // worker could return, so no OnFinish reports it. OnSweep logs it as OnFinish
 // logs any failed attempt — "flywheel: job failed and was discarded" at error
-// when the crash spent the job's last attempt, or "flywheel: job attempt failed"
+// when the crash ended the job (it spent the job's last attempt, or its last
+// crash under DriverOpts.MaxCrashes), or "flywheel: job attempt failed"
 // at warn when the job runs again — with outcome crashed, the job's fields, and
 // the state the sweep left it in. A crash carries no error text, error class, or
 // duration.
