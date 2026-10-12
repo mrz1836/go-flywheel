@@ -81,9 +81,10 @@ type Driver interface {
 	// Sweep reclaims jobs whose lease has expired (state running, leased_until
 	// in the past), in bounded batches, and marks each stale run stub crashed. A
 	// reclaimed job returns to available unless its crashed attempt was its last
-	// (attempt >= max_attempts): that job is discarded and finalized at now, as a
-	// failed last attempt is, so a job whose process dies on every attempt ends
-	// instead of looping. Each crashed stub records the state the reclaim applied.
+	// (attempt >= max_attempts), or, when DriverOpts.MaxCrashes is positive, its
+	// MaxCrashes-th crash: that job is discarded and finalized at now, as a failed
+	// last attempt is, so a job whose process dies on every attempt ends instead
+	// of looping. Each crashed stub records the state the reclaim applied.
 	// It reports how many jobs were reclaimed in total across every batch,
 	// returned and discarded alike.
 	//
@@ -137,8 +138,9 @@ const (
 	defaultBarrierMaxChildren = 10000
 )
 
-// DriverOpts configures a Driver's batching behavior. The zero value selects the
-// documented defaults, and no field is ever unbounded.
+// DriverOpts configures a Driver's batching behavior and its lease sweep's crash
+// budget. The zero value selects the documented defaults, and no field is ever
+// unbounded.
 type DriverOpts struct {
 	// SweepBatchSize is the number of expired leases reclaimed per transaction.
 	// Zero or negative selects defaultSweepBatchSize.
@@ -178,6 +180,11 @@ type DriverOpts struct {
 	// makes a barrier-bearing generation cost O(children²), where a plain fan-out is
 	// O(children).
 	BarrierMaxChildren int
+
+	// MaxCrashes, when positive, also discards a job on its MaxCrashes-th crashed
+	// attempt. Zero or negative gives crashes no budget of their own: a crash spends
+	// one attempt, and the job is discarded when its attempts are used up.
+	MaxCrashes int
 }
 
 // sweepBatchSize resolves the configured batch size, applying the default for a
@@ -227,8 +234,9 @@ func (o DriverOpts) barrierMaxChildren() int {
 
 // reclaimFunc is one dialect's expired-lease batch: it selects up to limit jobs
 // whose lease expired before now, discards each one whose crashed attempt was
-// its last and returns the rest to available, clears every fence token, and
-// reports the jobs it reclaimed in reclaim order.
+// its last or spent its crash budget (spentAttempts, crashBudgetSpent) and
+// returns the rest to available, clears every fence token, and reports the jobs
+// it reclaimed in reclaim order.
 //
 // The dialect passes this *up* into the shared loop rather than the loop
 // reaching *down* into the dialect, because Go embedding promotes methods
@@ -280,11 +288,29 @@ func inReclaimOrder(rows []reclaimRow) []reclaimedJob {
 }
 
 // spentAttempts reports whether a reclaimed attempt was the job's last, which is
-// what makes the sweep discard the job rather than return it: the same budget
-// rule a failed attempt's finalize applies (planFinalize).
+// one of the two things that make the sweep discard the job rather than return
+// it: the same budget rule a failed attempt's finalize applies (planFinalize).
+// The other is crashBudgetSpent.
 func spentAttempts(attempt, maxAttempts int) bool {
 	return attempt >= maxAttempts
 }
+
+// crashBudgetSpent reports whether a reclaim spends the job's crash budget: with
+// earlierCrashes recorded on its runs, the reclaim in progress is its
+// maxCrashes-th crash. The reclaim counts whether or not its attempt wrote a run.
+// A budget of zero or less is never spent (DriverOpts.MaxCrashes).
+func crashBudgetSpent(earlierCrashes, maxCrashes int) bool {
+	return maxCrashes > 0 && 1+earlierCrashes >= maxCrashes
+}
+
+// crashedRunCondition is the SQL condition, over a job_runs row aliased r, for a
+// run the lease sweep crashed: it reads crashed, or it was crashed and its
+// attempt's late finalize has since written its own outcome over it, superseded,
+// which keeps the job state the sweep recorded. Only the sweep writes a job
+// state on a run whose finalize was superseded, so this is the stats' own rule
+// (runAgg.observe), and a crash counts toward a crash budget exactly as it
+// counts in the stats. Both dialects' reclaims use it, so they cannot disagree.
+const crashedRunCondition = `(r.outcome = 'crashed' OR (r.superseded AND r.job_state IS NOT NULL))`
 
 // classifiedError is how the Runner hands the driver its verdict on a failed
 // attempt without widening the Driver.Finalize signature: the Runner wraps the
@@ -1214,9 +1240,9 @@ func reclaimUpdate(now time.Time) map[string]any {
 }
 
 // reclaimDiscardUpdate is the jobs-row column set for a lease reclaim whose
-// crashed attempt was the job's last: reclaimUpdate's columns, with the job
-// discarded and finalized at now, as a finalize discards a job whose last
-// attempt failed.
+// crashed attempt was the job's last, or spent its crash budget: reclaimUpdate's
+// columns, with the job discarded and finalized at now, as a finalize discards a
+// job whose last attempt failed.
 func reclaimDiscardUpdate(now time.Time) map[string]any {
 	upd := reclaimUpdate(now)
 	upd["state"] = string(StateDiscarded)

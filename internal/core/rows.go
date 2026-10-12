@@ -113,7 +113,8 @@ type jobRunRow struct {
 	// outcomes are countable from runs alone. It is NULL while the attempt runs,
 	// NULL when the finalize was superseded (it applied nothing), and, when the
 	// lease sweep reclaimed the job from a crashed attempt, the state the sweep
-	// applied: available, or discarded when that attempt was the job's last.
+	// applied: available, or discarded when that attempt was the job's last or its
+	// DriverOpts.MaxCrashes-th crash.
 	JobState *string `gorm:"column:job_state"`
 	// Superseded records that the attempt's finalize found its claim gone — the
 	// job was cancelled or reclaimed underneath it — so the outcome on this row
