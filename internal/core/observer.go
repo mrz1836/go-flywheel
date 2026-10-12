@@ -135,6 +135,10 @@ type FinishEvent struct {
 	// Duration because the two fail differently: a slow worker is a downstream
 	// problem, a slow finalize is a database problem.
 	FinalizeDuration time.Duration
+	// QueueWait is how long the attempt waited for a worker after it became
+	// claimable, clamped at zero: the value job_runs.queue_wait_ms records. Zero
+	// when the claimed job carries no ScheduledAt (a custom Driver's RawJob).
+	QueueWait time.Duration
 }
 
 // RetryEvent reports an attempt that has been scheduled to retry.

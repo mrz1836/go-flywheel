@@ -22,6 +22,12 @@ func TestRecoveredPanicKeepsItsStackPostgres(t *testing.T) {
 	assertRecoveredPanicKeepsItsStack(t, db, NewPostgresDriver(db))
 }
 
+func TestJobRunViewCarriesTheStoredErrorPayloadPostgres(t *testing.T) {
+	t.Parallel()
+	db := NewPostgresIsolatedDB(t)
+	assertJobRunViewCarriesTheStoredErrorPayload(t, db, NewPostgresDriver(db))
+}
+
 func TestMaxOutputBytesSetsTheCapPostgres(t *testing.T) {
 	t.Parallel()
 	db := NewPostgresIsolatedDB(t)
