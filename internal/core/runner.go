@@ -1524,6 +1524,12 @@ func (r *Runner) observe(
 		return
 	}
 
+	// The wait the run stub recorded, from the same two instants, so the event
+	// and the row agree to the millisecond.
+	var queueWait time.Duration
+	if ms := queueWaitMs(raw.ScheduledAt, startedAt); ms != nil {
+		queueWait = time.Duration(*ms) * time.Millisecond
+	}
 	r.cfg.Observer.OnFinish(ctx, FinishEvent{
 		JobEvent:         ev,
 		Outcome:          out.RunOutcome,
@@ -1533,6 +1539,7 @@ func (r *Runner) observe(
 		MaxAttempts:      raw.MaxAttempts,
 		Duration:         duration,
 		FinalizeDuration: finalizeDuration,
+		QueueWait:        queueWait,
 	})
 
 	if out.State == StateRetryable {
