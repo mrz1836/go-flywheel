@@ -85,6 +85,10 @@ type Driver interface {
 	// MaxCrashes-th crash: that job is discarded and finalized at now, as a failed
 	// last attempt is, so a job whose process dies on every attempt ends instead
 	// of looping. Each crashed stub records the state the reclaim applied.
+	//
+	// The stub it crashes is the reclaimed attempt's, and no other. An older
+	// attempt that a retry with RetryOpts.AllowRunning left running keeps its stub
+	// started until it returns, so one reclaim is one crashed attempt.
 	// It reports how many jobs were reclaimed in total across every batch,
 	// returned and discarded alike.
 	//
@@ -1116,24 +1120,31 @@ type crashedStub struct {
 	Attempt int    `gorm:"column:attempt"`
 }
 
-// crashStaleStubs marks the started stubs of reclaimed jobs crashed and logs
-// each one's finish, in the caller's transaction — one statement per state the
-// reclaim applied on PostgreSQL, and a read and two writes on SQLite, for the
+// crashStaleStubs marks the run stub of each reclaimed attempt crashed and logs
+// its finish, in the caller's transaction — one statement per state the reclaim
+// applied on PostgreSQL, and a read and a write per state on SQLite, for the
 // reasons finalizeRunRow gives. It returns, per job, the run of its crashed
-// attempt: the stub at the job's attempt, or another started stub of the job
-// when that one is missing. A job whose process died before it committed a stub
-// has none.
+// attempt: the stub at the job's attempt. A job whose process died before it
+// committed that stub has none.
+//
+// Only that stub is the sweep's to end. An older attempt of the same job can
+// still be running — a retry with RetryOpts.AllowRunning re-queued the job while
+// it ran — and its stub, still started, is left for that attempt's own finalize,
+// which records it as superseded. Crashing it too would count one reclaim as two
+// crashed attempts, and as two discards when the reclaim ended the job. An older
+// attempt whose process died as well keeps its stub started, as a cancelled
+// job's running attempt does.
+//
+// Each stub is found through its job's own attempt, keyed by the batch's job
+// ids, so a statement binds one value per job: the bound SweepBatchSize already
+// places on the reclaim.
 //
 // The stub records the state the reclaim applied to its job, so a crashed
-// attempt's effect on the job — back to available, or discarded when it was the
-// last — is countable from runs alone, like every finalized attempt's.
+// attempt's effect on the job — back to available, or discarded when it ended
+// the job — is countable from runs alone, like every finalized attempt's.
 func crashStaleStubs(tx *gorm.DB, jobs []reclaimedJob, now time.Time) (map[string]string, error) {
-	ids := make([]string, len(jobs))
-	attempts := make(map[string]int, len(jobs))
 	byState := make(map[string][]string, 2)
-	for i, j := range jobs {
-		ids[i] = j.ID
-		attempts[j.ID] = j.Attempt
+	for _, j := range jobs {
 		byState[j.State] = append(byState[j.State], j.ID)
 	}
 	upd := func(state string) map[string]any {
@@ -1155,8 +1166,9 @@ func crashStaleStubs(tx *gorm.DB, jobs []reclaimedJob, now time.Time) (map[strin
 			set, args := updateSetClause(upd(state))
 			args = append(args, group, string(OutcomeStarted))
 			var crashed []crashedStub
-			if err := tx.Raw(`WITH u AS (UPDATE job_runs SET `+set+
-				` WHERE job_id IN ? AND outcome = ? RETURNING id, job_id, attempt, finished_at), `+
+			if err := tx.Raw(`WITH u AS (UPDATE job_runs SET `+set+` FROM jobs j `+
+				`WHERE j.id IN ? AND job_runs.job_id = j.id AND job_runs.attempt = j.attempt AND job_runs.outcome = ? `+
+				`RETURNING job_runs.id, job_runs.job_id, job_runs.attempt, job_runs.finished_at), `+
 				`f AS (`+fmt.Sprintf(finishLogInsert, "u", "")+`) SELECT id, job_id, attempt FROM u`,
 				args...).Scan(&crashed).Error; err != nil {
 				return nil, err
@@ -1164,36 +1176,65 @@ func crashStaleStubs(tx *gorm.DB, jobs []reclaimedJob, now time.Time) (map[strin
 			stubs = append(stubs, crashed...)
 		}
 	} else {
-		// No data-modifying CTE here: read the stubs this transaction is about to
-		// crash, then crash them. The single writer holds the batch's lock, so the
-		// two cannot diverge.
-		if err := tx.Model(&jobRunRow{}).Select("id", "job_id", "attempt").
-			Where("job_id IN ? AND outcome = ?", ids, string(OutcomeStarted)).Find(&stubs).Error; err != nil {
-			return nil, err
-		}
-		for _, state := range states {
-			group := byState[state]
-			if len(group) == 0 {
-				continue
-			}
-			if err := tx.Model(&jobRunRow{}).
-				Where("job_id IN ? AND outcome = ?", group, string(OutcomeStarted)).Updates(upd(state)).Error; err != nil {
-				return nil, err
-			}
-		}
-		if err := tx.Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND job_id IN ? AND outcome = ? AND finished_at = ?"),
-			ids, string(OutcomeCrashed), now.UTC()).Error; err != nil {
+		var err error
+		if stubs, err = crashStaleStubsSQLite(tx, jobs, states, upd); err != nil {
 			return nil, err
 		}
 	}
 
 	runs := make(map[string]string, len(stubs))
 	for _, s := range stubs {
-		if _, seen := runs[s.JobID]; !seen || s.Attempt == attempts[s.JobID] {
-			runs[s.JobID] = s.ID
-		}
+		runs[s.JobID] = s.ID
 	}
 	return runs, nil
+}
+
+// crashStaleStubsSQLite is crashStaleStubs without a data-modifying CTE: it
+// reads the batch's started stubs, keeps each one at its job's attempt, and
+// crashes those by run id, one update per state, before logging their finishes.
+// The single writer holds the batch's lock, so the read and the writes cannot
+// diverge.
+func crashStaleStubsSQLite(
+	tx *gorm.DB, jobs []reclaimedJob, states []string, upd func(state string) map[string]any,
+) ([]crashedStub, error) {
+	ids := make([]string, len(jobs))
+	byID := make(map[string]reclaimedJob, len(jobs))
+	for i, j := range jobs {
+		ids[i] = j.ID
+		byID[j.ID] = j
+	}
+	var started []crashedStub
+	if err := tx.Model(&jobRunRow{}).Select("id", "job_id", "attempt").
+		Where("job_id IN ? AND outcome = ?", ids, string(OutcomeStarted)).Find(&started).Error; err != nil {
+		return nil, err
+	}
+
+	var stubs []crashedStub
+	runsByState := make(map[string][]string, len(states))
+	for _, s := range started {
+		if j := byID[s.JobID]; s.Attempt == j.Attempt {
+			stubs = append(stubs, s)
+			runsByState[j.State] = append(runsByState[j.State], s.ID)
+		}
+	}
+	if len(stubs) == 0 {
+		return nil, nil
+	}
+	for _, state := range states {
+		if group := runsByState[state]; len(group) > 0 {
+			if err := tx.Model(&jobRunRow{}).Where("id IN ?", group).Updates(upd(state)).Error; err != nil {
+				return nil, err
+			}
+		}
+	}
+	runIDs := make([]string, len(stubs))
+	for i, s := range stubs {
+		runIDs[i] = s.ID
+	}
+	if err := tx.Exec(fmt.Sprintf(finishLogInsert, "job_runs", " AND id IN ?"), runIDs).Error; err != nil {
+		return nil, err
+	}
+	return stubs, nil
 }
 
 // updateSetClause renders a column map as an UPDATE's SET list for raw SQL, in

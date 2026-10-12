@@ -198,7 +198,9 @@ type SweepEvent struct {
 type SweptJob struct {
 	// JobEvent names the job and its crashed attempt. RunID is that attempt's
 	// run, the job_runs row the sweep marked crashed; it is empty when the
-	// process died before committing one.
+	// process died before committing one. An older attempt's run is never named
+	// here: an attempt a retry with RetryOpts.AllowRunning left running keeps its
+	// run started until it returns, and the sweep leaves it so.
 	JobEvent
 	// MaxAttempts is the job's attempt budget, so Attempt reads against it.
 	MaxAttempts int
