@@ -206,25 +206,33 @@ func newJobsInspectCmd(configPath *string) *cobra.Command {
 	return cmd
 }
 
-// newJobsRetryCmd returns a waiting job to available through RetryJob, which
-// refuses a running job and a terminal one.
+// newJobsRetryCmd returns a job to available through RetryJobWithOptions. With
+// no flag it retries only a job that is still waiting; --force admits a terminal
+// job, and --allow-running a running one.
 func newJobsRetryCmd(configPath *string) *cobra.Command {
-	return &cobra.Command{
+	var force, allowRunning bool
+	cmd := &cobra.Command{
 		Use:   "retry <job-id>",
-		Short: "Make a waiting, retrying, or paused job available to run now",
-		Long: `Return a job to available so a runner claims it on its next poll.
-
-Only a job that is still waiting is retried: available, scheduled, retryable,
-or paused. A running job is refused with "flywheel: job is running", so its work
-never runs twice at once; wait for the attempt to finish. A terminal job
-(succeeded, cancelled, or discarded) is refused with "flywheel: job has already
-reached a terminal state"; re-running finished work takes RetryJobWithOptions
-with Force, which this command does not offer.`,
+		Short: "Return a job to available so it runs again",
+		Long: `A waiting, failed, or paused job returns to available. A terminal job
+(succeeded, cancelled, discarded) needs --force. A cancelled job whose attempt
+still runs is refused until that attempt returns. A running job is refused:
+cancel it first, or pass --allow-running to re-queue it while its current
+attempt keeps running; that attempt's result is then discarded, and the work
+runs twice.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return mutateJob(cmd, *configPath, args[0], flywheel.RetryJob, "retried")
+			opts := flywheel.RetryOpts{Force: force, AllowRunning: allowRunning}
+			retry := func(ctx context.Context, db *gorm.DB, id string) error {
+				return flywheel.RetryJobWithOptions(ctx, db, id, opts)
+			}
+			return mutateJob(cmd, *configPath, args[0], retry, "retried")
 		},
 	}
+	cmd.Flags().BoolVar(&force, "force", false, "retry a job that reached a terminal state")
+	cmd.Flags().BoolVar(&allowRunning, "allow-running", false,
+		"re-queue a running job; its current attempt keeps running and its result is discarded")
+	return cmd
 }
 
 // newJobsCancelCmd cancels a job.
