@@ -228,7 +228,7 @@ func TestMetricsObserverOnSweepTimesTheSweep(t *testing.T) {
 		Duration: 12 * time.Millisecond, Reclaimed: 4,
 	})
 
-	require.Len(t, rec.calls, 2, "a sweep records one duration histogram and one reclaimed count")
+	require.Len(t, rec.calls, 3, "a sweep records one duration histogram, one reclaimed count, and one discarded count")
 	h := rec.only(t, "histogram", MetricSweepDuration)
 	assert.InDelta(t, 0.012, h.value, 1e-9)
 	assert.Nil(t, h.tags, "the sweep duration is a single series with no tags")

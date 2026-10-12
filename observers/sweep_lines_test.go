@@ -59,6 +59,26 @@ func TestSlogLogsASweepDiscardAtError(t *testing.T) {
 	assert.EqualValues(t, 2, pass["reclaimed"].Int64())
 }
 
+// TestMetricsCountSweepDiscards proves MetricsObserver counts the jobs a sweep
+// pass discarded, as a single untagged series, and counts zero on a pass that
+// discarded nothing, so a rate alert has a baseline before the first discard.
+func TestMetricsCountSweepDiscards(t *testing.T) {
+	t.Parallel()
+
+	rec := &fakeRecorder{}
+	NewMetrics(rec).OnSweep(context.Background(), flywheel.SweepEvent{
+		Duration: time.Millisecond, Reclaimed: 3, Discarded: 2,
+	})
+	c := rec.only(t, "count", MetricSweepDiscarded)
+	assert.EqualValues(t, 2, c.delta, "the discarded count carries the jobs the pass ended")
+	assert.Nil(t, c.tags, "the discarded count is a single series with no tags")
+
+	quiet := &fakeRecorder{}
+	NewMetrics(quiet).OnSweep(context.Background(), flywheel.SweepEvent{Duration: time.Millisecond})
+	assert.EqualValues(t, 0, quiet.only(t, "count", MetricSweepDiscarded).delta,
+		"a pass that discarded nothing still records a zero")
+}
+
 // stringAttrs renders a record's attributes as strings, for one comparison of
 // every field a line carries.
 func stringAttrs(r slog.Record) map[string]string {
