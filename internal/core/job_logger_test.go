@@ -65,9 +65,10 @@ func (loggerWorker) Work(_ context.Context, job *Job[loggerArgs]) (Result, error
 }
 
 // TestJobLoggerCarriesQueueAndAttempt reads the lines a worker writes through
-// Job.Logger and expects each to carry the job, its kind, its queue, the run, and
-// the attempt, under the keys the slog observer's own lines use, so a log search
-// can filter a worker's lines by queue or by attempt.
+// Job.Logger and expects each to carry the job, its kind, its queue, the run, the
+// attempt, and the attempt budget, under the keys the slog observer's own lines
+// use, so a log search can filter a worker's lines by queue or by attempt, and a
+// line says whether its attempt was the last.
 func TestJobLoggerCarriesQueueAndAttempt(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
@@ -106,6 +107,7 @@ func TestJobLoggerCarriesQueueAndAttempt(t *testing.T) {
 		assert.Equal(t, "job_logger.worker", line["kind"])
 		assert.Equal(t, "periodic", line["queue"], "the line carries the job's queue")
 		assert.Equal(t, attempt, line["attempt"], "the line carries the attempt that wrote it")
+		assert.Equal(t, float64(2), line["max_attempts"], "the line carries the job's attempt budget")
 		assert.Equal(t, runIDs[attempt], line["run_id"])
 	}
 }

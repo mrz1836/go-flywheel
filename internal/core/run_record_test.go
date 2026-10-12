@@ -156,6 +156,40 @@ func assertRecoveredPanicKeepsItsStack(t *testing.T, db *gorm.DB, driver Driver)
 	assert.False(t, view.ErrorTruncated)
 }
 
+// assertJobRunViewCarriesTheStoredErrorPayload runs a failed attempt, a cut
+// message, a panic, and a success, and expects each run's view to carry its
+// error_payload exactly as stored, so a host can show the whole payload, and no
+// payload at all for the success.
+func assertJobRunViewCarriesTheStoredErrorPayload(t *testing.T, db *gorm.DB, driver Driver) {
+	t.Helper()
+	viewOf := func(args recordArgs) (jobRunRow, JobRunView, map[string]any) {
+		t.Helper()
+		id, run := runRecordJob(t, db, driver, args)
+		view := latestRunView(t, db, id)
+		require.NotEmpty(t, view.ErrorPayload, "a failed run's view carries its payload")
+		assert.Equal(t, []byte(run.ErrorPayload), []byte(view.ErrorPayload), "the payload is the column as stored")
+		return run, view, decodeObject(t, view.ErrorPayload)
+	}
+
+	failed, _, payload := viewOf(recordArgs{ErrorBytes: 10})
+	assert.Equal(t, map[string]any{"message": *failed.ErrorMessage}, payload, "a whole message is the only key")
+
+	_, _, payload = viewOf(recordArgs{ErrorBytes: 10_000})
+	assert.Equal(t, true, payload["truncated"], "a cut message's payload says it was cut")
+	assert.EqualValues(t, 10_000, payload["message_bytes"], "and how long it was")
+
+	_, panicked, payload := viewOf(recordArgs{Panic: true})
+	assert.Equal(t, "jobs: worker panicked: boom", payload["message"])
+	assert.Equal(t, panicked.ErrorStack, payload["stack"], "a panic's payload carries its stack")
+
+	id, _ := runRecordJob(t, db, driver, recordArgs{})
+	succeeded := latestRunView(t, db, id)
+	assert.Nil(t, succeeded.ErrorPayload, "a successful run has no payload")
+	encoded, err := json.Marshal(succeeded)
+	require.NoError(t, err)
+	assert.NotContains(t, decodeObject(t, encoded), "error_payload", "and its JSON leaves the key out")
+}
+
 // latestRunView reads a job's newest run through the public view.
 func latestRunView(t *testing.T, db *gorm.DB, jobID string) JobRunView {
 	t.Helper()
@@ -304,6 +338,12 @@ func TestRecoveredPanicKeepsItsStack(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	assertRecoveredPanicKeepsItsStack(t, db, sqliteRecordDriver(t, db))
+}
+
+func TestJobRunViewCarriesTheStoredErrorPayload(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	assertJobRunViewCarriesTheStoredErrorPayload(t, db, sqliteRecordDriver(t, db))
 }
 
 // runRecordAnchor keeps the seeded-row timestamps of the view tests fixed.
