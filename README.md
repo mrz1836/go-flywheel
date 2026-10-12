@@ -621,9 +621,12 @@ A claimed job carries a **lease**. If its executor dies, the lease expires and t
 returns the job to the queue for another runner — which is what makes a crashed process recoverable
 rather than a job lost forever. A crash spends the attempt it interrupted, so when that attempt was the
 job's last (`attempt >= max_attempts`) the sweep discards the job instead: a job whose worker takes its
-process down on every attempt ends after `max_attempts` crashes rather than looping. The sweep reports
-each job it reclaimed in `SweepEvent.Jobs`, and the slog observer logs each crashed attempt as it logs
-any failed one.
+process down on every attempt ends after `max_attempts` crashes rather than looping. To bound crashes on
+their own, set `DriverOpts.MaxCrashes`: the sweep then also discards a job on its `MaxCrashes`-th crash,
+counted over the job's life, however many attempts it has left — so a kind with a generous retry budget
+for ordinary errors still can't take a process down more than a few times. The sweep reports each job it
+reclaimed in `SweepEvent.Jobs`, the slog observer logs each crashed attempt as it logs any failed one,
+and `MetricsObserver` counts the jobs each pass discarded in `flywheel_sweep_discarded_total`.
 
 **`LeaseDuration` bounds dispatch liveness, not run duration.** It is how long a *crashed* executor's
 job stays stranded before it is reclaimed, not a ceiling on how long a worker may take. Size it to how
@@ -820,7 +823,7 @@ can store is capped, and a cut record says so:
 |---|---|
 | Before your worker body runs | The row is **committed** with outcome `started`. A side-effect row written during the attempt can reference it immediately, and it survives a rollback of your own work. |
 | Attempt finishes | The same row is updated in place with the outcome, timings, cost, and `Result.Output`. |
-| Process crashes mid-attempt | The lease sweep marks the row `crashed`, with the state it left the job in (`available`, or `discarded` when that was the job's last attempt). It is **not deleted**, so your FK never dangles. |
+| Process crashes mid-attempt | The lease sweep marks the row `crashed`, with the state it left the job in (`available`, or `discarded` when that was the job's last attempt or its `MaxCrashes`-th crash). The sweep crashes only the run of the attempt it reclaimed: an older attempt that a retry with `AllowRunning` left running keeps its row `started` until it returns. It is **not deleted**, so your FK never dangles. |
 | Retention runs | The only thing that removes it. `DeleteFinishedJobs` deletes `job_runs` **before** `jobs`, so a host FK onto `job_runs.id` wants **`ON DELETE SET NULL`** — or leave retention disabled. |
 
 Need run history that no worker produced — fixtures, a backfill, an import? `flywheel.SeedRun` writes a
@@ -1004,7 +1007,9 @@ terminal jobs only; it also refuses a job cancelled while its attempt runs, beca
 attempt without awaiting its worker. Wait for the attempt to finish, or pass
 `RetryOpts{AllowRunning: true}` to re-queue it anyway: the running attempt keeps going, its result is
 discarded, and the work runs twice. That is also the way past a cancelled job whose process died before
-its attempt returned, whose run stays `started`.
+its attempt returned, whose run stays `started`. If the re-queued job's new attempt then crashes, the
+sweep crashes only the run of the attempt it reclaimed: the older attempt keeps its run `started` until
+it returns, so the crash is counted once.
 
 **The fan-in barrier runs a continuation once a generation completes.** A worker returns `Result.Barrier`
 alongside its children, and the runtime enqueues the continuation exactly once, after the last child
