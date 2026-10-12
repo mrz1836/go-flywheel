@@ -216,39 +216,57 @@ jobs:
         run: go vet -tags=loadtest ./...
 
       # --------------------------------------------------------------------
-      # The one chaos scenario that asserts.
+      # The two chaos scenarios that assert.
       #
-      # A runner is killed 40% through a 2,000-job drain and the lease sweep must
-      # recover everything it was holding, with no job running twice. It is sized as
-      # an assertion rather than a measurement so it fits this job's budget; the
-      # measurements live in the benchmarks, which never run here.
+      # A runner is killed 40% through a 2,000-job drain, and the lease sweep must
+      # recover everything it was holding, with no job running twice. The first
+      # scenario gives every job the default budget, so each recovered job runs
+      # again and succeeds; the second gives every job one attempt, so each job the
+      # kill caught on its last attempt must end discarded, never claimed again.
+      # Both are sized as assertions rather than measurements so they fit this
+      # job's budget; the measurements live in the benchmarks, which never run here.
       #
       # FLYWHEEL_LOADTEST_DATABASE_URL is set only for this step. The harness reads
       # that variable and deliberately does not fall back to the suite's, so a 100k
       # benchmark can never start itself inside a job budgeted in seconds.
       # --------------------------------------------------------------------
-      - name: 💥 Run the worker-kill chaos scenario
+      - name: 💥 Run the worker-kill chaos scenarios
         env:
           FLYWHEEL_LOADTEST_DATABASE_URL: postgres://flywheel:flywheel@localhost:5432/flywheel_test?sslmode=disable
         run: |
           set -euo pipefail
           go test -tags=loadtest -count=1 -timeout=10m -v \
-            -run 'TestWorkerKillMidDrainReclaimsEveryJob' ./loadtest/ 2>&1 | tee /tmp/loadtest-chaos.log
+            -run 'TestWorkerKillMidDrainReclaimsEveryJob|TestWorkerKilledOnItsLastAttemptLeavesTheJobDiscarded' \
+            ./loadtest/ 2>&1 | tee /tmp/loadtest-chaos.log
 
       # --------------------------------------------------------------------
-      # Prove the scenario ran rather than skipped.
+      # Prove both scenarios ran rather than skipped.
       #
       # The harness skips itself when its DSN is unset, which is correct everywhere
       # except here. Without this check, a typo in the variable above would turn the
       # step green while running nothing — the same failure mode
       # FLYWHEEL_REQUIRE_POSTGRES exists to prevent for the suite.
       # --------------------------------------------------------------------
-      - name: ✅ Assert the chaos scenario ran
+      - name: ✅ Assert the chaos scenarios ran
         run: |
           set -euo pipefail
-          if grep -qE '^--- PASS: TestWorkerKillMidDrainReclaimsEveryJob\b' /tmp/loadtest-chaos.log; then
-            echo "  ✅ TestWorkerKillMidDrainReclaimsEveryJob"
-            exit 0
+          expected="TestWorkerKillMidDrainReclaimsEveryJob
+          TestWorkerKilledOnItsLastAttemptLeavesTheJobDiscarded"
+
+          missing=0
+          while read -r name; do
+            name="$(echo "${name}" | xargs)"
+            [ -z "${name}" ] && continue
+            if grep -qE "^--- PASS: ${name}\b" /tmp/loadtest-chaos.log; then
+              echo "  ✅ ${name}"
+            else
+              echo "::error::${name} did not report PASS — it was skipped, renamed, or removed."
+              missing=$((missing + 1))
+            fi
+          done <<< "${expected}"
+
+          if [ "${missing}" -ne 0 ]; then
+            echo "::error::${missing} chaos scenario(s) did not run. A green step that skips them proves nothing."
+            exit 1
           fi
-          echo "::error::TestWorkerKillMidDrainReclaimsEveryJob did not report PASS — it was skipped, renamed, or removed."
-          exit 1
+          echo "Both worker-kill scenarios exercised against real PostgreSQL."
