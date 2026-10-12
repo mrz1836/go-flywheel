@@ -1320,9 +1320,11 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 	}
 
 	// The attempt's fields, under the keys the slog observer's own lines use, so
-	// a worker's lines filter by queue or attempt and line up with the runtime's.
+	// a worker's lines filter by queue or attempt, read the attempt against its
+	// budget, and line up with the runtime's.
 	logger := r.cfg.Logger.With(
-		"job_id", raw.ID, "kind", raw.Kind, "queue", raw.Queue, "run_id", runID, "attempt", raw.Attempt,
+		"job_id", raw.ID, "kind", raw.Kind, "queue", raw.Queue, "run_id", runID,
+		"attempt", raw.Attempt, "max_attempts", raw.MaxAttempts,
 	)
 	if reqID := ctxutil.RequestIDFromMetadata(raw.Metadata); reqID != "" {
 		ctx = ctxutil.WithRequestID(ctx, reqID)

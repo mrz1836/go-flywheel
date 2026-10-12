@@ -207,9 +207,10 @@ type Job[A Args] struct {
 	Tags       []string
 	// Logger is RunnerConfig.Logger (slog.Default when unset) carrying the
 	// attempt's fields under the keys the slog observer's lines use: job_id,
-	// kind, queue, run_id, and attempt, plus request_id when the job was enqueued
-	// with one. A worker's lines can then be filtered by queue or by attempt, and
-	// read beside the runtime's own lines for the same attempt.
+	// kind, queue, run_id, attempt, and max_attempts, plus request_id when the
+	// job was enqueued with one. A worker's lines can then be filtered by queue
+	// or by attempt, say whether the attempt was the job's last, and be read
+	// beside the runtime's own lines for the same attempt.
 	Logger *slog.Logger
 	// RunID is the pre-allocated job_runs.id for this attempt. A side-effect
 	// row may set its job_run_id to RunID safely — the run row already exists.
