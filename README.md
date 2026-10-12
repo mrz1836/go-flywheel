@@ -812,7 +812,8 @@ can store is capped, and a cut record says so:
   if you keep full captures.
 - **Errors.** The error message is stored up to 4,096 bytes. A cut message's `error_payload` carries
   `"truncated": true` and `"message_bytes"`, its length before the cut, and `JobRunView.ErrorTruncated`
-  is true.
+  is true. `JobRunView.ErrorPayload` returns the stored `error_payload` as it is, so you can show the
+  whole payload; it is nil when the run stored none.
 - **Panics.** A worker that panics fails its attempt with `jobs: worker panicked: <value>`, and the run's
   `error_payload` keeps the goroutine's stack at the panic (`"stack"`, up to 16 KiB), which
   `JobRunView.ErrorStack` reports.
