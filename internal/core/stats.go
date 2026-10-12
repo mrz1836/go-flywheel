@@ -51,7 +51,8 @@ type KindStats struct {
 	Outcomes OutcomeCounts `json:"outcomes"`
 	// Succeeded and Discarded are job-level outcomes: jobs that finished
 	// successfully, and jobs that failed for good — a permanent error, a
-	// retryable one on the last attempt, or a crash on the last attempt.
+	// retryable one on the last attempt, or a crash on the last attempt or on the
+	// last one DriverOpts.MaxCrashes allows.
 	Succeeded int64 `json:"succeeded"`
 	Discarded int64 `json:"discarded"`
 	// Retries counts attempts after which the job ran again: failed and crashed

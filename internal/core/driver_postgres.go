@@ -43,18 +43,25 @@ func (d *postgresDriver) Sweep(ctx context.Context, now time.Time) (int, error) 
 }
 
 // reclaimExpired takes one batch of expired leases, discards each job whose
-// crashed attempt was its last, returns the rest to available, and reports the
-// jobs it reclaimed in reclaim order.
+// crashed attempt was its last or spent its crash budget, returns the rest to
+// available, and reports the jobs it reclaimed in reclaim order.
 //
 // It is one statement: the CTE selects and row-locks up to limit expired rows
 // with SKIP LOCKED and decides, per row, whether the attempt that held the lease
 // spent the job's budget (attempt >= max_attempts, the rule a failed attempt's
-// finalize applies); the UPDATE then applies each row's own state, stamping
-// finalized_at on a discard, and RETURNING hands back what the stub update, the
-// sweep's report, and the barrier check need. Splitting it into a SELECT and an
-// UPDATE would hold the locks across a round trip for no benefit. The columns it
-// writes are reclaimUpdate's and reclaimDiscardUpdate's, which SQLite applies as
-// two updates.
+// finalize applies) or, when DriverOpts.MaxCrashes is positive, its crash budget
+// (the job's earlier crashes, counted from its own runs, plus this one); the
+// UPDATE then applies each row's own state, stamping finalized_at on a discard,
+// and RETURNING hands back what the stub update, the sweep's report, and the
+// barrier check need. Splitting it into a SELECT and an UPDATE would hold the
+// locks across a round trip for no benefit. The columns it writes are
+// reclaimUpdate's and reclaimDiscardUpdate's, which SQLite applies as two
+// updates.
+//
+// The crash count is in the statement only when there is a budget, so the
+// default sweep reads no run before it updates the stubs. When it is there it
+// probes each reclaimed job's own runs through job_runs_job_attempt; the lock
+// SKIP LOCKED takes covers the jobs rows alone.
 //
 // The predicate carries deleted_at IS NULL explicitly. A raw statement gets no
 // GORM soft-delete scope, and without it this dialect would reclaim
@@ -64,9 +71,15 @@ func (d *postgresDriver) Sweep(ctx context.Context, now time.Time) (int, error) 
 func (d *postgresDriver) reclaimExpired(
 	ctx context.Context, tx *gorm.DB, now time.Time, limit int,
 ) ([]reclaimedJob, error) {
-	const sql = `
+	spent, args := "attempt >= max_attempts", []any{}
+	if maxCrashes := d.opts.MaxCrashes; maxCrashes > 0 {
+		spent = "(attempt >= max_attempts OR 1 + (SELECT count(*) FROM job_runs r " +
+			"WHERE r.job_id = jobs.id AND " + crashedRunCondition + ") >= ?)"
+		args = append(args, maxCrashes)
+	}
+	sql := `
 WITH expired AS (
-    SELECT id, leased_until, attempt >= max_attempts AS spent FROM jobs
+    SELECT id, leased_until, ` + spent + ` AS spent FROM jobs
     WHERE state = 'running' AND leased_until < ? AND deleted_at IS NULL
     ORDER BY leased_until
     LIMIT ?
@@ -82,7 +95,8 @@ RETURNING jobs.id, jobs.state, jobs.kind, jobs.queue, jobs.attempt, jobs.max_att
     expired.leased_until`
 
 	var rows []reclaimRow
-	if err := tx.WithContext(ctx).Raw(sql, now, limit, now, now).Scan(&rows).Error; err != nil {
+	args = append(args, now, limit, now, now)
+	if err := tx.WithContext(ctx).Raw(sql, args...).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("jobs: reclaim jobs: %w", err)
 	}
 	return inReclaimOrder(rows), nil

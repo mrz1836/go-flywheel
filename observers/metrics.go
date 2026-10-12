@@ -58,6 +58,12 @@ const (
 	// mid-attempt often enough that recovery leans on the sweep rather than on
 	// jobs finalizing themselves.
 	MetricSweepReclaimed = "flywheel_sweep_reclaimed_total"
+	// MetricSweepDiscarded counts the jobs a sweep pass discarded rather than
+	// returned to the queue: the crashed attempt was the job's last, or its crashes
+	// used up DriverOpts.MaxCrashes. Each one is work lost until it is replayed, so
+	// it is the series to alert on when a job keeps taking its process down. Like
+	// the reclaimed count it is recorded on every pass, zero included.
+	MetricSweepDiscarded = "flywheel_sweep_discarded_total"
 )
 
 // Duration histogram names. Unlike MetricJobDuration's historical summary form,
@@ -130,6 +136,7 @@ type HistogramConfig struct {
 //	OnSupersede -> Count(flywheel_jobs_superseded_total, 1, {kind, queue})
 //	OnSweep  -> Histogram(flywheel_sweep_duration_seconds, secs, {})
 //	            Count(flywheel_sweep_reclaimed_total, reclaimed, {})
+//	            Count(flywheel_sweep_discarded_total, discarded, {})
 //
 // The duration series are histograms, not summaries, so p50/p99 are derivable:
 // flywheel_job_duration_seconds was upgraded from the summary Observe form. A
@@ -222,15 +229,17 @@ func (m *MetricsObserver) OnSupersede(_ context.Context, ev flywheel.SupersedeEv
 	})
 }
 
-// OnSweep records the stuck-lease reclaim pass: its duration and the count of
-// expired leases it took, returned to available or discarded. Both carry no
-// tags — a deployment runs one scheduler, so each is a single series. The
-// duration's slow tail is the database-load signal; the reclaimed count is the
-// crash-recovery signal, and it is emitted even when zero so the counter series
-// always exists and rate() alerts have a baseline.
+// OnSweep records the stuck-lease reclaim pass: its duration, the count of
+// expired leases it took, returned to available or discarded, and the count of
+// those it discarded. None carries tags — a deployment runs one scheduler, so
+// each is a single series. The duration's slow tail is the database-load signal;
+// the reclaimed count is the crash-recovery signal, and the discarded count is
+// the work the crashes cost. Both counts are emitted even when zero, so the
+// counter series always exist and rate() alerts have a baseline.
 func (m *MetricsObserver) OnSweep(_ context.Context, ev flywheel.SweepEvent) {
 	m.rec.Histogram(MetricSweepDuration, ev.Duration.Seconds(), nil)
 	m.rec.Count(MetricSweepReclaimed, int64(ev.Reclaimed), nil)
+	m.rec.Count(MetricSweepDiscarded, int64(ev.Discarded), nil)
 }
 
 // MemRecorder is a concurrent-safe, in-memory MetricsRecorder. It is three things

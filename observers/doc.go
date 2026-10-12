@@ -19,7 +19,9 @@
 //     attempt at warn and a job a failure discarded at error, each with the
 //     worker's error, and a supersede at warn because it means work was executed
 //     and its outcome thrown away. A crashed attempt the lease sweep reclaimed
-//     logs the same two lines, one per job, with outcome crashed and no error.
+//     logs the same two lines, one per job, with outcome crashed and no error,
+//     and MetricsObserver counts the jobs each sweep discarded in
+//     flywheel_sweep_discarded_total.
 //   - Multi fans one event out to several observers, so a Node can run metrics and
 //     logging side by side: NewMulti(NewSlog(logger), NewMetrics(rec)).
 //

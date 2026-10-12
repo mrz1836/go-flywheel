@@ -24,7 +24,8 @@ so a legitimately long job is never mistaken for a dead one. If the worker's pro
 expires and the stuck-lease sweep returns the job to the queue — the runtime's recovery path for work
 lost to a crash. A crash spends an attempt like a failure does: when the crashed attempt was the job's
 last (`attempt >= max_attempts`), the sweep discards the job instead, so a job that kills its process on
-every attempt ends after `max_attempts` crashes rather than looping.
+every attempt ends after `max_attempts` crashes rather than looping. With `DriverOpts.MaxCrashes` set, it
+also discards a job on its `MaxCrashes`-th crash, counted over the job's life, whatever attempts remain.
 
 **A fence bounds a finalize: only the attempt holding the current claim advances the job's state.** Each
 claim mints a lease token, and the finalize's state update is scoped to `id = ? AND lease_token = ?`. If
@@ -46,7 +47,8 @@ discarded, so the work runs twice at once.
 outcome `started` — the run stub. Because it is committed first, a crash mid-attempt leaves a record,
 not a hole: the sweep marks that stub `crashed` rather than deleting it, and its `id` is a stable
 foreign-key target a side-effect row can reference. You always know an attempt happened, even one that
-died.
+died. The sweep crashes only the run of the attempt it reclaimed: an older attempt that a retry with
+`AllowRunning` left running keeps its stub `started` until it returns, so one crash is recorded once.
 
 **An outcome, once recorded, survives shutdown.** The finalize transaction detaches from context
 cancellation (`context.WithoutCancel`), so a drain or a `SIGTERM` that cancels the worker's context
@@ -75,7 +77,7 @@ transaction sees the holder and gets the `*AlreadyEnqueuedError`. See [`COOKBOOK
 **Exactly-once execution of side effects is not guaranteed, and cannot be.** A worker that makes an
 external call — charges a card, sends an email, writes to another system — and is then killed *after*
 the call returns but *before* its finalize commits will run again on recovery (unless that was its last
-attempt, which discards the job), and make the call a second time. This is not a defect to be fixed; it is a fundamental property of any system that survives crashes.
+attempt, or its `MaxCrashes`-th crash, which discards the job), and make the call a second time. This is not a defect to be fixed; it is a fundamental property of any system that survives crashes.
 The runtime guarantees exactly-once **state advance** (the job moves forward once), not exactly-once
 **side effect** (the external call happens once). The window is real and it is between "the side effect
 completed" and "the finalize committed."

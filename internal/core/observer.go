@@ -78,7 +78,9 @@ type Observer interface {
 	//
 	// A crashed attempt never reaches OnFinish — no worker returned to finalize
 	// it — so SweepEvent.Jobs is where each one is reported: the job, its crashed
-	// run, and whether the sweep returned it to the queue or discarded it.
+	// run, and whether the sweep returned it to the queue or discarded it, which it
+	// does when the crashed attempt was the job's last or, under
+	// DriverOpts.MaxCrashes, its last allowed crash.
 	OnSweep(ctx context.Context, ev SweepEvent)
 }
 
@@ -179,8 +181,8 @@ type SweepEvent struct {
 	// finalization, is recovering their work.
 	Reclaimed int
 	// Discarded is how many of the reclaimed jobs the pass discarded because the
-	// crashed attempt was the job's last. Each one is work lost until it is
-	// replayed.
+	// crashed attempt was the job's last, or was its DriverOpts.MaxCrashes-th
+	// crash. Each one is work lost until it is replayed.
 	Discarded int
 	// Jobs names each reclaimed job, in reclaim order: oldest expired lease
 	// first. The built-in drivers report them on the context Scheduler.Sweep
@@ -196,12 +198,15 @@ type SweepEvent struct {
 type SweptJob struct {
 	// JobEvent names the job and its crashed attempt. RunID is that attempt's
 	// run, the job_runs row the sweep marked crashed; it is empty when the
-	// process died before committing one.
+	// process died before committing one. An older attempt's run is never named
+	// here: an attempt a retry with RetryOpts.AllowRunning left running keeps its
+	// run started until it returns, and the sweep leaves it so.
 	JobEvent
 	// MaxAttempts is the job's attempt budget, so Attempt reads against it.
 	MaxAttempts int
 	// State is the state the sweep left the job in: StateAvailable when it runs
-	// again, or StateDiscarded when the crashed attempt was its last.
+	// again, or StateDiscarded when the crashed attempt was its last or its
+	// DriverOpts.MaxCrashes-th crash.
 	State JobState
 }
 

@@ -50,6 +50,7 @@ var metricHelp = map[string]string{
 	MetricClaimDuration:    "Claim round-trip duration in seconds.",
 	MetricFinalizeDuration: "Finalize (outcome persistence) duration in seconds.",
 	MetricSweepDuration:    "Lease-reclaim sweep duration in seconds.",
+	MetricSweepDiscarded:   "Jobs the lease-reclaim sweep discarded: the crashed attempt was the last, or crashes used up their budget.",
 	MetricDroppedSeries:    "Series dropped because the recorder's MaxSeries ceiling was reached.",
 	MetricQueueJobs:        "Jobs in the queue by state.",
 	MetricQueueReady:       "Jobs claimable right now.",

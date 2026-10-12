@@ -620,9 +620,9 @@ func (s *Scheduler) Tick(ctx context.Context) (int, error) {
 // Sweep reclaims jobs whose lease has expired — state running with leased_until
 // in the past, which is what a job looks like when its executor died mid-attempt
 // — and marks each stale run stub crashed. A reclaimed job returns to available
-// unless its crashed attempt was its last, which discards it, so a job whose
-// process dies on every attempt ends after max_attempts crashes instead of
-// looping. It is the runtime's only recovery path for work lost to a crashed
+// unless its crashed attempt was its last, or its DriverOpts.MaxCrashes-th crash,
+// which discards it, so a job whose process dies on every attempt ends after
+// max_attempts crashes, or MaxCrashes when that is set, instead of looping. It is the runtime's only recovery path for work lost to a crashed
 // process.
 //
 // It runs through the configured Driver, so a host that wrapped its Driver

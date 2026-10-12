@@ -25,6 +25,7 @@ timing lands in one recorder), then serve `observers.MetricsHandler(rec, sample)
 | `flywheel_jobs_finished_total{outcome}` | counter | State-advancing finalizations by outcome. |
 | `flywheel_jobs_retried_total` | counter | Scheduled retries. |
 | `flywheel_jobs_superseded_total` | counter | Attempts executed and discarded — the double-execution signal. |
+| `flywheel_sweep_discarded_total` | counter | Jobs the lease sweep discarded: a crash on the job's last attempt, or its `MaxCrashes`-th crash. A steady rate is a job taking its process down. |
 | `flywheel_metrics_dropped_series_total` | counter | Series dropped to the cardinality ceiling. |
 
 The gauges are sampled fresh on every scrape from `SampleQueueHealth`; the histograms and counters
@@ -77,11 +78,12 @@ process, and it is working as designed when it runs occasionally. It is a proble
 *constantly*.
 
 **How the sweep works.** The scheduler reclaims jobs in state `running` whose `leased_until` is in the
-past, in bounded batches, on its sweep cadence (30 seconds by default). Each reclaimed job's stale run
-stub — the `job_runs` row committed before the worker body ran — is marked with outcome `crashed`, so a
-crash leaves an audit record rather than a hole. A crash spends the attempt it interrupted: a job whose
-crashed attempt was its last (`attempt >= max_attempts`) is discarded rather than returned to the queue,
-and its stub records `job_state = 'discarded'` (`available` for a job that runs again).
+past, in bounded batches, on its sweep cadence (30 seconds by default). The stale run stub of each
+reclaimed attempt — the `job_runs` row committed before the worker body ran — is marked with outcome
+`crashed`, so a crash leaves an audit record rather than a hole. A crash spends the attempt it
+interrupted: a job whose crashed attempt was its last (`attempt >= max_attempts`), or, with
+`DriverOpts.MaxCrashes` set, whose crash was its `MaxCrashes`-th, is discarded rather than returned to
+the queue, and its stub records `job_state = 'discarded'` (`available` for a job that runs again).
 
 **A job that keeps killing its worker ends discarded.** A worker that takes its whole process down — out
 of memory, a fatal runtime error, a panic on a goroutine it started, `os.Exit` — crashes every attempt.
@@ -89,7 +91,9 @@ Each one is reclaimed and claimed again until the job's attempts are spent, and 
 it. With `observers.NewSlog` wired into the scheduler, every crashed attempt logs
 `flywheel: job attempt failed` at warn, and the last one `flywheel: job failed and was discarded` at
 error, each with `outcome` `crashed` (next section). A job with a large `MaxAttempts` takes the process
-down that many times first; give a kind that can kill its process a small budget, and fix the worker.
+down that many times first. Bound it with `DriverOpts.MaxCrashes` on the scheduler's driver: the sweep
+then also discards a job on its `MaxCrashes`-th crash, counted over the job's life, whatever attempts it
+has left. Then fix the worker. `flywheel_sweep_discarded_total` counts every job the sweep discarded.
 
 **`crashed` in `job_runs.outcome`** means the attempt's process died between claiming the job and
 finalizing it: the run stub was written, the worker never reported an outcome, and the sweep found the
@@ -197,8 +201,10 @@ Until it returns, the job reads `cancelled` while its run at the job's attempt s
 cancel fences the attempt without awaiting its worker, and the attempt's run reads `started` until the
 worker returns. Wait for the attempt to finish (`flywheel jobs inspect <id>` shows its run). If the process
 that ran it is gone — a cancelled job's process died before its attempt returned, so nothing will ever
-finish that run — retry it with `RetryOpts{Force: true, AllowRunning: true}`, which re-queues it
-regardless.
+finish that run — retry it with `RetryOpts{Force: true, AllowRunning: true}`, or
+`flywheel jobs retry <id> --force --allow-running`, which re-queues it regardless. If the re-queued job's
+new attempt then crashes, the sweep crashes only the run of the attempt it reclaimed: the older
+attempt's run stays `started` until it returns, and for good when its process is gone.
 
 <br>
 

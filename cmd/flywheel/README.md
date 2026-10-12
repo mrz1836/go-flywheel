@@ -99,7 +99,7 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel jobs ls` | List recent jobs, newest first (`--state --kind --queue --before <id> --limit --json`) |
 | `flywheel jobs running` | List running jobs, longest-running first, flagging any far slower than their kind's baseline (`--kind --queue --limit --json`) |
 | `flywheel jobs inspect <id>` | Show a job and its run history |
-| `flywheel jobs retry <id>` | Return a waiting job (available, scheduled, retryable, or paused) to available to run now. A running job is refused (`flywheel: job is running`), so its work never runs twice at once; a terminal job is refused too (`flywheel: job has already reached a terminal state`) |
+| `flywheel jobs retry <id>` | Return a job to available so it runs again (`--force` for a terminal job; `--allow-running` re-queues a running one, whose current attempt keeps running). Without them, a running job is refused (`flywheel: job is running`), so its work never runs twice at once, and so is a terminal one (`flywheel: job has already reached a terminal state`) |
 | `flywheel jobs cancel <id>` | Move a job to cancelled (refused once a job is terminal) |
 | `flywheel schedule ls` | List periodic schedules, with whether each is active and paused (`--json`) |
 | `flywheel schedule add <slug> <kind>` | Add/update a schedule (`--cron \| --every`, `--args`). A `--cron` that names no zone runs in the zone the scheduler evaluates it in: the daemon's local zone, as the database driver returns its times. Prefix it with `CRON_TZ=<zone>` to pin one, for example `--cron "CRON_TZ=UTC 0 9 * * *"` |

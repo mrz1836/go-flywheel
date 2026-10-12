@@ -165,3 +165,71 @@ func TestCrashedStubRecordsTheStateTheSweepApplied(t *testing.T) {
 	t.Parallel()
 	crashedStubSuite(t, newDB(t))
 }
+
+// crashThreeTimes crashes a job of 25 attempts three times through d, sweeping
+// past the lease after each crash, and returns the job's id and its state after
+// each sweep.
+func crashThreeTimes(t *testing.T, db *gorm.DB, d Driver) (string, []string) {
+	t.Helper()
+	s := crashScheduler(t, db, d)
+	ctx := context.Background()
+	id := seedCrashJob(t, db, "crash-budget", "default", 25)
+	states := make([]string, 0, 3)
+	for range 3 {
+		crashAttempt(t, ctx, d, "default")
+		sweepPastTheLease(t, s)
+		states = append(states, jobRowByID(t, db, id).State)
+	}
+	return id, states
+}
+
+// maxCrashesSuite crashes a job of 25 attempts three times on a driver built
+// with a crash budget of three, and again on one built with none. With the
+// budget, the third reclaim discards the job, as a crash on its last attempt
+// would, and its crashed run records the discard. Without it, the job is still
+// available after the third crash, its attempts far from spent.
+func maxCrashesSuite(
+	t *testing.T, newDB func(t *testing.T) *gorm.DB, newDriver func(t *testing.T, db *gorm.DB, opts DriverOpts) Driver,
+) {
+	t.Helper()
+	available, discarded := string(StateAvailable), string(StateDiscarded)
+
+	t.Run("a budget of three", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		id, states := crashThreeTimes(t, db, newDriver(t, db, DriverOpts{MaxCrashes: 3}))
+		assert.Equal(t, []string{available, available, discarded}, states, "the third crash spends the budget")
+
+		row := jobRowByID(t, db, id)
+		assert.Equal(t, 3, row.Attempt, "the job ended with 22 attempts unspent")
+		require.NotNil(t, row.FinalizedAt, "a discarded job carries its finalization instant")
+		assert.Nil(t, row.LeaseToken, "the discard clears the fence token")
+
+		runs := runsOf(t, db, id)
+		require.Len(t, runs, 3)
+		assert.Equal(t, string(OutcomeCrashed), runs[2].Outcome)
+		require.NotNil(t, runs[2].JobState)
+		assert.Equal(t, discarded, *runs[2].JobState, "the third crashed run records the discard")
+	})
+	t.Run("no budget", func(t *testing.T) {
+		t.Parallel()
+		db := newDB(t)
+		_, states := crashThreeTimes(t, db, newDriver(t, db, DriverOpts{}))
+		assert.Equal(t, []string{available, available, available}, states,
+			"without a budget a crash spends one attempt and nothing more")
+	})
+}
+
+// TestSweepDiscardsAJobOnItsMaxCrashesCrash proves the optional crash budget: a
+// job whose worker keeps killing its process ends on its MaxCrashes-th crash,
+// however many attempts it has left.
+func TestSweepDiscardsAJobOnItsMaxCrashesCrash(t *testing.T) {
+	t.Parallel()
+	maxCrashesSuite(t,
+		func(t *testing.T) *gorm.DB { return newDB(t) },
+		func(t *testing.T, db *gorm.DB, opts DriverOpts) Driver {
+			d, err := NewSQLiteDriverWithOptions(db, SQLiteOpts{DriverOpts: opts})
+			require.NoError(t, err)
+			return d
+		})
+}

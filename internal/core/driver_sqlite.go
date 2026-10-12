@@ -136,8 +136,8 @@ func (d *sqliteDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
 }
 
 // reclaimExpired takes one batch of expired leases, discards each job whose
-// crashed attempt was its last, returns the rest to available, and reports the
-// jobs it reclaimed in reclaim order.
+// crashed attempt was its last or spent its crash budget, returns the rest to
+// available, and reports the jobs it reclaimed in reclaim order.
 //
 // It is a SELECT of the oldest expired leases followed by an UPDATE per state
 // the reclaim applies, all inside the caller's transaction — structurally the
@@ -146,7 +146,9 @@ func (d *sqliteDriver) Sweep(ctx context.Context, now time.Time) (int, error) {
 // The SELECT reads each job's attempt against its budget (attempt >=
 // max_attempts, the rule a failed attempt's finalize applies), which splits the
 // batch into the jobs to discard (reclaimDiscardUpdate) and the jobs to return
-// (reclaimUpdate).
+// (reclaimUpdate). When DriverOpts.MaxCrashes is positive, one grouped read of
+// the batch's earlier crashes comes first, and a job whose crash budget this
+// reclaim spends is discarded too; with no budget it reads no run.
 //
 // It runs through Model(&jobRow{}), so GORM's soft-delete scope applies and a
 // soft-deleted running job is left alone. The PostgreSQL path spells that same
@@ -166,9 +168,14 @@ func (d *sqliteDriver) reclaimExpired(
 	if len(rows) == 0 {
 		return nil, nil
 	}
+	crashes, err := d.earlierCrashes(ctx, tx, rows)
+	if err != nil {
+		return nil, err
+	}
 	var discard, available []string
 	for i := range rows {
-		if spentAttempts(rows[i].Attempt, rows[i].MaxAttempts) {
+		if spentAttempts(rows[i].Attempt, rows[i].MaxAttempts) ||
+			crashBudgetSpent(crashes[rows[i].ID], d.opts.MaxCrashes) {
 			rows[i].State = string(StateDiscarded)
 			discard = append(discard, rows[i].ID)
 			continue
@@ -192,6 +199,32 @@ func (d *sqliteDriver) reclaimExpired(
 		}
 	}
 	return inReclaimOrder(rows), nil
+}
+
+// earlierCrashes counts, per job of a reclaim batch, the runs the sweep crashed
+// before this reclaim (crashedRunCondition), in one grouped read. With no crash
+// budget it reads nothing and returns nil, which counts zero for every job.
+func (d *sqliteDriver) earlierCrashes(ctx context.Context, tx *gorm.DB, rows []reclaimRow) (map[string]int, error) {
+	if d.opts.MaxCrashes <= 0 {
+		return nil, nil
+	}
+	ids := make([]string, len(rows))
+	for i, r := range rows {
+		ids[i] = r.ID
+	}
+	var counts []struct {
+		JobID string `gorm:"column:job_id"`
+		N     int    `gorm:"column:n"`
+	}
+	if err := tx.WithContext(ctx).Raw(`SELECT r.job_id, count(*) AS n FROM job_runs r `+
+		`WHERE r.job_id IN ? AND `+crashedRunCondition+` GROUP BY r.job_id`, ids).Scan(&counts).Error; err != nil {
+		return nil, fmt.Errorf("jobs: count earlier crashes: %w", err)
+	}
+	crashes := make(map[string]int, len(counts))
+	for _, c := range counts {
+		crashes[c.JobID] = c.N
+	}
+	return crashes, nil
 }
 
 // Dequeue claims up to limit ready jobs. SQLite has no SKIP LOCKED, so the
