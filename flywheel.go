@@ -39,6 +39,7 @@ type (
 	AnomalyThresholds     = core.AnomalyThresholds
 	Args                  = core.Args
 	Barrier               = core.Barrier
+	BarrierView           = core.BarrierView
 	Baseline              = core.Baseline
 	BatchItem             = core.BatchItem
 	BatchOpts             = core.BatchOpts
@@ -64,6 +65,7 @@ type (
 	FinishEvent           = core.FinishEvent
 	FinishedCursor        = core.FinishedCursor
 	FollowUp              = core.FollowUp
+	GetJobOpts            = core.GetJobOpts
 	Grant                 = core.Grant
 	HTTPDoer              = core.HTTPDoer
 	HealthConfig          = node.HealthConfig
@@ -72,8 +74,12 @@ type (
 	IndexDriftError       = core.IndexDriftError
 	IndexKind             = core.IndexKind
 	IndexOpts             = core.IndexOpts
+	InsertHook            = core.InsertHook
+	InsertInfo            = core.InsertInfo
 	InsertOpts            = core.InsertOpts
+	InsertSource          = core.InsertSource
 	JobArgsView           = core.JobArgsView
+	JobDetail             = core.JobDetail
 	JobEvent              = core.JobEvent
 	JobRunView            = core.JobRunView
 	JobState              = core.JobState
@@ -147,9 +153,16 @@ const (
 	ErrorValidation          = core.ErrorValidation
 	IndexCorrectness         = core.IndexCorrectness
 	IndexPerformance         = core.IndexPerformance
+	InsertSourceBarrier      = core.InsertSourceBarrier
+	InsertSourceClient       = core.InsertSourceClient
+	InsertSourceFollowUp     = core.InsertSourceFollowUp
+	InsertSourcePeriodic     = core.InsertSourcePeriodic
 	IntervalDay              = core.IntervalDay
 	IntervalHour             = core.IntervalHour
+	MaxMetadataBytes         = core.MaxMetadataBytes
 	MaxReadLimit             = core.MaxReadLimit
+	MaxTagBytes              = core.MaxTagBytes
+	MaxTags                  = core.MaxTags
 	OutcomeCancelled         = core.OutcomeCancelled
 	OutcomeCrashed           = core.OutcomeCrashed
 	OutcomeError             = core.OutcomeError
@@ -252,6 +265,14 @@ func Enqueue(ctx context.Context, c *Client, kind string, args []byte, opts Inse
 
 func FindJob(ctx context.Context, db *gorm.DB, id string) (JobView, error) {
 	return core.FindJob(ctx, db, id)
+}
+
+func GetJob(ctx context.Context, db *gorm.DB, id string) (JobDetail, error) {
+	return core.GetJob(ctx, db, id)
+}
+
+func GetJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts GetJobOpts) (JobDetail, error) {
+	return core.GetJobWithOptions(ctx, db, id, opts)
 }
 
 func HistogramBounds(version int) []int64 {
