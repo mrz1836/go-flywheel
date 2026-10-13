@@ -45,6 +45,7 @@ until it is done.
 | What were the slowest runs today? | `SlowRuns` | `job_run_finishes` + `job_runs` PK | 71 ms |
 | One job's attempts | `ListRuns` | `job_runs_job_attempt` | sub-ms |
 | One job's latest attempt and its output | `LatestRun` | `job_runs_job_attempt` | sub-ms |
+| One job in full: args (bounded), metadata, keys, barrier, latest run | `GetJob` | `jobs` primary key + `job_runs_job_attempt` | sub-ms |
 | Has this job finished yet? | `WaitForJob` | `jobs` primary key | sub-ms per poll |
 
 The [measured latencies](#measured-cost) are at the end. Everything above is bounded — by a window, a
@@ -559,6 +560,18 @@ is zone-proof on SQLite.
 `ListRuns` with `Limit: 1`. After `WaitForJob` reports a job succeeded, it is the attempt that succeeded,
 with the worker's `Output`. A job that `FindJob` reads `cancelled` while its run at the job's `Attempt` still
 reads outcome `started` is a cancel still waiting on a running attempt: the worker has not returned yet.
+
+**`GetJob(ctx, db, id)` / `GetJobWithOptions(ctx, db, id, GetJobOpts{MaxArgsBytes})`** — one job in full,
+the read behind a page that shows a single job: its `JobView`, plus its args as stored, its metadata, both
+unique keys, its timeout and lease, a declared barrier that has not fired (`BarrierView`), `CancelPending`,
+and `LatestRun`, the run of the attempt the job names. It returns what is stored, unredacted. Args are
+measured in SQL and selected in the same statement only within `MaxArgsBytes` (1 MiB at zero; a negative
+bound loads any size), so a larger payload never leaves the database: the detail reports its size
+(`ArgsBytes`) and `ArgsOmitted`. `CancelPending` is the cancel `LatestRun` shows above, read for you: the job
+is cancelled and the run of its current attempt still reads `started`; it stays true if that attempt's
+process died. Two keyed reads — the `jobs` primary key, then `job_runs_job_attempt` — with no transaction
+of their own; a missing or soft-deleted job returns `ErrJobNotFound`. `JobView`, and every list read here,
+carries no args or metadata.
 
 **`SlowRuns(ctx, db, SlowRunsParams{Kind, Since, MinDuration, Limit})`** — the slowest finished runs in a
 short window (24 hours by default), any outcome — a timeout is a slow run. A range of `job_run_finishes`;

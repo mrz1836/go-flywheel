@@ -1,9 +1,10 @@
-# Unique-key cookbook
+# Enqueue cookbook
 
 Deduplication, at-most-one-active, and side-effect correlation are things the runtime already answers
-with a unique index and a pre-allocated id. This is the how-to, recipe by recipe, each with the
-anti-pattern it replaces — because recognizing your own code in the anti-pattern is what makes the recipe
-land. For the guarantees underneath these recipes, see [`CONTRACT.md`](CONTRACT.md).
+with a unique index and a pre-allocated id, and what a job carries from the producer that enqueued it is
+one hook on the Client. This is the how-to, recipe by recipe, each with the anti-pattern it replaces —
+because recognizing your own code in the anti-pattern is what makes the recipe land. For the guarantees
+underneath these recipes, see [`CONTRACT.md`](CONTRACT.md).
 
 <br>
 
@@ -266,3 +267,66 @@ outlast that.
 
 `InsertOpts`' godoc points here; this table is the expanded form of the one-line summaries on the
 `UniqueKey` and `UniqueActiveKey` fields.
+
+<br>
+
+## 7. Record who enqueued a job — an insert hook, tags, and metadata
+
+An operator looking at a job wants to know where it came from: which user, which service, which request.
+Every job already carries the request id it was enqueued under. The rest belongs in its metadata, and one
+`InsertHook` on the Client puts it there for every job, including the ones no call site of yours creates.
+
+```go
+client := flywheel.NewClientWithOptions(db, flywheel.ClientOpts{
+    InsertHook: func(ctx context.Context, in flywheel.InsertInfo) map[string]any {
+        meta := map[string]any{"via": string(in.Source)} // client, periodic, follow_up, barrier
+        if user, ok := userFrom(ctx); ok {
+            meta["enqueued_by"] = user.ID
+        }
+        if in.SpawnedBy != "" {
+            meta["spawned_by"] = in.SpawnedBy // the job whose finalize or discard caused this one
+        }
+        return meta
+    },
+})
+
+// The same Client on the Runner and the Scheduler carries the hook to the follow-ups, barrier
+// continuations, and periodic fires they insert.
+runner, err := flywheel.NewRunner(flywheel.RunnerConfig{ /* ... */ Client: client})
+scheduler, err := flywheel.NewSchedulerWithConfig(flywheel.SchedulerConfig{ /* ... */ Client: client})
+```
+
+Tags and per-call metadata ride on the insert itself, and on a worker's follow-ups:
+
+```go
+_, err := flywheel.Insert(ctx, client, Invoice{ID: id}, flywheel.InsertOpts{
+    Tags:     []string{"billing", "eu"},
+    Metadata: map[string]any{"tenant": tenantID},
+})
+
+return flywheel.Result{FollowUps: []flywheel.FollowUp{{
+    Kind: "invoice.pdf", Args: PDFArgs{InvoiceID: id}, Parent: true,
+    Tags: []string{"billing"},
+}}}, nil
+```
+
+The stored metadata is the request id, then the call's keys, then the hook's, which win. Neither can
+replace `request_id`: the request-to-job trail holds whatever a caller or a hook returns. Read it back with
+`GetJob`, which returns the job in full, metadata and args included (args only within
+`GetJobOpts.MaxArgsBytes`).
+
+**The anti-pattern it replaces:** passing the same `Metadata` at every enqueue site. It is easy to forget
+one, it never reaches the follow-ups a worker returns or the jobs a schedule fires, and every new producer
+has to learn the convention. The hook is one place, and it sees every insert path the runtime has.
+
+**What it does not reach, by design:** a continuation fired by `CancelJob` or `CancelByParent`, even one a
+worker calls inside `Work`. A control holds no Client, and a worker's context never carries the Runner's,
+so that continuation carries the context's `request_id` alone.
+
+**Keep the hook small and quick.** It may run inside the transaction of a finalize or a sweep batch, so
+it must not block on I/O. It cannot refuse an insert, but its keys count toward `MaxMetadataBytes`
+(8 KiB): a result that pushes the merged object past it, or that JSON cannot encode, fails the insert,
+and inside a finalize or a sweep batch it fails that transaction. Tags follow their own limits, checked
+before the hook runs: at most `MaxTags` (16), each 1 to `MaxTagBytes` (64) bytes of valid UTF-8 with no
+control characters. A refusal writes nothing and names its field (`tags` or `metadata`) in a
+`*flywheel.ValidationError`; `InsertMany` names the item.

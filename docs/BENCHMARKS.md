@@ -235,6 +235,35 @@ earlier form that paid an id-`IN` read-back per chunk, where the read-back domin
 order of magnitude because a bulk load leaves the table's planner statistics stale. A uniquely-keyed bulk
 load still pays that read-back per chunk.
 
+### Stamping each row: tags, metadata, and a hook
+
+A host that records who enqueued each job gives every row two things a plain insert does not write: its
+tags and metadata, validated and merged over the request id, and the result of an `InsertHook` called once
+per row before the row is built. `BenchmarkEnqueueBatchedStamped100k` measures that against a plain bulk
+insert, 100,000 jobs through `InsertMany` at chunk 1,000: once with no stamp, and once through a Client
+whose hook returns three short keys, each job carrying two tags and three metadata keys of its own. Both
+arms run on one binary, through one timing loop, so the difference is the stamp alone.
+
+| Arm | Median of six | vs none |
+|---|---|---|
+| `stamp=none` | 23,889 jobs/s | — |
+| `stamp=hook-tags-metadata` | 19,140 jobs/s | **−19.9 %** (benchstat, p = 0.002, n = 6) |
+
+The cost is per row and independent of the table's size: the hook's call and its map, the merge and
+`json.Marshal` of the metadata object, and the larger `jsonb` values PostgreSQL parses and stores. An
+insert that sets no tags, no metadata, and no hook writes exactly the bytes it wrote before, so a host
+that stamps nothing pays nothing.
+
+These numbers come from a different machine from the rest of this document: an Apple M1 Max (10 cores),
+go1.27.2, and PostgreSQL 17.10 in Docker (`postgres:17-alpine`) on loopback. The absolute rates are lower
+than the chunk sweep above for that reason; the ratio between the two arms is the result. `-count 6` runs
+each arm's six repetitions back to back, and the stamped arm's sixth run was an outlier (12,083 jobs/s),
+which the median absorbs.
+
+```bash
+go test -tags=loadtest -run '^$' -bench 'BenchmarkEnqueueBatchedStamped100k' -count 6 ./loadtest/
+```
+
 <br/>
 
 ## The index comparison

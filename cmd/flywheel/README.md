@@ -98,7 +98,7 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel enqueue <kind> <json>` | Enqueue one job and print its id (`--queue --unique --priority --at`); a `--unique` collision fails with the id of the job holding the key. A kind no runner registers, a typo included, waits as `scheduled` for the runner's unknown-kind grace (15 minutes) before it is discarded |
 | `flywheel jobs ls` | List recent jobs, newest first (`--state --kind --queue --before <id> --limit --json`) |
 | `flywheel jobs running` | List running jobs, longest-running first, flagging any far slower than their kind's baseline (`--kind --queue --limit --json`) |
-| `flywheel jobs inspect <id>` | Show a job and its run history |
+| `flywheel jobs inspect <id>` | Show a job in full (args bounded by `--max-args-bytes`, 64 KiB by default; metadata, keys, timeout, barrier, cancel pending) and its run history (`--json`) |
 | `flywheel jobs retry <id>` | Return a job to available so it runs again (`--force` for a terminal job; `--allow-running` re-queues a running one, whose current attempt keeps running). Without them, a running job is refused (`flywheel: job is running`), so its work never runs twice at once, and so is a terminal one (`flywheel: job has already reached a terminal state`) |
 | `flywheel jobs cancel <id>` | Move a job to cancelled (refused once a job is terminal) |
 | `flywheel schedule ls` | List periodic schedules, with whether each is active and paused (`--json`) |
