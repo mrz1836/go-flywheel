@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -827,7 +828,7 @@ func (d *baseDriver) Finalize(
 		// sweep discard that took the claim ran the check itself, in the transaction
 		// that made the child terminal.
 		if !out.Superseded && raw.ParentJobID != nil && isTerminalStateString(string(plan.jobState)) {
-			if _, err := fireBarrierIfComplete(txCtx, tx, *raw.ParentJobID); err != nil {
+			if _, err := fireBarrierIfComplete(txCtx, tx, *raw.ParentJobID, raw.ID); err != nil {
 				return err
 			}
 		}
@@ -878,37 +879,56 @@ func (d *baseDriver) RenewLease(
 }
 
 // buildChildRow constructs the jobs row for one follow-up from fu, the spawning
-// job's id, and d, the defaults of fu's kind (nil for none).
+// job's id, and d, the defaults of fu's kind (nil for none), stamped for source
+// as spawned by spawnedBy.
 //
 // Each routing field fu leaves zero takes d's, then the runtime's default: queue,
 // priority, and executor class from fu, max attempts and timeout from d alone,
 // since a FollowUp names neither.
 //
+// Its tags and metadata are fu's, merged over the context's request id and
+// stamped by the InsertHook of the Client ctx carries (the Runner's on a
+// finalize, the Scheduler's on a sweep; none on a control's context). A refused
+// one fails the transaction that inserts the row.
+//
 // It preserves the child's asymmetry with a top-level Insert: a child may carry a
 // UniqueKey and, when fu.Parent, a parent_job_id, but never a UniqueActiveKey. It
 // is shared by InsertChild (one child), insertFollowUps (the chunked fan-out), and
 // the barrier's continuation, so they cannot drift on a child's row shape.
-func buildChildRow(ctx context.Context, fu FollowUp, parentID string, d *kindDefaults) (jobRow, error) {
+func buildChildRow(
+	ctx context.Context, fu FollowUp, parentID, spawnedBy string, source InsertSource, d *kindDefaults,
+) (jobRow, error) {
 	payload, err := json.Marshal(fu.Args)
 	if err != nil {
 		return jobRow{}, fmt.Errorf("jobs: marshal child args: %w", err)
 	}
 	routed := d.applyTo(InsertOpts{Queue: fu.Queue, Priority: fu.Priority, ExecutorClass: fu.ExecutorClass})
+	queue := orString(routed.Queue, defaultQueue)
+	recordedParent := ""
+	if fu.Parent {
+		recordedParent = parentID
+	}
+	st, err := stampRow(ctx, insertHookFrom(ctx), InsertInfo{
+		Kind: fu.Kind, Queue: queue, Source: source, SpawnedBy: spawnedBy, ParentJobID: recordedParent,
+	}, fu.Tags, fu.Metadata, ctxutil.RequestIDFrom(ctx))
+	if err != nil {
+		return jobRow{}, fmt.Errorf("jobs: build follow-up %q: %w", fu.Kind, err)
+	}
 	now := models.ClockFrom(ctx).Now(ctx)
 	row := jobRow{
 		ID:            models.NewID(),
 		CreatedAt:     now,
 		UpdatedAt:     now,
-		Metadata:      datatypes.JSON(ctxutil.RequestIDToMetadata(nil, ctxutil.RequestIDFrom(ctx))),
+		Metadata:      st.metadata,
 		Kind:          fu.Kind,
-		Queue:         orString(routed.Queue, defaultQueue),
+		Queue:         queue,
 		Args:          datatypes.JSON(payload),
 		Priority:      orInt(routed.Priority, defaultPriority),
 		State:         string(StateAvailable),
 		MaxAttempts:   orInt(routed.MaxAttempts, defaultMaxAttempts),
 		ScheduledAt:   now,
 		ExecutorClass: string(routed.ExecutorClass),
-		Tags:          datatypes.JSON("[]"),
+		Tags:          st.tags,
 	}
 	if routed.Timeout > 0 {
 		ms := int(routed.Timeout.Milliseconds())
@@ -922,8 +942,7 @@ func buildChildRow(ctx context.Context, fu FollowUp, parentID string, d *kindDef
 		row.UniqueKey = &uk
 	}
 	if fu.Parent {
-		pid := parentID
-		row.ParentJobID = &pid
+		row.ParentJobID = &recordedParent
 	}
 	return row, nil
 }
@@ -936,11 +955,12 @@ func buildChildRow(ctx context.Context, fu FollowUp, parentID string, d *kindDef
 // shared chunk primitive. Its single-row behavior here is unchanged. Like a
 // finalize's follow-ups, the child takes its kind's Defaults from the Registry
 // ctx carries (the Runner's, on the context a Runner finalizes on), and none
-// without one.
+// without one, and is stamped as a follow-up spawned by parentID by the
+// InsertHook of the Client ctx carries, if any.
 func (d *baseDriver) InsertChild(
 	ctx context.Context, tx *gorm.DB, fu FollowUp, parentID string,
 ) error {
-	row, err := buildChildRow(ctx, fu, parentID, kindDefaultsFrom(ctx, fu.Kind))
+	row, err := buildChildRow(ctx, fu, parentID, parentID, InsertSourceFollowUp, kindDefaultsFrom(ctx, fu.Kind))
 	if err != nil {
 		return err
 	}
@@ -1295,7 +1315,10 @@ func reclaimDiscardUpdate(now time.Time) map[string]any {
 // were enqueued. A unique_key collision is skipped rather than fatal: the child
 // is already enqueued, so the parent's finalization has nothing to correct and
 // must not be rolled back over it. Each child takes its kind's Defaults from the
-// Registry ctx carries, which is the Runner's when a Runner finalizes.
+// Registry ctx carries, which is the Runner's when a Runner finalizes, and is
+// stamped as spawned by parentID, the finishing job, by the InsertHook of the
+// Client ctx carries, if any. A child whose tags or metadata are refused fails
+// the call before anything is written.
 //
 // The fan-out is bounded on both axes. A count over the configured limit fails
 // with ErrFollowUpLimit before anything is written, so the finalize transaction
@@ -1319,7 +1342,7 @@ func (d *baseDriver) insertFollowUps(
 
 	rows := make([]jobRow, len(followUps))
 	for i, fu := range followUps {
-		row, err := buildChildRow(ctx, fu, parentID, kindDefaultsFrom(ctx, fu.Kind))
+		row, err := buildChildRow(ctx, fu, parentID, parentID, InsertSourceFollowUp, kindDefaultsFrom(ctx, fu.Kind))
 		if err != nil {
 			return 0, err
 		}
@@ -1439,10 +1462,14 @@ func resolveBarrierColumns(tx *gorm.DB, raw RawJob, b *Barrier) (string, datatyp
 // pending under READ COMMITTED and neither fire. On SQLite the single-writer model
 // already serializes those writes, so the row lock is taken on PostgreSQL alone.
 //
+// spawnedBy is the child whose terminal transition this check follows, which an
+// InsertHook on ctx's Client sees as the continuation's InsertInfo.SpawnedBy; a
+// control's context carries no Client, so it runs no hook.
+//
 // fired is true only when this call enqueued the continuation and cleared the
 // barrier. A caller that keeps writing the parent's children after a fire must
 // stop: the continuation is now the parent's one pending child.
-func fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, parentID string) (fired bool, err error) {
+func fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, parentID, spawnedBy string) (fired bool, err error) {
 	// Fast gate: a plain read of the parent's barrier_kind by primary key. A parent
 	// with no barrier — every parent that did not declare one — returns here, having
 	// touched nothing else.
@@ -1503,7 +1530,7 @@ func fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, parentID string) (f
 	if err != nil {
 		return false, err
 	}
-	row, err := buildChildRow(ctx, fu, parentID, d)
+	row, err := buildChildRow(ctx, fu, parentID, spawnedBy, InsertSourceBarrier, d)
 	if err != nil {
 		return false, err
 	}
@@ -1521,17 +1548,18 @@ func fireBarrierIfComplete(ctx context.Context, tx *gorm.DB, parentID string) (f
 // parent of the jobs a sweep batch discarded, in the batch's transaction: a
 // discard is a terminal transition like a finalize's, so it may complete its
 // parent's generation. The parents are checked in id order, so two sweeps whose
-// batches share parents lock those parent rows in the same order.
+// batches share parents lock those parent rows in the same order. jobs is in
+// reclaim order, and a continuation is spawned by the last of its parent's
+// children the batch discarded.
 func fireDiscardedParentsBarriers(ctx context.Context, tx *gorm.DB, jobs []reclaimedJob) error {
-	var parents []string
+	lastDiscarded := map[string]string{}
 	for _, j := range jobs {
 		if j.State == string(StateDiscarded) && j.ParentJobID != nil {
-			parents = append(parents, *j.ParentJobID)
+			lastDiscarded[*j.ParentJobID] = j.ID
 		}
 	}
-	slices.Sort(parents)
-	for _, parentID := range slices.Compact(parents) {
-		if _, err := fireBarrierIfComplete(ctx, tx, parentID); err != nil {
+	for _, parentID := range slices.Sorted(maps.Keys(lastDiscarded)) {
+		if _, err := fireBarrierIfComplete(ctx, tx, parentID, lastDiscarded[parentID]); err != nil {
 			return err
 		}
 	}

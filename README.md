@@ -898,6 +898,66 @@ including the rare collision whose holder finished before it could be named.
 </details>
 
 <details>
+<summary><strong><code>Tags, metadata, and who enqueued a job</code></strong></summary>
+<br>
+
+**A job carries tags and metadata from the producer that enqueued it.** Set them on `InsertOpts`, or on
+a `FollowUp` a worker returns:
+
+```go
+_, err := flywheel.Insert(ctx, client, Invoice{ID: id}, flywheel.InsertOpts{
+    Tags:     []string{"billing", "eu"},
+    Metadata: map[string]any{"tenant": tenantID},
+})
+```
+
+- **Tags** are stored in order with duplicates dropped: at most `MaxTags` (16), each 1 to `MaxTagBytes`
+  (64) bytes of valid UTF-8 with no control characters.
+- **Metadata** is one JSON object: the request id the job was enqueued under (`InsertOpts.RequestID`, else
+  the context's), then your keys, then an insert hook's, which win. Neither yours nor the hook's can
+  replace `request_id`. The merged object is at most `MaxMetadataBytes` (8 KiB).
+- **A refusal writes nothing.** A bad tag or an oversized metadata object fails the insert with a
+  `*ValidationError` naming `tags` or `metadata`. `InsertMany` checks every item before its first chunk
+  and names the item; a follow-up's refusal fails its finalize, as a follow-up that cannot be built does.
+
+**One hook stamps every insert.** Passing the same metadata at every call site misses the jobs no call
+site creates: follow-ups, periodic fires, barrier continuations. An `InsertHook` on the Client covers them:
+
+```go
+client := flywheel.NewClientWithOptions(db, flywheel.ClientOpts{
+    InsertHook: func(ctx context.Context, in flywheel.InsertInfo) map[string]any {
+        return map[string]any{"enqueued_by": callerFrom(ctx), "via": string(in.Source)}
+    },
+})
+// Hand the same Client to RunnerConfig.Client and SchedulerConfig.Client.
+```
+
+It is called once per row, before the row is built, with an `InsertInfo`: the kind, the queue the job
+lands on, the `InsertSource`, the job that spawned the insert, the parent, and the periodic schedule.
+
+| Insert | `InsertSource` |
+|---|---|
+| `Insert`, `Enqueue`, `InsertMany`, `InsertManyTyped` through the Client | `client` |
+| A Scheduler's periodic fire, with `SchedulerConfig.Client` | `periodic` |
+| A worker's `Result.FollowUps`, with `RunnerConfig.Client` | `follow_up`, spawned by the finishing job |
+| A barrier continuation a finalize fires, with `RunnerConfig.Client` | `barrier`, spawned by the finishing child |
+| A barrier continuation the lease sweep fires, with `SchedulerConfig.Client` | `barrier`, spawned by the last child it discarded |
+| A continuation `CancelJob` or `CancelByParent` fires, even from inside a worker | no hook: a control holds no Client |
+
+The Runner and the Scheduler carry the Client on the context they pass to `Driver.Finalize` and
+`Driver.Sweep`, never on a worker's, so a `Driver` that wraps a built-in one must pass that context
+through.
+
+**Keep the hook small and quick.** It may run inside the transaction of a finalize or a sweep batch, so
+it must not block. It cannot refuse an insert, but its keys count toward the 8 KiB limit: a result that
+pushes the metadata past it, or that JSON cannot encode, fails the insert, and inside a finalize or a
+sweep batch it fails that transaction. `GetJob` reads a job back in full, its metadata included. The
+[cookbook](docs/COOKBOOK.md#7-record-who-enqueued-a-job--an-insert-hook-tags-and-metadata) has the full
+recipe.
+
+</details>
+
+<details>
 <summary><strong><code>Bulk enqueue and the follow-up ceiling</code></strong></summary>
 <br>
 
@@ -1382,12 +1442,13 @@ for an at-a-glance report of queue health, schedules, and recent failures.
 
 **Dashboards over the database.** For history rather than this minute, set the scheduler's
 `StatsRollupInterval` and read the runtime's own tables: `ListRunning` (what is running now, slow runs
-flagged), `ListFinished`, `QueueDepths`, `Stats` and `StatsSeries` (per-kind outcomes, success rate,
-duration and queue-wait percentiles over any window, from hourly rollups that outlive retention),
-`Baselines`, and `Anomalies` (a low-noise "this kind got slower / started failing"). Every read is
-bounded and indexed — tens of milliseconds at a million runs. [`docs/INTEGRATING.md`](docs/INTEGRATING.md)
-covers the data contract, each API's cost, recipes, direct SQL, and the upgrade for an existing
-database; [`examples/dashboard-api`](examples/dashboard-api/main.go) is a read-only JSON API over all of it.
+flagged), `ListFinished`, `GetJob` (one job in full, args bounded), `QueueDepths`, `Stats` and
+`StatsSeries` (per-kind outcomes, success rate, duration and queue-wait percentiles over any window,
+from hourly rollups that outlive retention), `Baselines`, and `Anomalies` (a low-noise "this kind got
+slower / started failing"). Every read is bounded and indexed — tens of milliseconds at a million runs.
+[`docs/INTEGRATING.md`](docs/INTEGRATING.md) covers the data contract, each API's cost, recipes, direct
+SQL, and the upgrade for an existing database; [`examples/dashboard-api`](examples/dashboard-api/main.go)
+is a read-only JSON API over all of it.
 
 </details>
 
@@ -1650,7 +1711,7 @@ command, the config reference, and the macOS launchd setup.
 
 - **API Reference** – Dive into the godocs at [pkg.go.dev/github.com/mrz1836/go-flywheel](https://pkg.go.dev/github.com/mrz1836/go-flywheel)
 - **Contract** – The exactly-once guarantees and their limits in [`docs/CONTRACT.md`](docs/CONTRACT.md)
-- **Cookbook** – Unique-key recipes for deduplication, joining an in-flight job, and side-effect correlation in [`docs/COOKBOOK.md`](docs/COOKBOOK.md)
+- **Cookbook** – Enqueue recipes for deduplication, joining an in-flight job, side-effect correlation, and recording who enqueued a job in [`docs/COOKBOOK.md`](docs/COOKBOOK.md)
 - **Integrating** – Building dashboards and external platforms on the runtime's data, and upgrading an existing database, in [`docs/INTEGRATING.md`](docs/INTEGRATING.md)
 - **Runbook** – Operating the runtime and reading its metrics in [`docs/RUNBOOK.md`](docs/RUNBOOK.md)
 - **Tuning** – Sizing the knobs from measured numbers in [`docs/TUNING.md`](docs/TUNING.md)

@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"text/tabwriter"
+	"time"
 
 	flywheel "github.com/mrz1836/go-flywheel"
 	"github.com/spf13/cobra"
@@ -145,12 +148,16 @@ func runJobsRunning(ctx context.Context, w io.Writer, db *gorm.DB, p flywheel.Li
 	return tw.Flush()
 }
 
-// newJobsInspectCmd shows a job and its run history.
+// newJobsInspectCmd shows a job in full and its run history, its args bounded
+// by --max-args-bytes.
 func newJobsInspectCmd(configPath *string) *cobra.Command {
-	var asJSON bool
+	var (
+		maxArgsBytes int
+		asJSON       bool
+	)
 	cmd := &cobra.Command{
 		Use:   "inspect <job-id>",
-		Short: "Show a job and its run history",
+		Short: "Show a job in full and its run history",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, db, _, err := loadAndOpen(*configPath)
@@ -160,7 +167,7 @@ func newJobsInspectCmd(configPath *string) *cobra.Command {
 			defer closeDB(db)
 
 			ctx := cmd.Context()
-			job, err := flywheel.FindJob(ctx, db, args[0])
+			job, err := flywheel.GetJobWithOptions(ctx, db, args[0], flywheel.GetJobOpts{MaxArgsBytes: maxArgsBytes})
 			if err != nil {
 				return err
 			}
@@ -171,39 +178,88 @@ func newJobsInspectCmd(configPath *string) *cobra.Command {
 			if asJSON {
 				return writeJSON(cmd.OutOrStdout(), map[string]any{"job": job, "runs": runs})
 			}
-			out := cmd.OutOrStdout()
-			_, _ = fmt.Fprintf(out, "Job %s\n  kind:     %s\n  state:    %s\n  attempt:  %d\n  enqueued: %s\n",
-				job.ID, job.Kind, job.State, job.Attempt, job.EnqueuedAt.Format("2006-01-02 15:04:05"))
-			_, _ = fmt.Fprintf(out, "  runs:     %d\n", len(runs))
-			tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
-			_, _ = fmt.Fprintln(tw, "  RUN ID\tOUTCOME\tEXECUTOR\tSTARTED")
-			for _, r := range runs {
-				_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", r.ID, r.Outcome, orDash(r.ExecutorClass), r.StartedAt.Format("15:04:05"))
-			}
-			if err := tw.Flush(); err != nil {
-				return err
-			}
-			// Show the captured output and error for runs that recorded them — for the
-			// exec/shell/python/mage workers this is the command's stdout/stderr and
-			// exit code, the reason you ran it durably in the first place.
-			for _, r := range runs {
-				hasErr := r.Error != nil && *r.Error != ""
-				if !hasErr && len(r.Output) == 0 {
-					continue
-				}
-				_, _ = fmt.Fprintf(out, "\n  run %s (%s):\n", r.ID, r.Outcome)
-				if hasErr {
-					_, _ = fmt.Fprintf(out, "    error:  %s\n", *r.Error)
-				}
-				if len(r.Output) > 0 {
-					_, _ = fmt.Fprintf(out, "    output: %s\n", string(r.Output))
-				}
-			}
-			return nil
+			return writeJobDetail(cmd.OutOrStdout(), job, runs)
 		},
 	}
+	cmd.Flags().IntVar(&maxArgsBytes, "max-args-bytes", 64<<10,
+		"print args up to this many bytes, and only their size past it (0 selects 1 MiB; negative prints any size)")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON instead of text")
 	return cmd
+}
+
+// writeJobDetail writes a job's detail and its runs as text: the job's fields,
+// those it does not carry left out, then its metadata and args as stored, then
+// the run count, the run table, and each run's captured error and output.
+func writeJobDetail(out io.Writer, job flywheel.JobDetail, runs []flywheel.JobRunView) error {
+	const stamp = "2006-01-02 15:04:05"
+	_, _ = fmt.Fprintf(out, "Job %s\n", job.ID)
+	field := func(label, value string) { _, _ = fmt.Fprintf(out, "  %-9s %s\n", label+":", value) }
+	field("kind", job.Kind)
+	field("queue", job.Queue)
+	state := job.State
+	if job.CancelPending {
+		state += " (cancel pending)"
+	}
+	field("state", state)
+	field("attempt", fmt.Sprintf("%d/%d", job.Attempt, job.MaxAttempts))
+	field("priority", strconv.Itoa(job.Priority))
+	field("enqueued", job.EnqueuedAt.Format(stamp))
+	field("scheduled", job.ScheduledAt.Format(stamp))
+	if job.FinalizedAt != nil {
+		field("finalized", job.FinalizedAt.Format(stamp))
+	}
+	if len(job.Tags) > 0 {
+		field("tags", strings.Join(job.Tags, ", "))
+	}
+	if job.UniqueKey != "" {
+		field("unique key", job.UniqueKey)
+	}
+	if job.UniqueActiveKey != "" {
+		field("unique active key", job.UniqueActiveKey)
+	}
+	if job.TimeoutMs != nil {
+		field("timeout", (time.Duration(*job.TimeoutMs) * time.Millisecond).String())
+	}
+	if job.LeasedUntil != nil {
+		field("leased until", job.LeasedUntil.Format(stamp))
+	}
+	if job.Barrier != nil {
+		field("barrier", job.Barrier.Kind+" on "+job.Barrier.Queue)
+	}
+	// The payloads, as stored, each on a line of its own.
+	_, _ = fmt.Fprintf(out, "  metadata: %s\n", job.Metadata)
+	if job.ArgsOmitted {
+		_, _ = fmt.Fprintf(out, "  args: omitted (%d bytes; raise --max-args-bytes to show)\n", job.ArgsBytes)
+	} else {
+		_, _ = fmt.Fprintf(out, "  args: %s\n", job.Args)
+	}
+	field("runs", strconv.Itoa(len(runs)))
+
+	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "  RUN ID\tOUTCOME\tEXECUTOR\tSTARTED")
+	for _, r := range runs {
+		_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", r.ID, r.Outcome, orDash(r.ExecutorClass), r.StartedAt.Format("15:04:05"))
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	// Show the captured output and error for runs that recorded them — for the
+	// exec/shell/python/mage workers this is the command's stdout/stderr and
+	// exit code, the reason you ran it durably in the first place.
+	for _, r := range runs {
+		hasErr := r.Error != nil && *r.Error != ""
+		if !hasErr && len(r.Output) == 0 {
+			continue
+		}
+		_, _ = fmt.Fprintf(out, "\n  run %s (%s):\n", r.ID, r.Outcome)
+		if hasErr {
+			_, _ = fmt.Fprintf(out, "    error:  %s\n", *r.Error)
+		}
+		if len(r.Output) > 0 {
+			_, _ = fmt.Fprintf(out, "    output: %s\n", string(r.Output))
+		}
+	}
+	return nil
 }
 
 // newJobsRetryCmd returns a job to available through RetryJobWithOptions. With

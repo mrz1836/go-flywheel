@@ -266,6 +266,70 @@ func runBatchedEnqueueBenchmark(b *testing.B, cfg Config, chunkSize int) {
 	}
 }
 
+// BenchmarkEnqueueBatchedStamped100k measures what stamping costs a bulk
+// enqueue: 100,000 rows through flywheel.InsertMany at chunk 1,000, once plain
+// and once through a Client whose InsertHook returns three short keys, each job
+// carrying two tags and three metadata keys of its own. Both arms run on one
+// binary through the same timing loop, so the difference between them is the
+// stamp alone, and the name keeps it inside a -bench=BenchmarkEnqueue filter.
+func BenchmarkEnqueueBatchedStamped100k(b *testing.B) {
+	dsn := benchDSN(b)
+	for _, stamp := range []seedStamp{seedStampNone, seedStampHookTagsMetadata} {
+		b.Run("stamp="+stamp.String(), func(b *testing.B) {
+			cfg := baselineConfig(dsn)
+			cfg.Mix = WorkloadEnqueueOnly
+			runStampedEnqueueBenchmark(b, cfg, 1000, stamp)
+		})
+	}
+}
+
+// runStampedEnqueueBenchmark times seedInsertManyStamped at the given chunk size
+// and stamp, reporting jobs/s, as runBatchedEnqueueBenchmark times the plain
+// seed: the harness provisioning is bracketed out of the timer on every
+// iteration.
+func runStampedEnqueueBenchmark(b *testing.B, cfg Config, chunkSize int, stamp seedStamp) {
+	b.Helper()
+
+	var totalJobs, totalTime float64
+
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		h, err := newHarness(context.Background(), cfg)
+		if h == nil {
+			b.Fatalf("newHarness: %v", err)
+		}
+		if err != nil {
+			_ = h.Close(context.Background())
+			b.Fatalf("newHarness: %v", err)
+		}
+		_, specs := h.prepareWorkload()
+		b.StartTimer()
+
+		start := time.Now()
+		seedErr := seedInsertManyStamped(context.Background(), h.work, h.cfg, specs, chunkSize, stamp,
+			func(n int) { h.prog.enqueued.Add(int64(n)) })
+		elapsed := time.Since(start)
+
+		b.StopTimer()
+		if seedErr != nil {
+			_ = h.Close(context.Background())
+			b.Fatalf("seed: %v", seedErr)
+		}
+		totalJobs += float64(len(specs))
+		totalTime += elapsed.Seconds()
+		if err := h.Close(context.Background()); err != nil {
+			b.Fatalf("close: %v", err)
+		}
+		b.StartTimer()
+	}
+	b.StopTimer()
+
+	if totalTime > 0 {
+		b.ReportMetric(totalJobs/totalTime, "jobs/s")
+	}
+}
+
 // heartbeatBenchConfig is the shape both halves of the A/B derive from.
 //
 // The work duration and the lease are the whole design. At 25 ms of work against

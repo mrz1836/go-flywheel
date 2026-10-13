@@ -109,7 +109,49 @@ func seedAPI(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onIn
 func seedInsertMany(
 	ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, chunkSize int, onInsert func(int),
 ) error {
+	return seedInsertManyStamped(ctx, db, cfg, specs, chunkSize, seedStampNone, onInsert)
+}
+
+// seedStamp is what seedInsertManyStamped writes beside each job's args.
+type seedStamp int
+
+const (
+	// seedStampNone inserts each job as a plain InsertMany does: no tags, no
+	// metadata of its own, and no hook.
+	seedStampNone seedStamp = iota
+	// seedStampHookTagsMetadata inserts through a Client whose InsertHook
+	// returns three short keys, each job carrying two tags and three metadata
+	// keys of its own: the stamping a host that records provenance pays.
+	seedStampHookTagsMetadata
+)
+
+// String names the stamp as the benchmark labels it.
+func (s seedStamp) String() string {
+	if s == seedStampHookTagsMetadata {
+		return "hook-tags-metadata"
+	}
+	return "none"
+}
+
+// seedInsertManyStamped is seedInsertMany with each job stamped as stamp says,
+// so a benchmark can compare the two on one binary.
+func seedInsertManyStamped(
+	ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, chunkSize int, stamp seedStamp, onInsert func(int),
+) error {
 	client := flywheel.NewClient(db)
+	var (
+		tags     []string
+		metadata map[string]any
+	)
+	if stamp == seedStampHookTagsMetadata {
+		client = flywheel.NewClientWithOptions(db, flywheel.ClientOpts{
+			InsertHook: func(_ context.Context, in flywheel.InsertInfo) map[string]any {
+				return map[string]any{"enqueued_by": "loadtest", "via": string(in.Source), "host": "bench"}
+			},
+		})
+		tags = []string{"bench", "batch"}
+		metadata = map[string]any{"tenant": "t-1", "batch": "seed", "attempt_budget": 3}
+	}
 
 	items := make([]flywheel.BatchItem, len(specs))
 	for i, spec := range specs {
@@ -124,6 +166,8 @@ func seedInsertMany(
 				Queue:         cfg.Queue,
 				Priority:      spec.Priority,
 				ExecutorClass: flywheel.ExecutorClass(cfg.ExecutorClass),
+				Tags:          tags,
+				Metadata:      metadata,
 			},
 		}
 	}

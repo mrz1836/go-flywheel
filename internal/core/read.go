@@ -20,10 +20,10 @@ var ErrJobNotFound = errors.New("flywheel: job not found")
 // struct unexported and exposes this stable, JSON-tagged view instead, so a host
 // inspection API binds to flywheel's contract rather than the mutable schema.
 //
-// It carries every column a dashboard shows and none it should not: the args
-// payload is deliberately absent (it can be large and may hold data a dashboard
-// must not render — ListActiveByKind is the host-internal seam that carries it),
-// and the reads that return a JobView never load it.
+// It carries every column a list shows and none it should not: the args payload
+// and the metadata are deliberately absent (args can be large and may hold data
+// a list must not render), and the reads that return a JobView never load them.
+// GetJob reads one job in full, its args bounded.
 type JobView struct {
 	ID          string    `json:"id"`
 	Kind        string    `json:"kind"`

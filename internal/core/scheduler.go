@@ -67,7 +67,9 @@ type SchedulerConfig struct {
 	DB *gorm.DB
 	// Client is the producer the Scheduler enqueues periodic jobs through. One
 	// built with ClientOpts.Registry gives each fire its kind's Defaults under
-	// the periodic's queue.
+	// the periodic's queue. Its ClientOpts.InsertHook stamps each fire, and also
+	// the barrier continuations the lease sweep fires, which it reaches through
+	// the context the Scheduler passes to Driver.Sweep.
 	Client *Client
 	// Driver is the seam the lease sweep runs through. Required: a Scheduler
 	// constructs no Driver of its own.
@@ -633,11 +635,12 @@ func (s *Scheduler) Tick(ctx context.Context) (int, error) {
 // and each reclaimed job, whether the pass succeeded or a partial batch failed.
 // That keeps sweep timing in the same telemetry stream as claim and finalize
 // timing. The jobs reach the event on the context this passes to Driver.Sweep
-// (see SweepEvent.Jobs).
+// (see SweepEvent.Jobs), and so does the Client whose InsertHook stamps the
+// barrier continuations a discard fires.
 func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
 	start := models.ClockFrom(ctx).Now(ctx)
 	reportCtx, report := withSweepReport(ctx)
-	n, err := s.driver.Sweep(reportCtx, start)
+	n, err := s.driver.Sweep(withInsertClient(reportCtx, s.client), start)
 	duration := models.ClockFrom(ctx).Now(ctx).Sub(start)
 	jobs := report.list()
 	discarded := 0
@@ -748,7 +751,7 @@ func (s *Scheduler) enqueueBucket(ctx context.Context, def jobPeriodicRow, bucke
 		Queue:      def.Queue,
 		UniqueKey:  fmt.Sprintf("%s@%d", def.Slug, bucket.Unix()),
 		ScheduleAt: &scheduleAt,
-	})
+	}, insertOrigin{source: InsertSourcePeriodic, periodicSlug: def.Slug})
 	if err != nil {
 		return false, fmt.Errorf("jobs: enqueue periodic job: %w", err)
 	}
