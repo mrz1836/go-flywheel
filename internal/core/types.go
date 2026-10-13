@@ -338,6 +338,11 @@ type FollowUp struct {
 	// ExecutorClass routes the child job to a specific executor pool. Empty
 	// (AnyClass) leaves the child claimable by any runner.
 	ExecutorClass ExecutorClass
+	// Tags and Metadata are stored on the child as InsertOpts.Tags and
+	// InsertOpts.Metadata are, under the same limits; the child's request id is
+	// the finishing job's. A refused one fails the finalize that returns it.
+	Tags     []string
+	Metadata map[string]any
 }
 
 // InsertOpts configures a single Insert.
@@ -410,4 +415,16 @@ type InsertOpts struct {
 	// Runner can thread it through ctx + slog on dequeue. Falls back to
 	// [ctxutil.RequestIDFrom] on the caller's ctx when this field is empty.
 	RequestID string
+	// Tags label the job. They are stored in order with duplicates dropped, at
+	// most MaxTags of them, each 1 to MaxTagBytes bytes of valid UTF-8 with no
+	// control characters; anything else fails the insert with a
+	// *ValidationError naming "tags", and nothing is written. A tag filter
+	// matches a job carrying any of its tags.
+	Tags []string
+	// Metadata is merged into the job's metadata object: over the request id,
+	// whose key it cannot replace, and under the keys of the Client's
+	// InsertHook, which override its own. A merged object larger than
+	// MaxMetadataBytes, or one JSON cannot encode, fails the insert with a
+	// *ValidationError naming "metadata", and nothing is written.
+	Metadata map[string]any
 }

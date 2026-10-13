@@ -33,28 +33,37 @@ const (
 type Client struct {
 	writeDB  *gorm.DB
 	registry *Registry
+	hook     InsertHook
 }
 
-// ClientOpts configures a Client. The zero value applies no worker defaults, so
-// NewClientWithOptions(db, ClientOpts{}) is NewClient(db).
+// ClientOpts configures a Client. The zero value applies no worker defaults and
+// stamps nothing, so NewClientWithOptions(db, ClientOpts{}) is NewClient(db).
 type ClientOpts struct {
 	// Registry applies each registered kind's Defaults on every insert; nil
 	// applies none. A kind the registry does not register takes the runtime's
 	// defaults. See Defaults for which fields it fills.
 	Registry *Registry
+	// InsertHook is called once per job on every insert through the Client, and
+	// its keys are merged into the job's metadata; nil stamps nothing. Through
+	// RunnerConfig.Client and SchedulerConfig.Client it also reaches the
+	// follow-ups, barrier continuations, and periodic fires the runtime inserts.
+	// See InsertHook.
+	InsertHook InsertHook
 }
 
-// NewClient returns a Client that enqueues onto writeDB and applies no worker
-// defaults. It is NewClientWithOptions with the zero ClientOpts.
+// NewClient returns a Client that enqueues onto writeDB, applies no worker
+// defaults, and stamps nothing. It is NewClientWithOptions with the zero
+// ClientOpts.
 func NewClient(writeDB *gorm.DB) *Client {
 	return NewClientWithOptions(writeDB, ClientOpts{})
 }
 
 // NewClientWithOptions returns a Client that enqueues onto writeDB, configured
 // by opts. With opts.Registry set, every insert through the Client fills the
-// fields it leaves zero from its kind's Defaults (see Defaults).
+// fields it leaves zero from its kind's Defaults (see Defaults); with
+// opts.InsertHook set, every insert is stamped by the hook (see InsertHook).
 func NewClientWithOptions(writeDB *gorm.DB, opts ClientOpts) *Client {
-	return &Client{writeDB: writeDB, registry: opts.Registry}
+	return &Client{writeDB: writeDB, registry: opts.Registry, hook: opts.InsertHook}
 }
 
 // WriteDB returns the client's write connection. The Scheduler reuses it.
@@ -124,7 +133,7 @@ func (c *Client) handle(opts InsertOpts) *gorm.DB {
 // in it is visible only there, and on SQLite the write handle would wait on the
 // transaction's own lock.
 func (c *Client) enqueue(ctx context.Context, kind string, payload []byte, opts InsertOpts) (string, error) {
-	id, collided, err := c.insert(ctx, kind, payload, opts)
+	id, collided, err := c.insert(ctx, kind, payload, opts, insertOrigin{source: InsertSourceClient})
 	if err != nil {
 		return "", err
 	}
@@ -136,10 +145,11 @@ func (c *Client) enqueue(ctx context.Context, kind string, payload []byte, opts 
 
 // insert is the non-generic enqueue core shared by Insert, Enqueue, and the
 // Scheduler. It writes one jobs row, honoring opts over the kind's Defaults in
-// the Client's registry, and reports a unique-key collision as collided — never
-// as an error — so each caller decides what a collision is worth: Insert and
-// Enqueue name the job holding the key, while the Scheduler's bucketed tick
-// treats it as the no-op it is and reads nothing more.
+// the Client's registry and stamped by the Client's hook for origin, and reports
+// a unique-key collision as collided — never as an error — so each caller
+// decides what a collision is worth: Insert and Enqueue name the job holding the
+// key, while the Scheduler's bucketed tick treats it as the no-op it is and
+// reads nothing more. A refused tag or metadata object writes nothing.
 //
 // On opts.Tx a keyed row goes through the conflict-insert primitive InsertMany
 // uses — ON CONFLICT DO NOTHING, then the same-handle read-back of its own row —
@@ -149,10 +159,16 @@ func (c *Client) enqueue(ctx context.Context, kind string, payload []byte, opts 
 // handle. Every other insert is a plain INSERT whose duplicate-key error is the
 // collision signal, so its success path costs the insert alone.
 func (c *Client) insert(
-	ctx context.Context, kind string, payload []byte, opts InsertOpts,
+	ctx context.Context, kind string, payload []byte, opts InsertOpts, origin insertOrigin,
 ) (id string, collided bool, err error) {
 	db := c.handle(opts)
-	row := buildRow(ctx, kind, payload, c.withKindDefaults(kind, opts))
+	opts = c.withKindDefaults(kind, opts)
+	st, err := c.stampFor(ctx, kind, opts, origin)
+	if err != nil {
+		return "", false, fmt.Errorf("jobs: insert: %w", err)
+	}
+	row := buildRow(ctx, kind, payload, opts)
+	st.apply(&row)
 
 	if opts.Tx != nil && (row.UniqueKey != nil || row.UniqueActiveKey != nil) {
 		rows := []jobRow{row}
@@ -306,10 +322,28 @@ func alreadyEnqueued(ctx context.Context, db *gorm.DB, uniqueKey, activeKey stri
 	return &AlreadyEnqueuedError{ExistingID: id, Key: key}
 }
 
+// stampFor stamps the row of one insert through c: it resolves the request id
+// (opts.RequestID, else the context's) and calls stampRow with c's hook and what
+// the row will record, the queue's default resolved.
+func (c *Client) stampFor(ctx context.Context, kind string, opts InsertOpts, origin insertOrigin) (stamp, error) {
+	requestID := opts.RequestID
+	if requestID == "" {
+		requestID = ctxutil.RequestIDFrom(ctx)
+	}
+	return stampRow(ctx, c.hook, InsertInfo{
+		Kind:         kind,
+		Queue:        orString(opts.Queue, defaultQueue),
+		Source:       origin.source,
+		ParentJobID:  derefString(opts.Parent),
+		PeriodicSlug: origin.periodicSlug,
+	}, opts.Tags, opts.Metadata, requestID)
+}
+
 // buildRow constructs the jobs row for one enqueue from kind, payload, and opts:
-// it reads the context clock and request id, applies the producer defaults, and
-// sets the four optional columns (schedule, unique key, unique-active key,
-// timeout).
+// it reads the context clock, applies the producer defaults, and sets the four
+// optional columns (schedule, unique key, unique-active key, timeout). Its tags
+// and metadata are the stamp's (stampFor, then stamp.apply); a row inserted
+// without one takes the columns' defaults, [] and {}.
 //
 // It is a free function and never reads opts.Tx — picking the handle is the
 // caller's job — so the single insert and the bulk InsertMany path share one row
@@ -317,17 +351,10 @@ func alreadyEnqueued(ctx context.Context, db *gorm.DB, uniqueKey, activeKey stri
 // zero here, so the two paths cannot drift on a producer default either.
 func buildRow(ctx context.Context, kind string, payload []byte, opts InsertOpts) jobRow {
 	now := models.ClockFrom(ctx).Now(ctx)
-
-	requestID := opts.RequestID
-	if requestID == "" {
-		requestID = ctxutil.RequestIDFrom(ctx)
-	}
-
 	row := jobRow{
 		ID:            models.NewID(),
 		CreatedAt:     now,
 		UpdatedAt:     now,
-		Metadata:      datatypes.JSON(ctxutil.RequestIDToMetadata(nil, requestID)),
 		Kind:          kind,
 		Queue:         orString(opts.Queue, defaultQueue),
 		Args:          datatypes.JSON(payload),
@@ -337,7 +364,6 @@ func buildRow(ctx context.Context, kind string, payload []byte, opts InsertOpts)
 		ScheduledAt:   now,
 		ParentJobID:   opts.Parent,
 		ExecutorClass: string(opts.ExecutorClass),
-		Tags:          datatypes.JSON("[]"),
 	}
 	if opts.ScheduleAt != nil {
 		row.ScheduledAt = *opts.ScheduleAt

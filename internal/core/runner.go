@@ -84,6 +84,12 @@ type RunnerConfig struct {
 	// zero fields of the follow-ups this Runner's finalizes insert and of the
 	// barrier continuations they declare; see Defaults.
 	Registry *Registry
+	// Client is the producer whose ClientOpts apply to this Runner's follow-ups
+	// and barrier continuations: its InsertHook stamps each one. Nil applies
+	// none. It reaches them through the context the Runner passes to
+	// Driver.Finalize, and never through a worker's own context, so a Driver that
+	// wraps a built-in one passes that context through.
+	Client *Client
 	// UnknownKindGrace is how long this Runner defers a claimed job whose kind
 	// its Registry does not register before it discards the job, measured from
 	// the job's enqueue (Job.EnqueuedAt). Zero selects fifteen minutes; a
@@ -1392,8 +1398,11 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 	// Finalize runs on the parent ctx, not the (possibly expired) workCtx, so a
 	// timed-out attempt still records its outcome. The ctx carries the Registry,
 	// so the follow-ups and barrier continuations it declares take their kinds'
-	// Defaults without a change to the Driver interface.
-	out, err := r.cfg.Driver.Finalize(withKindRegistry(ctx, r.cfg.Registry), raw, runID, result, finalErr, finishedAt)
+	// Defaults, and the Client, whose InsertHook stamps them, without a change to
+	// the Driver interface. Only this context carries the Client: the worker's
+	// never does.
+	finalizeCtx := withInsertClient(withKindRegistry(ctx, r.cfg.Registry), r.cfg.Client)
+	out, err := r.cfg.Driver.Finalize(finalizeCtx, raw, runID, result, finalErr, finishedAt)
 	if err != nil {
 		// Nothing was persisted, so there is nothing to report. Emitting an event
 		// here would describe an outcome the database does not hold.
@@ -1434,7 +1443,9 @@ func (r *Runner) finalizeUnknownKind(
 		result.Snooze = &delay
 		finalErr = ErrUnknownKind
 	}
-	out, err := r.cfg.Driver.Finalize(ctx, raw, runID, result, finalErr, finishedAt)
+	// A discard can end a parent's last pending child, and the Client stamps the
+	// continuation that fires.
+	out, err := r.cfg.Driver.Finalize(withInsertClient(ctx, r.cfg.Client), raw, runID, result, finalErr, finishedAt)
 	if err != nil {
 		return err
 	}

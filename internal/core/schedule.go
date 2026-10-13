@@ -700,7 +700,7 @@ func CancelJob(ctx context.Context, db *gorm.DB, id string) error {
 		if row.ParentJobID == nil {
 			return nil
 		}
-		_, err := fireBarrierIfComplete(ctx, tx, *row.ParentJobID)
+		_, err := fireBarrierIfComplete(ctx, tx, *row.ParentJobID, id)
 		return err
 	})
 	if err != nil {
@@ -974,7 +974,7 @@ func scopeBatch(
 			return nil
 		}
 		var e error
-		fired, e = fireBarrierIfComplete(ctx, tx, parentJobID)
+		fired, e = fireBarrierIfComplete(ctx, tx, parentJobID, "")
 		return e
 	})
 	return selected, changed, fired, err

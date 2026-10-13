@@ -103,8 +103,13 @@ type BatchResult struct {
 
 // InsertMany enqueues many jobs in bounded chunks. It is the bulk counterpart to
 // Enqueue: same row defaults (each row's kind's Defaults, on a Client built with
-// ClientOpts.Registry), same unique-key semantics, same ErrAlreadyEnqueued
-// meaning — applied per row rather than to the call.
+// ClientOpts.Registry), same tags and metadata rules and InsertHook, same
+// unique-key semantics, same ErrAlreadyEnqueued meaning — applied per row rather
+// than to the call.
+//
+// Every item is stamped before the first chunk is written, so an item whose tags
+// or metadata are refused fails the whole call, naming the item, and writes no
+// row.
 //
 // A unique-key collision is never fatal. The colliding row is skipped, its entry
 // in IDs is left empty, and the batch continues. With BatchOpts.SkipDuplicates
@@ -139,7 +144,13 @@ func InsertMany(ctx context.Context, c *Client, items []BatchItem, opts BatchOpt
 	rows := make([]jobRow, len(items))
 	ids := make([]string, len(items))
 	for i := range items {
-		rows[i] = buildRow(ctx, items[i].Kind, items[i].Args, c.withKindDefaults(items[i].Kind, items[i].Opts))
+		itemOpts := c.withKindDefaults(items[i].Kind, items[i].Opts)
+		st, err := c.stampFor(ctx, items[i].Kind, itemOpts, insertOrigin{source: InsertSourceClient})
+		if err != nil {
+			return BatchResult{}, fmt.Errorf("jobs: insert many: item %d: %w", i, err)
+		}
+		rows[i] = buildRow(ctx, items[i].Kind, items[i].Args, itemOpts)
+		st.apply(&rows[i])
 		ids[i] = rows[i].ID
 	}
 
@@ -291,7 +302,7 @@ func (c *Client) insertChunk(
 // from RowsAffected, which is unusable here: jobRow's metadata and tags are
 // datatypes.JSON columns with a default: tag, so GORM auto-appends
 // RETURNING metadata, tags and scans it back — a path that skips every row whose
-// returning fields are already non-zero, and buildRow always sets tags.
+// returning fields are already non-zero, and every row is stamped with its tags.
 // RowsAffected therefore equals len(rows) whether a row conflicted or not. The
 // same-handle read-back sees rows still uncommitted in the caller's transaction,
 // and a skipped row — whose app-minted id was never inserted — is simply absent.
