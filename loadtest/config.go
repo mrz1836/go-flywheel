@@ -4,6 +4,8 @@ package loadtest
 
 import (
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -353,6 +355,14 @@ type Config struct {
 	// Storage selects the storage-parameter condition applied to jobs.
 	Storage StorageCondition
 
+	// ExplorerIndexes names, as a comma list, the opt-in explorer indexes
+	// (flywheel's ExplorerIndexSet) the run installs after the index condition's:
+	// any of kind, queue, state, and tags, each once. Empty installs none. With
+	// tags, every seeded job carries two tags, the index's worst case: an
+	// untagged job never enters it. It is the knob that measures what each index
+	// costs the write path. A string rather than a slice keeps Config comparable.
+	ExplorerIndexes string
+
 	// TerminalSeed writes this many already-finalized jobs, each with a finished
 	// run row, backdated by TerminalSeedAge before the run starts.
 	//
@@ -408,6 +418,44 @@ type Config struct {
 	// check holds the replayed cohort to: no job runs more than its restored budget.
 	ReplayBudget int
 }
+
+// ExplorerIndexNames lists the names Config.ExplorerIndexes accepts, in the
+// order flywheel's ExplorerIndexSet declares their indexes.
+func ExplorerIndexNames() []string { return []string{"kind", "queue", "state", "tags"} }
+
+// explorerIndexPrefix turns an ExplorerIndexes name into its index's name.
+const explorerIndexPrefix = "jobs_explore_"
+
+// validateExplorerIndexes refuses an unknown or repeated explorer index name.
+func validateExplorerIndexes(names []string) error {
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		if !slices.Contains(ExplorerIndexNames(), n) {
+			return fmt.Errorf("loadtest: unknown explorer index %q (want any of %s): %w",
+				n, strings.Join(ExplorerIndexNames(), ", "), ErrInvalidConfig)
+		}
+		if seen[n] {
+			return fmt.Errorf("loadtest: explorer index %q named twice: %w", n, ErrInvalidConfig)
+		}
+		seen[n] = true
+	}
+	return nil
+}
+
+// explorerIndexes splits ExplorerIndexes into its names, dropping empty ones.
+func (c Config) explorerIndexes() []string {
+	var out []string
+	for _, n := range strings.Split(c.ExplorerIndexes, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// seedsTags reports whether the run's seeded jobs carry tags: only when the tags
+// explorer index is installed, so every other run writes exactly what it did.
+func (c Config) seedsTags() bool { return slices.Contains(c.explorerIndexes(), "tags") }
 
 // connections reports the connection budget this configuration plans for: the
 // work pool, sized to Runners × (Workers + 1) so every runner can hold one
@@ -484,6 +532,9 @@ func (c Config) validate() (Config, error) {
 		return Config{}, fmt.Errorf(
 			"loadtest: unknown storage condition %q: %w", c.Storage, ErrInvalidConfig,
 		)
+	}
+	if err := validateExplorerIndexes(c.explorerIndexes()); err != nil {
+		return Config{}, err
 	}
 	if c.Duration < 0 || c.RetentionMaxAge < 0 || c.RetentionInterval < 0 || c.TerminalSeedAge < 0 {
 		return Config{}, fmt.Errorf(

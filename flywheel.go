@@ -50,6 +50,7 @@ type (
 	Classifier            = core.Classifier
 	Client                = core.Client
 	ClientOpts            = core.ClientOpts
+	CountOpts             = core.CountOpts
 	DBLimiter             = core.DBLimiter
 	DBLimiterConfig       = core.DBLimiterConfig
 	Defaults              = core.Defaults
@@ -78,10 +79,16 @@ type (
 	InsertInfo            = core.InsertInfo
 	InsertOpts            = core.InsertOpts
 	InsertSource          = core.InsertSource
+	InspectIndexOpts      = core.InspectIndexOpts
 	JobArgsView           = core.JobArgsView
+	JobCount              = core.JobCount
 	JobDetail             = core.JobDetail
 	JobEvent              = core.JobEvent
+	JobListItem           = core.JobListItem
+	JobPage               = core.JobPage
+	JobQuery              = core.JobQuery
 	JobRunView            = core.JobRunView
+	JobSort               = core.JobSort
 	JobState              = core.JobState
 	JobView               = core.JobView
 	JobsOverview          = core.JobsOverview
@@ -115,6 +122,7 @@ type (
 	Retryable             = core.Retryable
 	RollupResult          = core.RollupResult
 	RunOutcome            = core.RunOutcome
+	RunSummary            = core.RunSummary
 	RunSeed               = core.RunSeed
 	Runner                = core.Runner
 	RunnerConfig          = core.RunnerConfig
@@ -147,6 +155,7 @@ type (
 
 const (
 	AnyClass                 = core.AnyClass
+	DefaultCountCap          = core.DefaultCountCap
 	ErrorPermanent           = core.ErrorPermanent
 	ErrorTimeout             = core.ErrorTimeout
 	ErrorTransient           = core.ErrorTransient
@@ -159,6 +168,12 @@ const (
 	InsertSourcePeriodic     = core.InsertSourcePeriodic
 	IntervalDay              = core.IntervalDay
 	IntervalHour             = core.IntervalHour
+	JobSortFinished          = core.JobSortFinished
+	JobSortNewest            = core.JobSortNewest
+	JobSortOldest            = core.JobSortOldest
+	JobSortScheduled         = core.JobSortScheduled
+	MaxContainmentWindow     = core.MaxContainmentWindow
+	MaxCountCap              = core.MaxCountCap
 	MaxMetadataBytes         = core.MaxMetadataBytes
 	MaxReadLimit             = core.MaxReadLimit
 	MaxTagBytes              = core.MaxTagBytes
@@ -239,6 +254,14 @@ func CountActiveJobs(ctx context.Context, db *gorm.DB) (int64, error) {
 	return core.CountActiveJobs(ctx, db)
 }
 
+func CountJobs(ctx context.Context, db *gorm.DB, q JobQuery) (JobCount, error) {
+	return core.CountJobs(ctx, db, q)
+}
+
+func CountJobsWithOptions(ctx context.Context, db *gorm.DB, q JobQuery, opts CountOpts) (JobCount, error) {
+	return core.CountJobsWithOptions(ctx, db, q, opts)
+}
+
 func CountRuns(ctx context.Context, db *gorm.DB) (int64, error) {
 	return core.CountRuns(ctx, db)
 }
@@ -261,6 +284,10 @@ func DeletePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
 
 func Enqueue(ctx context.Context, c *Client, kind string, args []byte, opts InsertOpts) (string, error) {
 	return core.Enqueue(ctx, c, kind, args, opts)
+}
+
+func ExplorerIndexSet(dialect string) ([]Index, error) {
+	return core.ExplorerIndexSet(dialect)
 }
 
 func FindJob(ctx context.Context, db *gorm.DB, id string) (JobView, error) {
@@ -293,6 +320,10 @@ func InsertMany(ctx context.Context, c *Client, items []BatchItem, opts BatchOpt
 
 func InspectIndexes(ctx context.Context, db *gorm.DB) ([]IndexDrift, error) {
 	return core.InspectIndexes(ctx, db)
+}
+
+func InspectIndexesWithOptions(ctx context.Context, db *gorm.DB, opts InspectIndexOpts) ([]IndexDrift, error) {
+	return core.InspectIndexesWithOptions(ctx, db, opts)
 }
 
 func InspectSchema(ctx context.Context, db *gorm.DB) ([]SchemaDrift, error) {
@@ -446,6 +477,10 @@ func ProgressByKind(ctx context.Context, db *gorm.DB, kinds []string) (map[strin
 
 func ProgressMany(ctx context.Context, db *gorm.DB, parentJobIDs []string) (map[string]BatchProgress, error) {
 	return core.ProgressMany(ctx, db, parentJobIDs)
+}
+
+func QueryJobs(ctx context.Context, db *gorm.DB, q JobQuery) (JobPage, error) {
+	return core.QueryJobs(ctx, db, q)
 }
 
 func QueueDepths(ctx context.Context, db *gorm.DB) ([]QueueDepth, error) {

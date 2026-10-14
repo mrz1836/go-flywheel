@@ -45,7 +45,9 @@ until it is done.
 | What were the slowest runs today? | `SlowRuns` | `job_run_finishes` + `job_runs` PK | 71 ms |
 | One job's attempts | `ListRuns` | `job_runs_job_attempt` | sub-ms |
 | One job's latest attempt and its output | `LatestRun` | `job_runs_job_attempt` | sub-ms |
-| One job in full: args (bounded), metadata, keys, barrier, latest run | `GetJob` | `jobs` primary key + `job_runs_job_attempt` | sub-ms |
+| One job in full: args (bounded), metadata, keys, barrier, latest run | `GetJob` | `jobs` primary key + `job_runs_job_attempt` | 1.2 ms |
+| Which jobs match a filter, a page at a time? | `QueryJobs` | the primary key (newest, oldest, a created window); `jobs_finished`, `jobs_ready`, `jobs_parent_state`; an [explorer index](#the-explorer-index-set-opt-in) for a kind, queue, state, or tag | 2–9 ms; 95 ms for the scheduled sort over a deep queue |
+| How many match, honestly? | `CountJobs` | the filter's index; exact to 10,000, then the cap and an estimate | 1–14 ms |
 | Has this job finished yet? | `WaitForJob` | `jobs` primary key | sub-ms per poll |
 
 The [measured latencies](#measured-cost) are at the end. Everything above is bounded — by a window, a
@@ -502,8 +504,8 @@ refused for day buckets.
 Every read takes a `context.Context` and the `*gorm.DB` to read through — a replica is fine, except for
 `WaitForJob` — and returns JSON-tagged values. None writes.
 
-Every list read returns at most `MaxReadLimit` (200) rows: `ListJobs`, `ListFinished`, `ListRunning`,
-`SlowRuns`, `RecentFailures`, and `ListRuns`. A larger `Limit` is clamped rather than refused, so a handler
+Every list read returns at most `MaxReadLimit` (200) rows: `QueryJobs`, `ListJobs`, `ListFinished`,
+`ListRunning`, `SlowRuns`, `RecentFailures`, and `ListRuns`. A larger `Limit` is clamped rather than refused, so a handler
 can pass a request's limit through; one that asks for a row more than its page, to learn whether another
 follows, keeps its page below 200.
 
@@ -550,6 +552,7 @@ job's own final attempt — no args, outputs, or error payloads.
 
 **`ListJobs(ctx, db, ListJobsParams{State, Kind, Queue, BeforeID, Limit})`** — jobs newest first *by id*.
 Ids are UUIDv7, so id order is insertion order and the primary key serves the page; `BeforeID` pages it.
+For several values of a field, a time window, or another order, use [`QueryJobs`](#finding-jobs).
 
 **`ListRuns(ctx, db, jobID, ListRunsParams{BeforeAttempt, Before, Limit})`** — one job's attempts with
 every column above, newest attempt first. A zero `Limit` reads the newest 200 attempts. Page with
@@ -576,6 +579,99 @@ carries no args or metadata.
 **`SlowRuns(ctx, db, SlowRunsParams{Kind, Since, MinDuration, Limit})`** — the slowest finished runs in a
 short window (24 hours by default), any outcome — a timeout is a slow run. A range of `job_run_finishes`;
 for slow runs further back, read the hourly `SlowestRunID` from `Stats`.
+
+### Finding jobs
+
+**`QueryJobs(ctx, db, JobQuery{…})`** — the jobs a filter matches, one page at a time: the read behind a
+filtered job list. Every field narrows the match, and the values within a field widen it:
+
+| Field | Matches |
+|---|---|
+| `States`, `Kinds`, `Queues` | any of the values |
+| `Tags` | a job carrying any of the tags |
+| `IDs` | these ids, at most 200 |
+| `ParentJobID` | the children of one job |
+| `PriorityMin`, `PriorityMax`, `AttemptMin`, `AttemptMax` | an inclusive range; a nil end is open |
+| `CreatedFrom`, `CreatedTo` | `[from, to)` by insert time, applied to the UUIDv7 id at millisecond precision, so the primary key serves it and a job inserted under a simulated clock is found where its id puts it |
+| `ScheduledFrom`, `ScheduledTo`, `FinalizedFrom`, `FinalizedTo` | `[from, to)` on `scheduled_at` or `finalized_at` |
+| `ArgsContains`, `MetadataContains` | a job whose args or metadata contain this JSON object (PostgreSQL's `@>`), within a created window of at most `MaxContainmentWindow` (7 days; `CreatedTo` zero means now) |
+
+Soft-deleted jobs never match. Each `JobListItem` is the job's `JobView`, its metadata as stored, and
+`LatestRun`, a `RunSummary` of the run of the attempt the job names: its outcome, error class, and the
+error's first line, cut at 256 bytes. No list loads args.
+
+Four sorts, each broken by the id so a page boundary never falls between two rows it cannot tell apart:
+
+| `Sort` | Order | Reads |
+|---|---|---|
+| `JobSortNewest` (the zero value) | id, descending: insert order | the primary key, or a filter's explorer index |
+| `JobSortOldest` | id, ascending | the same, forward |
+| `JobSortFinished` | `finalized_at`, then id, descending; `States` terminal only | one `jobs_finished` range per state, merged |
+| `JobSortScheduled` | `scheduled_at`, then id, ascending; `States` non-terminal only | the claimable jobs within the filter, sorted |
+
+A page holds `Limit` items: 50 at zero, never more than 200. `NextCursor` is set only when another page
+exists; pass it back as `Cursor` with the same sort. It is opaque, prefixed `jq1.`, bound to its sort and
+not to the filter: a cursor used with a changed filter reads that filter's rows past the cursor's key.
+Before any statement runs, a query is refused with a `*ValidationError` naming its field: an unknown
+state or sort, a minimum above its maximum, an empty or inverted window, more than 200 ids, the finished
+sort without terminal states or the scheduled sort without waiting ones (`states`), a containment filter
+that is not an object or searches more than seven days, and a cursor that is malformed or from another
+sort. A containment filter on SQLite returns `ErrUnsupportedDialect`; [`CONTRACT.md`](CONTRACT.md#what-sqlite-does-differently)
+lists what else SQLite does differently.
+
+**`CountJobs(ctx, db, q)` / `CountJobsWithOptions(ctx, db, q, CountOpts{Cap})`** — how many jobs `q`
+matches, counted honestly and cheaply: exact up to the cap (`DefaultCountCap`, 10,000, at zero; at most
+`MaxCountCap`, 100,000), and past it `{N: cap, Capped: true}` with `Estimate`, PostgreSQL's planner estimate
+of the full count (at least the cap plus one; 0 on SQLite). It counts a sub-select limited to the cap
+plus one, so it never reads further, and it ignores the query's sort, cursor, and limit. Show
+`10,000+`, or `≈ 1.2M` from the estimate, rather than a number the read could not afford.
+
+### The explorer index set (opt-in)
+
+`ExplorerIndexSet(dialect)` returns four indexes that make the query's common shapes fast. They are
+outside `IndexSet`: `Migrate`, `InstallIndexes`, and `InspectIndexes` never install or report them, and
+you choose which to pay for.
+
+| Index | Serves | Size at 1M jobs |
+|---|---|---|
+| `jobs_explore_kind` `(kind, id)` | a kind filter, newest or oldest first, and its count | 65 MB |
+| `jobs_explore_queue` `(queue, id)` | a queue filter, the same | 65 MB |
+| `jobs_explore_state` `(state, id)` | one state, newest or oldest first | 65 MB |
+| `jobs_explore_tags`, GIN on `tags` (PostgreSQL) | a tag filter; only tagged jobs enter it | 0.8 MB with a tenth of jobs tagged |
+
+**What one buys.** A filter whose matches are common among the newest jobs is served by a short walk of
+the primary key, index or not. One whose matches are rare there, or long past, walks far without its
+index: at a million jobs, the newest page of a kind that last ran a month ago took 233 ms
+without `jobs_explore_kind` and 2.3 ms with it, and a tag a thousandth of the jobs carry
+70 ms against 8.9 ms.
+
+**What one costs.** Every state transition on `jobs` writes every index on it (see
+[`TUNING.md`](TUNING.md#explorer-indexes-and-their-write-cost)): on a zero-work drain each B-tree explorer
+index cost about 280 bytes of WAL per job, +11%, with no measurable throughput loss, and the tags index
+costs only the tagged jobs. [`BENCHMARKS.md`](BENCHMARKS.md#the-job-query-and-its-opt-in-indexes) has the
+reads with and without each, and each one's write cost.
+
+**Library-owned install.** Pass the entries you want; they are created, repaired, and reconciled with
+`IndexSet`'s, by the same rules:
+
+```go
+set, err := flywheel.ExplorerIndexSet(db.Name())
+// keep the entries you chose, here kind and queue
+err = flywheel.MigrateWithOptions(db, flywheel.MigrateOpts{ExtraIndexes: set[:2], Concurrently: true})
+```
+
+`InstallIndexesWithOptions(ctx, db, IndexOpts{ExtraIndexes: …})` does the same without the tables.
+
+**Host-owned install.** Copy each chosen entry's `DDL` into your migrations, byte for byte, and assert it
+in CI with the same entries:
+
+```go
+drift, err := flywheel.InspectIndexesWithOptions(ctx, db, flywheel.InspectIndexOpts{ExtraIndexes: chosen})
+// empty drift: IndexSet's indexes and your chosen explorer indexes are installed as declared
+```
+
+An entry you did not install is never drift until you pass it. An extra index whose name `IndexSet`
+declares, or a name given twice, is refused with a `*ValidationError` naming `extra_indexes`.
 
 ### History: how it has been going
 
@@ -614,7 +710,7 @@ their own baseline at an hour; see [What the anomaly detector catches](#what-the
 | `BackfillRunFinishes(ctx, db)` | write finish-log entries for runs an older release finalized, and re-roll any covered hour they land in; the rollup runs it for you, and `flywheel stats rebuild` runs it before rebuilding |
 | `NormalizeRunTimestamps(ctx, db)` | SQLite only: re-stamp pre-upgrade `job_runs` timestamps in UTC; the backfill runs it for you |
 | `HistogramBounds(version)` | the bucket bounds behind a stored histogram |
-| `InspectSchema`, `InspectIndexes` | the CI parity checks |
+| `InspectSchema`, `InspectIndexes`, `InspectIndexesWithOptions` | the CI parity checks; the last also checks the explorer indexes you installed |
 
 <br>
 
@@ -626,6 +722,8 @@ their own baseline at an hour; see [What the anomaly detector catches](#what-the
 | One job, until it finishes | `WaitForJob` | 0.5 s doubling to 5 s (built in) | one primary-key read |
 | Queue depth | `QueueDepths` | 10–30 s | three grouped index reads + one ordered read per queue with ready work |
 | Recently finished | `ListFinished` | 10–30 s | three `LIMIT n` index range scans |
+| A filtered job list | `QueryJobs` | on demand, or 10–30 s | one page: a `LIMIT 51` read (one per state for the finished sort), each job joined to its run by key |
+| A lens's count | `CountJobs` | 30–60 s | at most 10,001 index entries, plus one `EXPLAIN` past the cap |
 | Today's stats | `Stats` (24 h) | 30–60 s | 24 × kinds rollup rows by primary key + the open hour raw |
 | Trends | `StatsSeries` (30 d) | 5–15 min | 720 rollup rows (one per hour) + the open hour raw |
 | Anomalies | `Anomalies` | hourly, after the rollup | ~190 × kinds rollup rows |
@@ -875,6 +973,22 @@ whole API call; the plans behind them are in
 
 On SQLite, the same reads over a 100k-run month (`go test -bench SQLite ./internal/core`) are all under
 15 ms; `Stats` for the last day is about 1 ms.
+
+The job query, at 1,000,000 jobs over 30 days with every explorer index installed — the plans, and each
+shape without its index, are in [`benchmarks/explorer-plans-1m.txt`](benchmarks/explorer-plans-1m.txt):
+
+| Read | Median |
+|---|---|
+| `QueryJobs`, newest first, a kind, a queue, or a state | 2.2–3.3 ms |
+| `QueryJobs`, a kind last run a month ago (233 ms without `jobs_explore_kind`) | 2.3 ms |
+| `QueryJobs`, a tag on 0.1% of jobs (70 ms without `jobs_explore_tags`) | 8.9 ms |
+| `QueryJobs`, the finished sort over three terminal states | 6.8 ms |
+| `QueryJobs`, the scheduled sort over ~124,000 claimable jobs in one queue | 95 ms |
+| `QueryJobs`, a parent's children | 4.7 ms |
+| `QueryJobs`, a one-hour created window | 2.3 ms |
+| `CountJobs` at the cap (10,000) and past it | 1.2–1.9 ms |
+| `CountJobs` below the cap, one kind and one state | 14.2 ms |
+| `GetJob`, a running job and its run | 1.2 ms |
 
 ### Writes
 

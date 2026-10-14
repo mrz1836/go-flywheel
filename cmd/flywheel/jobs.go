@@ -15,12 +15,13 @@ import (
 	"gorm.io/gorm"
 )
 
-// newJobsCmd builds the `flywheel jobs` command group: ls, running, inspect,
-// retry, cancel.
+// newJobsCmd builds the `flywheel jobs` command group: ls, count, running,
+// inspect, retry, cancel.
 func newJobsCmd(configPath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "jobs", Short: "Inspect and operate jobs"}
 	cmd.AddCommand(
 		newJobsLsCmd(configPath),
+		newJobsCountCmd(configPath),
 		newJobsRunningCmd(configPath),
 		newJobsInspectCmd(configPath),
 		newJobsRetryCmd(configPath),
@@ -29,52 +30,150 @@ func newJobsCmd(configPath *string) *cobra.Command {
 	return cmd
 }
 
-// newJobsLsCmd lists recent jobs newest first, optionally filtered by state,
-// kind, and queue, and paged by id with --before.
+// jobFilterFlags are the filter flags `jobs ls` and `jobs count` share. A
+// repeated flag matches any of its values; different flags must all match.
+type jobFilterFlags struct {
+	states, kinds, queues, tags []string
+	createdAfter, createdBefore string
+}
+
+// register adds the filter flags to cmd.
+func (f *jobFilterFlags) register(cmd *cobra.Command) {
+	cmd.Flags().StringArrayVar(&f.states, "state", nil,
+		"filter by state (available, running, succeeded, ...); repeat for any of several")
+	cmd.Flags().StringArrayVar(&f.kinds, "kind", nil, "filter by job kind; repeat for any of several")
+	cmd.Flags().StringArrayVar(&f.queues, "queue", nil, "filter by queue; repeat for any of several")
+	cmd.Flags().StringArrayVar(&f.tags, "tag", nil, "filter by tag: a job carrying any of the repeated tags")
+	cmd.Flags().StringVar(&f.createdAfter, "created-after", "", "only jobs created at or after this RFC 3339 time")
+	cmd.Flags().StringVar(&f.createdBefore, "created-before", "", "only jobs created before this RFC 3339 time")
+}
+
+// query builds the JobQuery the flags describe. The library validates it; a
+// refusal prints as it comes.
+func (f *jobFilterFlags) query() (flywheel.JobQuery, error) {
+	q := flywheel.JobQuery{Kinds: f.kinds, Queues: f.queues, Tags: f.tags}
+	for _, s := range f.states {
+		q.States = append(q.States, flywheel.JobState(s))
+	}
+	var err error
+	if q.CreatedFrom, err = parseCreatedFlag("--created-after", f.createdAfter); err != nil {
+		return flywheel.JobQuery{}, err
+	}
+	if q.CreatedTo, err = parseCreatedFlag("--created-before", f.createdBefore); err != nil {
+		return flywheel.JobQuery{}, err
+	}
+	return q, nil
+}
+
+// parseCreatedFlag parses a created-window flag's RFC 3339 value; empty is an
+// open end.
+func parseCreatedFlag(name, value string) (time.Time, error) {
+	if value == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%s wants an RFC 3339 time such as 2026-06-22T00:00:00Z: %w", name, err)
+	}
+	return t, nil
+}
+
+// newJobsLsCmd lists jobs through QueryJobs: filtered by the shared flags,
+// ordered by --sort, and paged with the cursor each page prints under its table.
 func newJobsLsCmd(configPath *string) *cobra.Command {
 	var (
-		state  string
-		kind   string
-		queue  string
-		before string
+		filter jobFilterFlags
+		sortBy string
+		cursor string
 		limit  int
 		asJSON bool
 	)
 	cmd := &cobra.Command{
 		Use:   "ls",
-		Short: "List recent jobs",
+		Short: "List jobs, filtered and paged",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			q, err := filter.query()
+			if err != nil {
+				return err
+			}
+			q.Sort, q.Cursor, q.Limit = flywheel.JobSort(sortBy), cursor, limit
+
 			_, db, _, err := loadAndOpen(*configPath)
 			if err != nil {
 				return err
 			}
 			defer closeDB(db)
 
-			views, err := flywheel.ListJobs(cmd.Context(), db, flywheel.ListJobsParams{
-				State: state, Kind: kind, Queue: queue, BeforeID: before, Limit: limit,
-			})
+			page, err := flywheel.QueryJobs(cmd.Context(), db, q)
 			if err != nil {
 				return err
 			}
 			if asJSON {
-				return writeJSON(cmd.OutOrStdout(), views)
+				return writeJSON(cmd.OutOrStdout(), page)
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "ID\tKIND\tQUEUE\tSTATE\tATTEMPT\tENQUEUED")
-			for _, v := range views {
+			for _, v := range page.Items {
 				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n",
 					v.ID, v.Kind, v.Queue, v.State, v.Attempt, v.EnqueuedAt.Format("2006-01-02 15:04:05"))
 			}
-			return tw.Flush()
+			if err := tw.Flush(); err != nil {
+				return err
+			}
+			if page.NextCursor != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "next: --cursor %s\n", page.NextCursor)
+			}
+			return nil
 		},
 	}
-	cmd.Flags().StringVar(&state, "state", "", "filter by state (available, running, succeeded, ...)")
-	cmd.Flags().StringVar(&kind, "kind", "", "filter by job kind")
-	cmd.Flags().StringVar(&queue, "queue", "", "filter by queue")
-	cmd.Flags().StringVar(&before, "before", "", "page: list only jobs older than this job id (the last id of the previous page)")
-	cmd.Flags().IntVar(&limit, "limit", 50, "maximum rows")
-	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON instead of a table")
+	filter.register(cmd)
+	cmd.Flags().StringVar(&sortBy, "sort", string(flywheel.JobSortNewest),
+		"order: newest, oldest, finished (terminal --state only), or scheduled (waiting --state only)")
+	cmd.Flags().StringVar(&cursor, "cursor", "", "read the next page: the cursor printed under the previous one, with the same --sort")
+	cmd.Flags().IntVar(&limit, "limit", 50, "maximum rows (at most 200)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the page as JSON (items, next_cursor) instead of a table")
+	return cmd
+}
+
+// newJobsCountCmd counts the jobs the shared filter flags match through
+// CountJobsWithOptions: exactly up to --cap, then the cap and, on PostgreSQL,
+// the planner's estimate.
+func newJobsCountCmd(configPath *string) *cobra.Command {
+	var (
+		filter   jobFilterFlags
+		countCap int64
+		asJSON   bool
+	)
+	cmd := &cobra.Command{
+		Use:   "count",
+		Short: "Count the jobs a filter matches, exactly up to a cap",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			q, err := filter.query()
+			if err != nil {
+				return err
+			}
+			_, db, _, err := loadAndOpen(*configPath)
+			if err != nil {
+				return err
+			}
+			defer closeDB(db)
+
+			n, err := flywheel.CountJobsWithOptions(cmd.Context(), db, q, flywheel.CountOpts{Cap: countCap})
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				return writeJSON(cmd.OutOrStdout(), n)
+			}
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), formatJobCount(n))
+			return err
+		},
+	}
+	filter.register(cmd)
+	cmd.Flags().Int64Var(&countCap, "cap", 0, "count exactly up to this many jobs (0 selects 10,000; at most 100,000)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the count as JSON (n, capped, estimate)")
 	return cmd
 }
 
@@ -315,6 +414,19 @@ func mutateJob(cmd *cobra.Command, configPath, id string, mutate func(context.Co
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", verb, id)
 	return nil
+}
+
+// formatJobCount renders a count as `jobs count` prints it: the exact count,
+// or the cap with a plus past it, and the estimate when the database gave one.
+func formatJobCount(c flywheel.JobCount) string {
+	switch {
+	case !c.Capped:
+		return strconv.FormatInt(c.N, 10)
+	case c.Estimate > 0:
+		return fmt.Sprintf("%d+ (estimate %d)", c.N, c.Estimate)
+	default:
+		return fmt.Sprintf("%d+", c.N)
+	}
 }
 
 // writeJSON encodes v as indented JSON to w.

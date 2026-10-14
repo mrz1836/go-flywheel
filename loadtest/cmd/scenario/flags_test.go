@@ -213,3 +213,33 @@ func TestParseFlagsUsesNoGlobalState(t *testing.T) {
 		t.Fatalf("parses interfered: %d and %d", first.cfg.Jobs, second.cfg.Jobs)
 	}
 }
+
+// TestParseFlagsExplorerIndexes proves -explorer-indexes: none by default, a
+// comma list of the explorer set's names, and a refusal naming the flag for a
+// name the set does not declare or one named twice.
+func TestParseFlagsExplorerIndexes(t *testing.T) {
+	t.Setenv(dsnEnv, testDSN)
+
+	opts, err := parseFlags(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if opts.cfg.ExplorerIndexes != "" {
+		t.Errorf("ExplorerIndexes = %q by default, want none", opts.cfg.ExplorerIndexes)
+	}
+
+	opts, err = parseFlags([]string{"-explorer-indexes", "kind, queue,state,tags"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if opts.cfg.ExplorerIndexes != "kind,queue,state,tags" {
+		t.Errorf("ExplorerIndexes = %q, want kind,queue,state,tags", opts.cfg.ExplorerIndexes)
+	}
+
+	for _, bad := range []string{"kind,nope", "kind,kind"} {
+		_, err := parseFlags([]string{"-explorer-indexes", bad}, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "-explorer-indexes") {
+			t.Errorf("-explorer-indexes %q: err = %v, want a refusal naming the flag", bad, err)
+		}
+	}
+}

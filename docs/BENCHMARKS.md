@@ -860,6 +860,147 @@ where the HOT ratios above come from.
 
 <br/>
 
+## The job query and its opt-in indexes
+
+`QueryJobs` and `CountJobs` read `jobs` by any filter, and `ExplorerIndexSet` holds four indexes a host may
+add for their common shapes. Measured on **Apple M1 Max, 10 cores, 32 GB, macOS 15.7, PostgreSQL 17.10** in
+the `postgres:17-alpine` container on the same machine (`shared_buffers` 128MB, `max_wal_size` 1GB,
+`work_mem` 4MB), Go 1.27.2. The plans and each call's spread are in
+[`benchmarks/explorer-plans-1m.txt`](benchmarks/explorer-plans-1m.txt).
+
+### Reads at 1,000,000 jobs
+
+`explain -query explorer` seeds a million jobs over 30 days: twenty kinds, a dedicated kind of exactly
+10,000, and a retired kind whose ~1,700 jobs all ran on the first day; queues at 69, 30, and 1%; states
+60% succeeded, 10% discarded, 5% cancelled, 12% available, 6% retryable, 5% running, 2% paused; two tags on
+10% of jobs (one shared, one of a hundred rarer ones); 5% the children of 100 parents; one run per claimed
+job. It builds the four explorer indexes over the table, `VACUUM (ANALYZE)`s, and times each call as the
+median of 7 after a warm-up: once with every explorer index, and once without the one the shape is meant
+for (dropped, analyzed, measured, rebuilt, with a `CHECKPOINT` before each block). A page is 50 jobs.
+
+| Shape | Index meant for it | With | Without | Plan with → without |
+|---|---|---|---|---|
+| A kind, newest first: 1% of jobs | `jobs_explore_kind` | 3.3 ms | 2.7 ms | the index → `jobs_pkey` |
+| A kind: 5% of jobs | `jobs_explore_kind` | 2.6 ms | 2.4 ms | `jobs_pkey` → `jobs_pkey` |
+| **A kind last run a month ago: 0.2%** | `jobs_explore_kind` | **2.3 ms** | **233 ms** | the index → `jobs_pkey` |
+| A queue: 1% of jobs | `jobs_explore_queue` | 2.4 ms | 6.3 ms | the index → `jobs_pkey` |
+| A queue: 30% of jobs | `jobs_explore_queue` | 2.3 ms | 2.3 ms | `jobs_pkey` → `jobs_pkey` |
+| One state: 2% of jobs | `jobs_explore_state` | 2.2 ms | 2.6 ms | the index → `jobs_pkey` |
+| One state: 60% of jobs | `jobs_explore_state` | 2.2 ms | 2.4 ms | `jobs_pkey` → `jobs_pkey` |
+| **A tag on 0.1% of jobs** | `jobs_explore_tags` | **8.9 ms** | **70 ms** | the index → a sequential scan |
+| A tag on 10% of jobs | `jobs_explore_tags` | 2.3 ms | 16.3 ms | `jobs_pkey` → `jobs_pkey` (bound: a generic plan) |
+| Finished, three terminal states | `jobs_finished` | 6.8 ms | | `jobs_finished`, one range per state |
+| Scheduled, claimable states in one queue | `jobs_ready` | 95.2 ms | | `jobs_state`, then a sort |
+| A parent's children | `jobs_parent_state` | 4.7 ms | | `jobs_parent_state` |
+| A created window, one hour | the primary key | 2.3 ms | | `jobs_pkey` |
+| `CountJobs` below the cap: one kind and one state, ~1,000 | | 14.2 ms | | `jobs_state` |
+| `CountJobs` at the cap: 10,000 of one kind | | 1.2 ms | | `jobs_explore_kind` |
+| `CountJobs` past the cap: every job, with the estimate | | 1.9 ms | | `jobs_state` |
+| `GetJob`: a running job and its run | | 1.2 ms | | `jobs_pkey`, `job_runs_job_attempt` |
+
+What it says:
+
+- **A newest-first page is cheap whenever its matches are common among the newest jobs.** The primary
+  key's backward walk fills the page from the last few thousand rows, index or not: the kind, queue, and
+  state rows at 1–60% are all 2–3 ms either way, within the run's noise. An explorer index pays where the
+  matches are scarce in that recent stretch. A kind that last ran a month ago walked 29 days of jobs
+  without `jobs_explore_kind`, 233 ms, and read its page straight off the index with it, 2.3 ms; a tag a
+  thousandth of the jobs carry was a sequential scan without `jobs_explore_tags`, 70 ms, against 8.9 ms with
+  it. The walk's cost is how far back it must go, so the lens over a quiet kind, queue, or tag is the one
+  that needs its index.
+- **Bound values can plan differently.** The plans are of each statement with its values inlined; the timed
+  calls bind them, as an application does, so after five executions PostgreSQL may switch to a generic
+  plan that does not know how common a value is. The 10% tag without its index is that: its inlined plan
+  runs in 0.3 ms, and the generic one scanned the table, 16.3 ms.
+- **The scheduled sort is the expensive shape.** It sorts every job its states and filter select — here
+  about 124,000 claimable jobs in one queue, spilling the sort to disk at the default `work_mem` — so its
+  cost grows with the queue's backlog: 95 ms. `jobs_ready` narrows the read to the claimable jobs of a
+  queue (the plan test proves the statement reaches it), but `priority` sits between `queue` and
+  `scheduled_at` in its key, so neither it nor `jobs_state`, which the planner chose, hands back
+  `scheduled_at` order.
+- **A count never reads past its cap.** At the cap — 10,000 jobs of one kind — the count read 10,001 index
+  entries in 1.2 ms; past it, over every job, it read the cap plus one and asked the planner for the rest,
+  1.9 ms. Below the cap with a filter no index matches closely, one kind and one state (~1,000 jobs), it
+  read the 20,000 `jobs_state` entries of that state: 14 ms.
+- **Sizes at a million jobs.** `jobs_explore_kind`, `jobs_explore_queue`, and `jobs_explore_state` are 65 MB
+  each; `jobs_explore_tags` holds only tagged jobs, 0.8 MB with a tenth of them tagged. `jobs` is 545 MB,
+  341 MB of it the runtime's indexes.
+
+### What each index costs a write
+
+Each explorer index alone against none, on a 100,000-job zero-work drain (`-mix drain -runners 4
+-workers 8 -storage-tuning`): four rounds with the five arms interleaved and a `CHECKPOINT` before each
+run, so a drift in the machine lands on every arm alike. The tags arm tags every job, the index's worst
+case: an untagged job never enters it. Medians of four:
+
+| Arm | Drain throughput | vs none | WAL per job | vs none | `jobs` indexes at the end |
+|---|---|---|---|---|---|
+| No explorer index | 2,094 jobs/s | | 2,533 B | | 26.0 MB |
+| `jobs_explore_kind` | 2,078 jobs/s | −0.8% | 2,812 B | **+11.0%** | 34.0 MB |
+| `jobs_explore_queue` | 2,117 jobs/s | +1.1% | 2,807 B | **+10.8%** | 33.2 MB |
+| `jobs_explore_state` | 2,156 jobs/s | +3.0% | 2,822 B | **+11.4%** | 47.3 MB |
+| `jobs_explore_tags`, every job tagged | 2,073 jobs/s | −1.0% | 2,929 B | **+15.6%** | 30.8 MB |
+
+- **WAL is the cost.** Each B-tree explorer index adds about 280 bytes of WAL per job, +11%: a claim and a
+  finalize are non-HOT updates of the `jobs` row (see [storage parameters](#storage-parameters-measured-then-adopted)),
+  so each writes an entry in every index on the table. The tags index, with every job tagged, adds about
+  400 bytes, +16%.
+- **Throughput shows no resolvable difference.** One arm's own rounds span 1,826–2,247 jobs/s, about ±10%,
+  so ±3% between medians is inside it. A zero-work drain here is bound by the claim's and the finalize's
+  round trips, not by index maintenance. These drains are slower than the earlier sections' because the
+  database runs in a container's VM; what is compared is the arms, on one setup, interleaved.
+- **The state index grows the most.** A transition changes its key, so each version of a job lands in
+  another part of the index; a kind's or a queue's key never changes, and PostgreSQL's B-tree deduplication
+  folds a job's versions under it. On 100,000 drained jobs that is 21 MB of index against 7–8 MB.
+
+**All four at a million jobs.** The same drain at 1,000,000 jobs, once with every explorer index (every job
+tagged) and once with none, each after a `CHECKPOINT`:
+
+| | All four explorer indexes | None |
+|---|---|---|
+| Drain throughput | 1,883 jobs/s | 1,896 jobs/s |
+| WAL per job | **12,841 B (+42%)** | 9,044 B |
+| `jobs` indexes at the end | **549 MB** | 233 MB |
+| `jobs` with its indexes | 1,192 MB | 836 MB |
+| Updates of `jobs` that were HOT | 0 of 2.0 million | 0 of 2.0 million |
+
+The last row is the mechanism the WAL row prices: with or without the explorer indexes, no update of a
+`jobs` row is HOT, so every one of the two million writes an entry in every index on the table. Installing
+all four more than doubles the table's index footprint and adds 42% to the WAL each job writes, at no
+throughput cost on this zero-work drain. A host pays that only for the indexes it installs, which is why
+none is installed by default.
+
+### Reproducing
+
+```bash
+export FLYWHEEL_LOADTEST_DATABASE_URL="postgres://localhost:5432/flywheel_test?sslmode=disable"
+
+# Reads at 1M, with and without each explorer index.
+go run -tags=loadtest ./loadtest/cmd/explain -query explorer -jobs 1000000 \
+  -out docs/benchmarks/explorer-plans-1m.txt
+
+# Write cost: four rounds of the five arms, interleaved, with a CHECKPOINT before each run.
+for round in 1 2 3 4; do
+  for arm in none kind queue state tags; do
+    [ "$arm" = none ] && flag= || flag="-explorer-indexes $arm"
+    psql "$FLYWHEEL_LOADTEST_DATABASE_URL" -c CHECKPOINT
+    go run -tags=loadtest ./loadtest/cmd/scenario -jobs 100000 -runners 4 -workers 8 -mix drain \
+      -storage-tuning $flag -quiet -out "drain-$arm-$round.json"
+  done
+done
+
+# The 1M pair, each after a CHECKPOINT.
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 1000000 -runners 4 -workers 8 -mix drain \
+  -storage-tuning -explorer-indexes kind,queue,state,tags -timeout 90m -quiet -out drain-all-1m.json
+go run -tags=loadtest ./loadtest/cmd/scenario -jobs 1000000 -runners 4 -workers 8 -mix drain \
+  -storage-tuning -timeout 90m -quiet -out drain-none-1m.json
+```
+
+WAL per job is each run's summed `pg_stat_wal` delta, which is cluster-wide, over the jobs it drained; each
+report's notes list the indexes the run actually installed.
+
+<br>
+
 ## The queue-state telemetry index
 
 `jobs_state` is `(state) WHERE deleted_at IS NULL`. It serves three readers, not the two the

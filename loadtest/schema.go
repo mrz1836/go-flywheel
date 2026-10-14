@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -106,7 +107,13 @@ func dropSchema(ctx context.Context, admin *gorm.DB, schema string) error {
 // unconditionally, so the correctness-only condition would be unbuildable
 // through it, and its pre-1.0 column reconciliation is a no-op on a schema
 // created seconds earlier.
-func installSchema(ctx context.Context, db *gorm.DB, cond IndexCondition, storage StorageCondition) error {
+//
+// explorer names the opt-in explorer indexes to install after the condition's
+// (Config.ExplorerIndexes), from the runtime's own ExplorerIndexSet; none
+// installs none.
+func installSchema(
+	ctx context.Context, db *gorm.DB, cond IndexCondition, storage StorageCondition, explorer ...string,
+) error {
 	if db.Name() != "postgres" {
 		return fmt.Errorf("loadtest: target dialect is %q: %w", db.Name(), ErrUnsupportedDialect)
 	}
@@ -140,6 +147,37 @@ func installSchema(ctx context.Context, db *gorm.DB, cond IndexCondition, storag
 		if err := db.WithContext(ctx).Exec(idx.DDL).Error; err != nil {
 			return fmt.Errorf("loadtest: create index %s: %w", idx.Name, err)
 		}
+	}
+	return installExplorerIndexes(ctx, db, explorer)
+}
+
+// installExplorerIndexes creates the named explorer indexes, sourcing their DDL
+// from the runtime's ExplorerIndexSet as the conditions source theirs from
+// IndexSet, and fails on a name the set does not declare.
+func installExplorerIndexes(ctx context.Context, db *gorm.DB, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	if err := validateExplorerIndexes(names); err != nil {
+		return err
+	}
+	set, err := flywheel.ExplorerIndexSet(db.Name())
+	if err != nil {
+		return fmt.Errorf("loadtest: explorer index set: %w", err)
+	}
+	installed := 0
+	for _, idx := range set {
+		if !slices.Contains(names, strings.TrimPrefix(idx.Name, explorerIndexPrefix)) {
+			continue
+		}
+		if err := db.WithContext(ctx).Exec(idx.DDL).Error; err != nil {
+			return fmt.Errorf("loadtest: create index %s: %w", idx.Name, err)
+		}
+		installed++
+	}
+	if installed != len(names) {
+		return fmt.Errorf("loadtest: %s declares %d of the explorer indexes %v: %w",
+			db.Name(), installed, names, ErrInvalidConfig)
 	}
 	return nil
 }

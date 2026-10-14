@@ -89,12 +89,32 @@ func seedAPI(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec, onIn
 			Queue:         cfg.Queue,
 			Priority:      spec.Priority,
 			ExecutorClass: flywheel.ExecutorClass(cfg.ExecutorClass),
+			Tags:          seedTags(cfg),
 		}); err != nil {
 			return fmt.Errorf("loadtest: seed job %d: %w", i, err)
 		}
 		onInsert()
 	}
 	return nil
+}
+
+// seedTags is the two tags every seeded job carries when the run installs the
+// tags explorer index (Config.ExplorerIndexes), the index's worst case; nil
+// otherwise, so every other run writes exactly what it did.
+func seedTags(cfg Config) []string {
+	if !cfg.seedsTags() {
+		return nil
+	}
+	return []string{"loadtest", "seeded"}
+}
+
+// seedTagsJSON is seedTags as the jobs.tags column stores it: [] when there are
+// none.
+func seedTagsJSON(cfg Config) datatypes.JSON {
+	if !cfg.seedsTags() {
+		return datatypes.JSON(`[]`)
+	}
+	return datatypes.JSON(`["loadtest","seeded"]`)
 }
 
 // seedInsertMany inserts the workload through the real bulk producer API,
@@ -303,7 +323,7 @@ func seedBulkFrom(
 			ScheduledAt:   at,
 			ExecutorClass: cfg.ExecutorClass,
 			ParentJobID:   parent,
-			Tags:          datatypes.JSON(`[]`),
+			Tags:          seedTagsJSON(cfg),
 		}
 	}
 
@@ -376,7 +396,7 @@ func seedFairness(ctx context.Context, db *gorm.DB, cfg Config, specs []jobSpec,
 			ScheduledAt:   at,
 			ExecutorClass: cfg.ExecutorClass,
 			ParentJobID:   &parentID,
-			Tags:          datatypes.JSON(`[]`),
+			Tags:          seedTagsJSON(cfg),
 		}
 	}
 

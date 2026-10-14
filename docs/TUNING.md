@@ -138,6 +138,37 @@ not keep pace (two passes in two minutes).
 
 <br>
 
+## Explorer indexes and their write cost
+
+`ExplorerIndexSet` holds four optional indexes for `QueryJobs`' common shapes: `jobs_explore_kind`,
+`jobs_explore_queue`, `jobs_explore_state`, and, on PostgreSQL, `jobs_explore_tags`. None is installed by
+default, because an index on `jobs` is paid on every write, not only on the reads it serves.
+
+- **Every transition writes every index.** `state` sits in the predicate or the key of six runtime
+  indexes, so no update of a `jobs` row is HOT (see above): each claim and each finalize writes a new
+  tuple version and an entry in every index on the table. A B-tree explorer index adds an entry per
+  transition; the GIN tags index adds entries only for the jobs that carry tags.
+- **The measured cost is WAL.** On a 100,000-job zero-work drain, four interleaved rounds against no
+  explorer index, each B-tree explorer index added about 280 bytes of WAL per job (+11%), and the tags
+  index, with every job tagged, about 400 (+16%); drain throughput showed no difference beyond the runs'
+  own ±10% spread. `jobs_explore_state` also grew the most, 21 MB on 100,000 jobs against 7–8 MB for kind
+  and queue: a transition changes its key, so a job's versions cannot be folded together. All four at a
+  million jobs added 42% WAL per job (9.0 → 12.8 KB) and more than doubled the `jobs` index footprint
+  (233 → 549 MB), still with no throughput difference.
+- **Install the kind and queue indexes for an explorer.** They make a filtered list fast whatever the
+  value, which is what an operator's lens needs: at a million jobs, the newest page of a kind that last
+  ran a month ago took 233 ms without `jobs_explore_kind` and 2.3 ms with it.
+- **Install the state index only when one-state lists dominate.** A common state's newest page is a
+  short walk of the primary key with or without it; it pays for a rare state read often.
+- **Install the tags index only when jobs are tagged.** An untagged job never enters it, so it is cheap
+  to keep, and a tag filter without it reads `jobs` from the newest job back until it fills the page.
+
+The numbers, and the reads each index serves, are in
+[`BENCHMARKS.md`](BENCHMARKS.md#the-job-query-and-its-opt-in-indexes); how to install and check them is in
+[`INTEGRATING.md`](INTEGRATING.md#the-explorer-index-set-opt-in).
+
+<br>
+
 ## The stats rollup
 
 `StatsRollupInterval` turns on the hourly rollup the history reads (`Stats`, `StatsSeries`, `Baselines`,

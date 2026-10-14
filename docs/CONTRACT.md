@@ -145,6 +145,24 @@ from the runtime, the side-effect deduplication from you.
 
 <br>
 
+## What SQLite does differently
+
+SQLite is a supported dialect, and every guarantee above holds on it. These are the places where its
+reads answer differently from PostgreSQL's.
+
+| Where | PostgreSQL | SQLite |
+|---|---|---|
+| `JobQuery.ArgsContains`, `JobQuery.MetadataContains` | match with `@>` | refused: `QueryJobs` and `CountJobs` return `ErrUnsupportedDialect` (after the same field checks, so a bad filter is a `*ValidationError` on both) |
+| A capped count (`CountJobs` past its cap) | `Estimate` is the planner's estimate of the full count | `Estimate` is 0 |
+| `JobQuery.Tags` | served by `jobs_explore_tags`, a GIN index, when installed | read through `json_each` with no index; `ExplorerIndexSet("sqlite")` has no tags entry |
+| `ScheduledFrom`/`To`, `FinalizedFrom`/`To`, and the `scheduled` and `finished` sorts and their cursors | compare instants | compare the stored text, in the zone the `jobs` rows were written in, as `ListFinished` does: bounds given in that zone compare exactly, and rows written in another offset, across a DST change included, can order out of time order |
+
+A cursor keeps the time it was read with its zone, so paging a time sort is exact on SQLite as long as
+the rows share one. The connection itself has rules of its own — WAL, the busy timeout, one writer: see
+the [Embedder SQLite checklist](RUNBOOK.md#embedder-sqlite-checklist).
+
+<br>
+
 *The `jobs:` / `flywheel:` log prefixes are an observable contract of a different kind — greppable, and
 matched by tests. That rule, and the other conventions a change to the runtime inherits, live in
 [`CONVENTIONS.md`](CONVENTIONS.md).*
