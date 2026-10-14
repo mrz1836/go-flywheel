@@ -958,6 +958,63 @@ recipe.
 </details>
 
 <details>
+<summary><strong><code>Finding jobs — a filtered query, capped counts, and opt-in indexes</code></strong></summary>
+<br>
+
+**`QueryJobs` lists the jobs a filter matches, a page at a time.** Fields combine with AND, and a field's
+values with OR:
+
+```go
+page, err := flywheel.QueryJobs(ctx, db, flywheel.JobQuery{
+    States:      []flywheel.JobState{flywheel.StateDiscarded, flywheel.StateRetryable},
+    Kinds:       []string{"send_invoice"},
+    Tags:        []string{"eu"},
+    CreatedFrom: time.Now().Add(-24 * time.Hour),
+})
+for _, job := range page.Items { // each a JobView, its metadata, and its latest run in summary
+    fmt.Println(job.ID, job.Kind, job.State)
+}
+// page.NextCursor, when set, reads the next page: JobQuery{…, Cursor: page.NextCursor}
+```
+
+- **Filters:** states, kinds, queues, tags (any of them), ids, a parent, priority and attempt ranges, and
+  created, scheduled, and finalized windows. The created window is applied to the UUIDv7 id, so the
+  primary key serves it. On PostgreSQL, `ArgsContains` and `MetadataContains` find jobs whose args or
+  metadata contain a JSON object, within a created window of at most seven days.
+- **Sorts:** `JobSortNewest` (the default), `JobSortOldest`, `JobSortFinished` (terminal states, most
+  recently finished first), and `JobSortScheduled` (waiting states, next to become claimable first). The
+  id breaks every tie, so the opaque `jq1.` cursor never skips or repeats a row between pages.
+- **Bounds:** a page holds 50 jobs by default and never more than 200, and no list loads args. A query
+  that cannot run — an unknown state, an inverted window, the finished sort over a waiting state, a
+  cursor from another sort — is refused with a `*ValidationError` naming its field before any statement
+  runs.
+
+**`CountJobs` counts honestly.** It is exact up to 10,000 (`CountOpts.Cap`, at most 100,000), then
+returns the cap with `Capped` set and, on PostgreSQL, the planner's `Estimate`. It never reads past the
+cap, so a count over a large table costs what one over the cap does: show `10,000+` rather than a number
+the read could not afford.
+
+**Explorer indexes are yours to choose.** A filter whose matches are common among the newest jobs is
+served by the primary key. One whose matches are rare there walks far without an index, and
+`ExplorerIndexSet` holds four for those shapes: by kind, by queue, and by state, each with the id, and a
+GIN index on tags (PostgreSQL). They are never part of `IndexSet`, `Migrate`, or a plain
+`InstallIndexes`, because every index on `jobs` costs a write on every state transition. Install the
+ones your lists need through `MigrateOpts.ExtraIndexes` or `IndexOpts.ExtraIndexes`, or copy their DDL
+into your own migrations, and check them in CI with `InspectIndexesWithOptions`:
+
+```go
+set, err := flywheel.ExplorerIndexSet(db.Name()) // kind, queue, state, tags
+err = flywheel.MigrateWithOptions(db, flywheel.MigrateOpts{ExtraIndexes: set[:2]}) // kind and queue
+```
+
+[`docs/INTEGRATING.md`](docs/INTEGRATING.md#finding-jobs) has every field and refusal, and
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md#the-job-query-and-its-opt-in-indexes) each shape's cost at a
+million jobs, with and without its index, and each index's write cost. `flywheel jobs ls` and
+`flywheel jobs count` run the same query from a terminal.
+
+</details>
+
+<details>
 <summary><strong><code>Bulk enqueue and the follow-up ceiling</code></strong></summary>
 <br>
 
@@ -1442,7 +1499,8 @@ for an at-a-glance report of queue health, schedules, and recent failures.
 
 **Dashboards over the database.** For history rather than this minute, set the scheduler's
 `StatsRollupInterval` and read the runtime's own tables: `ListRunning` (what is running now, slow runs
-flagged), `ListFinished`, `GetJob` (one job in full, args bounded), `QueueDepths`, `Stats` and
+flagged), `ListFinished`, `QueryJobs` and `CountJobs` (any filter, paged, with an honest count), `GetJob`
+(one job in full, args bounded), `QueueDepths`, `Stats` and
 `StatsSeries` (per-kind outcomes, success rate, duration and queue-wait percentiles over any window,
 from hourly rollups that outlive retention), `Baselines`, and `Anomalies` (a low-noise "this kind got
 slower / started failing"). Every read is bounded and indexed — tens of milliseconds at a million runs.
