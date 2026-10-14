@@ -321,12 +321,20 @@ func TestCLIJobsLsFiltersByQueueAndPagesByID(t *testing.T) {
 	assert.Contains(t, out, ids[0])
 	assert.NotContains(t, out, other, "a queue filter excludes other queues")
 
-	out, err = runRoot(ctx, "--config", cfg, "jobs", "ls", "--queue", "batch", "--before", ids[2], "--limit", "1", "--json")
+	out, err = runRoot(ctx, "--config", cfg, "jobs", "ls", "--queue", "batch", "--limit", "1", "--json")
 	require.NoError(t, err)
-	var page []flywheel.JobView
+	var first flywheel.JobPage
+	require.NoError(t, json.Unmarshal([]byte(out), &first))
+	require.Len(t, first.Items, 1)
+	assert.Equal(t, ids[2], first.Items[0].ID, "newest first by id")
+	require.NotEmpty(t, first.NextCursor)
+
+	out, err = runRoot(ctx, "--config", cfg, "jobs", "ls", "--queue", "batch", "--cursor", first.NextCursor, "--limit", "1", "--json")
+	require.NoError(t, err)
+	var page flywheel.JobPage
 	require.NoError(t, json.Unmarshal([]byte(out), &page))
-	require.Len(t, page, 1)
-	assert.Equal(t, ids[1], page[0].ID, "--before pages to the next-older job by id")
+	require.Len(t, page.Items, 1)
+	assert.Equal(t, ids[1], page.Items[0].ID, "--cursor pages to the next-older job by id")
 }
 
 func TestCLIJobsRunningAndStatsFailOnUnopenableDB(t *testing.T) {
