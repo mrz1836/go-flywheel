@@ -78,6 +78,18 @@ func TestJobViewStillCarriesNoArgs(t *testing.T) {
 			assert.Empty(t, payloadColumn.FindString(m[1]), "%s selects a payload column: %s", name, stmt)
 		}
 	}
+
+	// QueryJobs lists each job's metadata beside its view, and never its args.
+	for _, stmt := range captureSQL(t, db, func(db *gorm.DB) {
+		page, err := QueryJobs(ctx, db, JobQuery{})
+		require.NoError(t, err)
+		require.Len(t, page.Items, 4)
+	}) {
+		m := selectList.FindStringSubmatch(stmt)
+		require.NotNil(t, m, "QueryJobs: a SELECT with a select list: %s", stmt)
+		assert.NotContains(t, m[1], "*", "QueryJobs selects every column: %s", stmt)
+		assert.NotRegexp(t, `(?i)\bargs\b`, m[1], "QueryJobs selects the args: %s", stmt)
+	}
 }
 
 // storedArgs reads a job's args as the database renders them, the bytes a read

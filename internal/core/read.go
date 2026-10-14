@@ -260,7 +260,8 @@ const defaultListJobsLimit = 50
 // ListJobs returns jobs newest-first by id, reading through db and optionally
 // filtered by exact state, kind, and queue. Soft-deleted jobs are excluded. It is
 // the inspection seam behind a "list jobs" CLI or dashboard. It returns at most
-// MaxReadLimit jobs, whatever p.Limit asks for.
+// MaxReadLimit jobs, whatever p.Limit asks for. For several values of a field,
+// time windows, or another order, use QueryJobs.
 //
 // # Ordered by id, not created_at
 //
