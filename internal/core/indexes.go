@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -144,6 +145,108 @@ type IndexOpts struct {
 	// retried at a quieter moment. Zero waits indefinitely, as PostgreSQL does by
 	// default. It does not apply to a concurrent build, whose waits block no one.
 	LockTimeout time.Duration
+
+	// ExtraIndexes are indexes the host chooses to install beside IndexSet's —
+	// entries of ExplorerIndexSet, or indexes of its own. They are installed,
+	// repaired, and reconciled by the same rules as IndexSet's, after them: an
+	// absent one is created (concurrently with Concurrently), an invalid
+	// performance one rebuilt concurrently with Concurrently, and a drifted one
+	// rebuilt with Reconcile or reported in the IndexDriftError. An entry whose
+	// name IndexSet also declares, or a name given twice, is refused with a
+	// *ValidationError (field extra_indexes) before any statement runs. Nil
+	// installs IndexSet's alone.
+	ExtraIndexes []Index
+}
+
+// InspectIndexOpts configures InspectIndexesWithOptions. The zero value inspects
+// IndexSet's indexes alone, as InspectIndexes does.
+type InspectIndexOpts struct {
+	// ExtraIndexes are inspected beside IndexSet's and reported after them, by the
+	// same rules: absent, invalid, or drifted. Pass the entries a host installed,
+	// so its parity check covers them; an index a host did not install is not
+	// drift until it claims it here. The rules of IndexOpts.ExtraIndexes on names
+	// apply.
+	ExtraIndexes []Index
+}
+
+// ExplorerIndexSet returns the opt-in indexes that serve QueryJobs' and
+// CountJobs' common shapes on the jobs table, for the given GORM dialect name,
+// in order: jobs_explore_kind, jobs_explore_queue, jobs_explore_state, and, on
+// PostgreSQL alone, jobs_explore_tags. Each is IndexPerformance.
+//
+//   - jobs_explore_kind (kind, id) serves a kind filter newest or oldest first,
+//     and its count.
+//   - jobs_explore_queue (queue, id) serves a queue filter the same way.
+//   - jobs_explore_state (state, id) serves one state newest or oldest first,
+//     where jobs_state alone would sort every job in that state.
+//   - jobs_explore_tags, a GIN index on tags (jsonb_path_ops) over the jobs that
+//     carry any, serves a tag filter.
+//
+// They are never part of IndexSet, Indexes, Migrate, or a plain InstallIndexes,
+// and InspectIndexes never reports them, because each costs every write on
+// jobs: every state transition updates a jobs row, and since state sits in the
+// runtime's partial-index predicates, no such update is HOT, so every index on
+// the table gains an entry per transition (docs/TUNING.md, and
+// docs/BENCHMARKS.md for the measured cost). A host chooses which to pay for:
+// IndexOpts.ExtraIndexes or MigrateOpts.ExtraIndexes install them, or the DDL
+// goes into the host's own migrations, and InspectIndexesWithOptions checks
+// whichever it installed. No query needs one to be correct, only to be fast.
+//
+// An unsupported dialect returns ErrUnsupportedDialect, as IndexSet does.
+func ExplorerIndexSet(dialect string) ([]Index, error) {
+	if _, err := IndexSet(dialect); err != nil {
+		return nil, err
+	}
+	return explorerIndexes(dialect), nil
+}
+
+// explorerIndexes is ExplorerIndexSet's entries for dialect, which IndexSet has
+// already gated. The B-tree entries are portable; the tags index is PostgreSQL's
+// GIN, which SQLite cannot express.
+func explorerIndexes(dialect string) []Index {
+	set := []Index{
+		{
+			Name: "jobs_explore_kind", Kind: IndexPerformance, Table: "jobs",
+			DDL: `CREATE INDEX IF NOT EXISTS jobs_explore_kind ON jobs (kind, id) WHERE deleted_at IS NULL`,
+		},
+		{
+			Name: "jobs_explore_queue", Kind: IndexPerformance, Table: "jobs",
+			DDL: `CREATE INDEX IF NOT EXISTS jobs_explore_queue ON jobs (queue, id) WHERE deleted_at IS NULL`,
+		},
+		{
+			Name: "jobs_explore_state", Kind: IndexPerformance, Table: "jobs",
+			DDL: `CREATE INDEX IF NOT EXISTS jobs_explore_state ON jobs (state, id) WHERE deleted_at IS NULL`,
+		},
+	}
+	if dialect == "postgres" {
+		set = append(set, Index{
+			Name: "jobs_explore_tags", Kind: IndexPerformance, Table: "jobs",
+			DDL: `CREATE INDEX IF NOT EXISTS jobs_explore_tags ON jobs USING gin (tags jsonb_path_ops) WHERE tags <> '[]'::jsonb AND deleted_at IS NULL`,
+		})
+	}
+	return set
+}
+
+// checkExtraIndexes refuses an extra index whose name set declares, which would
+// install or inspect one name under two definitions, and a name extras give
+// twice. The names are the runtime's or the host's own, never data, so the
+// refusal names them.
+func checkExtraIndexes(set, extras []Index) error {
+	runtime := make(map[string]bool, len(set))
+	for _, idx := range set {
+		runtime[idx.Name] = true
+	}
+	given := make(map[string]bool, len(extras))
+	for _, idx := range extras {
+		if runtime[idx.Name] {
+			return newValidationError("extra_indexes", fmt.Sprintf("%s is one of the runtime's own indexes", idx.Name))
+		}
+		if given[idx.Name] {
+			return newValidationError("extra_indexes", fmt.Sprintf("names %s twice", idx.Name))
+		}
+		given[idx.Name] = true
+	}
+	return nil
 }
 
 // InstallIndexes applies every index for db's dialect, reporting drift as an
@@ -166,8 +269,8 @@ func InstallIndexes(ctx context.Context, db *gorm.DB) error {
 	return InstallIndexesWithOptions(ctx, db, IndexOpts{})
 }
 
-// InstallIndexesWithOptions applies every index for db's dialect, in order,
-// reconciling by definition rather than by name.
+// InstallIndexesWithOptions applies every index for db's dialect, in order, then
+// opts.ExtraIndexes, reconciling by definition rather than by name.
 //
 // An absent index is created. An index whose installed definition matches the
 // runtime's is left alone. An index whose definition has drifted is, by default,
@@ -198,18 +301,25 @@ func InstallIndexesWithOptions(ctx context.Context, db *gorm.DB, opts IndexOpts)
 // not: the library never takes the rebuild's ACCESS EXCLUSIVE lock uninvited. A
 // retired index — one the runtime once installed and no longer declares — is
 // dropped unconditionally, since that takes no lock worth deferring.
+//
+// opts.ExtraIndexes follow IndexSet's entries through the same steps, so a
+// host's extra index is created, repaired, and reconciled by the same rules; a
+// name that collides is refused before any statement runs.
 func applyIndexes(ctx context.Context, db *gorm.DB, opts IndexOpts) error {
 	set, err := IndexSet(db.Name())
 	if err != nil {
 		return err
 	}
-	drift, err := inspectIndexes(ctx, db, set)
+	if err := checkExtraIndexes(set, opts.ExtraIndexes); err != nil {
+		return err
+	}
+	drift, err := inspectIndexes(ctx, db, set, opts.ExtraIndexes)
 	if err != nil {
 		return err
 	}
 	concurrent := opts.Concurrently && db.Name() == "postgres"
-	kinds := make(map[string]IndexKind, len(set))
-	for _, idx := range set {
+	kinds := make(map[string]IndexKind, len(set)+len(opts.ExtraIndexes))
+	for _, idx := range append(slices.Clone(set), opts.ExtraIndexes...) {
 		kinds[idx.Name] = idx.Kind
 	}
 	var drifted []IndexDrift
@@ -389,7 +499,23 @@ type IndexDrift struct {
 // is still installed is reported with Retired set and an empty Expected — surfaced
 // so a host that hand-applies DDL sees the straggler, never counted as drift. An
 // unsupported dialect returns ErrUnsupportedDialect.
+//
+// A host's own indexes, and an explorer index it installed (ExplorerIndexSet),
+// are reported only when passed as InspectIndexOpts.ExtraIndexes. InspectIndexes
+// is InspectIndexesWithOptions with the zero InspectIndexOpts.
 func InspectIndexes(ctx context.Context, db *gorm.DB) ([]IndexDrift, error) {
+	return InspectIndexesWithOptions(ctx, db, InspectIndexOpts{})
+}
+
+// InspectIndexesWithOptions reports IndexSet's drift as InspectIndexes does, then
+// that of each opts.ExtraIndexes entry, by the same rules: absent, invalid, or
+// drifted. A host that installs some of ExplorerIndexSet's entries, in its own
+// migrations or through IndexOpts.ExtraIndexes, passes exactly those, so its
+// parity check covers them and an entry it chose not to install is never drift.
+// An extra index is read back by name, whatever table it is on. An entry whose
+// name IndexSet declares, or a name given twice, returns a *ValidationError
+// (field extra_indexes) before the catalog is read.
+func InspectIndexesWithOptions(ctx context.Context, db *gorm.DB, opts InspectIndexOpts) ([]IndexDrift, error) {
 	if db == nil {
 		return nil, fmt.Errorf("flywheel: InspectIndexes: db is nil")
 	}
@@ -397,7 +523,10 @@ func InspectIndexes(ctx context.Context, db *gorm.DB) ([]IndexDrift, error) {
 	if err != nil {
 		return nil, fmt.Errorf("flywheel: InspectIndexes: %w", err)
 	}
-	drift, err := inspectIndexes(ctx, db, set)
+	if err := checkExtraIndexes(set, opts.ExtraIndexes); err != nil {
+		return nil, fmt.Errorf("flywheel: InspectIndexes: %w", err)
+	}
+	drift, err := inspectIndexes(ctx, db, set, opts.ExtraIndexes)
 	if err != nil {
 		return nil, fmt.Errorf("flywheel: InspectIndexes: %w", err)
 	}
@@ -413,13 +542,20 @@ func InspectIndexes(ctx context.Context, db *gorm.DB) ([]IndexDrift, error) {
 // It reads the catalog once into a name→definition map and is the shared core of
 // InspectIndexes, which reports the drift, and applyIndexes, which acts on it. It
 // leaves the caller's name off the error so each entry point can prefix its own.
-func inspectIndexes(ctx context.Context, db *gorm.DB, set []Index) ([]IndexDrift, error) {
-	installed, err := readInstalledIndexDefs(ctx, db)
+//
+// extras are compared after set by the same rules, so their entries follow
+// set's; the caller has refused a colliding name.
+func inspectIndexes(ctx context.Context, db *gorm.DB, set, extras []Index) ([]IndexDrift, error) {
+	extraNames := make([]string, len(extras))
+	for i, idx := range extras {
+		extraNames[i] = idx.Name
+	}
+	installed, err := readInstalledIndexDefs(ctx, db, extraNames)
 	if err != nil {
 		return nil, err
 	}
 	var drift []IndexDrift
-	for _, idx := range set {
+	for _, idx := range append(slices.Clone(set), extras...) {
 		got, ok := installed[idx.Name]
 		switch {
 		case !ok:
@@ -460,7 +596,9 @@ type installedIndex struct {
 // The PostgreSQL branch names the tables explicitly, so a new runtime table's
 // indexes must be added to its IN list or InspectIndexes reports them as
 // perpetually absent; the SQLite branch reads every index and needs no change.
-func readInstalledIndexDefs(ctx context.Context, db *gorm.DB) (map[string]installedIndex, error) {
+// It also reads each of extraNames, a host's extra indexes, by name, whatever
+// table it is on.
+func readInstalledIndexDefs(ctx context.Context, db *gorm.DB, extraNames []string) (map[string]installedIndex, error) {
 	out := map[string]installedIndex{}
 	switch db.Name() {
 	case "postgres":
@@ -469,6 +607,13 @@ func readInstalledIndexDefs(ctx context.Context, db *gorm.DB) (map[string]instal
 			Indexdef   string
 			Indisvalid bool
 		}
+		tables := `i.tablename IN ('jobs', 'job_runs', 'job_periodics', 'limiter_buckets', 'limiter_holds',
+			                      'job_run_finishes', 'job_stats_hourly')`
+		var args []any
+		if len(extraNames) > 0 {
+			tables = "(" + tables + " OR i.indexname IN ?)"
+			args = append(args, extraNames)
+		}
 		if err := db.WithContext(ctx).Raw(`
 			SELECT i.indexname, i.indexdef, x.indisvalid
 			FROM pg_indexes i
@@ -476,8 +621,7 @@ func readInstalledIndexDefs(ctx context.Context, db *gorm.DB) (map[string]instal
 			JOIN pg_class c ON c.relname = i.indexname AND c.relnamespace = n.oid
 			JOIN pg_index x ON x.indexrelid = c.oid
 			WHERE i.schemaname = current_schema()
-			  AND i.tablename IN ('jobs', 'job_runs', 'job_periodics', 'limiter_buckets', 'limiter_holds',
-			                      'job_run_finishes', 'job_stats_hourly')`).Scan(&rows).Error; err != nil {
+			  AND `+tables, args...).Scan(&rows).Error; err != nil {
 			return nil, fmt.Errorf("read installed index definitions: %w", err)
 		}
 		for _, r := range rows {

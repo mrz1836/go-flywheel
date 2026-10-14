@@ -133,10 +133,18 @@ type MigrateOpts struct {
 	// steps before the failure applied; every step is additive and idempotent, so
 	// the retry completes it.
 	LockTimeout time.Duration
+
+	// ExtraIndexes are indexes the host chooses to install beside IndexSet's,
+	// such as entries of ExplorerIndexSet: installed, repaired, and reconciled by
+	// the same rules, after them. A name IndexSet declares, or one given twice, is
+	// refused before any statement runs. Nil installs IndexSet's alone. See
+	// IndexOpts.ExtraIndexes.
+	ExtraIndexes []Index
 }
 
 // MigrateWithOptions installs the schema per opts: AutoMigrate over Models,
-// StorageParameterSet's statements, then IndexSet's statements in order.
+// StorageParameterSet's statements, then IndexSet's statements in order, then
+// opts.ExtraIndexes.
 //
 // A host whose migration tool already created the tables wants InstallIndexes
 // and InstallStorageParameters instead: together they apply everything Migrate
@@ -167,6 +175,11 @@ type MigrateOpts struct {
 func MigrateWithOptions(db *gorm.DB, opts MigrateOpts) error {
 	if db == nil {
 		return fmt.Errorf("flywheel: Migrate: db is nil")
+	}
+	// A colliding extra index is refused before the tables are touched, not
+	// after, when the index step would find it.
+	if err := checkExtraIndexes(runtimeIndexes(), opts.ExtraIndexes); err != nil {
+		return fmt.Errorf("flywheel: Migrate: %w", err)
 	}
 	ctx := context.Background()
 	if err := withMigrationLock(ctx, db, func(conn *gorm.DB) error {
