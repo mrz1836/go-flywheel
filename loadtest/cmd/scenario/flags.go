@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -49,6 +50,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		tuned    bool
 		limiter  string
 		fairness string
+		explorer string
 	)
 
 	fs.StringVar(&opts.cfg.DSN, "dsn", os.Getenv(dsnEnv),
@@ -96,6 +98,9 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		"serve the Prometheus /metrics exposition on this host:port for the run (empty disables)")
 	fs.BoolVar(&tuned, "storage-tuning", false,
 		"apply the tuned fillfactor and autovacuum settings to jobs")
+	fs.StringVar(&explorer, "explorer-indexes", "",
+		"opt-in explorer indexes to install, a comma list of "+strings.Join(loadtest.ExplorerIndexNames(), ", ")+
+			" (with tags, every seeded job carries two tags)")
 	fs.IntVar(&opts.cfg.TerminalSeed, "terminal-seed", 0,
 		"seed this many already-finalized jobs so retention has a backlog to prune")
 	fs.DurationVar(&opts.cfg.TerminalSeedAge, "terminal-seed-age", 0,
@@ -159,6 +164,11 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	if !opts.cfg.Limiter.Valid() {
 		return options{}, fmt.Errorf("scenario: -limiter %q is not one of none, token-bucket, db", limiter)
 	}
+	names, err := parseExplorerIndexes(explorer)
+	if err != nil {
+		return options{}, err
+	}
+	opts.cfg.ExplorerIndexes = strings.Join(names, ",")
 	// The fault is built here, not in the harness, for the same reason: an
 	// unknown name costs a message rather than a provisioned schema, and the
 	// message names the flag the operator typed.
@@ -176,4 +186,26 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		return options{}, fmt.Errorf("scenario: no target: pass -dsn or set %s", dsnEnv)
 	}
 	return opts, nil
+}
+
+// parseExplorerIndexes reads -explorer-indexes' comma list, refusing a name the
+// explorer set does not declare, or one named twice, with a message naming the
+// flag. Empty selects none.
+func parseExplorerIndexes(list string) ([]string, error) {
+	var names []string
+	for _, n := range strings.Split(list, ",") {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		if !slices.Contains(loadtest.ExplorerIndexNames(), n) {
+			return nil, fmt.Errorf("scenario: -explorer-indexes %q: %q is not one of %s",
+				list, n, strings.Join(loadtest.ExplorerIndexNames(), ", "))
+		}
+		if slices.Contains(names, n) {
+			return nil, fmt.Errorf("scenario: -explorer-indexes %q names %q twice", list, n)
+		}
+		names = append(names, n)
+	}
+	return names, nil
 }

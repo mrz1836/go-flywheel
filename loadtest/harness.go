@@ -336,7 +336,7 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 		return h, fmt.Errorf("loadtest: open scheduler pool: %w", err)
 	}
 
-	if err = installSchema(ctx, h.work, cfg.Indexes, cfg.Storage); err != nil {
+	if err = installSchema(ctx, h.work, cfg.Indexes, cfg.Storage, cfg.explorerIndexes()...); err != nil {
 		return h, err
 	}
 

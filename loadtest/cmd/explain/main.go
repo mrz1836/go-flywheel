@@ -18,6 +18,9 @@
 //	go run -tags=loadtest ./loadtest/cmd/explain -query stats -jobs 1000000 \
 //	  -out docs/benchmarks/stats-plans-1m.txt
 //
+//	go run -tags=loadtest ./loadtest/cmd/explain -query explorer -jobs 1000000 \
+//	  -out docs/benchmarks/explorer-plans-1m.txt
+//
 // The artifact it writes carries no credentials: the DSN is redacted to host,
 // port, and database, which is what makes these files safe to commit.
 package main
@@ -79,6 +82,19 @@ func run(args []string, stdout, stderr *os.File) error {
 		}
 		if !opts.quiet {
 			printStatsSummary(stderr, report)
+		}
+		return runErr
+	}
+
+	// The explorer query characterizes the job query: each of its shapes with and
+	// without the explorer index meant for it, its capped counts, and GetJob.
+	if opts.query == "explorer" {
+		report, runErr := loadtest.ExplainExplorer(ctx, opts.cfg)
+		if writeErr := writeArtifact(report.Text(), opts.out, stdout); writeErr != nil {
+			return errors.Join(runErr, writeErr)
+		}
+		if !opts.quiet {
+			printExplorerSummary(stderr, report)
 		}
 		return runErr
 	}
@@ -256,5 +272,26 @@ func printStatsSummary(w *os.File, r loadtest.StatsExplainReport) {
 	p("%-36s %12s %6s\n", "read", "median", "stmts")
 	for _, read := range r.Reads {
 		p("%-36s %12s %6d\n", read.Name, read.Median, len(read.Statements))
+	}
+}
+
+// printExplorerSummary writes the explorer characterization's latency table to
+// stderr: each read's median with every explorer index and without the one its
+// shape is meant for. Write errors are ignored for the same reason printSummary
+// ignores them.
+func printExplorerSummary(w *os.File, r loadtest.ExplorerExplainReport) {
+	p := func(format string, args ...any) { _, _ = fmt.Fprintf(w, format, args...) }
+	if len(r.Reads) == 0 {
+		p("\nno reads measured\n")
+		return
+	}
+	p("\njobs=%d schema=%s\n", r.Jobs, r.Schema)
+	p("%-46s %12s %12s\n", "read", "with", "without")
+	for _, read := range r.Reads {
+		without := "-"
+		if read.Without != nil {
+			without = read.Without.Median.String()
+		}
+		p("%-46s %12s %12s\n", read.Name, read.With.Median, without)
 	}
 }

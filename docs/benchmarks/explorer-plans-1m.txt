@@ -1,0 +1,683 @@
+explorer read plans — postgres://localhost:55433/flywheel_test
+server: PostgreSQL 17.10 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+schema: lt_dm45poeeaveo_10zj_1
+fixture: 1000000 jobs over 30 days across 20 kinds, a dedicated kind of 10000, and a retired kind whose jobs all ran on the first day;
+  queues default 69%, bulk 30%, urgent 1%; states succeeded 60%, discarded 10%, cancelled 5%, available 12%,
+  retryable 6%, running 5%, paused 2%; two tags on 10% (common, and one of a hundred at 0.1% each);
+  5% the children of 100 parents; one run per claimed job
+jobs: 544.6 MB total, 341.0 MB of indexes; jobs_explore_kind 64.8 MB; jobs_explore_queue 64.7 MB; jobs_explore_state 64.7 MB; jobs_explore_tags 0.8 MB
+
+Every statement was captured from the flywheel call named above it through a recording GORM logger
+and explained verbatim with EXPLAIN (ANALYZE, BUFFERS), after VACUUM (ANALYZE). Latency is the wall
+time of the whole call as the median of 7 after a warm-up. "with" is measured with all four explorer
+indexes installed; "without" drops the one the shape is meant for, analyzes jobs, measures, and
+rebuilds it. A page is QueryJobs' default 50 items; access is the index each plan reads jobs through.
+The plans explain each statement with its values inlined. The timed calls bind them, as an application's
+driver does, so after five executions PostgreSQL may run a generic plan that does not know how common a
+value is: where a latency is far above its plan's execution time, that is the generic plan.
+
+read                                           index                     with     without  access with                      access without
+kind, newest first: 1% of jobs                 jobs_explore_kind      3.314ms     2.658ms  jobs_explore_kind                jobs_pkey
+kind, newest first: 5% of jobs                 jobs_explore_kind      2.600ms     2.418ms  jobs_pkey                        jobs_pkey
+kind, newest first: 0.2%, all a month old      jobs_explore_kind      2.279ms   233.191ms  jobs_explore_kind                jobs_pkey
+queue, newest first: 1% of jobs                jobs_explore_queue     2.424ms     6.328ms  jobs_explore_queue               jobs_pkey
+queue, newest first: 30% of jobs               jobs_explore_queue     2.336ms     2.270ms  jobs_pkey                        jobs_pkey
+one state, newest first: 2% of jobs            jobs_explore_state     2.212ms     2.641ms  jobs_explore_state               jobs_pkey
+one state, newest first: 60% of jobs           jobs_explore_state     2.224ms     2.438ms  jobs_pkey                        jobs_pkey
+tag, newest first: 0.1% of jobs                jobs_explore_tags      8.874ms    70.078ms  jobs_explore_tags                Seq Scan
+tag, newest first: 10% of jobs                 jobs_explore_tags      2.272ms    16.348ms  jobs_pkey                        jobs_pkey
+finished, three terminal states                jobs_finished          6.794ms           -  jobs_finished                    -
+scheduled, claimable states in one queue       jobs_ready            95.198ms           -  jobs_state                       -
+a parent's children                            jobs_parent_state      4.747ms           -  jobs_parent_state                -
+created window, one hour                       jobs_pkey              2.289ms           -  jobs_pkey                        -
+CountJobs below the cap: one kind, one state   -                     14.235ms           -  jobs_state                       -
+CountJobs at the cap: 10,000 of one kind       -                      1.239ms           -  jobs_explore_kind                -
+CountJobs past the cap: every job              -                      1.910ms           -  jobs_state                       -
+GetJob, a running job and its run              -                      1.241ms           -  jobs_pkey                        -
+
+=== kind, newest first: 1% of jobs (with every explorer index): median 3.314ms, min 2.266ms, max 11.235ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.kind IN ('kind-cap') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..500.52 rows=51 width=259) (actual time=0.021..0.227 rows=51 loops=1)
+    Buffers: shared hit=252
+    ->  Nested Loop Left Join  (cost=0.85..97974.42 rows=10000 width=259) (actual time=0.021..0.223 rows=51 loops=1)
+          Buffers: shared hit=252
+          ->  Index Scan Backward using jobs_explore_kind on jobs  (cost=0.42..34039.42 rows=10000 width=138) (actual time=0.010..0.049 rows=51 loops=1)
+                Index Cond: (kind = 'kind-cap'::text)
+                Buffers: shared hit=56
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..6.39 rows=1 width=1189) (actual time=0.003..0.003 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=196
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.379 ms
+  Execution Time: 0.267 ms
+
+=== kind, newest first: 1% of jobs (without jobs_explore_kind): median 2.658ms, min 2.534ms, max 2.801ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.kind IN ('kind-cap') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..679.22 rows=51 width=258) (actual time=0.034..0.899 rows=51 loops=1)
+    Buffers: shared hit=415
+    ->  Nested Loop Left Join  (cost=0.85..138335.43 rows=10400 width=258) (actual time=0.033..0.894 rows=51 loops=1)
+          Buffers: shared hit=415
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..72389.43 rows=10400 width=137) (actual time=0.022..0.733 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (kind = 'kind-cap'::text))
+                Rows Removed by Filter: 5049
+                Buffers: shared hit=219
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..6.34 rows=1 width=1189) (actual time=0.003..0.003 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=196
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.409 ms
+  Execution Time: 0.936 ms
+
+=== kind, newest first: 5% of jobs (with every explorer index): median 2.600ms, min 2.456ms, max 3.917ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.kind IN ('kind-3') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..266.71 rows=51 width=259) (actual time=0.015..0.264 rows=51 loops=1)
+    Buffers: shared hit=245
+    ->  Nested Loop Left Join  (cost=0.85..243793.66 rows=46767 width=259) (actual time=0.015..0.260 rows=51 loops=1)
+          Buffers: shared hit=245
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..72389.43 rows=46767 width=138) (actual time=0.007..0.143 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (kind = 'kind-3'::text))
+                Rows Removed by Filter: 930
+                Buffers: shared hit=47
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..3.66 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=198
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.358 ms
+  Execution Time: 0.297 ms
+
+=== kind, newest first: 5% of jobs (without jobs_explore_kind): median 2.418ms, min 2.213ms, max 5.232ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.kind IN ('kind-3') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..267.16 rows=51 width=258) (actual time=0.018..0.276 rows=51 loops=1)
+    Buffers: shared hit=245
+    ->  Nested Loop Left Join  (cost=0.85..243509.69 rows=46633 width=258) (actual time=0.017..0.271 rows=51 loops=1)
+          Buffers: shared hit=245
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..72389.43 rows=46633 width=137) (actual time=0.009..0.147 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (kind = 'kind-3'::text))
+                Rows Removed by Filter: 930
+                Buffers: shared hit=47
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..3.67 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=198
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.280 ms
+  Execution Time: 0.305 ms
+
+=== kind, newest first: 0.2%, all a month old (with every explorer index): median 2.279ms, min 2.139ms, max 2.547ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.kind IN ('kind-retired') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..611.61 rows=51 width=259) (actual time=0.024..0.167 rows=51 loops=1)
+    Buffers: shared hit=225
+    ->  Nested Loop Left Join  (cost=0.85..16766.87 rows=1400 width=259) (actual time=0.024..0.163 rows=51 loops=1)
+          Buffers: shared hit=225
+          ->  Index Scan Backward using jobs_explore_kind on jobs  (cost=0.42..5524.37 rows=1400 width=138) (actual time=0.010..0.020 rows=51 loops=1)
+                Index Cond: (kind = 'kind-retired'::text)
+                Buffers: shared hit=30
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..8.03 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=195
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.238 ms
+  Execution Time: 0.196 ms
+
+=== kind, newest first: 0.2%, all a month old (without jobs_explore_kind): median 233.191ms, min 230.741ms, max 250.144ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.kind IN ('kind-retired') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..2816.88 rows=51 width=258) (actual time=222.671..223.125 rows=51 loops=1)
+    Buffers: shared hit=9188 read=32146
+    ->  Nested Loop Left Join  (cost=0.85..84647.44 rows=1533 width=258) (actual time=222.670..223.120 rows=51 loops=1)
+          Buffers: shared hit=9188 read=32146
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..72389.43 rows=1533 width=137) (actual time=222.617..222.853 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (kind = 'kind-retired'::text))
+                Rows Removed by Filter: 967636
+                Buffers: shared hit=9023 read=32116
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..7.99 rows=1 width=1189) (actual time=0.005..0.005 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=165 read=30
+  Planning:
+    Buffers: shared hit=20 read=15
+  Planning Time: 0.324 ms
+  Execution Time: 223.189 ms
+
+=== queue, newest first: 1% of jobs (with every explorer index): median 2.424ms, min 2.255ms, max 2.863ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.queue IN ('urgent') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..462.51 rows=51 width=259) (actual time=0.018..0.166 rows=51 loops=1)
+    Buffers: shared hit=249
+    ->  Nested Loop Left Join  (cost=0.85..98063.38 rows=10833 width=259) (actual time=0.018..0.162 rows=51 loops=1)
+          Buffers: shared hit=249
+          ->  Index Scan Backward using jobs_explore_queue on jobs  (cost=0.42..29975.61 rows=10833 width=138) (actual time=0.009..0.026 rows=51 loops=1)
+                Index Cond: (queue = 'urgent'::text)
+                Buffers: shared hit=49
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..6.28 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=200
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.249 ms
+  Execution Time: 0.193 ms
+
+=== queue, newest first: 1% of jobs (without jobs_explore_queue): median 6.328ms, min 2.519ms, max 14.570ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.queue IN ('urgent') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..725.47 rows=51 width=258) (actual time=0.019..0.824 rows=51 loops=1)
+    Buffers: shared hit=424
+    ->  Nested Loop Left Join  (cost=0.85..133089.16 rows=9367 width=258) (actual time=0.018..0.819 rows=51 loops=1)
+          Buffers: shared hit=424
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..72389.43 rows=9367 width=137) (actual time=0.008..0.672 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (queue = 'urgent'::text))
+                Rows Removed by Filter: 5153
+                Buffers: shared hit=224
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..6.48 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=200
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.285 ms
+  Execution Time: 0.853 ms
+
+=== queue, newest first: 30% of jobs (with every explorer index): median 2.336ms, min 2.176ms, max 6.030ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.queue IN ('bulk') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..70.91 rows=51 width=259) (actual time=0.019..0.180 rows=51 loops=1)
+    Buffers: shared hit=210
+    ->  Nested Loop Left Join  (cost=0.85..408665.91 rows=297467 width=259) (actual time=0.019..0.175 rows=51 loops=1)
+          Buffers: shared hit=210
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..72389.43 rows=297467 width=138) (actual time=0.008..0.038 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (queue = 'bulk'::text))
+                Rows Removed by Filter: 141
+                Buffers: shared hit=12
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..1.13 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=198
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.286 ms
+  Execution Time: 0.221 ms
+
+=== queue, newest first: 30% of jobs (without jobs_explore_queue): median 2.270ms, min 2.214ms, max 2.543ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.queue IN ('bulk') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..70.52 rows=51 width=258) (actual time=0.016..0.151 rows=51 loops=1)
+    Buffers: shared hit=210
+    ->  Nested Loop Left Join  (cost=0.85..409799.43 rows=300000 width=258) (actual time=0.015..0.146 rows=51 loops=1)
+          Buffers: shared hit=210
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..72389.43 rows=300000 width=137) (actual time=0.007..0.035 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (queue = 'bulk'::text))
+                Rows Removed by Filter: 141
+                Buffers: shared hit=12
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..1.12 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=198
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.297 ms
+  Execution Time: 0.180 ms
+
+=== one state, newest first: 2% of jobs (with every explorer index): median 2.212ms, min 2.169ms, max 2.393ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.state = 'paused' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..394.33 rows=51 width=259) (actual time=0.022..0.134 rows=51 loops=1)
+    Buffers: shared hit=189
+    ->  Nested Loop Left Join  (cost=0.85..161768.49 rows=20967 width=259) (actual time=0.022..0.129 rows=51 loops=1)
+          Buffers: shared hit=189
+          ->  Index Scan Backward using jobs_explore_state on jobs  (cost=0.42..56073.76 rows=20967 width=138) (actual time=0.009..0.019 rows=51 loops=1)
+                Index Cond: (state = 'paused'::text)
+                Buffers: shared hit=36
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..5.04 rows=1 width=1189) (actual time=0.002..0.002 rows=0 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=153
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.244 ms
+  Execution Time: 0.161 ms
+
+=== one state, newest first: 2% of jobs (without jobs_explore_state): median 2.641ms, min 2.442ms, max 2.767ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.state = 'paused' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..438.05 rows=51 width=259) (actual time=0.027..0.491 rows=51 loops=1)
+    Buffers: shared hit=267
+    ->  Nested Loop Left Join  (cost=0.85..177169.91 rows=20667 width=259) (actual time=0.027..0.487 rows=51 loops=1)
+          Buffers: shared hit=267
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..72389.43 rows=20667 width=138) (actual time=0.016..0.367 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (state = 'paused'::text))
+                Rows Removed by Filter: 2543
+                Buffers: shared hit=114
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..5.07 rows=1 width=1189) (actual time=0.002..0.002 rows=0 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=153
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.273 ms
+  Execution Time: 0.519 ms
+
+=== one state, newest first: 60% of jobs (with every explorer index): median 2.224ms, min 2.174ms, max 2.566ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.state = 'succeeded' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..47.25 rows=51 width=259) (actual time=0.014..0.126 rows=51 loops=1)
+    Buffers: shared hit=211
+    ->  Nested Loop Left Join  (cost=0.85..542318.58 rows=596133 width=259) (actual time=0.014..0.122 rows=51 loops=1)
+          Buffers: shared hit=211
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..72389.43 rows=596133 width=138) (actual time=0.007..0.021 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (state = 'succeeded'::text))
+                Rows Removed by Filter: 39
+                Buffers: shared hit=7
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..0.79 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=204
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.263 ms
+  Execution Time: 0.156 ms
+
+=== one state, newest first: 60% of jobs (without jobs_explore_state): median 2.438ms, min 2.340ms, max 2.576ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.state = 'succeeded' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..47.17 rows=51 width=259) (actual time=0.019..0.134 rows=51 loops=1)
+    Buffers: shared hit=211
+    ->  Nested Loop Left Join  (cost=0.85..543154.07 rows=598000 width=259) (actual time=0.019..0.129 rows=51 loops=1)
+          Buffers: shared hit=211
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..72389.43 rows=598000 width=138) (actual time=0.008..0.023 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (state = 'succeeded'::text))
+                Rows Removed by Filter: 39
+                Buffers: shared hit=7
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..0.78 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=204
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.351 ms
+  Execution Time: 0.163 ms
+
+=== tag, newest first: 0.1% of jobs (with every explorer index): median 8.874ms, min 6.190ms, max 12.975ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.tags <> '[]'::jsonb AND (jobs.tags @> CAST('["tag-7"]' AS jsonb)) AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=1292.72..1292.85 rows=51 width=259) (actual time=4.823..4.829 rows=51 loops=1)
+    Buffers: shared hit=4609
+    ->  Sort  (cost=1292.72..1292.98 rows=104 width=259) (actual time=4.822..4.825 rows=51 loops=1)
+          Sort Key: jobs.id DESC
+          Sort Method: top-N heapsort  Memory: 76kB
+          Buffers: shared hit=4609
+          ->  Nested Loop Left Join  (cost=13.29..1289.25 rows=104 width=259) (actual time=0.265..4.030 rows=953 loops=1)
+                Buffers: shared hit=4609
+                ->  Bitmap Heap Scan on jobs  (cost=12.87..410.71 rows=104 width=138) (actual time=0.252..1.035 rows=953 loops=1)
+                      Recheck Cond: ((tags @> '["tag-7"]'::jsonb) AND (tags <> '[]'::jsonb) AND (deleted_at IS NULL))
+                      Heap Blocks: exact=942
+                      Buffers: shared hit=945
+                      ->  Bitmap Index Scan on jobs_explore_tags  (cost=0.00..12.84 rows=104 width=0) (actual time=0.174..0.174 rows=953 loops=1)
+                            Index Cond: (tags @> '["tag-7"]'::jsonb)
+                            Buffers: shared hit=3
+                ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..8.45 rows=1 width=1189) (actual time=0.003..0.003 rows=1 loops=953)
+                      Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                      Buffers: shared hit=3664
+  Planning:
+    Buffers: shared hit=36
+  Planning Time: 0.362 ms
+  Execution Time: 4.894 ms
+
+=== tag, newest first: 0.1% of jobs (without jobs_explore_tags): median 70.078ms, min 34.869ms, max 82.830ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.tags <> '[]'::jsonb AND (jobs.tags @> CAST('["tag-7"]' AS jsonb)) AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=33304.56..33304.56 rows=1 width=259) (actual time=64.395..70.231 rows=51 loops=1)
+    Buffers: shared hit=16998 read=12712
+    ->  Sort  (cost=33304.56..33304.56 rows=1 width=259) (actual time=64.394..70.225 rows=51 loops=1)
+          Sort Key: jobs.id DESC
+          Sort Method: top-N heapsort  Memory: 76kB
+          Buffers: shared hit=16998 read=12712
+          ->  Nested Loop Left Join  (cost=1000.42..33304.55 rows=1 width=259) (actual time=0.326..69.451 rows=953 loops=1)
+                Buffers: shared hit=16998 read=12712
+                ->  Gather  (cost=1000.00..33296.10 rows=1 width=138) (actual time=0.309..65.025 rows=953 loops=1)
+                      Workers Planned: 2
+                      Workers Launched: 2
+                      Buffers: shared hit=13334 read=12712
+                      ->  Parallel Seq Scan on jobs  (cost=0.00..32296.00 rows=1 width=138) (actual time=0.065..54.370 rows=318 loops=3)
+                            Filter: ((deleted_at IS NULL) AND (tags <> '[]'::jsonb) AND (tags @> '["tag-7"]'::jsonb))
+                            Rows Removed by Filter: 333016
+                            Buffers: shared hit=13334 read=12712
+                ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..8.45 rows=1 width=1189) (actual time=0.004..0.004 rows=1 loops=953)
+                      Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                      Buffers: shared hit=3664
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.313 ms
+  Execution Time: 70.318 ms
+
+=== tag, newest first: 10% of jobs (with every explorer index): median 2.272ms, min 2.190ms, max 6.668ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.tags <> '[]'::jsonb AND (jobs.tags @> CAST('["common"]' AS jsonb)) AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..701.19 rows=51 width=259) (actual time=0.027..0.224 rows=51 loops=1)
+    Buffers: shared hit=224
+    ->  Nested Loop Left Join  (cost=0.85..139697.84 rows=10173 width=259) (actual time=0.026..0.220 rows=51 loops=1)
+          Buffers: shared hit=224
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..74889.43 rows=10173 width=138) (actual time=0.012..0.099 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (tags <> '[]'::jsonb) AND (tags @> '["common"]'::jsonb))
+                Rows Removed by Filter: 481
+                Buffers: shared hit=25
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..6.37 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=199
+  Planning:
+    Buffers: shared hit=36
+  Planning Time: 0.321 ms
+  Execution Time: 0.253 ms
+
+=== tag, newest first: 10% of jobs (without jobs_explore_tags): median 16.348ms, min 15.823ms, max 17.688ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.tags <> '[]'::jsonb AND (jobs.tags @> CAST('["common"]' AS jsonb)) AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..698.83 rows=51 width=259) (actual time=0.025..0.244 rows=51 loops=1)
+    Buffers: shared hit=224
+    ->  Nested Loop Left Join  (cost=0.85..139966.01 rows=10227 width=259) (actual time=0.025..0.240 rows=51 loops=1)
+          Buffers: shared hit=224
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..74889.43 rows=10227 width=138) (actual time=0.013..0.109 rows=51 loops=1)
+                Filter: ((deleted_at IS NULL) AND (tags <> '[]'::jsonb) AND (tags @> '["common"]'::jsonb))
+                Rows Removed by Filter: 481
+                Buffers: shared hit=25
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..6.36 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=199
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.317 ms
+  Execution Time: 0.279 ms
+
+=== finished, three terminal states (with every explorer index): median 6.794ms, min 6.415ms, max 9.475ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.state = 'succeeded' AND jobs.finalized_at IS NOT NULL AND "jobs"."deleted_at" IS NULL ORDER BY jobs.finalized_at DESC, jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..61.44 rows=51 width=259) (actual time=0.029..0.145 rows=51 loops=1)
+    Buffers: shared hit=212
+    ->  Nested Loop Left Join  (cost=0.85..528508.99 rows=444855 width=259) (actual time=0.028..0.141 rows=51 loops=1)
+          Buffers: shared hit=212
+          ->  Index Scan Backward using jobs_finished on jobs  (cost=0.42..126276.38 rows=444855 width=138) (actual time=0.018..0.032 rows=51 loops=1)
+                Index Cond: (state = 'succeeded'::text)
+                Filter: (deleted_at IS NULL)
+                Buffers: shared hit=8
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..0.90 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=204
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.309 ms
+  Execution Time: 0.177 ms
+
+--- statement 2 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.state = 'cancelled' AND jobs.finalized_at IS NOT NULL AND "jobs"."deleted_at" IS NULL ORDER BY jobs.finalized_at DESC, jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..316.43 rows=51 width=259) (actual time=0.028..0.161 rows=51 loops=1)
+    Buffers: shared hit=228
+    ->  Nested Loop Left Join  (cost=0.85..234730.45 rows=37934 width=259) (actual time=0.028..0.157 rows=51 loops=1)
+          Buffers: shared hit=228
+          ->  Index Scan Backward using jobs_finished on jobs  (cost=0.42..83306.98 rows=37934 width=138) (actual time=0.019..0.040 rows=51 loops=1)
+                Index Cond: (state = 'cancelled'::text)
+                Filter: (deleted_at IS NULL)
+                Buffers: shared hit=24
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..3.99 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=204
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.273 ms
+  Execution Time: 0.187 ms
+
+--- statement 3 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.state = 'discarded' AND jobs.finalized_at IS NOT NULL AND "jobs"."deleted_at" IS NULL ORDER BY jobs.finalized_at DESC, jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..223.18 rows=51 width=259) (actual time=0.029..0.204 rows=51 loops=1)
+    Buffers: shared hit=222
+    ->  Nested Loop Left Join  (cost=0.85..322928.11 rows=74076 width=259) (actual time=0.029..0.199 rows=51 loops=1)
+          Buffers: shared hit=222
+          ->  Index Scan Backward using jobs_finished on jobs  (cost=0.42..100847.10 rows=74076 width=138) (actual time=0.012..0.027 rows=51 loops=1)
+                Index Cond: (state = 'discarded'::text)
+                Filter: (deleted_at IS NULL)
+                Buffers: shared hit=18
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..3.00 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=204
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.244 ms
+  Execution Time: 0.232 ms
+
+=== scheduled, claimable states in one queue (with every explorer index): median 95.198ms, min 91.629ms, max 97.270ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.state IN ('available', 'retryable', 'scheduled') AND jobs.queue IN ('default') AND "jobs"."deleted_at" IS NULL ORDER BY jobs.scheduled_at ASC, jobs.id ASC LIMIT 51
+
+plan:
+  Limit  (cost=38095.81..38206.86 rows=51 width=259) (actual time=85.707..92.333 rows=51 loops=1)
+    Buffers: shared hit=741 read=25654 written=6, temp read=1361 written=2295
+    ->  Nested Loop Left Join  (cost=38095.81..312265.53 rows=125912 width=259) (actual time=85.706..92.327 rows=51 loops=1)
+          Buffers: shared hit=741 read=25654 written=6, temp read=1361 written=2295
+          ->  Gather Merge  (cost=38095.39..52759.91 rows=125912 width=138) (actual time=85.657..92.075 rows=51 loops=1)
+                Workers Planned: 2
+                Workers Launched: 2
+                Buffers: shared hit=576 read=25638 written=6, temp read=1361 written=2295
+                ->  Sort  (cost=37095.36..37226.52 rows=52463 width=138) (actual time=76.598..76.624 rows=273 loops=3)
+                      Sort Key: jobs.scheduled_at, jobs.id
+                      Sort Method: external merge  Disk: 6872kB
+                      Buffers: shared hit=576 read=25638 written=6, temp read=1361 written=2295
+                      Worker 0:  Sort Method: external merge  Disk: 5656kB
+                      Worker 1:  Sort Method: external merge  Disk: 5800kB
+                      ->  Parallel Bitmap Heap Scan on jobs  (cost=1938.01..29216.52 rows=52463 width=138) (actual time=3.096..59.490 rows=41422 loops=3)
+                            Recheck Cond: ((state = ANY ('{available,retryable,scheduled}'::text[])) AND (deleted_at IS NULL))
+                            Filter: (queue = 'default'::text)
+                            Rows Removed by Filter: 18688
+                            Heap Blocks: exact=9708
+                            Buffers: shared hit=544 read=25638 written=6
+                            ->  Bitmap Index Scan on jobs_state  (cost=0.00..1906.53 rows=182033 width=0) (actual time=6.446..6.446 rows=180330 loops=1)
+                                  Index Cond: (state = ANY ('{available,retryable,scheduled}'::text[]))
+                                  Buffers: shared hit=3 read=147
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..2.06 rows=1 width=1189) (actual time=0.004..0.004 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=165 read=16
+  Planning:
+    Buffers: shared hit=19
+  Planning Time: 0.384 ms
+  Execution Time: 93.501 ms
+
+=== a parent's children (with every explorer index): median 4.747ms, min 4.108ms, max 10.629ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.parent_job_id = 'parent-7' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=6333.85..6333.98 rows=51 width=259) (actual time=2.697..2.704 rows=51 loops=1)
+    Buffers: shared hit=2482
+    ->  Sort  (cost=6333.85..6335.19 rows=533 width=259) (actual time=2.696..2.699 rows=51 loops=1)
+          Sort Key: jobs.id DESC
+          Sort Method: top-N heapsort  Memory: 67kB
+          Buffers: shared hit=2482
+          ->  Nested Loop Left Join  (cost=8.85..6316.07 rows=533 width=259) (actual time=0.121..2.245 rows=509 loops=1)
+                Buffers: shared hit=2482
+                ->  Bitmap Heap Scan on jobs  (cost=8.42..1901.55 rows=533 width=138) (actual time=0.110..0.494 rows=509 loops=1)
+                      Recheck Cond: ((parent_job_id = 'parent-7'::text) AND (deleted_at IS NULL))
+                      Heap Blocks: exact=509
+                      Buffers: shared hit=511
+                      ->  Bitmap Index Scan on jobs_parent_state  (cost=0.00..8.29 rows=533 width=0) (actual time=0.070..0.070 rows=509 loops=1)
+                            Index Cond: (parent_job_id = 'parent-7'::text)
+                            Buffers: shared hit=2
+                ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..8.28 rows=1 width=1189) (actual time=0.003..0.003 rows=1 loops=509)
+                      Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                      Buffers: shared hit=1971
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.319 ms
+  Execution Time: 2.753 ms
+
+=== created window, one hour (with every explorer index): median 2.289ms, min 2.133ms, max 6.048ms ===
+
+--- statement 1 ---
+SELECT jobs.id,jobs.kind,jobs.queue,jobs.state,jobs.parent_job_id,jobs.created_at,jobs.attempt,jobs.max_attempts,jobs.priority,jobs.executor_class,jobs.scheduled_at,jobs.finalized_at,jobs.updated_at,jobs.tags,jobs.metadata,r.id AS run_id,r.attempt AS run_attempt,r.outcome AS run_outcome,r.error_class AS run_error_class,substr(r.error_message, 1, 256) AS run_error,r.started_at AS run_started_at,r.finished_at AS run_finished_at,r.duration_ms AS run_duration_ms FROM "jobs" LEFT JOIN job_runs r ON r.job_id = jobs.id AND r.attempt = jobs.attempt WHERE jobs.id >= '019bc41a-0c00-0000-0000-000000000000' AND jobs.id < '019bc450-fa80-0000-0000-000000000000' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id DESC LIMIT 51
+
+plan:
+  Limit  (cost=0.85..431.77 rows=51 width=259) (actual time=0.022..0.140 rows=51 loops=1)
+    Buffers: shared hit=203
+    ->  Nested Loop Left Join  (cost=0.85..2544.14 rows=301 width=259) (actual time=0.021..0.136 rows=51 loops=1)
+          Buffers: shared hit=203
+          ->  Index Scan Backward using jobs_pkey on jobs  (cost=0.42..29.45 rows=301 width=138) (actual time=0.012..0.022 rows=51 loops=1)
+                Index Cond: ((id >= '019bc41a-0c00-0000-0000-000000000000'::text) AND (id < '019bc450-fa80-0000-0000-000000000000'::text))
+                Filter: (deleted_at IS NULL)
+                Buffers: shared hit=7
+          ->  Index Scan using job_runs_job_attempt on job_runs r  (cost=0.42..8.35 rows=1 width=1189) (actual time=0.002..0.002 rows=1 loops=51)
+                Index Cond: ((job_id = jobs.id) AND (attempt = jobs.attempt))
+                Buffers: shared hit=196
+  Planning:
+    Buffers: shared hit=35
+  Planning Time: 0.274 ms
+  Execution Time: 0.169 ms
+
+=== CountJobs below the cap: one kind, one state (with every explorer index): median 14.235ms, min 12.786ms, max 18.585ms ===
+
+--- statement 1 ---
+SELECT count(*) FROM (SELECT 1 FROM "jobs" WHERE jobs.state = 'paused' AND jobs.kind IN ('kind-3') AND "jobs"."deleted_at" IS NULL LIMIT 10001) AS capped
+
+plan:
+  Aggregate  (cost=26373.54..26373.55 rows=1 width=8) (actual time=13.271..13.272 rows=1 loops=1)
+    Buffers: shared hit=13948
+    ->  Limit  (cost=225.92..26361.28 rows=981 width=4) (actual time=3.597..13.220 rows=980 loops=1)
+          Buffers: shared hit=13948
+          ->  Bitmap Heap Scan on jobs  (cost=225.92..26361.28 rows=981 width=4) (actual time=3.596..13.148 rows=980 loops=1)
+                Recheck Cond: ((state = 'paused'::text) AND (deleted_at IS NULL))
+                Filter: (kind = 'kind-3'::text)
+                Rows Removed by Filter: 18981
+                Heap Blocks: exact=13930
+                Buffers: shared hit=13948
+                ->  Bitmap Index Scan on jobs_state  (cost=0.00..225.68 rows=20967 width=0) (actual time=2.147..2.147 rows=19961 loops=1)
+                      Index Cond: (state = 'paused'::text)
+                      Buffers: shared hit=18
+  Planning:
+    Buffers: shared hit=3
+  Planning Time: 0.108 ms
+  Execution Time: 13.463 ms
+
+=== CountJobs at the cap: 10,000 of one kind (with every explorer index): median 1.239ms, min 1.146ms, max 1.394ms ===
+
+--- statement 1 ---
+SELECT count(*) FROM (SELECT 1 FROM "jobs" WHERE jobs.kind IN ('kind-cap') AND "jobs"."deleted_at" IS NULL LIMIT 10001) AS capped
+
+plan:
+  Aggregate  (cost=632.42..632.43 rows=1 width=8) (actual time=2.160..2.161 rows=1 loops=1)
+    Buffers: shared hit=86
+    ->  Limit  (cost=0.42..507.43 rows=10000 width=4) (actual time=0.014..1.703 rows=10000 loops=1)
+          Buffers: shared hit=86
+          ->  Index Only Scan using jobs_explore_kind on jobs  (cost=0.42..507.43 rows=10000 width=4) (actual time=0.013..0.978 rows=10000 loops=1)
+                Index Cond: (kind = 'kind-cap'::text)
+                Heap Fetches: 0
+                Buffers: shared hit=86
+  Planning:
+    Buffers: shared hit=3
+  Planning Time: 0.057 ms
+  Execution Time: 2.178 ms
+
+=== CountJobs past the cap: every job (with every explorer index): median 1.910ms, min 1.436ms, max 4.195ms ===
+
+--- statement 1 ---
+SELECT count(*) FROM (SELECT 1 FROM "jobs" WHERE "jobs"."deleted_at" IS NULL LIMIT 10001) AS capped
+
+plan:
+  Aggregate  (cost=307.38..307.39 rows=1 width=8) (actual time=1.765..1.766 rows=1 loops=1)
+    Buffers: shared hit=11
+    ->  Limit  (cost=0.42..182.36 rows=10001 width=4) (actual time=0.016..1.345 rows=10001 loops=1)
+          Buffers: shared hit=11
+          ->  Index Only Scan using jobs_state on jobs  (cost=0.42..18192.42 rows=1000000 width=4) (actual time=0.016..0.636 rows=10001 loops=1)
+                Heap Fetches: 0
+                Buffers: shared hit=11
+  Planning:
+    Buffers: shared hit=3
+  Planning Time: 0.035 ms
+  Execution Time: 1.774 ms
+
+=== GetJob, a running job and its run (with every explorer index): median 1.241ms, min 1.038ms, max 3.021ms ===
+
+--- statement 1 ---
+SELECT id, kind, queue, state, parent_job_id, created_at, attempt, max_attempts, priority, executor_class, scheduled_at, finalized_at, updated_at, tags, metadata, unique_key, unique_active_key, timeout_ms, leased_until, barrier_kind, barrier_spec, octet_length(args::text) AS args_bytes, CASE WHEN octet_length(args::text) <= 1048576 THEN args END AS args FROM "jobs" WHERE id = '019b76db-86c0-7000-8000-000000000016' AND "jobs"."deleted_at" IS NULL LIMIT 1
+
+plan:
+  Limit  (cost=0.42..8.46 rows=1 width=318) (actual time=0.018..0.018 rows=1 loops=1)
+    Buffers: shared hit=4
+    ->  Index Scan using jobs_pkey on jobs  (cost=0.42..8.46 rows=1 width=318) (actual time=0.017..0.017 rows=1 loops=1)
+          Index Cond: (id = '019b76db-86c0-7000-8000-000000000016'::text)
+          Filter: (deleted_at IS NULL)
+          Buffers: shared hit=4
+  Planning:
+    Buffers: shared hit=3
+  Planning Time: 0.049 ms
+  Execution Time: 0.029 ms
+
+--- statement 2 ---
+SELECT * FROM "job_runs" WHERE job_id = '019b76db-86c0-7000-8000-000000000016' AND attempt = 1 LIMIT 1
+
+plan:
+  Limit  (cost=0.42..8.45 rows=1 width=1316) (actual time=0.036..0.037 rows=1 loops=1)
+    Buffers: shared hit=7
+    ->  Index Scan using job_runs_job_attempt on job_runs  (cost=0.42..8.45 rows=1 width=1316) (actual time=0.036..0.036 rows=1 loops=1)
+          Index Cond: ((job_id = '019b76db-86c0-7000-8000-000000000016'::text) AND (attempt = 1))
+          Buffers: shared hit=7
+  Planning Time: 0.023 ms
+  Execution Time: 0.043 ms
