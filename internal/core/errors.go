@@ -376,6 +376,13 @@ var ErrJobTerminal = errors.New("flywheel: job has already reached a terminal st
 // finish, or set RetryOpts.AllowRunning to re-queue it anyway.
 var ErrJobRunning = errors.New("flywheel: job is running")
 
+// ErrJobNotTerminal is returned when an operator action that needs a finished
+// job, such as DeleteJob, targets one that hasn't finished: a job that is
+// available, retryable, scheduled, or paused. (A running one is refused with
+// ErrJobRunning.) The runtime refuses the write and leaves the job as it was:
+// cancel it first, or wait for it to finish.
+var ErrJobNotTerminal = errors.New("flywheel: job has not reached a terminal state")
+
 // ErrReplayUnbounded is returned by Replay when neither Kinds nor FailedSince is
 // set. An unscoped replay of every discarded job in the database is almost never
 // the intent, so the runtime refuses it rather than doing something enormous by

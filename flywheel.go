@@ -175,6 +175,8 @@ const (
 	AuditOldest              = core.AuditOldest
 	AuditPaused              = core.AuditPaused
 	AuditReplayed            = core.AuditReplayed
+	AuditReprioritized       = core.AuditReprioritized
+	AuditRescheduled         = core.AuditRescheduled
 	AuditResumed             = core.AuditResumed
 	AuditRetried             = core.AuditRetried
 	AuditTargetJob           = core.AuditTargetJob
@@ -235,6 +237,7 @@ var (
 	ErrIndexDrift         = core.ErrIndexDrift
 	ErrJobCancelled       = core.ErrJobCancelled
 	ErrJobNotFound        = core.ErrJobNotFound
+	ErrJobNotTerminal     = core.ErrJobNotTerminal
 	ErrJobRunning         = core.ErrJobRunning
 	ErrJobTerminal        = core.ErrJobTerminal
 	ErrMissingKind        = core.ErrMissingKind
@@ -317,6 +320,10 @@ func DeleteFinishedJobs(ctx context.Context, db *gorm.DB, olderThan time.Time) (
 
 func DeleteFinishedJobsWithOptions(ctx context.Context, db *gorm.DB, olderThan time.Time, opts RetentionOpts) (int64, error) {
 	return core.DeleteFinishedJobsWithOptions(ctx, db, olderThan, opts)
+}
+
+func DeleteJob(ctx context.Context, db *gorm.DB, id string) error {
+	return core.DeleteJob(ctx, db, id)
 }
 
 func DeletePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
@@ -508,6 +515,10 @@ func PauseByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts Sc
 	return core.PauseByParent(ctx, db, parentJobID, opts)
 }
 
+func PauseJob(ctx context.Context, db *gorm.DB, id string) error {
+	return core.PauseJob(ctx, db, id)
+}
+
 func PausePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
 	return core.PausePeriodic(ctx, db, slug)
 }
@@ -548,8 +559,16 @@ func ReplayByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts R
 	return core.ReplayByParent(ctx, db, parentJobID, opts)
 }
 
+func RescheduleJob(ctx context.Context, db *gorm.DB, id string, at time.Time) error {
+	return core.RescheduleJob(ctx, db, id, at)
+}
+
 func ResumeByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
 	return core.ResumeByParent(ctx, db, parentJobID, opts)
+}
+
+func ResumeJob(ctx context.Context, db *gorm.DB, id string) error {
+	return core.ResumeJob(ctx, db, id)
 }
 
 func ResumePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
@@ -570,6 +589,10 @@ func SampleQueueHealth(ctx context.Context, db *gorm.DB) (QueueHealth, error) {
 
 func SeedRun(ctx context.Context, db *gorm.DB, seed RunSeed) (string, error) {
 	return core.SeedRun(ctx, db, seed)
+}
+
+func SetJobPriority(ctx context.Context, db *gorm.DB, id string, priority int) error {
+	return core.SetJobPriority(ctx, db, id, priority)
 }
 
 func SetPeriodicActive(ctx context.Context, db *gorm.DB, slug string, active bool) error {

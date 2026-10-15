@@ -196,19 +196,11 @@ func deleteFinishedBatch(
 		if len(ids) == 0 {
 			return nil
 		}
-		// The runs' finish-log entries go first, then runs before jobs, per the
-		// contract in the exported doc comment.
-		if err := deleteRunFinishes(tx, ids); err != nil {
+		n, err := deleteJobRows(tx, ids)
+		if err != nil {
 			return err
 		}
-		if err := tx.Where("job_id IN ?", ids).Delete(&jobRunRow{}).Error; err != nil {
-			return fmt.Errorf("flywheel: delete finished job runs: %w", err)
-		}
-		res := tx.Unscoped().Where("id IN ?", ids).Delete(&jobRow{})
-		if res.Error != nil {
-			return fmt.Errorf("flywheel: delete finished jobs: %w", res.Error)
-		}
-		deleted = res.RowsAffected
+		deleted = n
 		// Pluck ordered by id, so the last element is the batch's high-water mark.
 		last = ids[len(ids)-1]
 		return nil
@@ -217,6 +209,26 @@ func deleteFinishedBatch(
 		return 0, "", fmt.Errorf("flywheel: delete finished jobs: %w", err)
 	}
 	return deleted, last, nil
+}
+
+// deleteJobRows hard-deletes the jobs in ids with their runs, on tx, in the
+// order DeleteFinishedJobsWithOptions' doc comment makes contractual: the runs'
+// job_run_finishes entries first, then the job_runs rows, then the jobs rows,
+// past the soft-delete scope (Unscoped). It reports how many jobs it deleted.
+// Retention and DeleteJob both delete through it, so the order lives in one
+// place.
+func deleteJobRows(tx *gorm.DB, ids []string) (int64, error) {
+	if err := deleteRunFinishes(tx, ids); err != nil {
+		return 0, err
+	}
+	if err := tx.Where("job_id IN ?", ids).Delete(&jobRunRow{}).Error; err != nil {
+		return 0, fmt.Errorf("flywheel: delete finished job runs: %w", err)
+	}
+	res := tx.Unscoped().Where("id IN ?", ids).Delete(&jobRow{})
+	if res.Error != nil {
+		return 0, fmt.Errorf("flywheel: delete finished jobs: %w", res.Error)
+	}
+	return res.RowsAffected, nil
 }
 
 // deleteRunFinishes deletes the job_run_finishes entries of the given jobs'
