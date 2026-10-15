@@ -16,7 +16,7 @@ import (
 )
 
 // newJobsCmd builds the `flywheel jobs` command group: ls, count, running,
-// inspect, retry, cancel.
+// inspect, history, retry, cancel.
 func newJobsCmd(configPath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "jobs", Short: "Inspect and operate jobs"}
 	cmd.AddCommand(
@@ -24,6 +24,7 @@ func newJobsCmd(configPath *string) *cobra.Command {
 		newJobsCountCmd(configPath),
 		newJobsRunningCmd(configPath),
 		newJobsInspectCmd(configPath),
+		newJobsHistoryCmd(configPath),
 		newJobsRetryCmd(configPath),
 		newJobsCancelCmd(configPath),
 	)
@@ -286,6 +287,67 @@ func newJobsInspectCmd(configPath *string) *cobra.Command {
 	return cmd
 }
 
+// newJobsHistoryCmd prints a job's control history through ListAudit, newest
+// first: who retried, cancelled, paused, resumed, or replayed it, and why.
+func newJobsHistoryCmd(configPath *string) *cobra.Command {
+	var (
+		cursor string
+		limit  int
+		asJSON bool
+	)
+	cmd := &cobra.Command{
+		Use:   "history <job-id>",
+		Short: "Show who changed a job, and why, newest first",
+		Long: `Print the job's control history, newest first: one line per change a
+control made to it, with when it ran (UTC), what it did, who ran it, through
+which source, and the reason they gave. The history outlives the job.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, db, _, err := loadAndOpen(*configPath)
+			if err != nil {
+				return err
+			}
+			defer closeDB(db)
+
+			page, err := flywheel.ListAudit(cmd.Context(), db, flywheel.ListAuditParams{
+				TargetType: flywheel.AuditTargetJob, TargetID: args[0], Cursor: cursor, Limit: limit,
+			})
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				return writeJSON(cmd.OutOrStdout(), page)
+			}
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
+			_, _ = fmt.Fprintln(tw, "WHEN\tACTION\tACTOR\tSOURCE\tREASON")
+			for _, e := range page.Entries {
+				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", e.CreatedAt.UTC().Format(time.RFC3339), e.Action,
+					actorLabel(e.Actor), orDash(e.Actor.Source), orDash(e.Actor.Reason))
+			}
+			if err := tw.Flush(); err != nil {
+				return err
+			}
+			if page.NextCursor != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "next: --cursor %s\n", page.NextCursor)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&cursor, "cursor", "", "read the next page: the cursor printed under the previous one")
+	cmd.Flags().IntVar(&limit, "limit", 50, "maximum entries (at most 200)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the page as JSON (entries, next_cursor) instead of a table")
+	return cmd
+}
+
+// actorLabel renders an actor as history prints it: <type>:<id>, or the type
+// alone when the actor has no id, as the system has none.
+func actorLabel(a flywheel.Actor) string {
+	if a.ID == "" {
+		return string(a.Type)
+	}
+	return string(a.Type) + ":" + a.ID
+}
+
 // writeJobDetail writes a job's detail and its runs as text: the job's fields,
 // those it does not carry left out, then its metadata and args as stored, then
 // the run count, the run table, and each run's captured error and output.
@@ -365,7 +427,10 @@ func writeJobDetail(out io.Writer, job flywheel.JobDetail, runs []flywheel.JobRu
 // no flag it retries only a job that is still waiting; --force admits a terminal
 // job, and --allow-running a running one.
 func newJobsRetryCmd(configPath *string) *cobra.Command {
-	var force, allowRunning bool
+	var (
+		force, allowRunning bool
+		reason              string
+	)
 	cmd := &cobra.Command{
 		Use:   "retry <job-id>",
 		Short: "Return a job to available so it runs again",
@@ -381,35 +446,47 @@ runs twice.`,
 			retry := func(ctx context.Context, db *gorm.DB, id string) error {
 				return flywheel.RetryJobWithOptions(ctx, db, id, opts)
 			}
-			return mutateJob(cmd, *configPath, args[0], retry, "retried")
+			return mutateJob(cmd, *configPath, args[0], reason, retry, "retried")
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "retry a job that reached a terminal state")
 	cmd.Flags().BoolVar(&allowRunning, "allow-running", false,
 		"re-queue a running job; its current attempt keeps running and its result is discarded")
+	addReasonFlag(cmd, &reason)
 	return cmd
 }
 
 // newJobsCancelCmd cancels a job.
 func newJobsCancelCmd(configPath *string) *cobra.Command {
-	return &cobra.Command{
+	var reason string
+	cmd := &cobra.Command{
 		Use:   "cancel <job-id>",
 		Short: "Move a job to the terminal cancelled state",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return mutateJob(cmd, *configPath, args[0], flywheel.CancelJob, "cancelled")
+			return mutateJob(cmd, *configPath, args[0], reason, flywheel.CancelJob, "cancelled")
 		},
 	}
+	addReasonFlag(cmd, &reason)
+	return cmd
 }
 
-// mutateJob runs a job mutator (retry/cancel) and reports the result.
-func mutateJob(cmd *cobra.Command, configPath, id string, mutate func(context.Context, *gorm.DB, string) error, verb string) error {
+// addReasonFlag adds --reason to a control command.
+func addReasonFlag(cmd *cobra.Command, reason *string) {
+	cmd.Flags().StringVar(reason, "reason", "", "why you are running it; recorded in the history")
+}
+
+// mutateJob runs a job mutator (retry/cancel) as the operating-system user, with
+// reason, and reports the result.
+func mutateJob(
+	cmd *cobra.Command, configPath, id, reason string, mutate func(context.Context, *gorm.DB, string) error, verb string,
+) error {
 	_, db, _, err := loadAndOpen(configPath)
 	if err != nil {
 		return err
 	}
 	defer closeDB(db)
-	if err := mutate(cmd.Context(), db, id); err != nil {
+	if err := mutate(flywheel.WithActor(cmd.Context(), operatorActor(reason)), db, id); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", verb, id)

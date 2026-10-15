@@ -292,6 +292,32 @@ type jobStatsProgressRow struct {
 // TableName binds jobStatsProgressRow to the job_stats_progress table.
 func (jobStatsProgressRow) TableName() string { return "job_stats_progress" }
 
+// jobAuditRow is one entry of the control history: one change one control made
+// to one target, with who made it and why. Entries are only ever inserted, by
+// the control in the transaction that makes the change; they outlive the jobs
+// and schedules they name, and only DeleteAuditEntries removes them.
+//
+// TargetID is the target's stable name — a job's id, a periodic's slug — and is
+// text whatever type a host gives jobs.id, so it is compared only with bound
+// values, never joined to another table's key. CreatedAt is UTC, so SQLite's
+// text comparison of it is a time comparison.
+type jobAuditRow struct {
+	ID         string         `gorm:"column:id;primaryKey"`
+	CreatedAt  time.Time      `gorm:"column:created_at;not null"`
+	TargetType string         `gorm:"column:target_type;not null"`
+	TargetID   string         `gorm:"column:target_id;not null"`
+	Action     string         `gorm:"column:action;not null"`
+	ActorType  string         `gorm:"column:actor_type;not null"`
+	ActorID    string         `gorm:"column:actor_id;not null;default:''"`
+	Reason     string         `gorm:"column:reason;not null;default:''"`
+	Source     string         `gorm:"column:source;not null;default:''"`
+	RequestID  string         `gorm:"column:request_id;not null;default:''"`
+	Details    datatypes.JSON `gorm:"column:details;type:jsonb;not null;default:'{}'"`
+}
+
+// TableName binds jobAuditRow to the job_audit table.
+func (jobAuditRow) TableName() string { return "job_audit" }
+
 // limiterBucketRow is the DBLimiter's per-resource rate reservoir. The resource
 // string is the primary key — one bucket per protected dependency — and the row
 // doubles as the per-resource mutex a shared Acquire locks. It carries no

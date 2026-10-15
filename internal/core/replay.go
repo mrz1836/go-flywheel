@@ -22,6 +22,10 @@ import (
 // not returned (a cancel fences a running attempt without awaiting it). It
 // ignores RetryOpts.AllowRunning; a single RetryJobWithOptions is the way to
 // re-queue such a job deliberately.
+//
+// Each replayed job gets one AuditReplayed entry in its batch's transaction,
+// recording the state it changed from and these retry options, with
+// allow_running false.
 type ReplayOpts struct {
 	RetryOpts
 
@@ -119,11 +123,21 @@ func (o ReplayOpts) replayStates() []JobState {
 // cancellation is checked between batches, so a cancelled replay is partial
 // progress returned alongside the wrapped context error, with the committed batches
 // kept.
+//
+// Each batch locks the children it is about to replay, in id order (FOR UPDATE on
+// PostgreSQL), and writes one AuditReplayed entry per child it returned to
+// available, in its own transaction: attributed to the context's actor
+// (WithActor; the system when there is none), with via "parent" and the parent's
+// id. A child left terminal for its key gets no entry, and a batch rerun after a
+// lost race writes its entries once. A batch reads back the ids its update changed
+// (RETURNING id), so a GORM handle configured without RETURNING fails the batch
+// rather than record less than it changed. An actor the history can't record is
+// refused with a *ValidationError before anything is read.
 func ReplayByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ReplayOpts) (ScopeResult, error) {
 	scope := func(q *gorm.DB) *gorm.DB {
 		return applyKindFilter(q.Where("parent_job_id = ?", parentJobID), opts.Kinds)
 	}
-	return replay(ctx, db, scope, "replay by parent", opts)
+	return replay(ctx, db, scope, "replay by parent", auditScope{via: "parent", parentJobID: parentJobID}, opts)
 }
 
 // Replay returns every job matching opts to available, unscoped by lineage,
@@ -138,7 +152,8 @@ func ReplayByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts R
 //
 // It carries the same state guards (a running job, or a cancelled one whose
 // attempt is still running, is never replayed), UniqueActiveKey rule, batching,
-// and cancellation contract as ReplayByParent.
+// cancellation contract, and control history as ReplayByParent; its entries record
+// via "replay".
 func Replay(ctx context.Context, db *gorm.DB, opts ReplayOpts) (ScopeResult, error) {
 	if len(opts.Kinds) == 0 && opts.FailedSince.IsZero() {
 		return ScopeResult{}, ErrReplayUnbounded
@@ -146,7 +161,7 @@ func Replay(ctx context.Context, db *gorm.DB, opts ReplayOpts) (ScopeResult, err
 	scope := func(q *gorm.DB) *gorm.DB {
 		return applyKindFilter(q, opts.Kinds)
 	}
-	return replay(ctx, db, scope, "replay", opts)
+	return replay(ctx, db, scope, "replay", auditScope{via: "replay"}, opts)
 }
 
 // applyKindFilter narrows q to the given kinds when any are named, and leaves it
@@ -186,7 +201,7 @@ func applyKindFilter(q *gorm.DB, kinds []string) *gorm.DB {
 // UPDATE is skipped by the UPDATE's re-guard and counted in no bucket: Changed
 // counts only real transitions.
 func replay(
-	ctx context.Context, db *gorm.DB, scope func(*gorm.DB) *gorm.DB, label string, opts ReplayOpts,
+	ctx context.Context, db *gorm.DB, scope func(*gorm.DB) *gorm.DB, label string, audit auditScope, opts ReplayOpts,
 ) (ScopeResult, error) {
 	if db == nil {
 		return ScopeResult{}, fmt.Errorf("flywheel: %s: db is nil", label)
@@ -203,6 +218,10 @@ func replay(
 	}
 	if !opts.Force && slices.Contains(states, StateSucceeded) {
 		return ScopeResult{}, ErrJobTerminal
+	}
+	actor, err := resolveActor(ctx)
+	if err != nil {
+		return ScopeResult{}, err
 	}
 	stateStrs := stateStrings(states)
 	batchSize := opts.batchSize()
@@ -281,7 +300,7 @@ func replay(
 		if err := ctx.Err(); err != nil {
 			return result, fmt.Errorf("flywheel: %s cancelled after %d changed: %w", label, result.Changed, err)
 		}
-		b, err := replayBatch(ctx, db, scope, stateStrs, opts, cursor, batchSize, now, base, total, placed)
+		b, err := replayBatch(ctx, db, scope, stateStrs, opts, cursor, batchSize, now, base, total, placed, actor, audit)
 		if err != nil {
 			// A batch that lost a race for a key rolled back whole, so running it
 			// again is safe, and the rerun reads the new holder and leaves that job
@@ -359,6 +378,13 @@ func retryableBatchError(err error) bool {
 	return false
 }
 
+// auditScope is what bounded a replay's cohort, which its entries record: via is
+// "parent", with the parent's id, for ReplayByParent, and "replay" for Replay.
+type auditScope struct {
+	via         string
+	parentJobID string
+}
+
 // replayBatchResult is what one replay batch did.
 type replayBatchResult struct {
 	// selected is how many rows the batch's SELECT returned, which drives the loop's
@@ -405,6 +431,7 @@ type replayCandidate struct {
 func replayBatch(
 	ctx context.Context, db *gorm.DB, scope func(*gorm.DB) *gorm.DB, stateStrs []string,
 	opts ReplayOpts, cursor string, batchSize int, now, base time.Time, total, placed int,
+	actor Actor, audit auditScope,
 ) (b replayBatchResult, err error) {
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		q := skipAttemptsStillRunning(scope(tx.Model(&jobRow{})).Where("state IN ?", stateStrs), stateStrs)
@@ -453,16 +480,40 @@ func replayBatch(
 		}
 		applyRetryBudget(upd, opts.RetryOpts)
 
-		res := skipAttemptsStillRunning(tx.Model(&jobRow{}).
-			Where("id IN ? AND state IN ? AND NOT "+activeKeyHeld("jobs"), live, stateStrs), stateStrs).
-			Updates(upd)
-		if res.Error != nil {
-			return res.Error
+		states, e := lockJobStates(ctx, tx, live)
+		if e != nil {
+			return e
 		}
-		b.changed = res.RowsAffected
-		return nil
+		guard := "id IN ? AND state IN ? AND NOT " + activeKeyHeld("jobs")
+		if namesCancelled(stateStrs) {
+			guard += " AND NOT " + cancelledAttemptStillRuns("jobs")
+		}
+		replayed, e := updateJobsReturningIDs(tx, guard, []any{live, stateStrs}, upd)
+		if e != nil {
+			return e
+		}
+		b.changed = int64(len(replayed))
+		return recordAudit(ctx, tx, actor, models.ClockFrom(ctx).Now(ctx), replayChanges(replayed, states, opts, audit))
 	})
 	return b, err
+}
+
+// replayChanges is one AuditReplayed change per replayed id: the state it
+// changed from, the retry options the replay used (allow_running false, since a
+// replay ignores it), and what bounded the cohort.
+func replayChanges(ids []string, states map[string]JobState, opts ReplayOpts, audit auditScope) []auditChange {
+	retry := opts.RetryOpts
+	retry.AllowRunning = false
+	changes := make([]auditChange, len(ids))
+	for i, id := range ids {
+		details := retryDetails(states[id], retry)
+		details["via"] = audit.via
+		if audit.parentJobID != "" {
+			details["parent_job_id"] = audit.parentJobID
+		}
+		changes[i] = auditChange{target: AuditTargetJob, targetID: id, action: AuditReplayed, details: details}
+	}
+	return changes
 }
 
 // liveReplayCandidates returns the ids of the rows that may go live, in id order:

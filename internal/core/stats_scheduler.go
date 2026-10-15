@@ -92,7 +92,8 @@ func runPathModels() []any {
 // the run path's tables, so they must carry every column it names, or each
 // sweep would fail and a crashed worker's jobs would stay running for good; its
 // tick reads job_periodics, filtering on paused_at, so that table must carry
-// every column too; and with the rollup enabled, so must the two rollup tables.
+// every column too; with the rollup enabled, so must the two rollup tables; and
+// with AuditRetention set, the retention pass prunes job_audit, so it must exist.
 // A gap fails Run before any activity starts, rather than logging the same
 // failure every tick. See probeSchema for why an unreachable database is not a
 // failure here.
@@ -100,6 +101,9 @@ func (s *Scheduler) checkSchema(ctx context.Context) error {
 	models := append(runPathModels(), &jobPeriodicRow{})
 	if s.statsInterval > 0 {
 		models = append(models, &jobStatsHourlyRow{}, &jobStatsProgressRow{})
+	}
+	if s.auditRetention > 0 {
+		models = append(models, &jobAuditRow{})
 	}
 	if _, err := probeSchema(ctx, s.db, models...); err != nil {
 		return fmt.Errorf("jobs: scheduler schema check: %w", err)

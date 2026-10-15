@@ -62,26 +62,35 @@ default — and changes and removes nothing, so:
 
 - **a database migrated for a release keeps working with the previous release's binaries**, which never
   read or write what was added — the safe direction of a rolling deploy;
-- **a release's binaries refuse to start against a database that has not been migrated.** A Runner, a
-  Scheduler, and a Node each check the tables they use at startup and stop with `ErrSchemaOutdated`,
-  naming every missing column and table and the fix — rather than claiming work whose audit row they
-  cannot write, or ticking schedules on a column that is not there.
+- **a release's binaries need the database migrated first.** A Runner, a Scheduler, and a Node each
+  check the tables they use at startup and stop with `ErrSchemaOutdated`, naming every missing column and
+  table and the fix — rather than claiming work whose audit row they cannot write, or ticking schedules on
+  a column that is not there — and a call that writes a table the database lacks fails naming it.
 
 **So the order is always: migrate the database, then deploy the binaries.**
 
-This section is the upgrade from the previous release. A database older than that, one a release before
-the stats tables installed, needs [their upgrade](#from-a-release-before-the-stats-tables) as well;
-`InspectSchema` names every gap, whichever release left it.
+This section is the upgrade from the previous release: one table, `job_audit`, and its two indexes, and
+nothing else changes. The operator controls (`RetryJob`, `CancelJob`, `CancelByParent`, `Replay`,
+`SetPeriodicActive`, and the rest) write the table, so against a database without it a control fails
+naming the missing relation, and a Scheduler with `AuditRetention` set refuses to start. Runners, and
+Schedulers without `AuditRetention`, never touch the table and start either way.
+
+A database several releases behind applies each older upgrade first, oldest first —
+[from a release before the stats tables](#from-a-release-before-the-stats-tables), then
+[from a release before the schedule pause](#from-a-release-before-the-schedule-pause) — and then this
+one. `InspectSchema` names every gap, whichever release left it, and `Migrate` closes them all in one
+call.
 
 ### What the release adds
 
 | Object | Kind | Purpose |
 |---|---|---|
-| `job_periodics.paused_at` | column, nullable `timestamptz` | when an operator paused the schedule with `PausePeriodic`; NULL while it is not paused |
+| `job_audit` | table | the control history: one row per change a control made to a job or a schedule — what it did, who ran it and why, and the state the job changed from |
+| `job_audit_target` | index on `job_audit` | one target's history, newest or oldest first |
+| `job_audit_created` | index on `job_audit` | the whole feed in either order, and the audit prune's oldest-first batches |
 
-Nothing is backfilled and no index is added: every existing schedule reads `paused_at` as NULL, so it fires
-on its cadence as it did before the migration. A Scheduler of this release refuses to start without the
-column, since its tick filters on it; a Runner does not read `job_periodics` and starts either way.
+Nothing is backfilled: the history starts with the first control run after the deploy. Both indexes are
+on the new, empty table, so building them takes no time and blocks no writer.
 
 ### Library-owned install (`Migrate`, `flywheel migrate`)
 
@@ -100,7 +109,7 @@ err := flywheel.MigrateWithOptions(db, flywheel.MigrateOpts{
 })
 ```
 
-`flywheel migrate` prints what it added (`added: job_periodics.paused_at`), and a re-run prints nothing
+`flywheel migrate` prints what it added (`added: job_audit (table)`), and a re-run prints nothing
 new — an up-to-date schema issues no DDL at all. Both options are no-ops on SQLite. Each step commits on
 its own, so a lock timeout fails only the statement that could not get its lock: everything before it is
 applied, and a re-run completes the rest. Two migrations of one schema run one after the other.
@@ -120,25 +129,54 @@ exactly the statements below. To write it by hand, use these — they are the st
 `Models()`, and a test runs this file's blocks against the previous release's schema to prove they produce
 one with no drift.
 
-PostgreSQL — adding a nullable column with no default is a catalog-only change, but it takes a brief
-`ACCESS EXCLUSIVE` lock on `job_periodics`, so run it with a lock timeout:
+PostgreSQL — the table and both its indexes are new, so the statements lock nothing that already holds
+rows, and need no lock timeout:
 
 <!-- upgrade-ddl:postgres -->
 ```sql
-SET lock_timeout = '5s';
-ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS paused_at timestamptz;
+CREATE TABLE IF NOT EXISTS job_audit (
+  id          text        NOT NULL,
+  created_at  timestamptz NOT NULL,
+  target_type text        NOT NULL,
+  target_id   text        NOT NULL,
+  action      text        NOT NULL,
+  actor_type  text        NOT NULL,
+  actor_id    text        NOT NULL DEFAULT '',
+  reason      text        NOT NULL DEFAULT '',
+  source      text        NOT NULL DEFAULT '',
+  request_id  text        NOT NULL DEFAULT '',
+  details     jsonb       NOT NULL DEFAULT '{}',
+  PRIMARY KEY (id)
+);
+CREATE INDEX IF NOT EXISTS job_audit_target ON job_audit (target_type, target_id, created_at, id);
+CREATE INDEX IF NOT EXISTS job_audit_created ON job_audit (created_at, id);
 ```
 
-SQLite — `ADD COLUMN` has no `IF NOT EXISTS` there, so this block is for a migration tool that runs it once:
+SQLite:
 
 <!-- upgrade-ddl:sqlite -->
 ```sql
-ALTER TABLE job_periodics ADD COLUMN paused_at datetime;
+CREATE TABLE IF NOT EXISTS job_audit (
+  id          text     NOT NULL,
+  created_at  datetime NOT NULL,
+  target_type text     NOT NULL,
+  target_id   text     NOT NULL,
+  action      text     NOT NULL,
+  actor_type  text     NOT NULL,
+  actor_id    text     NOT NULL DEFAULT '',
+  reason      text     NOT NULL DEFAULT '',
+  source      text     NOT NULL DEFAULT '',
+  request_id  text     NOT NULL DEFAULT '',
+  details     JSON     NOT NULL DEFAULT '{}',
+  PRIMARY KEY (id)
+);
+CREATE INDEX IF NOT EXISTS job_audit_target ON job_audit (target_type, target_id, created_at, id);
+CREATE INDEX IF NOT EXISTS job_audit_created ON job_audit (created_at, id);
 ```
 
-**2. Install the indexes at deploy, the way you already do.** This release adds none, so against indexes
-that are already in sync the call changes nothing. On a live PostgreSQL database, build any missing one
-concurrently:
+**2. Install the indexes at deploy, the way you already do.** This release's two indexes are on the new
+table and in the block above, so the call finds them in place; against indexes that are already in sync it
+changes nothing. On a live PostgreSQL database, build any missing one concurrently:
 
 ```go
 err := flywheel.InstallIndexesWithOptions(ctx, db, flywheel.IndexOpts{
@@ -162,20 +200,15 @@ indexDrift, _ := flywheel.InspectIndexes(ctx, db) // missing, drifted, or invali
 
 ### After the deploy
 
-Nothing remains to do. Every schedule written before the migration is not paused and keeps firing on its
-cadence. Pause one with `PausePeriodic` (`flywheel schedule pause`) once the Scheduler runs this release.
+Nothing remains to do. The history grows by one entry for each job or schedule a control changes; to keep
+it bounded, set `SchedulerConfig.AuditRetention` (zero keeps every entry), as
+[the history's read API](#who-changed-what-the-control-history) describes.
 
 ### Rolling deploys
 
-During a rolling deploy both releases run against the migrated database. A Scheduler of the previous
-release does not read `paused_at`, so it fires a paused schedule: pause schedules only once no Scheduler of
-the previous release is running. One Scheduler runs per database (see [`CONTRACT.md`](CONTRACT.md)), so
-that is once the deploy has replaced it.
-
-Right after the migration, a previous-release process on PostgreSQL may fail one statement on the table
-the migration changed with `cached plan must not change result type` (SQLSTATE `0A000`): its driver cached
-a `SELECT *` plan before the column was added. The driver drops the plan and the retry succeeds; the error
-is a one-off per connection, not a sign the migration went wrong.
+During a rolling deploy both releases run against the migrated database. A process of the previous
+release never writes `job_audit`, so a control it runs is not recorded: run controls through this release
+once the deploy has replaced the previous one, and the history is whole from then on.
 
 A deploy that adds a job kind has its own overlap to plan for: a runner of the previous release can claim
 a job of the new kind. See **Rolling deploys and new job kinds** in the [README](../README.md).
@@ -183,23 +216,75 @@ a job of the new kind. See **Rolling deploys and new job kinds** in the [README]
 ### Verifying
 
 ```bash
-flywheel doctor        # schema: up to date · indexes: in sync · stats: rolled up through … (lag …)
-flywheel schedule ls   # every schedule, with PAUSED "-" until an operator pauses one
+flywheel doctor              # schema: up to date · indexes: in sync · stats: rolled up through … (lag …)
+flywheel jobs history <id>   # after a control: when it ran, what it did, who ran it, and why
 ```
 
 ### Rolling back
 
-Deploy the previous release's binaries: they run unchanged against the migrated schema. They do not read
-the pause, so a schedule paused under this release fires again under them; deactivate one that must stay
-off (`SetPeriodicActive`, or `Active: false` in its declaration) before you roll back. Nothing needs to be
-dropped. If you want the schema back as it was, drop `job_periodics.paused_at` — but only after no
-Scheduler of this release is running, since it refuses to start without the column.
+Deploy the previous release's binaries: they run unchanged against the migrated schema, and never read or
+write `job_audit`, so a control they run is not recorded. Nothing needs to be dropped. If you want the
+schema back as it was, drop `job_audit` (its indexes go with it) — but only after no process of this
+release is running, since its controls write the table, and only once the history is no longer wanted.
+
+### From a release before the schedule pause
+
+A database a release before the schedule pause installed lacks one column more than this release's
+upgrade adds. `Migrate` adds both in one call. A hand-written migration applies the statements below
+first, then [this release's](#host-owned-install-your-migration-tool).
+
+| Object | Kind | Purpose |
+|---|---|---|
+| `job_periodics.paused_at` | column, nullable `timestamptz` | when an operator paused the schedule with `PausePeriodic`; NULL while it is not paused |
+
+Nothing is backfilled and no index is added: every existing schedule reads `paused_at` as NULL, so it fires
+on its cadence as it did before the migration. A Scheduler refuses to start without the column, since its
+tick filters on it; a Runner does not read `job_periodics` and starts either way.
+
+PostgreSQL — adding a nullable column with no default is a catalog-only change, but it takes a brief
+`ACCESS EXCLUSIVE` lock on `job_periodics`, so run it with a lock timeout:
+
+<!-- upgrade-ddl:postgres:pause -->
+```sql
+SET lock_timeout = '5s';
+ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS paused_at timestamptz;
+```
+
+SQLite — `ADD COLUMN` has no `IF NOT EXISTS` there, so this block is for a migration tool that runs it once:
+
+<!-- upgrade-ddl:sqlite:pause -->
+```sql
+ALTER TABLE job_periodics ADD COLUMN paused_at datetime;
+```
+
+**After the deploy**, every schedule written before the migration is not paused and keeps firing on its
+cadence. Pause one with `PausePeriodic` (`flywheel schedule pause`) once the Scheduler runs a release with
+the pause.
+
+**During a rolling deploy** a Scheduler of the older release does not read `paused_at`, so it fires a
+paused schedule: pause schedules only once no Scheduler of the older release is running. One Scheduler
+runs per database (see [`CONTRACT.md`](CONTRACT.md)), so that is once the deploy has replaced it.
+
+Right after the migration, an older-release process on PostgreSQL may fail one statement on the table the
+migration changed with `cached plan must not change result type` (SQLSTATE `0A000`): its driver cached a
+`SELECT *` plan before the column was added. The driver drops the plan and the retry succeeds; the error
+is a one-off per connection, not a sign the migration went wrong.
+
+**To verify**, `flywheel schedule ls` lists every schedule, with PAUSED "-" until an operator pauses one.
+
+**To roll back** to the older release, deploy its binaries: they run unchanged against the migrated
+schema. They do not read the pause, so a schedule paused under a newer release fires again under them;
+deactivate one that must stay off (`SetPeriodicActive`, or `Active: false` in its declaration) before you
+roll back. Nothing needs to be dropped. If you want the schema back as it was, drop
+`job_periodics.paused_at` and what the later releases added — but only after no Scheduler of a newer
+release is running, since it refuses to start without the column.
 
 ### From a release before the stats tables
 
-A database a release before the stats tables installed lacks more than this release's column: the
-analytics columns on `job_runs`, the three stats tables, and one index. `Migrate` adds all of it, with this
-release's column, in one call. A hand-written migration applies the statements below first, then
+A database a release before the stats tables installed lacks more than the later releases add: the
+analytics columns on `job_runs`, the three stats tables, and one index. `Migrate` adds all of it, with the
+later releases' additions, in one call. A hand-written migration applies the statements below first, then
+[the schedule pause's](#from-a-release-before-the-schedule-pause), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -365,8 +450,8 @@ over the deploy window afterwards — a rebuild backfills before it recomputes.
 
 **To roll back** to the older release, deploy its binaries: they run unchanged against the migrated
 schema. To restore its schema as well, drop `job_stats_progress`, `job_stats_hourly`, `job_run_finishes`,
-the `jobs_finished` index, the five `job_runs` columns, and `job_periodics.paused_at` — but only after no
-binary of a newer release is running.
+the `jobs_finished` index, the five `job_runs` columns, `job_periodics.paused_at`, and `job_audit` — but
+only after no binary of a newer release is running.
 
 <br>
 
@@ -486,11 +571,25 @@ start; `paused_at` is when an operator paused it with `PausePeriodic`, NULL whil
 nothing that declares a schedule writes it. A paused schedule's `next_run_at` stays where the pause found
 it until `ResumePeriodic` moves it to the first fire after now.
 
+**`job_audit`** — the control history: one row per change a control made, written in the transaction that
+made the change, and never updated. Rows outlive the jobs and schedules they name; only
+`DeleteAuditEntries` (or `SchedulerConfig.AuditRetention`) removes them. Stable for SQL:
+
+| Column | Meaning |
+|---|---|
+| `id` | the entry's id |
+| `created_at` | when the control made the change, in UTC; the entries one transaction wrote share it and order by `id` |
+| `target_type`, `target_id` | what changed: `job` and the job's id, or `periodic` and the schedule's slug. `target_id` is text whatever type your schema gives `jobs.id`: compare it with bound values, never join it to another table's key |
+| `action` | `retried`, `replayed`, `cancelled`, `paused`, `resumed`, `activated`, `deactivated`, or `deleted` |
+| `actor_type`, `actor_id` | who ran the control: `user`, `agent`, or `system` (a control called with no actor), and the host's id for them |
+| `reason`, `source`, `request_id` | why they ran it, the channel they used (`cli` from the CLI), and the request it came from; `''` when absent |
+| `details` | a JSON object: `from_state` on every job entry; the retry options (`force`, `allow_running`, `reset_attempts`, `budget`, `delay_ms`) on `retried` and `replayed`; `was_running` on `cancelled`; `via` (`parent` or `replay`) and `parent_job_id` (with `via: parent`) on the entries a batched control wrote; `{}` on a schedule's |
+
 ### Time and zones
 
-`job_runs` and `job_run_finishes` timestamps are stored in UTC. On PostgreSQL every timestamp column is
+`job_runs`, `job_run_finishes`, and `job_audit` timestamps are stored in UTC. On PostgreSQL every timestamp column is
 `timestamptz`, so this is invisible. On SQLite timestamps are text and compared as text, which is only a
-time comparison within one zone: pass `job_runs` bounds in UTC (the Go API does it for you). `jobs`
+time comparison within one zone: pass `job_runs` and `job_audit` bounds in UTC (the Go API does it for you). `jobs`
 timestamps keep the zone of the clock that wrote them, as they always have; compare them in that zone.
 
 Rollup hours are UTC hours. `StatsSeries` sums them into calendar days in any zone whose offset is a whole
@@ -505,7 +604,7 @@ Every read takes a `context.Context` and the `*gorm.DB` to read through — a re
 `WaitForJob` — and returns JSON-tagged values. None writes.
 
 Every list read returns at most `MaxReadLimit` (200) rows: `QueryJobs`, `ListJobs`, `ListFinished`,
-`ListRunning`, `SlowRuns`, `RecentFailures`, and `ListRuns`. A larger `Limit` is clamped rather than refused, so a handler
+`ListRunning`, `SlowRuns`, `RecentFailures`, `ListRuns`, and `ListAudit`. A larger `Limit` is clamped rather than refused, so a handler
 can pass a request's limit through; one that asks for a row more than its page, to learn whether another
 follows, keeps its page below 200.
 
@@ -701,6 +800,31 @@ read.
 
 **`Anomalies(ctx, db, AnomalyParams{Hour, BaselineWindow, Thresholds})`** — the kinds behaving unlike
 their own baseline at an hour; see [What the anomaly detector catches](#what-the-anomaly-detector-catches).
+
+### Who changed what: the control history
+
+Every operator control — `RetryJob`, `RetryJobWithOptions`, `CancelJob`, `PauseByParent`,
+`ResumeByParent`, `CancelByParent`, `Replay`, `ReplayByParent`, `SetPeriodicActive`, and `DeletePeriodic`
+— writes one `job_audit` entry for each job or schedule it changes, in the transaction that makes the
+change, attributed to the actor on its context (`WithActor`; `system` when there is none). A call that
+changes nothing writes nothing.
+
+**`ListAudit(ctx, db, ListAuditParams{TargetType, TargetID, Actions, ActorType, ActorID, Since, Until, Order, Cursor, Limit})`**
+— one target's history (`TargetType` and `TargetID`; `job_audit_target` serves it), or the whole feed
+(`job_audit_created`), filtered by any of `Actions`, the actor, and `[Since, Until)`. `Order` is
+`AuditNewest` (the zero value, for a job's history tab) or `AuditOldest` (for a feed a reader follows
+forward). It pages behind an opaque `NextCursor` bound to its order, 50 entries by default; no page skips or
+repeats an entry. An entry is stamped in the transaction that writes it, so a feed reader that holds back a
+few seconds from now (`Until`) never misses a late batch's entries.
+
+**`WithAuditHook(ctx, hook)`** — runs your function on the control's transaction after it writes its
+entries, with those entries, so a record of your own (an application audit log) commits or rolls back
+with the change; the hook's error rolls the control back and is returned. A host that already wraps each
+control in a transaction of its own and writes its record there needs no hook.
+
+**Retention.** Entries outlive the jobs they name: retention and deletes of jobs keep them.
+`SchedulerConfig.AuditRetention` prunes entries older than it on the retention cadence, and
+`DeleteAuditEntries` / `DeleteAuditEntriesWithOptions` do it on demand, oldest first, in batches.
 
 ### Maintenance
 

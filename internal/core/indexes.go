@@ -608,7 +608,7 @@ func readInstalledIndexDefs(ctx context.Context, db *gorm.DB, extraNames []strin
 			Indisvalid bool
 		}
 		tables := `i.tablename IN ('jobs', 'job_runs', 'job_periodics', 'limiter_buckets', 'limiter_holds',
-			                      'job_run_finishes', 'job_stats_hourly')`
+			                      'job_run_finishes', 'job_stats_hourly', 'job_audit')`
 		var args []any
 		if len(extraNames) > 0 {
 			tables = "(" + tables + " OR i.indexname IN ?)"
@@ -866,6 +866,18 @@ func runtimeIndexes() []Index {
 			// resource and so wants expires_at leading.
 			Name: "limiter_holds_expiry", Kind: IndexPerformance, Table: "limiter_holds",
 			DDL: `CREATE INDEX IF NOT EXISTS limiter_holds_expiry ON limiter_holds (expires_at)`,
+		},
+		{
+			// Performance: one target's history, newest or oldest first — what
+			// ListAudit reads for a job or a schedule.
+			Name: "job_audit_target", Kind: IndexPerformance, Table: "job_audit",
+			DDL: `CREATE INDEX IF NOT EXISTS job_audit_target ON job_audit (target_type, target_id, created_at, id)`,
+		},
+		{
+			// Performance: the whole feed in either order, and the audit prune's
+			// oldest-first batches, whose range ends at the cutoff.
+			Name: "job_audit_created", Kind: IndexPerformance, Table: "job_audit",
+			DDL: `CREATE INDEX IF NOT EXISTS job_audit_created ON job_audit (created_at, id)`,
 		},
 	}
 }

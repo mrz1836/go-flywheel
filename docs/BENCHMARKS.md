@@ -1480,6 +1480,50 @@ would have granted a single attempt and discarded.
 
 <br/>
 
+## Attributed controls: one audit entry per changed job
+
+`CancelByParent` and `ReplayByParent` record one entry in the control history (`job_audit`) for each job
+they change, in the transaction of the batch that changes it: each batch locks the rows it selected, runs
+its guarded update with `RETURNING id`, and writes an entry for exactly the ids that came back.
+`BenchmarkScopedControlsPostgres` measures both over a parent with 10,000 children. Each iteration seeds a
+fresh parent outside the timer and analyzes `jobs`, so every timed run changes all 10,000 children in the
+default batches of 1,000: a cancel of available children, and a replay of discarded ones.
+
+| | |
+|---|---|
+| **Machine** | Apple M1 Max, 10 cores, 32 GB (arm64) |
+| **Go** | go1.27.2 darwin/arm64 |
+| **PostgreSQL** | 17.10 (`postgres:17-alpine` in Docker, default parameters), on a loopback port |
+| **Before / after** | the same benchmark on the commit before the history (`a074741`), then on the change, back to back on one machine and one container |
+
+| Sub-benchmark | Before (ms/op) | After (ms/op) | Cost per changed job |
+|---|---:|---:|---:|
+| `CancelByParent10k` | 212.3 | 620.9 | 40.9 µs |
+| `ReplayByParent10k` | 226.5 | 606.5 | 38.0 µs |
+
+Each figure is the median of three counts of five iterations (before: cancel 226.8, 212.3, 184.4 ms;
+replay 226.5, 223.5, 241.3 ms. After: cancel 620.9, 621.7, 558.5 ms; replay 699.0, 606.5, 518.6 ms). The
+cost per changed job is the difference over 10,000.
+
+The added time is in the database, not the client: a CPU profile of the benchmark puts the client's
+own work at under a quarter of the run's wall clock. Each changed job costs a row lock (`FOR UPDATE`
+writes the lock into the row), the id the update returns, and its entry: a row with its JSON details and
+three index entries (the primary key, `job_audit_target`, and `job_audit_created`). The cost is per
+changed job and does not grow with the size of `jobs`, since the lock read and the read-back go by
+primary key and the entries go to their own table.
+
+The 30,000-job replay [above](#replaying-a-failed-cohort-re-convergence-and-the-one-more-try-defect-it-replaces)
+was measured before the history existed; at this cost its replay writes 30,000 entries in a little over
+a second more.
+
+```bash
+# Run on the commit before the change (the benchmark uses only the controls' existing API), then on the change.
+go test -exec 'env FLYWHEEL_TEST_DATABASE_URL=postgres://localhost:5432/flywheel_test?sslmode=disable FLYWHEEL_REQUIRE_POSTGRES=1' \
+  -tags=integration -run '^$' -bench BenchmarkScopedControlsPostgres -benchtime=5x -count=3 ./internal/core/
+```
+
+<br/>
+
 ## Admission control: the pre-claim gate vs. claim-then-snooze
 
 Two runs drain the same 2,000 jobs against the same 50-per-second budget. One installs a pre-claim

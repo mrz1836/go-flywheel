@@ -256,3 +256,74 @@ func deleteRunFinishes(tx *gorm.DB, jobIDs []string) error {
 // finishDeleteChunk is the number of finish-log keys deleted per statement:
 // 2,000 binds, far below PostgreSQL's 65,535 and SQLite's 32,766.
 const finishDeleteChunk = 1000
+
+// DeleteAuditEntries deletes the control history's entries created before
+// olderThan and reports how many it deleted. It is DeleteAuditEntriesWithOptions
+// with default options.
+func DeleteAuditEntries(ctx context.Context, db *gorm.DB, olderThan time.Time) (int64, error) {
+	return DeleteAuditEntriesWithOptions(ctx, db, olderThan, RetentionOpts{})
+}
+
+// DeleteAuditEntriesWithOptions deletes the control history's (job_audit)
+// entries created before olderThan, compared in UTC, in bounded batches, each its
+// own transaction, and reports the total deleted across every batch. It is the
+// only delete of the history: retention and job deletion keep a job's entries,
+// so the history outlives the jobs it names. SchedulerConfig.AuditRetention runs
+// it on the retention cadence.
+//
+// Batches are taken oldest first by (created_at, id) — the job_audit_created
+// range, which ends at the cutoff, so a batch reads only what it deletes.
+// opts.BatchSize bounds a batch (zero or negative: 1,000), and a positive
+// opts.MaxBatches caps a pass; opts.HoldForStatsRollup is ignored, since the
+// history has no rollup to wait for. Cancellation is checked between batches,
+// and the returned count is meaningful alongside a non-nil error: committed
+// batches are not rolled back by a later one's failure.
+func DeleteAuditEntriesWithOptions(
+	ctx context.Context, db *gorm.DB, olderThan time.Time, opts RetentionOpts,
+) (int64, error) {
+	cutoff := olderThan.UTC()
+	batchSize := opts.batchSize()
+	var deleted int64
+	for batch := 0; opts.MaxBatches <= 0 || batch < opts.MaxBatches; batch++ {
+		if err := ctx.Err(); err != nil {
+			return deleted, fmt.Errorf("flywheel: delete audit entries cancelled after %d deleted: %w", deleted, err)
+		}
+		n, selected, err := deleteAuditBatch(ctx, db, cutoff, batchSize)
+		if err != nil {
+			return deleted, fmt.Errorf("flywheel: delete audit entries: %w", err)
+		}
+		deleted += n
+		if selected < batchSize {
+			return deleted, nil
+		}
+	}
+	return deleted, nil
+}
+
+// deleteAuditBatch deletes, in one transaction, up to batchSize of the oldest
+// entries created before cutoff, reporting how many it deleted and how many it
+// selected, which tells the caller whether any are left.
+func deleteAuditBatch(ctx context.Context, db *gorm.DB, cutoff time.Time, batchSize int) (int64, int, error) {
+	var (
+		deleted  int64
+		selected int
+	)
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var ids []string
+		if err := tx.Model(&jobAuditRow{}).Where("created_at < ?", cutoff).
+			Order("created_at, id").Limit(batchSize).Pluck("id", &ids).Error; err != nil {
+			return err
+		}
+		selected = len(ids)
+		if selected == 0 {
+			return nil
+		}
+		res := tx.Where("id IN ?", ids).Delete(&jobAuditRow{})
+		deleted = res.RowsAffected
+		return res.Error
+	})
+	if err != nil {
+		return 0, selected, err
+	}
+	return deleted, selected, nil
+}

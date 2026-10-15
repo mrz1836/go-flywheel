@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/mrz1836/go-foundation/models"
@@ -315,34 +316,78 @@ func scheduleChanged(existing jobPeriodicRow, spec PeriodicSpec) bool {
 // a declared definition at run time, through every restart, use PausePeriodic.
 // The two are separate, and the definition fires only when it is active and not
 // paused; this call neither pauses nor resumes it.
+//
+// It reads the definition under a row lock (FOR UPDATE on PostgreSQL) in a
+// transaction of its own, and, when the flag flips, writes one AuditActivated or
+// AuditDeactivated entry for the slug to the control history in that
+// transaction, attributed to the context's actor (WithActor; the system when
+// there is none). Setting the flag it already has writes no entry. An actor the
+// history can't record is refused with a *ValidationError before anything is
+// read.
 func SetPeriodicActive(ctx context.Context, db *gorm.DB, slug string, active bool) error {
-	now := models.ClockFrom(ctx).Now(ctx)
-	res := db.WithContext(ctx).Model(&jobPeriodicRow{}).Where("slug = ?", slug).Updates(map[string]any{
-		"is_active":  active,
-		"updated_at": now,
+	actor, err := resolveActor(ctx)
+	if err != nil {
+		return err
+	}
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		row, err := lockPeriodic(tx, slug)
+		if err != nil {
+			return err
+		}
+		now := models.ClockFrom(ctx).Now(ctx)
+		if err := tx.Model(&jobPeriodicRow{}).Where("id = ?", row.ID).Updates(map[string]any{
+			"is_active":  active,
+			"updated_at": now,
+		}).Error; err != nil {
+			return err
+		}
+		if (row.IsActive != nil && *row.IsActive) == active {
+			return nil
+		}
+		action := AuditDeactivated
+		if active {
+			action = AuditActivated
+		}
+		return recordAudit(ctx, tx, actor, now, []auditChange{{target: AuditTargetPeriodic, targetID: slug, action: action}})
 	})
-	if res.Error != nil {
-		return fmt.Errorf("flywheel: set periodic %q active: %w", slug, res.Error)
+	if err != nil && !errors.Is(err, ErrPeriodicNotFound) {
+		return fmt.Errorf("flywheel: set periodic %q active: %w", slug, err)
 	}
-	if res.RowsAffected == 0 {
-		return ErrPeriodicNotFound
-	}
-	return nil
+	return err
 }
 
 // DeletePeriodic removes a periodic definition by slug. Jobs it already enqueued
 // are untouched — only the schedule that would produce new ones is removed. It is
 // the writer behind `flywheel schedule rm`, idiomatic with UpsertPeriodic, and
 // returns ErrPeriodicNotFound when no definition has the slug.
+//
+// It reads the definition under a row lock (FOR UPDATE on PostgreSQL) in a
+// transaction of its own, and writes one AuditDeleted entry for the slug to the
+// control history in that transaction, attributed to the context's actor
+// (WithActor; the system when there is none). The slug's history outlives the
+// definition: a definition declared again under the slug continues it. An actor
+// the history can't record is refused with a *ValidationError before anything is
+// read.
 func DeletePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
-	res := db.WithContext(ctx).Where("slug = ?", slug).Delete(&jobPeriodicRow{})
-	if res.Error != nil {
-		return fmt.Errorf("flywheel: delete periodic %q: %w", slug, res.Error)
+	actor, err := resolveActor(ctx)
+	if err != nil {
+		return err
 	}
-	if res.RowsAffected == 0 {
-		return ErrPeriodicNotFound
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		row, err := lockPeriodic(tx, slug)
+		if err != nil {
+			return err
+		}
+		if err := tx.Where("id = ?", row.ID).Delete(&jobPeriodicRow{}).Error; err != nil {
+			return err
+		}
+		return recordAudit(ctx, tx, actor, models.ClockFrom(ctx).Now(ctx),
+			[]auditChange{{target: AuditTargetPeriodic, targetID: slug, action: AuditDeleted}})
+	})
+	if err != nil && !errors.Is(err, ErrPeriodicNotFound) {
+		return fmt.Errorf("flywheel: delete periodic %q: %w", slug, err)
 	}
-	return nil
+	return err
 }
 
 // PeriodicView is the public read projection of a periodic definition. A
@@ -461,6 +506,9 @@ type RetryOpts struct {
 //
 // This is a change from the earlier unguarded behavior, which returned any job —
 // including a succeeded one — to available. The guard is the point.
+//
+// It records one AuditRetried entry under the context's actor (WithActor), as
+// RetryJobWithOptions does.
 func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
 	return RetryJobWithOptions(ctx, db, id, RetryOpts{})
 }
@@ -484,8 +532,71 @@ func RetryJob(ctx context.Context, db *gorm.DB, id string) error {
 // off GORM's nested transactions — so that refusal leaves a caller's PostgreSQL
 // transaction usable, for the read that names the holder and for the caller's
 // own writes after it.
+//
+// In that transaction it reads the job under a row lock (FOR UPDATE on
+// PostgreSQL), refuses from the state it read, and, when it changes the job,
+// writes one AuditRetried entry to the control history: attributed to the
+// context's actor (WithActor; the system when there is none), stamped with the
+// time it acted, and recording the state the job changed from and opts. A refused
+// call writes nothing, and a caller's rollback removes the entry with the change.
+// An actor the history can't record is refused with a *ValidationError before
+// anything is read.
 func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts RetryOpts) error {
-	now := models.ClockFrom(ctx).Now(ctx)
+	actor, err := resolveActor(ctx)
+	if err != nil {
+		return err
+	}
+	// A refused UPDATE aborts the PostgreSQL transaction it runs in. Running it in
+	// a transaction of its own — GORM makes that a savepoint on a caller's
+	// transaction handle — confines the abort to this call, so the holder read
+	// below and the caller's own work after this call still run. Retry is an
+	// operator action, so the extra statements cost nothing that matters.
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		job, err := lockJob(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		// The states the options allow are named rather than the refused ones
+		// excluded — the same guard CancelJob uses, and for the same reason: a row
+		// in a state this runtime does not recognize is refused rather than
+		// clobbered.
+		from := JobState(job.State)
+		if !slices.Contains(retryStateStrings(opts), job.State) {
+			return controlMiss(from)
+		}
+		if from == StateCancelled && opts.Force && !opts.AllowRunning {
+			// A cancelled job is terminal by state while its attempt may still be
+			// running; re-queueing it then would run its work twice at once.
+			running, err := attemptStillRuns(tx, job)
+			if err != nil {
+				return err
+			}
+			if running {
+				return ErrJobRunning
+			}
+		}
+		now := models.ClockFrom(ctx).Now(ctx)
+		if err := updateLockedJob(tx, job, retryUpdates(now, opts)); err != nil {
+			return err
+		}
+		return recordAudit(ctx, tx, actor, now, []auditChange{{
+			target: AuditTargetJob, targetID: id, action: AuditRetried, details: retryDetails(from, opts),
+		}})
+	})
+	switch {
+	case err == nil:
+		return nil
+	case isDuplicateKey(err):
+		return fmt.Errorf("flywheel: retry job %q: %w", id, retryHolder(ctx, db, id))
+	case errors.Is(err, ErrJobNotFound), errors.Is(err, ErrJobTerminal), errors.Is(err, ErrJobRunning):
+		return err
+	default:
+		return fmt.Errorf("flywheel: retry job %q: %w", id, err)
+	}
+}
+
+// retryUpdates is the column map a retry with opts writes at now.
+func retryUpdates(now time.Time, opts RetryOpts) map[string]any {
 	upd := map[string]any{
 		"state":        string(StateAvailable),
 		"leased_until": nil,
@@ -500,39 +611,33 @@ func RetryJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts Retry
 		"updated_at":   now,
 	}
 	applyRetryBudget(upd, opts)
+	return upd
+}
 
-	// A refused UPDATE aborts the PostgreSQL transaction it runs in. Running it in
-	// a transaction of its own — GORM makes that a savepoint on a caller's
-	// transaction handle — confines the abort to the UPDATE, so the holder read
-	// below and the caller's own work after this call still run. Retry is an
-	// operator action, so the extra statements cost nothing that matters.
-	var affected int64
-	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Scope the write to the states the options allow, naming them rather than
-		// excluding the ones refused — the same guard CancelJob uses, and for the
-		// same reason: a row in a state this runtime does not recognize is refused
-		// rather than clobbered, so the guard can never be defeated by a state added
-		// to the vocabulary but missed here.
-		q := tx.Model(&jobRow{}).Where("id = ? AND state IN ?", id, retryStateStrings(opts))
-		if opts.Force && !opts.AllowRunning {
-			// A cancelled job is terminal by state while its attempt may still be
-			// running; re-queueing it then would run its work twice at once.
-			q = q.Where("NOT " + cancelledAttemptStillRuns("jobs"))
-		}
-		res := q.Updates(upd)
-		affected = res.RowsAffected
-		return res.Error
-	})
-	if err != nil {
-		if isDuplicateKey(err) {
-			return fmt.Errorf("flywheel: retry job %q: %w", id, retryHolder(ctx, db, id))
-		}
-		return fmt.Errorf("flywheel: retry job %q: %w", id, err)
+// retryDetails is the details a retry records: the state the job changed from,
+// and the options the call used.
+func retryDetails(from JobState, opts RetryOpts) map[string]any {
+	return map[string]any{
+		"from_state":     string(from),
+		"force":          opts.Force,
+		"allow_running":  opts.AllowRunning,
+		"reset_attempts": opts.ResetAttempts,
+		"budget":         opts.Budget,
+		"delay_ms":       opts.Delay.Milliseconds(),
 	}
-	if affected == 0 {
-		return classifyRetryMiss(ctx, db, id, opts)
+}
+
+// attemptStillRuns reports whether job's run at its attempt still reads started:
+// a cancel fences a running attempt without awaiting it, and the run is recorded
+// only when its worker returns. It is one probe of job_runs_job_attempt, on tx.
+func attemptStillRuns(tx *gorm.DB, job jobRow) (bool, error) {
+	var started int64
+	if err := tx.Model(&jobRunRow{}).
+		Where("job_id = ? AND attempt = ? AND outcome = ?", job.ID, job.Attempt, string(OutcomeStarted)).
+		Count(&started).Error; err != nil {
+		return false, err
 	}
-	return nil
+	return started > 0, nil
 }
 
 // retryStateStrings returns the states a retry with opts may move a job out of:
@@ -599,47 +704,6 @@ func applyRetryBudget(upd map[string]any, opts RetryOpts) {
 	}
 }
 
-// classifyRetryMiss explains why RetryJobWithOptions's UPDATE matched no row, as
-// classifyCancelMiss does for CancelJob: the job does not exist (ErrJobNotFound);
-// its attempt is still running — it is running, or, under Force without
-// AllowRunning, it is cancelled with its attempt's run still started
-// (ErrJobRunning); or it is in a state the options do not allow, which is a
-// terminal one without Force (ErrJobTerminal).
-//
-// The read is scoped exactly like the UPDATE — Model(&jobRow{}) applies gorm's
-// deleted_at IS NULL — so a soft-deleted job reads as missing rather than terminal.
-// It runs outside a transaction for the same reason classifyCancelMiss does: the
-// miss path writes nothing, and serializing an operator-scale diagnostic read would
-// cost a write lock on SQLite for no correctness gain.
-func classifyRetryMiss(ctx context.Context, db *gorm.DB, id string, opts RetryOpts) error {
-	var rows []jobRow
-	if err := db.WithContext(ctx).Model(&jobRow{}).Select("state", "attempt").
-		Where("id = ?", id).Limit(1).Find(&rows).Error; err != nil {
-		return fmt.Errorf("flywheel: retry job %q: %w", id, err)
-	}
-	if len(rows) == 0 {
-		return ErrJobNotFound
-	}
-	switch JobState(rows[0].State) {
-	case StateRunning:
-		return ErrJobRunning
-	case StateCancelled:
-		if !opts.Force || opts.AllowRunning {
-			break
-		}
-		var started int64
-		if err := db.WithContext(ctx).Model(&jobRunRow{}).
-			Where("job_id = ? AND attempt = ? AND outcome = ?", id, rows[0].Attempt, string(OutcomeStarted)).
-			Count(&started).Error; err != nil {
-			return fmt.Errorf("flywheel: retry job %q: %w", id, err)
-		}
-		if started > 0 {
-			return ErrJobRunning
-		}
-	}
-	return ErrJobTerminal
-}
-
 // CancelJob moves a still-in-flight job to the terminal cancelled state. The job
 // will not be retried or re-claimed, and an attempt already running is fenced:
 // its result is discarded when it returns. That attempt is not interrupted
@@ -664,76 +728,63 @@ func classifyRetryMiss(ctx context.Context, db *gorm.DB, id string, opts RetryOp
 //
 // The update and the barrier check run in a transaction of their own — a
 // savepoint when db is a caller's transaction, unless the host turned off GORM's
-// nested transactions.
+// nested transactions. In it the cancel reads the job under a row lock (FOR
+// UPDATE on PostgreSQL), so a concurrent change commits first, refuses from the
+// state it read, and writes one AuditCancelled entry to the control history:
+// attributed to the context's actor (WithActor; the system when there is none),
+// and recording the state the job changed from and whether its attempt was
+// running. A caller's rollback removes the entry with the cancel. An actor the
+// history can't record is refused with a *ValidationError before anything is
+// read.
 func CancelJob(ctx context.Context, db *gorm.DB, id string) error {
-	now := models.ClockFrom(ctx).Now(ctx)
-	var affected int64
-	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Scope the write to the states a job can still be cancelled from. Naming
-		// the allowed states rather than excluding the terminal ones is deliberate:
-		// a row in a state this runtime does not recognize is refused rather than
-		// clobbered, so the guard can never be defeated by a state added to the
-		// vocabulary but missed here.
-		res := tx.Model(&jobRow{}).
-			Where("id = ? AND state IN ?", id, nonTerminalStateStrings()).
-			Updates(map[string]any{
-				"state":        string(StateCancelled),
-				"leased_until": nil,
-				// The running attempt is not interrupted here, but its claim is:
-				// clearing the token is what keeps its finalize from overwriting the
-				// cancel, and what a cooperative Runner's heartbeat notices.
-				"lease_token":  nil,
-				"finalized_at": now,
-				"updated_at":   now,
-			})
-		if res.Error != nil {
-			return res.Error
-		}
-		affected = res.RowsAffected
-		if affected == 0 {
-			return nil
-		}
-		var row jobRow
-		if err := tx.Model(&jobRow{}).Select("parent_job_id").Where("id = ?", id).First(&row).Error; err != nil {
-			return fmt.Errorf("read parent: %w", err)
-		}
-		if row.ParentJobID == nil {
-			return nil
-		}
-		_, err := fireBarrierIfComplete(ctx, tx, *row.ParentJobID, id)
-		return err
-	})
+	actor, err := resolveActor(ctx)
 	if err != nil {
+		return err
+	}
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		job, err := lockJob(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		// The states a job can still be cancelled from are named rather than the
+		// terminal ones excluded: a row in a state this runtime does not recognize
+		// is refused rather than clobbered, so the guard can never be defeated by a
+		// state added to the vocabulary but missed here.
+		from := JobState(job.State)
+		if !slices.Contains(nonTerminalStateStrings(), job.State) {
+			return controlMiss(from)
+		}
+		now := models.ClockFrom(ctx).Now(ctx)
+		if err := updateLockedJob(tx, job, map[string]any{
+			"state":        string(StateCancelled),
+			"leased_until": nil,
+			// The running attempt is not interrupted here, but its claim is:
+			// clearing the token is what keeps its finalize from overwriting the
+			// cancel, and what a cooperative Runner's heartbeat notices.
+			"lease_token":  nil,
+			"finalized_at": now,
+			"updated_at":   now,
+		}); err != nil {
+			return err
+		}
+		if job.ParentJobID != nil {
+			if _, err := fireBarrierIfComplete(ctx, tx, *job.ParentJobID, id); err != nil {
+				return err
+			}
+		}
+		return recordAudit(ctx, tx, actor, now, []auditChange{{
+			target: AuditTargetJob, targetID: id, action: AuditCancelled,
+			details: map[string]any{"from_state": string(from), "was_running": from == StateRunning},
+		}})
+	})
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrJobNotFound), errors.Is(err, ErrJobTerminal):
+		return err
+	default:
 		return fmt.Errorf("flywheel: cancel job %q: %w", id, err)
 	}
-	if affected == 0 {
-		return classifyCancelMiss(ctx, db, id)
-	}
-	return nil
-}
-
-// classifyCancelMiss explains why CancelJob's guarded UPDATE matched no row: the
-// job does not exist (ErrJobNotFound), or it exists but is no longer cancellable
-// (ErrJobTerminal). The count is scoped exactly like the UPDATE — Model(&jobRow{})
-// applies gorm's deleted_at IS NULL — so a soft-deleted job reads as missing
-// rather than terminal.
-//
-// It runs outside a transaction on purpose. The miss path writes nothing, and the
-// only interleaving it can misread is a concurrent RetryJob resurrecting the job
-// between the two statements, which reports ErrJobTerminal for a job that just
-// became available again — a stale diagnosis the operator resolves by re-running
-// the cancel. A deletion in the same window yields ErrJobNotFound, which is the
-// right answer regardless. Serializing an operator-scale diagnostic read would
-// cost a write lock on SQLite for no correctness gain.
-func classifyCancelMiss(ctx context.Context, db *gorm.DB, id string) error {
-	var count int64
-	if err := db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", id).Count(&count).Error; err != nil {
-		return fmt.Errorf("flywheel: cancel job %q: %w", id, err)
-	}
-	if count == 0 {
-		return ErrJobNotFound
-	}
-	return ErrJobTerminal
 }
 
 // defaultScopeBatchSize bounds a parent-scoped operation's per-transaction batch
@@ -749,6 +800,9 @@ const defaultScopeBatchSize = 1000
 // every in-scope job that was terminal or running when the replay began, unless a
 // concurrent operation moved one mid-replay. A FailedSince window leaves the
 // targeted jobs finalized before it out of the sum.
+//
+// Each changed job has one entry in the control history, written in its batch's
+// transaction, so Changed is also the number of entries the call wrote.
 type ScopeResult struct {
 	// Changed is the number of children whose state the operation advanced.
 	Changed int64
@@ -780,7 +834,8 @@ type ScopeResult struct {
 // ScopeOpts bounds a parent-scoped operation.
 type ScopeOpts struct {
 	// BatchSize is the number of children updated per transaction. Zero or negative
-	// selects defaultScopeBatchSize; it is never unbounded.
+	// selects defaultScopeBatchSize; it is never unbounded. On PostgreSQL a batch
+	// holds its children's row locks until it commits.
 	BatchSize int
 }
 
@@ -799,6 +854,7 @@ func (o ScopeOpts) batchSize() int {
 // scopeByParent's batched, guarded loop.
 type scopeTransition struct {
 	op      string
+	action  AuditAction
 	source  []string
 	updates func(now time.Time) map[string]any
 	// fireBarrier runs the parent's barrier check after each batch that changed a
@@ -817,9 +873,19 @@ type scopeTransition struct {
 // loop terminates on a short batch with no cursor. Cancellation is checked between
 // batches and committed batches are kept, so a cancelled pause is partial progress,
 // returned alongside the wrapped context error.
+//
+// Each batch locks the children it selected, in id order (FOR UPDATE on
+// PostgreSQL), and writes one AuditPaused entry per child it changed, in its own
+// transaction: attributed to the context's actor (WithActor; the system when
+// there is none), with the state the child changed from, via "parent", and the
+// parent's id. A batch reads back the ids its update changed (RETURNING id), so a
+// child it skipped gets no entry, and a GORM handle configured without RETURNING
+// fails the batch rather than record less than it changed. An actor the history
+// can't record is refused with a *ValidationError before anything is read.
 func PauseByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
 	return scopeByParent(ctx, db, parentJobID, opts, scopeTransition{
 		op:     "pause",
+		action: AuditPaused,
 		source: []string{string(StateAvailable), string(StateRetryable), string(StateScheduled)},
 		updates: func(now time.Time) map[string]any {
 			return map[string]any{"state": string(StatePaused), "updated_at": now}
@@ -833,10 +899,13 @@ func PauseByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts Sc
 // keeps its scheduled_at, so one paused while deferred stays deferred rather than
 // becoming claimable early.
 //
-// It is bounded and cancellable on the same terms as PauseByParent.
+// It is bounded and cancellable on the same terms as PauseByParent, and records
+// one AuditResumed entry per child it changed the way PauseByParent records its
+// pauses.
 func ResumeByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
 	return scopeByParent(ctx, db, parentJobID, opts, scopeTransition{
 		op:     "resume",
+		action: AuditResumed,
 		source: []string{string(StatePaused)},
 		updates: func(now time.Time) map[string]any {
 			return map[string]any{"state": string(StateAvailable), "updated_at": now}
@@ -858,10 +927,20 @@ func ResumeByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts S
 // when that child finishes. A later CancelByParent on the same parent cancels a
 // still-pending continuation like any other pending child.
 //
-// It is bounded and cancellable on the same terms as PauseByParent.
+// It is bounded and cancellable on the same terms as PauseByParent. Each batch
+// locks the children it selected, in id order (FOR UPDATE on PostgreSQL), and
+// writes one AuditCancelled entry per child it cancelled, in its own transaction:
+// attributed to the context's actor (WithActor; the system when there is none),
+// with the state the child changed from as it read it under the lock,
+// was_running false, via "parent", and the parent's id. A batch reads back the
+// ids its update changed (RETURNING id), so a child it skipped gets no entry, and
+// a GORM handle configured without RETURNING fails the batch rather than record
+// less than it changed. An actor the history can't record is refused with a
+// *ValidationError before anything is read.
 func CancelByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {
 	return scopeByParent(ctx, db, parentJobID, opts, scopeTransition{
-		op: "cancel",
+		op:     "cancel",
+		action: AuditCancelled,
 		source: []string{
 			string(StatePaused), string(StateAvailable), string(StateRetryable), string(StateScheduled),
 		},
@@ -883,6 +962,10 @@ func scopeByParent(
 ) (ScopeResult, error) {
 	if db == nil {
 		return ScopeResult{}, fmt.Errorf("flywheel: %s by parent: db is nil", t.op)
+	}
+	actor, err := resolveActor(ctx)
+	if err != nil {
+		return ScopeResult{}, err
 	}
 	batchSize := opts.batchSize()
 	now := models.ClockFrom(ctx).Now(ctx)
@@ -920,7 +1003,7 @@ func scopeByParent(
 				"flywheel: %s by parent cancelled after %d changed: %w", t.op, result.Changed, err,
 			)
 		}
-		selected, changed, fired, err := scopeBatch(ctx, db, parentJobID, t, batchSize, now)
+		selected, changed, fired, err := scopeBatch(ctx, db, parentJobID, t, batchSize, now, actor)
 		if err != nil {
 			return result, fmt.Errorf("flywheel: %s by parent: %w", t.op, err)
 		}
@@ -938,10 +1021,10 @@ func scopeByParent(
 }
 
 // scopeBatch moves one bounded batch of a parent's source-state children to the
-// target inside a single transaction. It returns how many rows it selected (which
-// drives the loop's termination), how many it actually changed, and, for a
-// transition that runs the barrier check, whether the batch fired the parent's
-// barrier.
+// target inside a single transaction, and records one entry per child it changed,
+// attributed to actor. It returns how many rows it selected (which drives the
+// loop's termination), how many it actually changed, and, for a transition that
+// runs the barrier check, whether the batch fired the parent's barrier.
 //
 // The UPDATE re-guards on the source states — WHERE id IN ? AND state IN ? — rather
 // than trusting the ids the SELECT found: without SKIP LOCKED a concurrent operation
@@ -949,8 +1032,13 @@ func scopeByParent(
 // would resurrect it out of the state that concurrent operation left it in. The
 // re-guard makes the batch move only children still eligible, so Changed counts real
 // transitions and no terminal row is ever revived.
+//
+// Before the UPDATE the batch reads the selected rows' states under a lock, in id
+// order (FOR UPDATE on PostgreSQL), so an entry names the state its child changed
+// from; the UPDATE returns the ids it changed, so a child the re-guard skipped gets
+// no entry.
 func scopeBatch(
-	ctx context.Context, db *gorm.DB, parentJobID string, t scopeTransition, batchSize int, now time.Time,
+	ctx context.Context, db *gorm.DB, parentJobID string, t scopeTransition, batchSize int, now time.Time, actor Actor,
 ) (selected int, changed int64, fired bool, err error) {
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var ids []string
@@ -963,19 +1051,32 @@ func scopeBatch(
 		if selected == 0 {
 			return nil
 		}
-		res := tx.Model(&jobRow{}).
-			Where("id IN ? AND state IN ?", ids, t.source).
-			Updates(t.updates(now))
-		if res.Error != nil {
-			return res.Error
+		states, e := lockJobStates(ctx, tx, ids)
+		if e != nil {
+			return e
 		}
-		changed = res.RowsAffected
-		if !t.fireBarrier || changed == 0 {
+		moved, e := updateJobsReturningIDs(tx, "id IN ? AND state IN ?", []any{ids, t.source}, t.updates(now))
+		if e != nil {
+			return e
+		}
+		changed = int64(len(moved))
+		if changed == 0 {
 			return nil
 		}
-		var e error
-		fired, e = fireBarrierIfComplete(ctx, tx, parentJobID, "")
-		return e
+		if t.fireBarrier {
+			if fired, e = fireBarrierIfComplete(ctx, tx, parentJobID, ""); e != nil {
+				return e
+			}
+		}
+		changes := make([]auditChange, len(moved))
+		for i, id := range moved {
+			details := map[string]any{"from_state": string(states[id]), "via": "parent", "parent_job_id": parentJobID}
+			if t.action == AuditCancelled {
+				details["was_running"] = false
+			}
+			changes[i] = auditChange{target: AuditTargetJob, targetID: id, action: t.action, details: details}
+		}
+		return recordAudit(ctx, tx, actor, models.ClockFrom(ctx).Now(ctx), changes)
 	})
 	return selected, changed, fired, err
 }

@@ -20,7 +20,8 @@ const integratingDoc = "../../docs/INTEGRATING.md"
 // documentedUpgradeDDL extracts the statements of the SQL block that follows
 // the guide's `<!-- upgrade-ddl:<block> -->` marker, split on the semicolons
 // that end its lines. A block is named by its dialect — this release's upgrade
-// — or by its dialect and ":stats", the upgrade from a release before the stats
+// — or by its dialect and the older release it upgrades from: ":pause", a
+// release before the schedule pause, and ":stats", a release before the stats
 // tables.
 func documentedUpgradeDDL(t *testing.T, block string) []string {
 	t.Helper()
@@ -61,8 +62,9 @@ func applyDocumentedUpgrade(t *testing.T, db *gorm.DB, blocks ...string) {
 // documentedUpgradeSuite applies the guide's upgrade, exactly as written, to a
 // database the previous release installed and wrote a schedule into, then the
 // deploy step the guide names, and asserts the result has no drift and works:
-// the schedule is not paused and fires. The documented upgrade is the upgrade,
-// not a description of one.
+// the schedule is not paused and fires, and a control on the job it fired is
+// recorded in the history. The documented upgrade is the upgrade, not a
+// description of one.
 func documentedUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
@@ -83,18 +85,32 @@ func documentedUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 	n, err := s.Tick(clockCtx(ctx, models.NewFixedClock(due.Add(time.Second))))
 	require.NoError(t, err)
 	assert.Equal(t, 1, n, "and it fires on its cadence")
+
+	// A control on the upgraded schema records its entry, and the history reads
+	// it back.
+	var fired []string
+	require.NoError(t, db.Model(&jobRow{}).Where("kind = ?", "doc.periodic").Pluck("id", &fired).Error)
+	require.Len(t, fired, 1)
+	operator := WithActor(ctx, Actor{Type: ActorUser, ID: "operator", Reason: "after the upgrade"})
+	require.NoError(t, RetryJobWithOptions(operator, db, fired[0], RetryOpts{Force: true}))
+	page, err := ListAudit(ctx, db, ListAuditParams{TargetType: AuditTargetJob, TargetID: fired[0]})
+	require.NoError(t, err)
+	require.Len(t, page.Entries, 1)
+	assert.Equal(t, AuditRetried, page.Entries[0].Action)
+	assert.Equal(t, "operator", page.Entries[0].Actor.ID)
 }
 
 // documentedStatsUpgradeSuite applies the guide's upgrade from a release
-// before the stats tables — that upgrade's block, then this release's — to a
-// database such a release installed and wrote history into, then the deploy
-// step, and asserts the result has no drift, runs, and reaches the old history.
+// before the stats tables — that upgrade's block, then the schedule pause's,
+// then this release's, oldest first — to a database such a release installed
+// and wrote history into, then the deploy step, and asserts the result has no
+// drift, runs, and reaches the old history.
 func documentedStatsUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 	t.Helper()
 	installLegacySchema(t, db)
 	writeLegacyHistory(t, db, "doc-legacy", "doc.kind", StateSucceeded, rollupBase)
 
-	applyDocumentedUpgrade(t, db, dialect+":stats", dialect)
+	applyDocumentedUpgrade(t, db, dialect+":stats", dialect+":pause", dialect)
 	ctx := context.Background()
 	require.NoError(t, InstallIndexesWithOptions(ctx, db, IndexOpts{Concurrently: true}))
 

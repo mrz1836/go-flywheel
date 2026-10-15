@@ -100,12 +100,13 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel jobs count` | Count the jobs the same filter flags match, exactly up to `--cap` (10,000 by default, at most 100,000): it prints the count, the cap with a plus past it (`10000+`), and on PostgreSQL the planner's estimate beside it (`10000+ (estimate 1234567)`); `--json` prints `n`, `capped`, and `estimate` |
 | `flywheel jobs running` | List running jobs, longest-running first, flagging any far slower than their kind's baseline (`--kind --queue --limit --json`) |
 | `flywheel jobs inspect <id>` | Show a job in full (args bounded by `--max-args-bytes`, 64 KiB by default; metadata, keys, timeout, barrier, cancel pending) and its run history (`--json`) |
-| `flywheel jobs retry <id>` | Return a job to available so it runs again (`--force` for a terminal job; `--allow-running` re-queues a running one, whose current attempt keeps running). Without them, a running job is refused (`flywheel: job is running`), so its work never runs twice at once, and so is a terminal one (`flywheel: job has already reached a terminal state`) |
-| `flywheel jobs cancel <id>` | Move a job to cancelled (refused once a job is terminal) |
+| `flywheel jobs history <id>` | Show who changed a job, and why, newest first: when (UTC), the action, the actor, the source, and the reason (`--limit` (50, at most 200); a page with another after it ends with `next: --cursor <cursor>`, which `--cursor` reads; `--json` prints the page) |
+| `flywheel jobs retry <id>` | Return a job to available so it runs again (`--force` for a terminal job; `--allow-running` re-queues a running one, whose current attempt keeps running; `--reason`, recorded in its history). Without them, a running job is refused (`flywheel: job is running`), so its work never runs twice at once, and so is a terminal one (`flywheel: job has already reached a terminal state`) |
+| `flywheel jobs cancel <id>` | Move a job to cancelled (refused once a job is terminal; `--reason`, recorded in its history) |
 | `flywheel schedule ls` | List periodic schedules, with whether each is active and paused (`--json`) |
 | `flywheel schedule add <slug> <kind>` | Add/update a schedule (`--cron \| --every`, `--args`). A `--cron` that names no zone runs in the zone the scheduler evaluates it in: the daemon's local zone, as the database driver returns its times. Prefix it with `CRON_TZ=<zone>` to pin one, for example `--cron "CRON_TZ=UTC 0 9 * * *"` |
-| `flywheel schedule rm <slug>` | Remove a schedule (warns when the config declares it: `serve` re-creates it) |
-| `flywheel schedule enable <slug>` / `disable <slug>` | Reactivate or deactivate a schedule, keeping its row. This is the config's own switch: for a schedule the file declares, the next `serve` start re-applies the file's setting |
+| `flywheel schedule rm <slug>` | Remove a schedule (warns when the config declares it: `serve` re-creates it; `--reason`, recorded in its history) |
+| `flywheel schedule enable <slug>` / `disable <slug>` | Reactivate or deactivate a schedule, keeping its row (`--reason`, recorded in its history). This is the config's own switch: for a schedule the file declares, the next `serve` start re-applies the file's setting |
 | `flywheel schedule pause <slug>` / `resume <slug>` | Hold a schedule through every `serve` start until it is resumed; a resume fires it next at its first fire time after now, without running the fires it missed |
 | `flywheel prune` | Delete finished jobs and their runs older than a cutoff, holding for the stats rollup when it is on (`--older-than 14d --ignore-stats-rollup`) |
 | `flywheel status` | Show queue health, schedules, and recent failures (`--json --watch`) |
@@ -115,6 +116,10 @@ flywheel serve                        # run the runtime until Ctrl+C
 
 All commands take `--config <path>` (default `./flywheel.yaml`, else
 `$XDG_CONFIG_HOME/flywheel/flywheel.yaml`).
+
+The control commands — `jobs retry`, `jobs cancel`, and `schedule rm`, `enable`, and `disable` — run as the
+operating-system user (its name, else `$USER`) with the source `cli`, so `flywheel jobs history` and
+`ListAudit` show who ran each one and the `--reason` they gave.
 
 ## Replacing cron
 

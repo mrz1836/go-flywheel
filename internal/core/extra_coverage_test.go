@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -499,13 +500,11 @@ func TestPeriodicWritersReturnNotFound(t *testing.T) {
 	assert.ErrorIs(t, CancelJob(ctx, db, "missing"), ErrJobNotFound)
 }
 
-// TestCancelJobSurfacesClassificationReadError drives the error branch inside
-// CancelJob's miss classifier. Closing the DB cannot reach it — the UPDATE
-// fails first — so the read is failed on its own: gorm routes Count through the
-// Query callbacks while Updates goes through the Update callbacks, so a
-// Query-only fault leaves the write path intact. The fault is narrowed to a
-// Count, because a cancel that lands also reads the job's parent (a Query) for
-// the barrier check, and that read must still work.
+// TestCancelJobSurfacesClassificationReadError drives the error branch of the
+// read CancelJob classifies a miss from: its lock read of the job. The read is
+// failed on its own — gorm routes it through the Query callbacks while Updates
+// goes through the Update callbacks — and only for the second cancel, so the
+// first proves the cancel itself still works.
 func TestCancelJobSurfacesClassificationReadError(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
@@ -514,9 +513,10 @@ func TestCancelJobSurfacesClassificationReadError(t *testing.T) {
 	seedJob(t, db, jobRow{ID: "j-active", Kind: "k", State: string(StateAvailable)})
 
 	errQuery := errors.New("query callback failed")
+	var failLockRead atomic.Bool
 	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:fail_query",
 		func(tx *gorm.DB) {
-			if _, isCount := tx.Statement.Dest.(*int64); isCount {
+			if _, isLockRead := tx.Statement.Dest.(*jobRow); isLockRead && failLockRead.Load() {
 				_ = tx.AddError(errQuery)
 			}
 		}))
@@ -525,8 +525,9 @@ func TestCancelJobSurfacesClassificationReadError(t *testing.T) {
 	// UPDATE failing instead of the classifying read.
 	require.NoError(t, CancelJob(ctx, db, "j-active"))
 
-	// The job is now terminal, so the second cancel misses and must classify —
-	// which is the read that now fails.
+	// The job is now terminal, so the second cancel must classify its miss from
+	// the lock read — which is the read that now fails.
+	failLockRead.Store(true)
 	err := CancelJob(ctx, db, "j-active")
 	require.ErrorIs(t, err, errQuery)
 	assert.NotErrorIs(t, err, ErrJobTerminal, "a failed classification is not a verdict")
