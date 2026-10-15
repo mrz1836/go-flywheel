@@ -1116,8 +1116,9 @@ preserving a deferred child's schedule. The per-id `CancelJob` and `RetryJob` ar
 standard: a job that has already reached a terminal state is left exactly as it is and `ErrJobTerminal`
 is returned, so an operator action can never overwrite a recorded outcome. Re-running a finished job is
 deliberate — `RetryJobWithOptions` with `Force` — and replaying a whole cohort of failures, with a
-restored retry budget, is its own guide: **Replaying work** below. Each of these controls records who ran
-it, and why, in the history of every job it changes: **Who changed a job, and why** below.
+restored retry budget, is its own guide: **Replaying work** below. Moving, reprioritizing, holding,
+releasing, or deleting one job is **Changing one job** below. Each of these controls records who ran it,
+and why, in the history of every job it changes: **Who changed a job, and why** below.
 
 **A retry never starts a job while its attempt still runs.** `RetryJob` refuses a running job with
 `ErrJobRunning` and leaves it and its lease alone: re-queueing it would let a runner start a second
@@ -1305,7 +1306,8 @@ work depends on the intent:
 **Every operator control records who ran it, and why.** Put the operator on the request's context once,
 with `WithActor`, and each control called with that context writes one entry to `job_audit` for every job
 or schedule it changes: `RetryJob`, `RetryJobWithOptions`, `CancelJob`, `PauseByParent`, `ResumeByParent`,
-`CancelByParent`, `Replay`, `ReplayByParent`, `SetPeriodicActive`, and `DeletePeriodic`.
+`CancelByParent`, `Replay`, `ReplayByParent`, `SetPeriodicActive`, `DeletePeriodic`, and the single-job
+controls of **Changing one job** below.
 
 ```go
 ctx = flywheel.WithActor(ctx, flywheel.Actor{
@@ -1367,13 +1369,71 @@ page, err := flywheel.ListAudit(ctx, db, flywheel.ListAuditParams{
 record that it existed and of who acted on it. `SchedulerConfig.AuditRetention` bounds the table (see
 **Retention and scheduler maintenance** below).
 
-**From the CLI.** `flywheel jobs retry`, `jobs cancel`, and `schedule rm`, `enable`, and `disable` take
-`--reason`, and record the operating-system user with the source `cli`; `flywheel jobs history <job-id>`
+**From the CLI.** `flywheel jobs retry`, `cancel`, `reschedule`, `priority`, `pause`, `resume`, and
+`delete`, and `schedule rm`, `enable`, and `disable` take `--reason`, and record the operating-system user with the source `cli`; `flywheel jobs history <job-id>`
 prints a job's history.
 
 `Migrate` creates the table. A host-owned schema adds it with the statements in
 [Upgrading an existing database](docs/INTEGRATING.md#upgrading-an-existing-database) before deploying,
 because every control writes it.
+
+</details>
+
+<details>
+<summary><strong><code>Changing one job — reschedule, priority, pause, resume, delete</code></strong></summary>
+<br>
+
+**A waiting job can be moved, reprioritized, held, or released in place, and a finished one deleted.**
+Each of these controls changes one job by its id and keeps its id, its lineage, and its history, which a
+cancel and a fresh enqueue would lose:
+
+```go
+ctx = flywheel.WithActor(ctx, flywheel.Actor{Type: flywheel.ActorUser, ID: userID, Reason: "after the vendor window"})
+
+switch err := flywheel.RescheduleJob(ctx, db, jobID, windowCloses); {
+case errors.Is(err, flywheel.ErrJobRunning):
+    // a runner claimed it first: let it run, or cancel it
+case errors.Is(err, flywheel.ErrJobTerminal):
+    // it has already finished
+case err != nil:
+    return err
+}
+// SetJobPriority(ctx, db, jobID, 10), PauseJob, ResumeJob, and DeleteJob take the same shape.
+```
+
+**Moving and reprioritizing.** `RescheduleJob` sets the `scheduled_at` of a waiting job — `available`,
+`retryable`, `scheduled`, or `paused` — to the time you give, as `InsertOpts.ScheduleAt` does, and keeps
+its state: a time in the past makes an available job due at once, and a paused job stays paused.
+`SetJobPriority` gives a waiting job another priority, at least 1; runners claim the lowest first. Setting
+the priority a job already has changes nothing.
+
+**Holding and releasing.** `PauseJob` holds an `available`, `retryable`, or `scheduled` job in `paused`,
+where no runner claims it, and `ResumeJob` returns a paused job to `available` with its `scheduled_at`
+kept, so a job paused while deferred stays deferred. Pausing a paused job, or resuming one that isn't
+paused, changes nothing. They are the single-job twins of `PauseByParent` and `ResumeByParent`.
+
+**Deleting.** `DeleteJob` hard-deletes a finished job — `succeeded`, `cancelled`, or `discarded` — with its
+runs and their finish-log entries, in the order retention deletes them: the finish-log entries, then the
+runs, then the job, so a schema that declares foreign keys between the tables sees one order from both.
+The job's history stays, and records the delete. Only the job's own rows go: its children keep their
+`parent_job_id`, and a fan-in barrier it declared and had not fired goes with its row, so it never fires.
+A job that hasn't finished is refused with `ErrJobNotTerminal`: cancel it first.
+
+**None of them touches a running job.** A running job's row belongs to the attempt in flight until that
+attempt finalizes, so each control refuses it with `ErrJobRunning` and leaves the job and its lease as
+they were. A finished job is refused with `ErrJobTerminal` (by all but `DeleteJob`), and an id no live job
+has with `ErrJobNotFound`. Each reads the job under a row lock (`FOR UPDATE` on PostgreSQL) in a
+transaction of its own, a savepoint inside yours, and decides from the state it read, so a job claimed a
+moment earlier is refused rather than changed under its attempt.
+
+**Each records who ran it.** A control that changes the job writes one entry to its history in the same
+transaction, under the context's actor (see **Who changed a job, and why** above): `rescheduled` with the
+old and new time (`from`, `to`, in UTC), `reprioritized` with the old and new priority, `paused`,
+`resumed`, or `deleted` with the job's `kind` and `state`, each with the state the job changed from
+(`from_state`). A call that changes nothing writes nothing.
+
+**From the CLI.** `flywheel jobs reschedule <job-id> --at <RFC3339>`, `jobs priority <job-id> <priority>`,
+`jobs pause <job-id>`, `jobs resume <job-id>`, and `jobs delete <job-id>`, each with `--reason`.
 
 </details>
 
