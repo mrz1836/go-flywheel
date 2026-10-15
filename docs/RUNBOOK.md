@@ -208,6 +208,34 @@ attempt's run stays `started` until it returns, and for good when its process is
 
 <br>
 
+## Who changed this job, and why
+
+Every operator control records who ran it, in the job's history: a retry, a cancel, a pause or resume of
+its parent's batch, a replay, and, for a schedule, a deactivate, activate, or delete. Read it with:
+
+```bash
+flywheel jobs history <job-id>             # WHEN (UTC), ACTION, ACTOR, SOURCE, REASON — newest first
+flywheel jobs history <job-id> --json      # the entries in full, details included
+```
+
+or `ListAudit(ctx, db, ListAuditParams{TargetType: AuditTargetJob, TargetID: id})` in code (a schedule's
+history is `AuditTargetPeriodic` and its slug). An entry holds when the control ran, what it did, the actor
+(`user`, `agent`, or `system` — `system` when the caller set none with `WithActor`), the source (`cli` for
+the CLI's own commands, which take `--reason` and record the operating-system user), the reason, the
+request id, and details: the state the job changed from, and the options the call used. The history
+outlives the job, so a job retention has pruned still has one.
+
+**A control fails with a missing `job_audit` relation.** Every control writes the table, so this release
+was deployed before its migration ran. Migrate (`flywheel migrate`, or the statements in
+[`INTEGRATING.md`](INTEGRATING.md#upgrading-an-existing-database) for a host-owned schema), then run the
+control again: the failed call changed nothing. A Scheduler with `AuditRetention` set refuses to start
+with `ErrSchemaOutdated` naming `job_audit (table)` for the same reason.
+
+**The history grows by one entry per changed job.** Set `SchedulerConfig.AuditRetention` to bound it (see
+[Bounded retention](#bounded-retention)).
+
+<br>
+
 ## Symptom: jobs deferred or discarded as `jobs: unknown job kind`
 
 A runner that claims a job of a kind its `Registry` does not register runs nothing. While the job is
@@ -273,6 +301,10 @@ tables grow without bound.
 **Enabling it.** Set `SchedulerConfig.RetentionMaxAge` to the age past which a *finalized* job may be
 deleted. Zero (the default) disables retention entirely — no surprise deletes for a consumer that never
 asked for them. The prune runs on `RetentionInterval` (one hour by default) in bounded batches.
+
+Retention keeps the control history: a pruned job's `job_audit` entries stay, and
+`SchedulerConfig.AuditRetention` gives them a window of their own (zero keeps every entry); set alone, it
+turns the retention pass on for the history only.
 
 **Choosing the window.** Retention deletes jobs finalized *longer ago than* the window — not jobs
 created that long ago. The window is a function of how long you need the audit trail (`job_runs`) and

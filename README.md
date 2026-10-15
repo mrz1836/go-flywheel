@@ -260,11 +260,11 @@ Each section below is self-contained; open the ones you need.
 <summary><strong><code>Schema setup — pick exactly one install path</code></strong></summary>
 <br>
 
-`go-flywheel` owns eight tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
+`go-flywheel` owns nine tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
 `limiter_buckets` and `limiter_holds` for the shared database-backed limiter (additive: empty unless you
-construct a `DBLimiter`); and `job_run_finishes`, `job_stats_hourly`, and `job_stats_progress`, the
-finish log every finalize writes and the stats rollup's tables — and there are **two ways to install
-them. Pick exactly one.** They are not layers; running both means two migration authorities against one
+construct a `DBLimiter`); `job_run_finishes`, `job_stats_hourly`, and `job_stats_progress`, the finish
+log every finalize writes and the stats rollup's tables; and `job_audit`, the history every control
+writes — and there are **two ways to install them. Pick exactly one.** They are not layers; running both means two migration authorities against one
 database.
 
 | Question | **Library-owned** | **Host-owned** |
@@ -274,11 +274,11 @@ database.
 | Who sets the storage parameters? | `Migrate(db)` | you, from `InstallStorageParameters` |
 | Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
 | Does the runtime run DDL at startup? | yes, every start | no |
-| Is a co-located host schema safe? | only if the host's tooling excludes all eight tables | yes — the tables are in your loader |
+| Is a co-located host schema safe? | only if the host's tooling excludes all nine tables | yes — the tables are in your loader |
 | **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
 
 **The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
-same database, your migration tool must know about all eight — a tool that cannot see them will happily
+same database, your migration tool must know about all nine — a tool that cannot see them will happily
 propose dropping them. A tool told to leave the runtime's tables alone by name needs every name above.
 
 **Library-owned** — one call, no external tooling:
@@ -299,7 +299,7 @@ up-to-date schema — a re-run creates nothing and changes nothing — so it is 
 
 ```go
 // 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
-//    so your migration tool knows all eight tables exist and never proposes dropping them.
+//    so your migration tool knows all nine tables exist and never proposes dropping them.
 stmts, err := gormschema.New("postgres").Load(
     append(myapp.AllModels(), flywheel.Models()...)...,
 )
@@ -315,7 +315,7 @@ if err := flywheel.InstallStorageParameters(ctx, db); err != nil {
 
 Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
 it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
-GORM struct tag cannot express. `IndexSet` declares twelve indexes, and four of them are
+GORM struct tag cannot express. `IndexSet` declares fourteen indexes, and four of them are
 correctness-bearing: `jobs_unique_key`, `jobs_unique_active_key`, `job_runs_job_attempt`, and
 `idx_job_periodics_slug`. Without `jobs_unique_key` and `jobs_unique_active_key` the database accepts
 duplicate enqueues and **`ErrAlreadyEnqueued` is never returned.** Use `flywheel.IndexSet(dialect)` when
@@ -1116,7 +1116,8 @@ preserving a deferred child's schedule. The per-id `CancelJob` and `RetryJob` ar
 standard: a job that has already reached a terminal state is left exactly as it is and `ErrJobTerminal`
 is returned, so an operator action can never overwrite a recorded outcome. Re-running a finished job is
 deliberate — `RetryJobWithOptions` with `Force` — and replaying a whole cohort of failures, with a
-restored retry budget, is its own guide: **Replaying work** below.
+restored retry budget, is its own guide: **Replaying work** below. Each of these controls records who ran
+it, and why, in the history of every job it changes: **Who changed a job, and why** below.
 
 **A retry never starts a job while its attempt still runs.** `RetryJob` refuses a running job with
 `ErrJobRunning` and leaves it and its lease alone: re-queueing it would let a runner start a second
@@ -1229,6 +1230,9 @@ res, err := flywheel.ReplayByParent(ctx, db, parentID, flywheel.ReplayOpts{
 // res.SkippedActiveKey left terminal because their UniqueActiveKey was already held.
 ```
 
+Each replayed job gets an entry in its history, with the options the replay used and who ran it: see
+**Who changed a job, and why** below.
+
 **A replay restores the retry budget as headroom, not by rewinding the counter.** A job discarded at
 `attempt == max_attempts` has no budget left, so a plain retry gives it exactly one more attempt before
 it discards again. `ResetAttempts` raises `max_attempts` — to `attempt + Budget`, or to
@@ -1291,6 +1295,85 @@ work depends on the intent:
 > outlive retention, keep the key where retention cannot reach it — leave retention off or its window
 > longer than the key must hold, or record the key in a table of your own under a unique constraint, in
 > the same transaction as the enqueue (`InsertOpts.Tx`).
+
+</details>
+
+<details>
+<summary><strong><code>Who changed a job, and why — the audit history</code></strong></summary>
+<br>
+
+**Every operator control records who ran it, and why.** Put the operator on the request's context once,
+with `WithActor`, and each control called with that context writes one entry to `job_audit` for every job
+or schedule it changes: `RetryJob`, `RetryJobWithOptions`, `CancelJob`, `PauseByParent`, `ResumeByParent`,
+`CancelByParent`, `Replay`, `ReplayByParent`, `SetPeriodicActive`, and `DeletePeriodic`.
+
+```go
+ctx = flywheel.WithActor(ctx, flywheel.Actor{
+    Type:   flywheel.ActorUser,
+    ID:     userID,
+    Reason: "stuck behind the payments outage",
+    Source: "admin-console",
+})
+err := flywheel.CancelJob(ctx, db, jobID) // one "cancelled" entry, from the state the job was in
+```
+
+An entry names its target (a job's id, or a schedule's slug), the action, the actor, and details: the
+state the job changed from, and what the call was told to do — a retry's options, whether a cancel fenced
+a running attempt, the parent a batched call was scoped to. A control called with no actor is recorded as
+`system`, with the context's request id. The runtime requires no reason: whether an action needs one is
+your policy, so check it before you call. An actor the history can't record — an unknown `Type`, a
+`Reason` over 1,024 bytes, a `Source` over 64 — is refused with a `*ValidationError` before anything is
+read or written.
+
+Enqueues write no entry: who enqueued a job is its metadata (see **Tags, metadata, and who enqueued a
+job** above). Neither does the lease sweep: its crashes are recorded in `job_runs`.
+
+**The history agrees with the change.** An entry is written in the transaction that makes its change —
+each batch's, for the batched calls — so it exists exactly when the change committed, and a caller's
+rollback removes both. A control reads the job under a row lock (`FOR UPDATE` on PostgreSQL) and records
+the state it found there, so a concurrent change commits first and the entry names the state the job
+really changed from. A batch reads back the ids its update changed (`RETURNING id`), so a job a concurrent
+call moved, or one a replay left terminal for its key, gets no entry; a GORM handle configured without
+`RETURNING` fails the batched controls rather than record less than they changed. A call that changes
+nothing writes nothing.
+
+**Your own record, in the same transaction.** `WithAuditHook` runs your function on the control's
+transaction after the entries are written, with those entries, so an audit row of your own commits or
+rolls back with the change; the hook's error rolls the control back and is returned.
+
+```go
+ctx = flywheel.WithAuditHook(ctx, func(ctx context.Context, tx *gorm.DB, entries []flywheel.AuditEntry) error {
+    for _, e := range entries {
+        row := AppAudit{Target: e.TargetID, Action: string(e.Action), By: e.Actor.ID, Why: e.Actor.Reason}
+        if err := tx.Create(&row).Error; err != nil {
+            return err
+        }
+    }
+    return nil
+})
+```
+
+**Reading it.** `ListAudit` reads one target's history newest first, or the whole feed oldest first
+(`AuditOldest`), filtered by action, actor, and time, behind an opaque cursor, at most 200 entries a page:
+
+```go
+page, err := flywheel.ListAudit(ctx, db, flywheel.ListAuditParams{
+    TargetType: flywheel.AuditTargetJob, TargetID: jobID, Limit: 20,
+})
+// page.Entries newest first; pass page.NextCursor as Cursor for the next page.
+```
+
+**Keeping it.** Entries outlive the jobs they name: retention prunes the job and keeps its history, the
+record that it existed and of who acted on it. `SchedulerConfig.AuditRetention` bounds the table (see
+**Retention and scheduler maintenance** below).
+
+**From the CLI.** `flywheel jobs retry`, `jobs cancel`, and `schedule rm`, `enable`, and `disable` take
+`--reason`, and record the operating-system user with the source `cli`; `flywheel jobs history <job-id>`
+prints a job's history.
+
+`Migrate` creates the table. A host-owned schema adds it with the statements in
+[Upgrading an existing database](docs/INTEGRATING.md#upgrading-an-existing-database) before deploying,
+because every control writes it.
 
 </details>
 
@@ -1565,7 +1648,7 @@ A cancelled pass reports the rows it committed alongside the context error — t
 not rolled back — so treat a non-nil error as "partial progress", not "nothing happened".
 
 The reads are bounded the same way. Every list read — `ListJobs`, `ListFinished`, `ListRunning`,
-`SlowRuns`, `RecentFailures`, and `ListRuns` — returns at most `flywheel.MaxReadLimit` (200) rows: a
+`SlowRuns`, `RecentFailures`, `ListRuns`, and `ListAudit` — returns at most `flywheel.MaxReadLimit` (200) rows: a
 larger `Limit` is clamped, so a handler can pass a request's limit straight through. `ListRuns` with no
 `Limit` reads a job's newest 200 attempts; page past them with `BeforeAttempt`. `ChildOutputs` is the
 one exception: with no `Limit` it reads every terminal child, the fold a barrier continuation needs, and
@@ -1614,6 +1697,22 @@ the cutoff. Pending and running work is never touched, whatever its age.
 **Retention frees `UniqueKey`s.** A `UniqueKey` collides only with a job whose row exists, so deleting a
 job frees its key, and an `Insert` with that key afterwards runs the work again. If a key must keep
 refusing duplicates for longer than the window, see **Replaying work** above for where to hold it.
+
+**The control history has a window of its own.** Retention keeps a pruned job's `job_audit` entries, so
+the history of who changed what outlives the jobs. Set `AuditRetention` to bound it; zero, the default,
+keeps every entry:
+
+```go
+cfg := flywheel.SchedulerConfig{
+    RetentionMaxAge: 30 * 24 * time.Hour,
+    AuditRetention:  400 * 24 * time.Hour, // the history outlives the jobs it names
+}
+```
+
+`AuditRetention` alone turns the retention activity on, and each pass prunes finished jobs first, then the
+entries older than the window, oldest first, in the same bounded batches (`RetentionBatchSize`,
+`RetentionMaxBatches`), logging `jobs: retention sweep pruned audit entries`. A scheduler with it set
+refuses to start without the table (`ErrSchemaOutdated`). `DeleteAuditEntries` prunes on demand.
 
 ### The queue-health heartbeat
 
@@ -1686,8 +1785,8 @@ or resuming one that is not paused, changes nothing; an unknown slug is `ErrPeri
 `ListPeriodics` reports `Paused` and `PausedAt`. The pause lives on the row, in the nullable
 `job_periodics.paused_at` column, so `DeletePeriodic` removes it with the row. A scheduler refuses to start
 without that column (`ErrSchemaOutdated`): `Migrate` adds it to an existing database, and
-[Upgrading an existing database](docs/INTEGRATING.md#upgrading-an-existing-database) has the statement for
-a host-owned schema on each dialect.
+[From a release before the schedule pause](docs/INTEGRATING.md#from-a-release-before-the-schedule-pause)
+has the statement for a host-owned schema on each dialect.
 
 **While it runs, the reconcile only inserts.** A definition that exists — deactivated, paused, or edited by
 hand — is left exactly as it is until the next start, and one this host does not declare is never
