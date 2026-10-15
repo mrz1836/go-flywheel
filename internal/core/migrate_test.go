@@ -18,6 +18,7 @@ import (
 var (
 	migrateTables = []string{
 		"jobs", "job_runs", "job_periodics", "limiter_buckets", "limiter_holds", "job_run_finishes", "job_stats_hourly",
+		"job_audit",
 	}
 	// migrateJobColumns are jobs columns whose absence is silent rather than
 	// loud: the runtime writes them through a map-valued Updates, which a missing
@@ -38,6 +39,8 @@ var (
 		"idx_job_periodics_slug",
 		"limiter_holds_resource",
 		"limiter_holds_expiry",
+		"job_audit_target",
+		"job_audit_created",
 	}
 )
 

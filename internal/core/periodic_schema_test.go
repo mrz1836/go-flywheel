@@ -11,8 +11,9 @@ import (
 	"gorm.io/gorm"
 )
 
-// previousReleaseGapSuite proves the parity check names exactly the one column
-// this release adds to a schema the previous release installed, and no index.
+// previousReleaseGapSuite proves the parity checks name exactly what this
+// release adds to a schema the previous release installed: the one table, and
+// its two indexes, absent.
 func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
@@ -20,10 +21,15 @@ func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 
 	drift, err := InspectSchema(ctx, db)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"job_periodics.paused_at"}, schemaDriftNames(drift))
+	assert.Equal(t, []string{"job_audit (table)"}, schemaDriftNames(drift))
 	idx, err := InspectIndexes(ctx, db)
 	require.NoError(t, err)
-	assert.Empty(t, idx, "the release adds no index")
+	missing := make([]string, len(idx))
+	for i, d := range idx {
+		missing[i] = d.Name
+		assert.Empty(t, d.Installed, "%s is absent", d.Name)
+	}
+	assert.ElementsMatch(t, previousReleaseIndexNames, missing, "the release's indexes are the new table's")
 }
 
 // TestInspectSchemaReportsWhatThePreviousReleaseLacks is the parity check
@@ -37,10 +43,12 @@ func TestInspectSchemaReportsWhatThePreviousReleaseLacks(t *testing.T) {
 // column: a Scheduler's tick filters on paused_at, so against a schema without
 // it Run stops before starting any activity, naming the column and the fix,
 // rather than failing every tick. A Runner never reads job_periodics, so it
-// runs against the same schema.
+// runs against the same schema. The schema is the previous release's without
+// the column, as a release before the pause left it.
 func schedulerRefusesWithoutPausedAtSuite(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
+	require.NoError(t, db.Exec("ALTER TABLE job_periodics DROP COLUMN paused_at").Error)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 

@@ -32,12 +32,20 @@ type Worker[A Args] = core.Worker[A]
 
 type (
 	ActiveCount           = core.ActiveCount
+	Actor                 = core.Actor
+	ActorType             = core.ActorType
 	AlreadyEnqueuedError  = core.AlreadyEnqueuedError
 	Anomaly               = core.Anomaly
 	AnomalyParams         = core.AnomalyParams
 	AnomalySignal         = core.AnomalySignal
 	AnomalyThresholds     = core.AnomalyThresholds
 	Args                  = core.Args
+	AuditAction           = core.AuditAction
+	AuditEntry            = core.AuditEntry
+	AuditHook             = core.AuditHook
+	AuditOrder            = core.AuditOrder
+	AuditPage             = core.AuditPage
+	AuditTarget           = core.AuditTarget
 	Barrier               = core.Barrier
 	BarrierView           = core.BarrierView
 	Baseline              = core.Baseline
@@ -95,6 +103,7 @@ type (
 	KindStats             = core.KindStats
 	LeaseRenewal          = core.LeaseRenewal
 	Limiter               = core.Limiter
+	ListAuditParams       = core.ListAuditParams
 	ListFinishedParams    = core.ListFinishedParams
 	ListJobsParams        = core.ListJobsParams
 	ListRunningParams     = core.ListRunningParams
@@ -154,7 +163,25 @@ type (
 )
 
 const (
+	ActorAgent               = core.ActorAgent
+	ActorSystem              = core.ActorSystem
+	ActorUser                = core.ActorUser
 	AnyClass                 = core.AnyClass
+	AuditActivated           = core.AuditActivated
+	AuditCancelled           = core.AuditCancelled
+	AuditDeactivated         = core.AuditDeactivated
+	AuditDeleted             = core.AuditDeleted
+	AuditNewest              = core.AuditNewest
+	AuditOldest              = core.AuditOldest
+	AuditPaused              = core.AuditPaused
+	AuditReplayed            = core.AuditReplayed
+	AuditResumed             = core.AuditResumed
+	AuditRetried             = core.AuditRetried
+	AuditTargetJob           = core.AuditTargetJob
+	AuditTargetLimiter       = core.AuditTargetLimiter
+	AuditTargetNode          = core.AuditTargetNode
+	AuditTargetPeriodic      = core.AuditTargetPeriodic
+	AuditTargetQueue         = core.AuditTargetQueue
 	DefaultCountCap          = core.DefaultCountCap
 	ErrorPermanent           = core.ErrorPermanent
 	ErrorTimeout             = core.ErrorTimeout
@@ -172,10 +199,12 @@ const (
 	JobSortNewest            = core.JobSortNewest
 	JobSortOldest            = core.JobSortOldest
 	JobSortScheduled         = core.JobSortScheduled
+	MaxActorSourceBytes      = core.MaxActorSourceBytes
 	MaxContainmentWindow     = core.MaxContainmentWindow
 	MaxCountCap              = core.MaxCountCap
 	MaxMetadataBytes         = core.MaxMetadataBytes
 	MaxReadLimit             = core.MaxReadLimit
+	MaxReasonBytes           = core.MaxReasonBytes
 	MaxTagBytes              = core.MaxTagBytes
 	MaxTags                  = core.MaxTags
 	OutcomeCancelled         = core.OutcomeCancelled
@@ -221,6 +250,10 @@ var (
 	ErrUnsupportedDialect = core.ErrUnsupportedDialect
 	ErrValidation         = core.ErrValidation
 )
+
+func ActorFrom(ctx context.Context) (Actor, bool) {
+	return core.ActorFrom(ctx)
+}
 
 func Anomalies(ctx context.Context, db *gorm.DB, p AnomalyParams) ([]Anomaly, error) {
 	return core.Anomalies(ctx, db, p)
@@ -268,6 +301,14 @@ func CountRuns(ctx context.Context, db *gorm.DB) (int64, error) {
 
 func DefaultHTTPDoer() HTTPDoer {
 	return core.DefaultHTTPDoer()
+}
+
+func DeleteAuditEntries(ctx context.Context, db *gorm.DB, olderThan time.Time) (int64, error) {
+	return core.DeleteAuditEntries(ctx, db, olderThan)
+}
+
+func DeleteAuditEntriesWithOptions(ctx context.Context, db *gorm.DB, olderThan time.Time, opts RetentionOpts) (int64, error) {
+	return core.DeleteAuditEntriesWithOptions(ctx, db, olderThan, opts)
 }
 
 func DeleteFinishedJobs(ctx context.Context, db *gorm.DB, olderThan time.Time) (int64, error) {
@@ -357,6 +398,10 @@ func LatestRun(ctx context.Context, db *gorm.DB, jobID string) (JobRunView, bool
 // probe.
 func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsView, error) {
 	return core.ListActiveByKind(ctx, db, kind) //nolint:staticcheck // forwards a deprecated function under its own deprecation
+}
+
+func ListAudit(ctx context.Context, db *gorm.DB, p ListAuditParams) (AuditPage, error) {
+	return core.ListAudit(ctx, db, p)
 }
 
 func ListFinished(ctx context.Context, db *gorm.DB, p ListFinishedParams) ([]JobView, error) {
@@ -565,6 +610,14 @@ func WaitForJob(ctx context.Context, db *gorm.DB, id string) (JobView, error) {
 
 func WaitForJobWithOptions(ctx context.Context, db *gorm.DB, id string, opts WaitOpts) (JobView, error) {
 	return core.WaitForJobWithOptions(ctx, db, id, opts)
+}
+
+func WithActor(ctx context.Context, a Actor) context.Context {
+	return core.WithActor(ctx, a)
+}
+
+func WithAuditHook(ctx context.Context, hook AuditHook) context.Context {
+	return core.WithAuditHook(ctx, hook)
 }
 
 // Generic function forwarders. A generic function cannot be an alias, so each

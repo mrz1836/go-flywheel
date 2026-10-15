@@ -35,6 +35,7 @@ type Scheduler struct {
 	tickInterval         time.Duration
 	sweepInterval        time.Duration
 	retentionMaxAge      time.Duration
+	auditRetention       time.Duration
 	retentionInterval    time.Duration
 	retentionOpts        RetentionOpts
 	healthSampleInterval time.Duration
@@ -118,7 +119,8 @@ type SchedulerConfig struct {
 	// because no run would live long enough to be rolled up.
 	RetentionMaxAge time.Duration
 	// RetentionInterval is the cadence of the retention sweep. It applies only
-	// when RetentionMaxAge is set; left zero, it defaults to one hour.
+	// when RetentionMaxAge or AuditRetention is set; left zero, it defaults to one
+	// hour.
 	RetentionInterval time.Duration
 	// RetentionBatchSize is the number of jobs the retention sweep deletes per
 	// transaction. Zero selects the documented default; it is never unbounded.
@@ -130,6 +132,15 @@ type SchedulerConfig struct {
 	// A pass that ends on this ceiling is logged, so "retention can never keep up
 	// with its window" is visible rather than silent.
 	RetentionMaxBatches int
+	// AuditRetention is how long the control history (job_audit) keeps an entry.
+	// Zero (the default) or negative keeps every entry. Positive turns the
+	// retention activity on, whether or not RetentionMaxAge is set, and each pass,
+	// after pruning jobs, deletes the entries created longer ago than this, oldest
+	// first, in batches of RetentionBatchSize capped by RetentionMaxBatches (see
+	// DeleteAuditEntriesWithOptions), logging how many it deleted. A Scheduler with
+	// it set refuses to start, with ErrSchemaOutdated, against a schema without
+	// job_audit.
+	AuditRetention time.Duration
 	// HealthSampleInterval enables the queue-health heartbeat: when > 0 the
 	// Scheduler samples QueueHealth on this cadence and logs a one-line pulse
 	// (ready, inflight, scheduled_ahead, the oldest-ready lag as both the
@@ -300,6 +311,7 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 		tickInterval:      cfg.TickInterval,
 		sweepInterval:     cfg.SweepInterval,
 		retentionMaxAge:   cfg.RetentionMaxAge,
+		auditRetention:    cfg.AuditRetention,
 		retentionInterval: cfg.RetentionInterval,
 		retentionOpts: RetentionOpts{
 			BatchSize: cfg.RetentionBatchSize, MaxBatches: cfg.RetentionMaxBatches,
@@ -321,8 +333,9 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 	if s.sweepInterval <= 0 {
 		s.sweepInterval = defaultSweepInterval
 	}
-	// Retention is opt-in via RetentionMaxAge; only then does the interval default.
-	if s.retentionMaxAge > 0 && s.retentionInterval <= 0 {
+	// Retention is opt-in via RetentionMaxAge or AuditRetention; only then does
+	// the interval default.
+	if s.retentionEnabled() && s.retentionInterval <= 0 {
 		s.retentionInterval = defaultRetentionInterval
 	}
 	if err := s.configurePeriodics(cfg); err != nil {
@@ -475,7 +488,7 @@ func (s *Scheduler) activities() []*activity {
 		{name: "periodic", interval: s.tickInterval, run: s.tickOnce},
 		{name: "sweep", interval: s.sweepInterval, run: s.sweepOnce},
 	}
-	if s.retentionMaxAge > 0 {
+	if s.retentionEnabled() {
 		acts = append(acts, &activity{
 			name: "retention", interval: s.retentionInterval, run: s.pruneOnce,
 		})
@@ -513,8 +526,38 @@ func (s *Scheduler) sweepOnce(ctx context.Context) {
 	}
 }
 
-// pruneOnce runs one retention pass.
+// retentionEnabled reports whether this Scheduler prunes anything: finished jobs
+// (RetentionMaxAge), the control history (AuditRetention), or both.
+func (s *Scheduler) retentionEnabled() bool {
+	return s.retentionMaxAge > 0 || s.auditRetention > 0
+}
+
+// pruneOnce runs one retention pass: the finished jobs, then the control
+// history's entries.
 func (s *Scheduler) pruneOnce(ctx context.Context) {
+	s.pruneJobs(ctx)
+	if s.auditRetention > 0 {
+		s.pruneAudit(ctx)
+	}
+}
+
+// pruneAudit deletes the control history's entries older than AuditRetention.
+func (s *Scheduler) pruneAudit(ctx context.Context) {
+	cutoff := models.ClockFrom(ctx).Now(ctx).Add(-s.auditRetention)
+	n, err := DeleteAuditEntriesWithOptions(ctx, s.db, cutoff, RetentionOpts{
+		BatchSize: s.retentionOpts.BatchSize, MaxBatches: s.retentionOpts.MaxBatches,
+	})
+	if err != nil {
+		s.logMaintenanceError(ctx, "jobs: audit retention sweep failed", err)
+		return
+	}
+	if n > 0 {
+		s.logger.InfoContext(ctx, "jobs: retention sweep pruned audit entries", "deleted", n)
+	}
+}
+
+// pruneJobs runs the retention pass over finished jobs.
+func (s *Scheduler) pruneJobs(ctx context.Context) {
 	n, err := s.PruneRetention(ctx)
 	if err != nil {
 		s.logMaintenanceError(ctx, "jobs: retention sweep failed", err)

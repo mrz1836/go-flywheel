@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 // legacyJobRunRow is job_runs exactly as the release before the analytics
@@ -66,11 +67,23 @@ type legacyJobPeriodicRow struct {
 // TableName binds legacyJobPeriodicRow to the job_periodics table.
 func (legacyJobPeriodicRow) TableName() string { return "job_periodics" }
 
-// legacyIndexNames are the indexes the analytics release added. A legacy
-// schema is the current IndexSet minus these — derived, never hand-written.
+// legacyIndexNames are the indexes added since a release before the stats
+// tables: the analytics release's, and the two on the audit history's table. A
+// legacy schema is the current IndexSet minus these — derived, never
+// hand-written.
 //
 //nolint:gochecknoglobals // shared fixture
-var legacyIndexNames = []string{"jobs_finished"}
+var legacyIndexNames = []string{"jobs_finished", "job_audit_target", "job_audit_created"}
+
+// previousReleaseTableNames and previousReleaseIndexNames are what this release
+// adds: the previous release's schema is Models and IndexSet minus these —
+// derived, never hand-written.
+//
+//nolint:gochecknoglobals // shared fixture
+var (
+	previousReleaseTableNames = []string{"job_audit"}
+	previousReleaseIndexNames = []string{"job_audit_target", "job_audit_created"}
+)
 
 // installLegacySchema builds, on a bare database, the schema a release before
 // the stats tables installed: its tables (no job_run_finishes or
@@ -92,20 +105,26 @@ func installLegacySchema(t *testing.T, db *gorm.DB) {
 }
 
 // installPreviousReleaseSchema builds, on a bare database, the schema the
-// previous release installed: every table Models returns, with job_periodics
-// as legacyJobPeriodicRow declares it, and every index in IndexSet.
+// previous release installed: every table Models returns but
+// previousReleaseTableNames, and every index in IndexSet but
+// previousReleaseIndexNames.
 func installPreviousReleaseSchema(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	tables := Models()
-	for i, model := range tables {
-		if _, periodics := model.(*jobPeriodicRow); periodics {
-			tables[i] = &legacyJobPeriodicRow{}
+	var tables []any
+	for _, model := range Models() {
+		named, ok := model.(schema.Tabler)
+		require.True(t, ok, "%T names its table", model)
+		if !slices.Contains(previousReleaseTableNames, named.TableName()) {
+			tables = append(tables, model)
 		}
 	}
 	require.NoError(t, db.AutoMigrate(tables...))
 	set, err := IndexSet(db.Name())
 	require.NoError(t, err)
 	for _, idx := range set {
+		if slices.Contains(previousReleaseIndexNames, idx.Name) {
+			continue
+		}
 		require.NoError(t, db.Exec(idx.DDL).Error, "previous-release index %s", idx.Name)
 	}
 }
@@ -158,8 +177,8 @@ func schemaDriftNames(drift []SchemaDrift) []string {
 
 // TestInspectSchemaReportsWhatAnOlderSchemaLacks proves the parity check names
 // exactly the columns and tables added since a release before the stats
-// tables — the analytics release's and the pause's — and nothing on a current
-// schema.
+// tables — the analytics release's, the pause's, and the audit history's — and
+// nothing on a current schema.
 func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -171,7 +190,7 @@ func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	assert.ElementsMatch(t, []string{
 		"job_runs.kind", "job_runs.queue", "job_runs.queue_wait_ms", "job_runs.job_state",
 		"job_runs.superseded", "job_periodics.paused_at", "job_run_finishes (table)",
-		"job_stats_hourly (table)", "job_stats_progress (table)",
+		"job_stats_hourly (table)", "job_stats_progress (table)", "job_audit (table)",
 	}, schemaDriftNames(drift))
 
 	current, err := InspectSchema(ctx, newDB(t))

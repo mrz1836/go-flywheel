@@ -628,7 +628,8 @@ func TestRetryJobForceOnACallerTransactionLeavesItUsable(t *testing.T) {
 // TestRetryJobForceCollisionLookupFailureStillReportsTheCollision proves a failed
 // holder read never masks the forced retry's collision: the error still matches
 // ErrAlreadyEnqueued, with no holder named. Both reads behind it fail here — the
-// retried job's key, and the holder — since every read fails.
+// retried job's key, and the holder — since every read after the retry's UPDATE
+// fails; the reads the retry decides from, before it, succeed.
 func TestRetryJobForceCollisionLookupFailureStillReportsTheCollision(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
@@ -641,8 +642,15 @@ func TestRetryJobForceCollisionLookupFailureStillReportsTheCollision(t *testing.
 	_, err = Enqueue(ctx, c, "k", []byte(`{}`), InsertOpts{UniqueActiveKey: "subject"})
 	require.NoError(t, err)
 
+	var updated atomic.Bool
+	require.NoError(t, db.Callback().Update().After("gorm:update").Register("test:mark_update",
+		func(*gorm.DB) { updated.Store(true) }))
 	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:fail_reads",
-		func(tx *gorm.DB) { _ = tx.AddError(errors.New("read failed")) }))
+		func(tx *gorm.DB) {
+			if updated.Load() {
+				_ = tx.AddError(errors.New("read failed"))
+			}
+		}))
 
 	err = RetryJobWithOptions(ctx, db, first, RetryOpts{Force: true})
 	require.ErrorIs(t, err, ErrAlreadyEnqueued)
