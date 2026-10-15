@@ -126,7 +126,8 @@ func newScheduleAddCmd(configPath *string) *cobra.Command {
 // declares is removed all the same, with a warning: serve re-creates it, so
 // retiring it means removing it from the config first.
 func newScheduleRmCmd(configPath *string) *cobra.Command {
-	return &cobra.Command{
+	var reason string
+	cmd := &cobra.Command{
 		Use:   "rm <slug>",
 		Short: "Remove a periodic schedule",
 		Long: "Remove a periodic schedule. A schedule the config file declares comes back:\n" +
@@ -134,7 +135,7 @@ func newScheduleRmCmd(configPath *string) *cobra.Command {
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			slug := args[0]
-			cfg, err := mutateSchedule(cmd, *configPath, slug, flywheel.DeletePeriodic, "removed")
+			cfg, err := mutateSchedule(cmd, *configPath, slug, reason, flywheel.DeletePeriodic, "removed")
 			if err != nil {
 				return err
 			}
@@ -146,6 +147,8 @@ func newScheduleRmCmd(configPath *string) *cobra.Command {
 			return nil
 		},
 	}
+	addReasonFlag(cmd, &reason)
+	return cmd
 }
 
 // activeSwitchHelp is the part of enable's and disable's help that says whose
@@ -157,31 +160,37 @@ const activeSwitchHelp = "This is the config's own on/off switch: for a schedule
 
 // newScheduleEnableCmd reactivates a periodic schedule by slug.
 func newScheduleEnableCmd(configPath *string) *cobra.Command {
-	return &cobra.Command{
+	var reason string
+	cmd := &cobra.Command{
 		Use:   "enable <slug>",
 		Short: "Reactivate a periodic schedule",
 		Long:  "Reactivate a periodic schedule on its existing cadence.\n\n" + activeSwitchHelp,
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, err := mutateSchedule(cmd, *configPath, args[0], setPeriodicActive(true), "enabled")
+			_, err := mutateSchedule(cmd, *configPath, args[0], reason, setPeriodicActive(true), "enabled")
 			return err
 		},
 	}
+	addReasonFlag(cmd, &reason)
+	return cmd
 }
 
 // newScheduleDisableCmd deactivates a periodic schedule by slug — it is preserved
 // (and inspectable) but stops firing.
 func newScheduleDisableCmd(configPath *string) *cobra.Command {
-	return &cobra.Command{
+	var reason string
+	cmd := &cobra.Command{
 		Use:   "disable <slug>",
 		Short: "Deactivate a periodic schedule (preserved, but stops firing)",
 		Long:  "Deactivate a periodic schedule: its row is kept, but it stops firing.\n\n" + activeSwitchHelp,
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, err := mutateSchedule(cmd, *configPath, args[0], setPeriodicActive(false), "disabled")
+			_, err := mutateSchedule(cmd, *configPath, args[0], reason, setPeriodicActive(false), "disabled")
 			return err
 		},
 	}
+	addReasonFlag(cmd, &reason)
+	return cmd
 }
 
 // newSchedulePauseCmd holds a periodic schedule by slug until it is resumed.
@@ -195,7 +204,7 @@ func newSchedulePauseCmd(configPath *string) *cobra.Command {
 			"it is paused. Pausing a paused schedule changes nothing.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, err := mutateSchedule(cmd, *configPath, args[0], flywheel.PausePeriodic, "paused")
+			_, err := mutateSchedule(cmd, *configPath, args[0], "", flywheel.PausePeriodic, "paused")
 			return err
 		},
 	}
@@ -211,7 +220,7 @@ func newScheduleResumeCmd(configPath *string) *cobra.Command {
 			"disabled. Resuming a schedule that is not paused changes nothing.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, err := mutateSchedule(cmd, *configPath, args[0], flywheel.ResumePeriodic, "resumed")
+			_, err := mutateSchedule(cmd, *configPath, args[0], "", flywheel.ResumePeriodic, "resumed")
 			return err
 		},
 	}
@@ -225,18 +234,19 @@ func setPeriodicActive(active bool) func(context.Context, *gorm.DB, string) erro
 	}
 }
 
-// mutateSchedule runs a schedule mutator (rm/enable/disable/pause/resume) on slug and reports
-// the result, mirroring jobs.go's mutateJob. It returns the loaded config, so a
-// caller can relate the slug to what the config declares.
+// mutateSchedule runs a schedule mutator (rm/enable/disable/pause/resume) on slug as
+// the operating-system user, with reason, and reports the result, mirroring
+// jobs.go's mutateJob. It returns the loaded config, so a caller can relate the
+// slug to what the config declares.
 func mutateSchedule(
-	cmd *cobra.Command, configPath, slug string, mutate func(context.Context, *gorm.DB, string) error, verb string,
+	cmd *cobra.Command, configPath, slug, reason string, mutate func(context.Context, *gorm.DB, string) error, verb string,
 ) (*Config, error) {
 	cfg, db, _, err := loadAndOpen(configPath)
 	if err != nil {
 		return nil, err
 	}
 	defer closeDB(db)
-	if err := mutate(cmd.Context(), db, slug); err != nil {
+	if err := mutate(flywheel.WithActor(cmd.Context(), operatorActor(reason)), db, slug); err != nil {
 		return nil, err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", verb, slug)
