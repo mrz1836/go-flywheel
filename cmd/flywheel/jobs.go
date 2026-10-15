@@ -16,7 +16,7 @@ import (
 )
 
 // newJobsCmd builds the `flywheel jobs` command group: ls, count, running,
-// inspect, history, retry, cancel.
+// inspect, history, retry, cancel, reschedule, priority, pause, resume, delete.
 func newJobsCmd(configPath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "jobs", Short: "Inspect and operate jobs"}
 	cmd.AddCommand(
@@ -27,6 +27,11 @@ func newJobsCmd(configPath *string) *cobra.Command {
 		newJobsHistoryCmd(configPath),
 		newJobsRetryCmd(configPath),
 		newJobsCancelCmd(configPath),
+		newJobsRescheduleCmd(configPath),
+		newJobsPriorityCmd(configPath),
+		newJobsPauseCmd(configPath),
+		newJobsResumeCmd(configPath),
+		newJobsDeleteCmd(configPath),
 	)
 	return cmd
 }
@@ -476,8 +481,9 @@ func addReasonFlag(cmd *cobra.Command, reason *string) {
 	cmd.Flags().StringVar(reason, "reason", "", "why you are running it; recorded in the history")
 }
 
-// mutateJob runs a job mutator (retry/cancel) as the operating-system user, with
-// reason, and reports the result.
+// mutateJob runs a job control (retry, cancel, reschedule, priority, pause,
+// resume, delete) as the operating-system user, with reason, and reports the
+// result.
 func mutateJob(
 	cmd *cobra.Command, configPath, id, reason string, mutate func(context.Context, *gorm.DB, string) error, verb string,
 ) error {

@@ -211,7 +211,8 @@ attempt's run stays `started` until it returns, and for good when its process is
 ## Who changed this job, and why
 
 Every operator control records who ran it, in the job's history: a retry, a cancel, a pause or resume of
-its parent's batch, a replay, and, for a schedule, a deactivate, activate, or delete. Read it with:
+its parent's batch, a replay, a reschedule, a priority change, a pause, resume, or delete of the job itself,
+and, for a schedule, a deactivate, activate, or delete. Read it with:
 
 ```bash
 flywheel jobs history <job-id>             # WHEN (UTC), ACTION, ACTOR, SOURCE, REASON — newest first
@@ -233,6 +234,39 @@ with `ErrSchemaOutdated` naming `job_audit (table)` for the same reason.
 
 **The history grows by one entry per changed job.** Set `SchedulerConfig.AuditRetention` to bound it (see
 [Bounded retention](#bounded-retention)).
+
+<br>
+
+## Holding, moving, or deleting one job
+
+Five controls change one job in place, by its id, and keep its id and its history:
+
+```bash
+flywheel jobs reschedule <job-id> --at 2026-01-02T09:00:00Z --reason "after the vendor window"
+flywheel jobs priority <job-id> 10 --reason "customer waiting"   # at least 1; lower runs first
+flywheel jobs pause <job-id> --reason "hold for review"          # no runner claims it
+flywheel jobs resume <job-id> --reason "reviewed"                # available again, at its scheduled time
+flywheel jobs delete <job-id> --reason "a test job"              # a finished job, with its runs
+```
+
+In code they are `RescheduleJob`, `SetJobPriority`, `PauseJob`, `ResumeJob`, and `DeleteJob`. Each one that
+changes the job records an entry in its history (`flywheel jobs history <job-id>`). One that finds nothing
+to change — pausing a paused job, resuming one that isn't paused, the priority it already has — changes
+nothing and records nothing.
+
+- **Refused with `flywheel: job is running` (`ErrJobRunning`).** None of them touches a running job: its row
+  belongs to the attempt in flight. Wait for the attempt to finish, or cancel the job
+  (`flywheel jobs cancel`), after which it can be retried or deleted.
+- **Refused with `flywheel: job has already reached a terminal state` (`ErrJobTerminal`).** The job has
+  finished, so there is nothing to move, reprioritize, hold, or release. Retry it with `--force` to run it
+  again, or delete it.
+- **`delete` refused with `flywheel: job has not reached a terminal state` (`ErrJobNotTerminal`).** Only a
+  finished job is deleted. Cancel it first, then delete it.
+- **A resumed job isn't claimed yet.** `resume` keeps the job's `scheduled_at`, so a job paused while
+  deferred runs at its time, not at once. Reschedule it to the current time to run it now.
+- **What a delete removes.** The job, its runs, and their finish-log entries, in the order `flywheel prune`
+  deletes them. Its history stays, with the delete in it. Its children keep their `parent_job_id`, and a
+  fan-in barrier it declared and had not fired goes with it, so that barrier never fires.
 
 <br>
 

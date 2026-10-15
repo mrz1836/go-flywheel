@@ -125,16 +125,21 @@ const (
 	AuditReplayed AuditAction = "replayed"
 	// AuditCancelled is a job cancelled by CancelJob or CancelByParent.
 	AuditCancelled AuditAction = "cancelled"
-	// AuditPaused is a job paused by PauseByParent.
+	// AuditPaused is a job paused by PauseByParent or PauseJob.
 	AuditPaused AuditAction = "paused"
-	// AuditResumed is a job resumed by ResumeByParent.
+	// AuditResumed is a job resumed by ResumeByParent or ResumeJob.
 	AuditResumed AuditAction = "resumed"
 	// AuditActivated is a periodic definition SetPeriodicActive turned on.
 	AuditActivated AuditAction = "activated"
 	// AuditDeactivated is a periodic definition SetPeriodicActive turned off.
 	AuditDeactivated AuditAction = "deactivated"
-	// AuditDeleted is a periodic definition DeletePeriodic removed.
+	// AuditDeleted is a periodic definition DeletePeriodic removed, or a
+	// finished job DeleteJob removed.
 	AuditDeleted AuditAction = "deleted"
+	// AuditRescheduled is a waiting job RescheduleJob moved to another time.
+	AuditRescheduled AuditAction = "rescheduled"
+	// AuditReprioritized is a waiting job SetJobPriority gave another priority.
+	AuditReprioritized AuditAction = "reprioritized"
 )
 
 // AuditEntry is one entry of the control history: one change one control made
@@ -347,10 +352,16 @@ func updateJobsReturningIDs(tx *gorm.DB, where string, args []any, upd map[strin
 }
 
 // controlMiss is the error a control returns for a job in a state it can't act
-// on: ErrJobRunning for a running job, and ErrJobTerminal otherwise.
+// on: ErrJobRunning for a running job, ErrJobTerminal for a terminal one, and
+// ErrJobNotTerminal otherwise, for a job still waiting, which only DeleteJob
+// refuses.
 func controlMiss(state JobState) error {
-	if state == StateRunning {
+	switch {
+	case state == StateRunning:
 		return ErrJobRunning
+	case slices.Contains(TerminalStates(), state):
+		return ErrJobTerminal
+	default:
+		return ErrJobNotTerminal
 	}
-	return ErrJobTerminal
 }

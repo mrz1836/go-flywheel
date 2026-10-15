@@ -103,6 +103,11 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel jobs history <id>` | Show who changed a job, and why, newest first: when (UTC), the action, the actor, the source, and the reason (`--limit` (50, at most 200); a page with another after it ends with `next: --cursor <cursor>`, which `--cursor` reads; `--json` prints the page) |
 | `flywheel jobs retry <id>` | Return a job to available so it runs again (`--force` for a terminal job; `--allow-running` re-queues a running one, whose current attempt keeps running; `--reason`, recorded in its history). Without them, a running job is refused (`flywheel: job is running`), so its work never runs twice at once, and so is a terminal one (`flywheel: job has already reached a terminal state`) |
 | `flywheel jobs cancel <id>` | Move a job to cancelled (refused once a job is terminal; `--reason`, recorded in its history) |
+| `flywheel jobs reschedule <id>` | Move a waiting job (available, retryable, scheduled, or paused) to another time, keeping its state: `--at` (RFC 3339, required; a time in the past makes it due now) and `--reason`, recorded in its history. A running job is refused (`flywheel: job is running`), and so is a finished one (`flywheel: job has already reached a terminal state`) |
+| `flywheel jobs priority <id> <priority>` | Give a waiting job another priority, at least 1; lower runs first (`--reason`, recorded in its history). The priority it already has changes nothing. Refused for a running or finished job, as `reschedule` is |
+| `flywheel jobs pause <id>` | Hold an available, retryable, or scheduled job so no runner claims it until it is resumed; a paused job is left as it is (`--reason`, recorded in its history). Refused for a running or finished job, as `reschedule` is |
+| `flywheel jobs resume <id>` | Return a paused job to available, keeping its scheduled time; any other waiting job is left as it is (`--reason`, recorded in its history). Refused for a running or finished job, as `reschedule` is |
+| `flywheel jobs delete <id>` | Delete a finished job (succeeded, cancelled, or discarded) with its runs, as `prune` deletes them; its history stays, with the delete in it (`--reason`). A job that hasn't finished is refused (`flywheel: job has not reached a terminal state`): cancel it first |
 | `flywheel schedule ls` | List periodic schedules, with whether each is active and paused (`--json`) |
 | `flywheel schedule add <slug> <kind>` | Add/update a schedule (`--cron \| --every`, `--args`). A `--cron` that names no zone runs in the zone the scheduler evaluates it in: the daemon's local zone, as the database driver returns its times. Prefix it with `CRON_TZ=<zone>` to pin one, for example `--cron "CRON_TZ=UTC 0 9 * * *"` |
 | `flywheel schedule rm <slug>` | Remove a schedule (warns when the config declares it: `serve` re-creates it; `--reason`, recorded in its history) |
@@ -117,8 +122,8 @@ flywheel serve                        # run the runtime until Ctrl+C
 All commands take `--config <path>` (default `./flywheel.yaml`, else
 `$XDG_CONFIG_HOME/flywheel/flywheel.yaml`).
 
-The control commands — `jobs retry`, `jobs cancel`, and `schedule rm`, `enable`, and `disable` — run as the
-operating-system user (its name, else `$USER`) with the source `cli`, so `flywheel jobs history` and
+The control commands — `jobs retry`, `cancel`, `reschedule`, `priority`, `pause`, `resume`, and `delete`,
+and `schedule rm`, `enable`, and `disable` — run as the operating-system user (its name, else `$USER`) with the source `cli`, so `flywheel jobs history` and
 `ListAudit` show who ran each one and the `--reason` they gave.
 
 ## Replacing cron
