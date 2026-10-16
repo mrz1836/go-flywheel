@@ -30,6 +30,10 @@ type Job[A Args] = core.Job[A]
 // Worker processes jobs whose args decode to A.
 type Worker[A Args] = core.Worker[A]
 
+// ArgsValidator is the optional worker interface that checks a kind's decoded
+// args before Registry.Validate and Registry.Enqueue accept them.
+type ArgsValidator[A Args] = core.ArgsValidator[A]
+
 type (
 	ActiveCount           = core.ActiveCount
 	Actor                 = core.Actor
@@ -40,6 +44,8 @@ type (
 	AnomalySignal         = core.AnomalySignal
 	AnomalyThresholds     = core.AnomalyThresholds
 	Args                  = core.Args
+	ArgsExampler          = core.ArgsExampler
+	ArgsSchemer           = core.ArgsSchemer
 	AuditAction           = core.AuditAction
 	AuditEntry            = core.AuditEntry
 	AuditHook             = core.AuditHook
@@ -62,6 +68,7 @@ type (
 	DBLimiter             = core.DBLimiter
 	DBLimiterConfig       = core.DBLimiterConfig
 	Defaults              = core.Defaults
+	Describer             = core.Describer
 	DrainTimeoutError     = core.DrainTimeoutError
 	Driver                = core.Driver
 	DriverOpts            = core.DriverOpts
@@ -100,9 +107,12 @@ type (
 	JobState              = core.JobState
 	JobView               = core.JobView
 	JobsOverview          = core.JobsOverview
+	KindInfo              = core.KindInfo
+	KindRecord            = core.KindRecord
 	KindStats             = core.KindStats
 	LeaseRenewal          = core.LeaseRenewal
 	Limiter               = core.Limiter
+	LimiterInfo           = core.LimiterInfo
 	ListAuditParams       = core.ListAuditParams
 	ListFinishedParams    = core.ListFinishedParams
 	ListJobsParams        = core.ListJobsParams
@@ -116,6 +126,7 @@ type (
 	OverviewParams        = core.OverviewParams
 	PeriodicSpec          = core.PeriodicSpec
 	PeriodicView          = core.PeriodicView
+	PublishKindsOpts      = core.PublishKindsOpts
 	QueueDepth            = core.QueueDepth
 	QueueHealth           = core.QueueHealth
 	RawJob                = core.RawJob
@@ -419,6 +430,14 @@ func ListJobs(ctx context.Context, db *gorm.DB, p ListJobsParams) ([]JobView, er
 	return core.ListJobs(ctx, db, p)
 }
 
+func ListKinds(ctx context.Context, db *gorm.DB) ([]KindRecord, error) {
+	return core.ListKinds(ctx, db)
+}
+
+func ListLimiters(ctx context.Context, db *gorm.DB) ([]LimiterInfo, error) {
+	return core.ListLimiters(ctx, db)
+}
+
 func ListPeriodics(ctx context.Context, db *gorm.DB) ([]PeriodicView, error) {
 	return core.ListPeriodics(ctx, db)
 }
@@ -533,6 +552,14 @@ func ProgressByKind(ctx context.Context, db *gorm.DB, kinds []string) (map[strin
 
 func ProgressMany(ctx context.Context, db *gorm.DB, parentJobIDs []string) (map[string]BatchProgress, error) {
 	return core.ProgressMany(ctx, db, parentJobIDs)
+}
+
+func PublishKinds(ctx context.Context, db *gorm.DB, reg *Registry) error {
+	return core.PublishKinds(ctx, db, reg)
+}
+
+func PublishKindsWithOptions(ctx context.Context, db *gorm.DB, reg *Registry, opts PublishKindsOpts) error {
+	return core.PublishKindsWithOptions(ctx, db, reg, opts)
 }
 
 func QueryJobs(ctx context.Context, db *gorm.DB, q JobQuery) (JobPage, error) {

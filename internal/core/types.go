@@ -143,13 +143,14 @@ type Classifier interface {
 }
 
 // Defaults is an optional worker interface that declares a kind's routing once,
-// on its worker. Register calls Defaults once and keeps five of the fields it
-// returns: Queue, Priority, MaxAttempts, Timeout, and ExecutorClass. Every other
-// field (UniqueKey, UniqueActiveKey, ScheduleAt, Parent, Tx, RequestID) is
-// ignored.
+// on its worker. Register calls Defaults once and keeps six of the fields it
+// returns: Queue, Priority, MaxAttempts, Timeout, ExecutorClass, and Tags. Every
+// other field (UniqueKey, UniqueActiveKey, ScheduleAt, Parent, Tx, RequestID,
+// Metadata) is ignored.
 //
 // An insert that knows the worker's Registry fills each of those fields it leaves
 // zero from them, so a field the call sets always wins. These inserts know it:
+//   - Registry.Enqueue, through any Client;
 //   - every insert through a Client built with ClientOpts.Registry: Insert,
 //     Enqueue, InsertMany, InsertManyTyped, and the periodic fires of a
 //     Scheduler whose SchedulerConfig.Client it is;
@@ -162,13 +163,16 @@ type Classifier interface {
 //
 // A field resolves in this order: the call's own value, then the kind's
 // Defaults, then the runtime's default (queue "default", priority 100, 25
-// attempts, no timeout, AnyClass). A FollowUp names no max attempts or timeout,
-// so a follow-up takes those from its kind's Defaults or the runtime's. A barrier
-// continuation's queue, executor class, and priority take the Barrier's own
-// value, then the kind's Defaults, then the spawning job's (see Barrier). A
-// Timeout is stored on the job like InsertOpts.Timeout, so it overrides the
-// worker's Timeouter. Since a zero field is one the call left unset, a call
-// cannot choose AnyClass for a kind whose Defaults name an ExecutorClass.
+// attempts, no timeout, AnyClass, no tags). Tags count as left zero when the
+// call names none, and the kind's then replace them whole, never merged. A
+// FollowUp names no max attempts or timeout, so a follow-up takes those from its
+// kind's Defaults or the runtime's. A barrier continuation's queue, executor
+// class, and priority take the Barrier's own value, then the kind's Defaults,
+// then the spawning job's (see Barrier). A Timeout is stored on the job like
+// InsertOpts.Timeout, so it overrides the worker's Timeouter. Since a zero field
+// is one the call left unset, a call cannot choose AnyClass for a kind whose
+// Defaults name an ExecutorClass, or no tags for a kind whose Defaults name some.
+// The Defaults tags meet the limits InsertOpts.Tags does, at each insert.
 type Defaults interface {
 	Defaults() InsertOpts
 }
@@ -296,10 +300,10 @@ type Result struct {
 // The continuation is resolved when the barrier is declared, in the finalize
 // that returns it. Each of Queue, ExecutorClass, and Priority takes the Barrier's
 // own value, then the continuation kind's Defaults in the Runner's Registry, then
-// the spawning job's; its max attempts and timeout take the kind's Defaults, or
-// the runtime's. All of it is stored with the barrier, so whichever path fires
-// it builds the same continuation, and a kind without Defaults inherits the
-// spawning job's routing.
+// the spawning job's; its max attempts, timeout, and tags take the kind's
+// Defaults, or the runtime's. All of it is stored with the barrier, so whichever
+// path fires it builds the same continuation, and a kind without Defaults
+// inherits the spawning job's routing.
 //
 // A barrier-bearing generation is bounded by DriverOpts.BarrierMaxChildren
 // (default 10,000): the barrier costs an index-only completion count per child
@@ -321,11 +325,11 @@ type Barrier struct {
 
 // FollowUp describes a child job a worker requests be enqueued.
 //
-// A routing field it leaves zero (Queue, Priority, ExecutorClass) takes its
-// kind's Defaults in the Runner's Registry, then the runtime's default. It names
-// no max attempts or timeout, so the child takes those from the same Defaults,
-// or the runtime's. A kind the Runner's Registry does not register takes the
-// runtime's defaults alone.
+// A field it leaves zero (Queue, Priority, ExecutorClass, Tags) takes its kind's
+// Defaults in the Runner's Registry, then the runtime's default. It names no max
+// attempts or timeout, so the child takes those from the same Defaults, or the
+// runtime's. A kind the Runner's Registry does not register takes the runtime's
+// defaults alone.
 type FollowUp struct {
 	Kind       string
 	Args       any
@@ -347,9 +351,9 @@ type FollowUp struct {
 
 // InsertOpts configures a single Insert.
 //
-// Through a Client built with ClientOpts.Registry, each of Queue, Priority,
-// MaxAttempts, Timeout, and ExecutorClass left zero takes the kind's Defaults;
-// see Defaults.
+// Through Registry.Enqueue, or a Client built with ClientOpts.Registry, each of
+// Queue, Priority, MaxAttempts, Timeout, ExecutorClass, and Tags left zero takes
+// the kind's Defaults; see Defaults.
 //
 // For worked recipes and a decision table covering UniqueKey, UniqueActiveKey,
 // the bucketed-key pattern, and correlating side effects to an attempt, see

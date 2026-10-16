@@ -21,6 +21,7 @@ type routing struct {
 	MaxAttempts   int
 	TimeoutMs     int // 0 when the row carries no timeout
 	ExecutorClass string
+	Tags          []string // nil when the row carries none
 }
 
 // runtimeRouting is what a row gets when nothing names a value: the runtime's
@@ -31,7 +32,9 @@ func runtimeRouting() routing {
 
 // welcomeRouting is the routing welcomeWorker's Defaults declare.
 func welcomeRouting() routing {
-	return routing{Queue: "mail", Priority: 40, MaxAttempts: 4, TimeoutMs: 30_000, ExecutorClass: "ecs"}
+	return routing{
+		Queue: "mail", Priority: 40, MaxAttempts: 4, TimeoutMs: 30_000, ExecutorClass: "ecs", Tags: []string{"mail"},
+	}
 }
 
 // routingOf reads the routing of the job with id.
@@ -49,6 +52,10 @@ func routingOfRow(row jobRow) routing {
 	}
 	if row.TimeoutMs != nil {
 		r.TimeoutMs = *row.TimeoutMs
+	}
+	var tags []string
+	if err := json.Unmarshal(row.Tags, &tags); err == nil && len(tags) > 0 {
+		r.Tags = tags
 	}
 	return r
 }
@@ -69,16 +76,17 @@ func (welcomeWorker) Kind() string { return "mail.welcome" }
 
 func (welcomeWorker) Work(context.Context, *Job[defaultsArgs]) (Result, error) { return Result{}, nil }
 
-// Defaults declares the five fields an insert takes from it, and fields it must
-// never take: a unique key, a unique active key, a schedule, a parent, and a
-// request id.
+// Defaults declares the six fields an insert takes from it, and fields it must
+// never take: a unique key, a unique active key, a schedule, a parent, a
+// request id, and metadata.
 func (welcomeWorker) Defaults() InsertOpts {
 	later := time.Now().Add(30 * 24 * time.Hour)
 	parent := "defaults-parent"
 	return InsertOpts{
 		Queue: "mail", Priority: 40, MaxAttempts: 4, Timeout: 30 * time.Second, ExecutorClass: "ecs",
+		Tags:      []string{"mail"},
 		UniqueKey: "welcome", UniqueActiveKey: "welcome-live", ScheduleAt: &later, Parent: &parent,
-		RequestID: "request-from-defaults",
+		RequestID: "request-from-defaults", Metadata: map[string]any{"from_defaults": true},
 	}
 }
 
@@ -102,6 +110,7 @@ func assertNothingElseFromDefaults(t testing.TB, db *gorm.DB, id string) {
 	}
 	assert.True(t, row.ScheduledAt.Before(time.Now().Add(7*24*time.Hour)), "nor a schedule")
 	assert.NotContains(t, string(row.Metadata), "request-from-defaults", "nor a request id")
+	assert.NotContains(t, string(row.Metadata), "from_defaults", "nor metadata")
 }
 
 // insertPath is one way a producer inserts a job through a Client.
@@ -172,12 +181,27 @@ func defaultsInsertCases() []defaultsInsertCase {
 		{
 			name: "the caller's fields win and the rest come from the defaults", registry: true, kind: "mail.welcome",
 			opts: InsertOpts{Queue: "urgent", MaxAttempts: 9},
-			want: routing{Queue: "urgent", Priority: 40, MaxAttempts: 9, TimeoutMs: 30_000, ExecutorClass: "ecs"},
+			want: routing{
+				Queue: "urgent", Priority: 40, MaxAttempts: 9, TimeoutMs: 30_000, ExecutorClass: "ecs", Tags: []string{"mail"},
+			},
+		},
+		{
+			name: "the caller's tags win over the kind's", registry: true, kind: "mail.welcome",
+			opts: InsertOpts{Tags: []string{"vip", "retry"}},
+			want: routing{
+				Queue: "mail", Priority: 40, MaxAttempts: 4, TimeoutMs: 30_000, ExecutorClass: "ecs",
+				Tags: []string{"vip", "retry"},
+			},
 		},
 		{
 			name: "a caller that names every field keeps every one", registry: true, kind: "mail.welcome",
-			opts: InsertOpts{Queue: "urgent", Priority: 7, MaxAttempts: 9, Timeout: 5 * time.Second, ExecutorClass: "gpu"},
-			want: routing{Queue: "urgent", Priority: 7, MaxAttempts: 9, TimeoutMs: 5_000, ExecutorClass: "gpu"},
+			opts: InsertOpts{
+				Queue: "urgent", Priority: 7, MaxAttempts: 9, Timeout: 5 * time.Second, ExecutorClass: "gpu",
+				Tags: []string{"vip"},
+			},
+			want: routing{
+				Queue: "urgent", Priority: 7, MaxAttempts: 9, TimeoutMs: 5_000, ExecutorClass: "gpu", Tags: []string{"vip"},
+			},
 		},
 		{
 			name: "a kind the registry does not register takes the runtime's defaults", registry: true,
@@ -190,11 +214,15 @@ func defaultsInsertCases() []defaultsInsertCase {
 	}
 }
 
-// defaultsInsertSuite runs every case on every insert path. Each case inserts
-// twice: the worker's Defaults name a unique key, which an insert never takes,
-// so both rows land.
+// defaultsInsertSuite runs every case on every insert path, then
+// Registry.Enqueue's cases. Each case inserts twice: the worker's Defaults name
+// a unique key, which an insert never takes, so both rows land.
 func defaultsInsertSuite(t *testing.T, open dbOpener) {
 	t.Helper()
+	t.Run("Registry.Enqueue", func(t *testing.T) {
+		t.Parallel()
+		registryEnqueueDefaultsSuite(t, open(t))
+	})
 	for _, path := range defaultsInsertPaths() {
 		t.Run(path.name, func(t *testing.T) {
 			t.Parallel()
@@ -221,13 +249,64 @@ func defaultsInsertSuite(t *testing.T, open dbOpener) {
 	}
 }
 
+// registryEnqueueDefaultsSuite proves Registry.Enqueue fills each field a call
+// leaves zero from the kind's Defaults whatever Client it enqueues through, one
+// built without a registry included, keeps the fields the call sets, ignores
+// every other field of Defaults, and refuses a kind its registry does not
+// register.
+func registryEnqueueDefaultsSuite(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	ctx := context.Background()
+	reg := welcomeRegistry()
+	payload := []byte(`{"user":"u1"}`)
+	clients := []struct {
+		name string
+		c    *Client
+	}{
+		{name: "a client without a registry", c: NewClient(db)},
+		{name: "a client with the registry", c: NewClientWithOptions(db, ClientOpts{Registry: reg})},
+	}
+	cases := []struct {
+		name string
+		opts InsertOpts
+		want routing
+	}{
+		{name: "zero options take the worker's defaults", want: welcomeRouting()},
+		{
+			name: "the caller's fields win and the rest come from the defaults",
+			opts: InsertOpts{Queue: "urgent", MaxAttempts: 9, Tags: []string{"vip"}},
+			want: routing{
+				Queue: "urgent", Priority: 40, MaxAttempts: 9, TimeoutMs: 30_000, ExecutorClass: "ecs", Tags: []string{"vip"},
+			},
+		},
+	}
+	for _, client := range clients {
+		for _, tc := range cases {
+			t.Run(client.name+"/"+tc.name, func(t *testing.T) {
+				for range 2 {
+					id, err := reg.Enqueue(ctx, client.c, "mail.welcome", payload, tc.opts)
+					require.NoError(t, err)
+					assert.Equal(t, tc.want, routingOf(t, db, id))
+					assertNothingElseFromDefaults(t, db, id)
+				}
+			})
+		}
+		t.Run(client.name+"/an unregistered kind is refused", func(t *testing.T) {
+			_, err := reg.Enqueue(ctx, client.c, "mail.stray", payload, InsertOpts{})
+			require.ErrorIs(t, err, ErrUnknownKind)
+			assert.EqualValues(t, 0, countJobsOfKind(t, db, "mail.stray"))
+		})
+	}
+}
+
 // TestDefaultsSeedEveryInsertUnderTheCallersOptions proves a Client built with
 // ClientOpts.Registry fills each field a call leaves zero (queue, priority, max
-// attempts, timeout, and executor class) from the kind's Defaults, on Insert,
-// Enqueue, InsertMany, and InsertManyTyped; that a field the call sets wins; and
-// that every other field of Defaults is ignored. A kind the registry does not
-// register, and any kind through a Client without a registry, take the runtime's
-// defaults.
+// attempts, timeout, executor class, and tags) from the kind's Defaults, on
+// Insert, Enqueue, InsertMany, and InsertManyTyped; that a field the call sets
+// wins; and that every other field of Defaults is ignored. A kind the registry
+// does not register, and any kind through a Client without a registry, take the
+// runtime's defaults. Registry.Enqueue applies the kind's Defaults through any
+// Client, and refuses a kind its registry does not register.
 func TestDefaultsSeedEveryInsertUnderTheCallersOptions(t *testing.T) {
 	t.Parallel()
 	defaultsInsertSuite(t, sqliteOpener)
@@ -279,7 +358,10 @@ func defaultsPeriodicSuite(t *testing.T, open dbOpener) {
 	}{
 		{
 			name: "a client with a registry", registry: true,
-			want: routing{Queue: "periodic", Priority: 40, MaxAttempts: 4, TimeoutMs: 30_000, ExecutorClass: "ecs"},
+			want: routing{
+				Queue: "periodic", Priority: 40, MaxAttempts: 4, TimeoutMs: 30_000, ExecutorClass: "ecs",
+				Tags: []string{"mail"},
+			},
 		},
 		{
 			name: "a client without a registry", registry: false,
@@ -321,8 +403,8 @@ func TestDefaultsReachAPeriodicFire(t *testing.T) {
 }
 
 // fanOutWorker returns three follow-ups: one of kind "mail.welcome" that names
-// nothing, one of the same kind that names its queue, priority, and executor
-// class, and one of a kind the Runner does not register.
+// nothing, one of the same kind that names its queue, priority, executor class,
+// and tags, and one of a kind the Runner does not register.
 type fanOutWorker struct{}
 
 func (fanOutWorker) Kind() string { return "defaults.fan_out" }
@@ -332,7 +414,7 @@ func (fanOutWorker) Work(context.Context, *Job[defaultsArgs]) (Result, error) {
 		{Kind: "mail.welcome", Args: map[string]string{"case": "bare"}, Parent: true},
 		{
 			Kind: "mail.welcome", Args: map[string]string{"case": "routed"}, Parent: true,
-			Queue: "urgent", Priority: 7, ExecutorClass: "gpu",
+			Queue: "urgent", Priority: 7, ExecutorClass: "gpu", Tags: []string{"priority"},
 		},
 		{Kind: "mail.stray", Args: map[string]string{"case": "stray"}, Parent: true},
 	}}, nil
@@ -381,8 +463,9 @@ func defaultsFollowUpSuite(t *testing.T, db *gorm.DB) {
 	bare := childByCase(t, db, parentID, "bare")
 	assert.Equal(t, welcomeRouting(), routingOfRow(bare), "a follow-up's zero fields take its kind's defaults")
 	routed := childByCase(t, db, parentID, "routed")
-	assert.Equal(t, routing{Queue: "urgent", Priority: 7, MaxAttempts: 4, TimeoutMs: 30_000, ExecutorClass: "gpu"},
-		routingOfRow(routed), "a follow-up's own fields win")
+	assert.Equal(t, routing{
+		Queue: "urgent", Priority: 7, MaxAttempts: 4, TimeoutMs: 30_000, ExecutorClass: "gpu", Tags: []string{"priority"},
+	}, routingOfRow(routed), "a follow-up's own fields win")
 	stray := childByCase(t, db, parentID, "stray")
 	assert.Equal(t, runtimeRouting(), routingOfRow(stray), "a kind the Runner does not register gets no defaults")
 
@@ -420,7 +503,10 @@ func (rollupWorker) Kind() string { return "report.rollup" }
 func (rollupWorker) Work(context.Context, *Job[defaultsArgs]) (Result, error) { return Result{}, nil }
 
 func (rollupWorker) Defaults() InsertOpts {
-	return InsertOpts{Queue: "reports", Priority: 30, MaxAttempts: 3, Timeout: 20 * time.Second, ExecutorClass: "batch"}
+	return InsertOpts{
+		Queue: "reports", Priority: 30, MaxAttempts: 3, Timeout: 20 * time.Second, ExecutorClass: "batch",
+		Tags: []string{"reports"},
+	}
 }
 
 // plainRollupWorker is a barrier continuation kind with no Defaults.
@@ -541,12 +627,17 @@ func defaultsBarrierSuite(t *testing.T, open dbOpener) {
 		{
 			name:    "an empty barrier takes the continuation kind's defaults",
 			barrier: Barrier{Kind: "report.rollup"},
-			want:    routing{Queue: "reports", Priority: 30, MaxAttempts: 3, TimeoutMs: 20_000, ExecutorClass: "batch"},
+			want: routing{
+				Queue: "reports", Priority: 30, MaxAttempts: 3, TimeoutMs: 20_000, ExecutorClass: "batch",
+				Tags: []string{"reports"},
+			},
 		},
 		{
 			name:    "the barrier's own fields win",
 			barrier: Barrier{Kind: "report.rollup", Queue: "x", Priority: 9, ExecutorClass: "y"},
-			want:    routing{Queue: "x", Priority: 9, MaxAttempts: 3, TimeoutMs: 20_000, ExecutorClass: "y"},
+			want: routing{
+				Queue: "x", Priority: 9, MaxAttempts: 3, TimeoutMs: 20_000, ExecutorClass: "y", Tags: []string{"reports"},
+			},
 		},
 		{
 			name:    "a kind without defaults takes the spawning job's routing",
@@ -575,9 +666,9 @@ func defaultsBarrierSuite(t *testing.T, open dbOpener) {
 // TestDefaultsReachBarrierContinuationsOnEveryFiringPath proves a barrier's
 // continuation is resolved when the barrier is declared: the Barrier's own
 // field, then the continuation kind's default, then the spawning job's routing,
-// then the runtime's default. Its max attempts and timeout are stored with it,
-// so a child's finalize, CancelByParent, CancelJob, and the sweep's discard,
-// none of which knows the registry, build the same row.
+// then the runtime's default. Its max attempts, timeout, and tags are stored
+// with it, so a child's finalize, CancelByParent, CancelJob, and the sweep's
+// discard, none of which knows the registry, build the same row.
 func TestDefaultsReachBarrierContinuationsOnEveryFiringPath(t *testing.T) {
 	t.Parallel()
 	defaultsBarrierSuite(t, sqliteOpener)
@@ -606,10 +697,11 @@ func seedLegacyBarrier(t *testing.T, db *gorm.DB) string {
 	return parentID
 }
 
-// legacyBarrierSuite fires a spec stored before the spec carried attempts and a
-// timeout, once through a Runner whose registry declares the continuation
-// kind's defaults and once through CancelByParent. Both build the row the spec
-// always built: its own routing, with the runtime's attempts and no timeout.
+// legacyBarrierSuite fires a spec stored before the spec carried attempts, a
+// timeout, and tags, once through a Runner whose registry declares the
+// continuation kind's defaults and once through CancelByParent. Both build the
+// row the spec always built: its own routing, with the runtime's attempts, no
+// timeout, and no tags.
 func legacyBarrierSuite(t *testing.T, open dbOpener) {
 	t.Helper()
 	paths := []struct {
@@ -644,8 +736,8 @@ func legacyBarrierSuite(t *testing.T, open dbOpener) {
 }
 
 // TestABarrierSpecStoredWithoutDefaultsBuildsItsOldRow proves a barrier spec
-// that carries no attempts or timeout, as every spec stored before the spec
-// carried them, builds the continuation it always built, even when the
+// that carries no attempts, timeout, or tags, as every spec stored before the
+// spec carried them, builds the continuation it always built, even when the
 // finalize that fires it knows the continuation kind's defaults.
 func TestABarrierSpecStoredWithoutDefaultsBuildsItsOldRow(t *testing.T) {
 	t.Parallel()

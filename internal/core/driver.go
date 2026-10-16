@@ -883,13 +883,13 @@ func (d *baseDriver) RenewLease(
 // as spawned by spawnedBy.
 //
 // Each routing field fu leaves zero takes d's, then the runtime's default: queue,
-// priority, and executor class from fu, max attempts and timeout from d alone,
-// since a FollowUp names neither.
+// priority, executor class, and tags from fu, max attempts and timeout from d
+// alone, since a FollowUp names neither.
 //
-// Its tags and metadata are fu's, merged over the context's request id and
-// stamped by the InsertHook of the Client ctx carries (the Runner's on a
-// finalize, the Scheduler's on a sweep; none on a control's context). A refused
-// one fails the transaction that inserts the row.
+// Its tags are fu's, else d's, and its metadata fu's, merged over the context's
+// request id and stamped by the InsertHook of the Client ctx carries (the
+// Runner's on a finalize, the Scheduler's on a sweep; none on a control's
+// context). A refused one fails the transaction that inserts the row.
 //
 // It preserves the child's asymmetry with a top-level Insert: a child may carry a
 // UniqueKey and, when fu.Parent, a parent_job_id, but never a UniqueActiveKey. It
@@ -902,7 +902,9 @@ func buildChildRow(
 	if err != nil {
 		return jobRow{}, fmt.Errorf("jobs: marshal child args: %w", err)
 	}
-	routed := d.applyTo(InsertOpts{Queue: fu.Queue, Priority: fu.Priority, ExecutorClass: fu.ExecutorClass})
+	routed := d.applyTo(InsertOpts{
+		Queue: fu.Queue, Priority: fu.Priority, ExecutorClass: fu.ExecutorClass, Tags: fu.Tags,
+	})
 	queue := orString(routed.Queue, defaultQueue)
 	recordedParent := ""
 	if fu.Parent {
@@ -910,7 +912,7 @@ func buildChildRow(
 	}
 	st, err := stampRow(ctx, insertHookFrom(ctx), InsertInfo{
 		Kind: fu.Kind, Queue: queue, Source: source, SpawnedBy: spawnedBy, ParentJobID: recordedParent,
-	}, fu.Tags, fu.Metadata, ctxutil.RequestIDFrom(ctx))
+	}, routed.Tags, fu.Metadata, ctxutil.RequestIDFrom(ctx))
 	if err != nil {
 		return jobRow{}, fmt.Errorf("jobs: build follow-up %q: %w", fu.Kind, err)
 	}
@@ -1363,14 +1365,14 @@ func (d *baseDriver) insertFollowUps(
 }
 
 // barrierSpec is the fully-resolved continuation stored in jobs.barrier_spec: the
-// defaulted routing, the continuation kind's max attempts and timeout, and the
-// marshaled args, so every path that fires the barrier builds the same
+// defaulted routing, the continuation kind's max attempts, timeout, and tags,
+// and the marshaled args, so every path that fires the barrier builds the same
 // continuation from the spec alone, without a registry or a re-read of the
 // parent's columns.
 //
-// MaxAttempts and TimeoutMs are omitted when zero. A spec that carries neither,
-// as every spec declared without the kind's Defaults does, builds a continuation
-// with the runtime's max attempts and no timeout.
+// MaxAttempts, TimeoutMs, and Tags are omitted when zero. A spec that carries
+// none of them, as every spec declared without the kind's Defaults does, builds
+// a continuation with the runtime's max attempts, no timeout, and no tags.
 type barrierSpec struct {
 	Args          json.RawMessage `json:"args,omitempty"`
 	Queue         string          `json:"queue"`
@@ -1378,6 +1380,7 @@ type barrierSpec struct {
 	Priority      int             `json:"priority"`
 	MaxAttempts   int             `json:"max_attempts,omitempty"`
 	TimeoutMs     int             `json:"timeout_ms,omitempty"`
+	Tags          []string        `json:"tags,omitempty"`
 }
 
 // validateBarrier rejects a barrier that could never fire or would cost too much:
@@ -1407,8 +1410,8 @@ func validateBarrier(result Result, maxChildren int) error {
 // the spawning job's row, resolving the continuation when the barrier is declared
 // so the later fire needs no defaulting. Each of queue, executor class, and
 // priority takes the Barrier's own value, then the continuation kind's default,
-// then the parent's; max attempts and the timeout take the kind's default, or
-// stay unset for the runtime's.
+// then the parent's; max attempts, the timeout, and the tags take the kind's
+// default, or stay unset for the runtime's.
 //
 // The kind's defaults come from the Registry on tx's context, which is the
 // Runner's when a Runner finalizes (its transaction carries the finalize's
@@ -1436,6 +1439,7 @@ func resolveBarrierColumns(tx *gorm.DB, raw RawJob, b *Barrier) (string, datatyp
 		ExecutorClass: orString(string(routed.ExecutorClass), parent.ExecutorClass),
 		Priority:      orInt(routed.Priority, parent.Priority),
 		MaxAttempts:   routed.MaxAttempts,
+		Tags:          routed.Tags,
 	}
 	if routed.Timeout > 0 {
 		spec.TimeoutMs = int(routed.Timeout.Milliseconds())
@@ -1566,10 +1570,10 @@ func fireDiscardedParentsBarriers(ctx context.Context, tx *gorm.DB, jobs []recla
 	return nil
 }
 
-// barrierSpecDefaults returns the max attempts and timeout a barrier spec stored
-// for its continuation. A spec that stored neither, as one declared without the
-// continuation kind's Defaults, yields zero values, which leave the runtime's max
-// attempts and no timeout.
+// barrierSpecDefaults returns the max attempts, timeout, and tags a barrier spec
+// stored for its continuation. A spec that stored none of them, as one declared
+// without the continuation kind's Defaults, yields zero values, which leave the
+// runtime's max attempts, no timeout, and no tags.
 func barrierSpecDefaults(specJSON datatypes.JSON) (*kindDefaults, error) {
 	var spec barrierSpec
 	if err := json.Unmarshal(specJSON, &spec); err != nil {
@@ -1578,6 +1582,7 @@ func barrierSpecDefaults(specJSON datatypes.JSON) (*kindDefaults, error) {
 	return &kindDefaults{
 		maxAttempts: spec.MaxAttempts,
 		timeout:     time.Duration(spec.TimeoutMs) * time.Millisecond,
+		tags:        spec.Tags,
 	}, nil
 }
 

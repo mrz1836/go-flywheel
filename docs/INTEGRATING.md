@@ -69,15 +69,15 @@ default — and changes and removes nothing, so:
 
 **So the order is always: migrate the database, then deploy the binaries.**
 
-This section is the upgrade from the previous release: one table, `job_audit`, and its two indexes, and
-nothing else changes. The operator controls (`RetryJob`, `CancelJob`, `CancelByParent`, `Replay`,
-`SetPeriodicActive`, and the rest) write the table, so against a database without it a control fails
-naming the missing relation, and a Scheduler with `AuditRetention` set refuses to start. Runners, and
-Schedulers without `AuditRetention`, never touch the table and start either way.
+This section is the upgrade from the previous release: one table, `job_kinds`, and nothing else changes.
+`PublishKinds` writes the table and `ListKinds` (and `flywheel kinds`) reads it, so against a database
+without it each fails naming the missing relation. No Runner, Scheduler, or Node reads the table, and
+all of them start either way.
 
 A database several releases behind applies each older upgrade first, oldest first —
 [from a release before the stats tables](#from-a-release-before-the-stats-tables), then
-[from a release before the schedule pause](#from-a-release-before-the-schedule-pause) — and then this
+[from a release before the schedule pause](#from-a-release-before-the-schedule-pause), then
+[from a release before the audit history](#from-a-release-before-the-audit-history) — and then this
 one. `InspectSchema` names every gap, whichever release left it, and `Migrate` closes them all in one
 call.
 
@@ -85,12 +85,10 @@ call.
 
 | Object | Kind | Purpose |
 |---|---|---|
-| `job_audit` | table | the control history: one row per change a control made to a job or a schedule — what it did, who ran it and why, and the state the job changed from |
-| `job_audit_target` | index on `job_audit` | one target's history, newest or oldest first |
-| `job_audit_created` | index on `job_audit` | the whole feed in either order, and the audit prune's oldest-first batches |
+| `job_kinds` | table | the published kind catalog: one row per kind a node publishes — its description, args schema, example, and defaults — and when and by whom it was first and last published |
 
-Nothing is backfilled: the history starts with the first control run after the deploy. Both indexes are
-on the new, empty table, so building them takes no time and blocks no writer.
+Nothing is backfilled: the catalog fills the first time a process calls `PublishKinds`. The table has no
+index beyond its primary key, so the release adds no index.
 
 ### Library-owned install (`Migrate`, `flywheel migrate`)
 
@@ -109,7 +107,7 @@ err := flywheel.MigrateWithOptions(db, flywheel.MigrateOpts{
 })
 ```
 
-`flywheel migrate` prints what it added (`added: job_audit (table)`), and a re-run prints nothing
+`flywheel migrate` prints what it added (`added: job_kinds (table)`), and a re-run prints nothing
 new — an up-to-date schema issues no DDL at all. Both options are no-ops on SQLite. Each step commits on
 its own, so a lock timeout fails only the statement that could not get its lock: everything before it is
 applied, and a re-run completes the rest. Two migrations of one schema run one after the other.
@@ -129,54 +127,58 @@ exactly the statements below. To write it by hand, use these — they are the st
 `Models()`, and a test runs this file's blocks against the previous release's schema to prove they produce
 one with no drift.
 
-PostgreSQL — the table and both its indexes are new, so the statements lock nothing that already holds
-rows, and need no lock timeout:
+PostgreSQL — the table is new, so the statement locks nothing that already holds rows, and needs no lock
+timeout:
 
 <!-- upgrade-ddl:postgres -->
 ```sql
-CREATE TABLE IF NOT EXISTS job_audit (
-  id          text        NOT NULL,
-  created_at  timestamptz NOT NULL,
-  target_type text        NOT NULL,
-  target_id   text        NOT NULL,
-  action      text        NOT NULL,
-  actor_type  text        NOT NULL,
-  actor_id    text        NOT NULL DEFAULT '',
-  reason      text        NOT NULL DEFAULT '',
-  source      text        NOT NULL DEFAULT '',
-  request_id  text        NOT NULL DEFAULT '',
-  details     jsonb       NOT NULL DEFAULT '{}',
-  PRIMARY KEY (id)
+CREATE TABLE IF NOT EXISTS job_kinds (
+  kind               text        NOT NULL,
+  description        text        NOT NULL DEFAULT '',
+  args_schema        jsonb,
+  example_args       jsonb,
+  queue              text        NOT NULL DEFAULT '',
+  priority           bigint      NOT NULL DEFAULT 0,
+  max_attempts       bigint      NOT NULL DEFAULT 0,
+  timeout_ms         bigint,
+  executor_class     text        NOT NULL DEFAULT '',
+  validates_args     boolean     NOT NULL DEFAULT false,
+  custom_backoff     boolean     NOT NULL DEFAULT false,
+  classifies_errors  boolean     NOT NULL DEFAULT false,
+  published_by       text        NOT NULL DEFAULT '',
+  first_published_at timestamptz NOT NULL,
+  published_at       timestamptz NOT NULL,
+  PRIMARY KEY (kind)
 );
-CREATE INDEX IF NOT EXISTS job_audit_target ON job_audit (target_type, target_id, created_at, id);
-CREATE INDEX IF NOT EXISTS job_audit_created ON job_audit (created_at, id);
 ```
 
 SQLite:
 
 <!-- upgrade-ddl:sqlite -->
 ```sql
-CREATE TABLE IF NOT EXISTS job_audit (
-  id          text     NOT NULL,
-  created_at  datetime NOT NULL,
-  target_type text     NOT NULL,
-  target_id   text     NOT NULL,
-  action      text     NOT NULL,
-  actor_type  text     NOT NULL,
-  actor_id    text     NOT NULL DEFAULT '',
-  reason      text     NOT NULL DEFAULT '',
-  source      text     NOT NULL DEFAULT '',
-  request_id  text     NOT NULL DEFAULT '',
-  details     JSON     NOT NULL DEFAULT '{}',
-  PRIMARY KEY (id)
+CREATE TABLE IF NOT EXISTS job_kinds (
+  kind               text     NOT NULL,
+  description        text     NOT NULL DEFAULT '',
+  args_schema        JSON,
+  example_args       JSON,
+  queue              text     NOT NULL DEFAULT '',
+  priority           integer  NOT NULL DEFAULT 0,
+  max_attempts       integer  NOT NULL DEFAULT 0,
+  timeout_ms         integer,
+  executor_class     text     NOT NULL DEFAULT '',
+  validates_args     numeric  NOT NULL DEFAULT false,
+  custom_backoff     numeric  NOT NULL DEFAULT false,
+  classifies_errors  numeric  NOT NULL DEFAULT false,
+  published_by       text     NOT NULL DEFAULT '',
+  first_published_at datetime NOT NULL,
+  published_at       datetime NOT NULL,
+  PRIMARY KEY (kind)
 );
-CREATE INDEX IF NOT EXISTS job_audit_target ON job_audit (target_type, target_id, created_at, id);
-CREATE INDEX IF NOT EXISTS job_audit_created ON job_audit (created_at, id);
 ```
 
-**2. Install the indexes at deploy, the way you already do.** This release's two indexes are on the new
-table and in the block above, so the call finds them in place; against indexes that are already in sync it
-changes nothing. On a live PostgreSQL database, build any missing one concurrently:
+**2. Install the indexes at deploy, the way you already do.** This release adds no index, so against
+indexes that are already in sync the call changes nothing. On a live PostgreSQL database, build any
+missing one concurrently:
 
 ```go
 err := flywheel.InstallIndexesWithOptions(ctx, db, flywheel.IndexOpts{
@@ -200,15 +202,17 @@ indexDrift, _ := flywheel.InspectIndexes(ctx, db) // missing, drifted, or invali
 
 ### After the deploy
 
-Nothing remains to do. The history grows by one entry for each job or schedule a control changes; to keep
-it bounded, set `SchedulerConfig.AuditRetention` (zero keeps every entry), as
-[the history's read API](#who-changed-what-the-control-history) describes.
+The catalog stays empty until a process publishes it. Call `PublishKinds` at startup in the process that
+holds the registry — a node — and read the catalog anywhere with `ListKinds` or `flywheel kinds`, as
+[the catalog's read API](#the-kind-catalog-and-limiter-state) describes. A publish never deletes a row,
+so a kind no release registers any more stays listed with an old `published_at`.
 
 ### Rolling deploys
 
 During a rolling deploy both releases run against the migrated database. A process of the previous
-release never writes `job_audit`, so a control it runs is not recorded: run controls through this release
-once the deploy has replaced the previous one, and the history is whole from then on.
+release never reads or writes `job_kinds`. Two processes of this release that publish at once each upsert
+their own kinds; for a kind both register, the last publisher's metadata wins, and its first publish
+time never moves.
 
 A deploy that adds a job kind has its own overlap to plan for: a runner of the previous release can claim
 a job of the new kind. See **Rolling deploys and new job kinds** in the [README](../README.md).
@@ -216,22 +220,105 @@ a job of the new kind. See **Rolling deploys and new job kinds** in the [README]
 ### Verifying
 
 ```bash
-flywheel doctor              # schema: up to date · indexes: in sync · stats: rolled up through … (lag …)
-flywheel jobs history <id>   # after a control: when it ran, what it did, who ran it, and why
+flywheel doctor   # schema: up to date · indexes: in sync · stats: rolled up through … (lag …)
+flywheel kinds    # after a publish: one line per kind, with its queue, priority, attempts, timeout, and publish time
 ```
 
 ### Rolling back
 
-Deploy the previous release's binaries: they run unchanged against the migrated schema, and never read or
-write `job_audit`, so a control they run is not recorded. Nothing needs to be dropped. If you want the
-schema back as it was, drop `job_audit` (its indexes go with it) — but only after no process of this
-release is running, since its controls write the table, and only once the history is no longer wanted.
+Deploy the previous release's binaries: they run unchanged against the migrated schema, and never read
+or write `job_kinds`. Nothing needs to be dropped. If you want the schema back as it was, drop
+`job_kinds` — but only after no process of this release publishes or reads the catalog, since both fail
+without the table.
+
+### From a release before the audit history
+
+A database a release before the audit history installed lacks one table more than this release's upgrade
+adds, with its two indexes. `Migrate` adds all of it in one call. A hand-written migration applies the
+statements below first, then [this release's](#host-owned-install-your-migration-tool).
+
+| Object | Kind | Purpose |
+|---|---|---|
+| `job_audit` | table | the control history: one row per change a control made to a job or a schedule — what it did, who ran it and why, and the state the job changed from |
+| `job_audit_target` | index on `job_audit` | one target's history, newest or oldest first |
+| `job_audit_created` | index on `job_audit` | the whole feed in either order, and the audit prune's oldest-first batches |
+
+Nothing is backfilled: the history starts with the first control run after the deploy. Both indexes are
+on the new, empty table, so building them takes no time and blocks no writer.
+
+The operator controls (`RetryJob`, `CancelJob`, `CancelByParent`, `Replay`, `SetPeriodicActive`, and the
+rest) write the table, so against a database without it a control fails naming the missing relation, and
+a Scheduler with `AuditRetention` set refuses to start. Runners, and Schedulers without `AuditRetention`,
+never touch the table and start either way.
+
+PostgreSQL — the table and both its indexes are new, so the statements lock nothing that already holds
+rows, and need no lock timeout:
+
+<!-- upgrade-ddl:postgres:audit -->
+```sql
+CREATE TABLE IF NOT EXISTS job_audit (
+  id          text        NOT NULL,
+  created_at  timestamptz NOT NULL,
+  target_type text        NOT NULL,
+  target_id   text        NOT NULL,
+  action      text        NOT NULL,
+  actor_type  text        NOT NULL,
+  actor_id    text        NOT NULL DEFAULT '',
+  reason      text        NOT NULL DEFAULT '',
+  source      text        NOT NULL DEFAULT '',
+  request_id  text        NOT NULL DEFAULT '',
+  details     jsonb       NOT NULL DEFAULT '{}',
+  PRIMARY KEY (id)
+);
+CREATE INDEX IF NOT EXISTS job_audit_target ON job_audit (target_type, target_id, created_at, id);
+CREATE INDEX IF NOT EXISTS job_audit_created ON job_audit (created_at, id);
+```
+
+SQLite:
+
+<!-- upgrade-ddl:sqlite:audit -->
+```sql
+CREATE TABLE IF NOT EXISTS job_audit (
+  id          text     NOT NULL,
+  created_at  datetime NOT NULL,
+  target_type text     NOT NULL,
+  target_id   text     NOT NULL,
+  action      text     NOT NULL,
+  actor_type  text     NOT NULL,
+  actor_id    text     NOT NULL DEFAULT '',
+  reason      text     NOT NULL DEFAULT '',
+  source      text     NOT NULL DEFAULT '',
+  request_id  text     NOT NULL DEFAULT '',
+  details     JSON     NOT NULL DEFAULT '{}',
+  PRIMARY KEY (id)
+);
+CREATE INDEX IF NOT EXISTS job_audit_target ON job_audit (target_type, target_id, created_at, id);
+CREATE INDEX IF NOT EXISTS job_audit_created ON job_audit (created_at, id);
+```
+
+**After the deploy**, nothing remains to do. The history grows by one entry for each job or schedule a
+control changes; to keep it bounded, set `SchedulerConfig.AuditRetention` (zero keeps every entry), as
+[the history's read API](#who-changed-what-the-control-history) describes.
+
+**During a rolling deploy** both releases run against the migrated database. A process of the older
+release never writes `job_audit`, so a control it runs is not recorded: run controls through a newer
+release once the deploy has replaced the older one, and the history is whole from then on.
+
+**To verify**, `flywheel jobs history <id>` after a control prints when it ran, what it did, who ran it,
+and why.
+
+**To roll back** to the older release, deploy its binaries: they run unchanged against the migrated
+schema, and never read or write `job_audit`, so a control they run is not recorded. Nothing needs to be
+dropped. If you want the schema back as it was, drop `job_audit` (its indexes go with it) and what the
+later releases added — but only after no process of a newer release is running, since its controls write
+the table, and only once the history is no longer wanted.
 
 ### From a release before the schedule pause
 
-A database a release before the schedule pause installed lacks one column more than this release's
-upgrade adds. `Migrate` adds both in one call. A hand-written migration applies the statements below
-first, then [this release's](#host-owned-install-your-migration-tool).
+A database a release before the schedule pause installed lacks one column more than the later releases
+add. `Migrate` adds all of it in one call. A hand-written migration applies the statements below
+first, then [the audit history's](#from-a-release-before-the-audit-history), then
+[this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
 |---|---|---|
@@ -285,6 +372,7 @@ A database a release before the stats tables installed lacks more than the later
 analytics columns on `job_runs`, the three stats tables, and one index. `Migrate` adds all of it, with the
 later releases' additions, in one call. A hand-written migration applies the statements below first, then
 [the schedule pause's](#from-a-release-before-the-schedule-pause), then
+[the audit history's](#from-a-release-before-the-audit-history), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -450,8 +538,8 @@ over the deploy window afterwards — a rebuild backfills before it recomputes.
 
 **To roll back** to the older release, deploy its binaries: they run unchanged against the migrated
 schema. To restore its schema as well, drop `job_stats_progress`, `job_stats_hourly`, `job_run_finishes`,
-the `jobs_finished` index, the five `job_runs` columns, `job_periodics.paused_at`, and `job_audit` — but
-only after no binary of a newer release is running.
+the `jobs_finished` index, the five `job_runs` columns, `job_periodics.paused_at`, `job_audit`, and
+`job_kinds` — but only after no binary of a newer release is running.
 
 <br>
 
@@ -585,9 +673,22 @@ made the change, and never updated. Rows outlive the jobs and schedules they nam
 | `reason`, `source`, `request_id` | why they ran it, the channel they used (`cli` from the CLI), and the request it came from; `''` when absent |
 | `details` | a JSON object: `from_state` on every job entry; the retry options (`force`, `allow_running`, `reset_attempts`, `budget`, `delay_ms`) on `retried` and `replayed`; `was_running` on `cancelled`; `via` (`parent` or `replay`) and `parent_job_id` (with `via: parent`) on the entries a batched control wrote; `{}` on a schedule's |
 
+**`job_kinds`** — the published kind catalog: one row per kind `PublishKinds` has published, upserted
+by each publish and never deleted, so a kind no release registers any more keeps its row with an old
+`published_at`. Stable for SQL:
+
+| Column | Meaning |
+|---|---|
+| `kind` | the kind; the primary key |
+| `description`, `args_schema`, `example_args` | what the worker declares: `''` and NULL when it declares nothing |
+| `queue`, `priority`, `max_attempts`, `timeout_ms`, `executor_class` | what an insert of the kind defaults to; `timeout_ms` is NULL when there is no timeout |
+| `validates_args`, `custom_backoff`, `classifies_errors` | whether the worker implements `ArgsValidator`, `Retryable`, and `Classifier` |
+| `published_by` | the last publisher: `PublishKindsOpts.Publisher`, else the process's `host:pid` |
+| `first_published_at`, `published_at` | the kind's first publish, which never moves, and its last, in UTC |
+
 ### Time and zones
 
-`job_runs`, `job_run_finishes`, and `job_audit` timestamps are stored in UTC. On PostgreSQL every timestamp column is
+`job_runs`, `job_run_finishes`, `job_audit`, and `job_kinds` timestamps are stored in UTC. On PostgreSQL every timestamp column is
 `timestamptz`, so this is invisible. On SQLite timestamps are text and compared as text, which is only a
 time comparison within one zone: pass `job_runs` and `job_audit` bounds in UTC (the Go API does it for you). `jobs`
 timestamps keep the zone of the clock that wrote them, as they always have; compare them in that zone.
@@ -604,9 +705,10 @@ Every read takes a `context.Context` and the `*gorm.DB` to read through — a re
 `WaitForJob` — and returns JSON-tagged values. None writes.
 
 Every list read returns at most `MaxReadLimit` (200) rows: `QueryJobs`, `ListJobs`, `ListFinished`,
-`ListRunning`, `SlowRuns`, `RecentFailures`, `ListRuns`, and `ListAudit`. A larger `Limit` is clamped rather than refused, so a handler
+`ListRunning`, `SlowRuns`, `RecentFailures`, `ListRuns`, `ListAudit`, and `ListLimiters`. A larger `Limit` is clamped rather than refused, so a handler
 can pass a request's limit through; one that asks for a row more than its page, to learn whether another
-follows, keeps its page below 200.
+follows, keeps its page below 200. `ListKinds` returns every row: it lists your kinds, which your code
+bounds, and a cut catalog would hide one.
 
 ### Live: what is happening now
 
@@ -825,6 +927,25 @@ control in a transaction of its own and writes its record there needs no hook.
 **Retention.** Entries outlive the jobs they name: retention and deletes of jobs keep them.
 `SchedulerConfig.AuditRetention` prunes entries older than it on the retention cadence, and
 `DeleteAuditEntries` / `DeleteAuditEntriesWithOptions` do it on demand, oldest first, in batches.
+
+### The kind catalog and limiter state
+
+**`ListKinds(ctx, db)`** — every kind of the published catalog, sorted by kind, as `KindRecord` values:
+the `KindInfo` a process's `PublishKinds` wrote (the description, args schema and example, the queue,
+priority, attempts, and timeout an insert of the kind defaults to, and which optional interfaces its
+worker implements), its last publisher, and when it was first and last published. It is one ordered read
+of `job_kinds`, a table as small as your list of kinds. Against a database without the table it fails,
+naming it. A process that holds the registry reads the same catalog, live, from `Registry.Kinds`.
+
+**`ListLimiters(ctx, db)`** — each shared `DBLimiter` resource's state, sorted by resource, at most
+`MaxReadLimit` of them: `Tokens` and `UpdatedAt` as the rate bucket last stored them (its tokens before
+any refill since), `Held`, the permits its live concurrency holds take, counted as `Acquire` counts them,
+and `NextHoldExpiry`, the soonest of those holds' expiries, nil when nothing is held. It costs three
+reads: the buckets by primary key, one grouped sum over those resources' live holds (served by
+`limiter_holds_resource`), and one single-row read per held resource for its soonest expiry. It takes no
+lock and leaves an expired hold for `Acquire` or the sweeper to reclaim. A limiter with neither a rate nor
+a concurrency cap admits without a round trip and writes no bucket, so it is not listed. A resource's
+configured budget is your `DBLimiterConfig`, so the result carries none.
 
 ### Maintenance
 

@@ -20,9 +20,9 @@ const integratingDoc = "../../docs/INTEGRATING.md"
 // documentedUpgradeDDL extracts the statements of the SQL block that follows
 // the guide's `<!-- upgrade-ddl:<block> -->` marker, split on the semicolons
 // that end its lines. A block is named by its dialect — this release's upgrade
-// — or by its dialect and the older release it upgrades from: ":pause", a
-// release before the schedule pause, and ":stats", a release before the stats
-// tables.
+// — or by its dialect and the older release it upgrades from: ":audit", a
+// release before the audit history, ":pause", a release before the schedule
+// pause, and ":stats", a release before the stats tables.
 func documentedUpgradeDDL(t *testing.T, block string) []string {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Clean(integratingDoc))
@@ -102,15 +102,15 @@ func documentedUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 
 // documentedStatsUpgradeSuite applies the guide's upgrade from a release
 // before the stats tables — that upgrade's block, then the schedule pause's,
-// then this release's, oldest first — to a database such a release installed
-// and wrote history into, then the deploy step, and asserts the result has no
-// drift, runs, and reaches the old history.
+// then the audit history's, then this release's, oldest first — to a database
+// such a release installed and wrote history into, then the deploy step, and
+// asserts the result has no drift, runs, and reaches the old history.
 func documentedStatsUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 	t.Helper()
 	installLegacySchema(t, db)
 	writeLegacyHistory(t, db, "doc-legacy", "doc.kind", StateSucceeded, rollupBase)
 
-	applyDocumentedUpgrade(t, db, dialect+":stats", dialect+":pause", dialect)
+	applyDocumentedUpgrade(t, db, dialect+":stats", dialect+":pause", dialect+":audit", dialect)
 	ctx := context.Background()
 	require.NoError(t, InstallIndexesWithOptions(ctx, db, IndexOpts{Concurrently: true}))
 
