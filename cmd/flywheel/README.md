@@ -116,7 +116,7 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel kinds` | List the kind catalog a host's processes published with `PublishKinds`, sorted by kind: each kind's default queue, priority, attempts, and timeout (`-` for none), and when it was last published (`--json` prints the records, with each kind's description, args schema and example, and publisher). The CLI publishes no catalog of its own |
 | `flywheel prune` | Delete finished jobs and their runs older than a cutoff, holding for the stats rollup when it is on (`--older-than 14d --ignore-stats-rollup`) |
 | `flywheel status` | Show queue health, schedules, and recent failures (`--json --watch`) |
-| `flywheel stats` | Per-kind outcomes, success rate, duration percentiles, and queue wait (`--since 24h --kind --queue --json`) |
+| `flywheel stats` | Outcomes, jobs enqueued, success rate, duration percentiles, and queue wait, per kind, per queue, or per kind and queue (`--since 24h --kind --queue --by queue --json`) |
 | `flywheel stats rebuild` | Backfill the finish log for runs an older release finalized, then recompute the hourly stats rollups for a range, rolling any hours between it and the rollup's progress too (`--from --to [--force]`) |
 | `flywheel doctor` | Validate the config as `serve` does (failing on anything `serve` would refuse, such as a malformed schedule), migrate (as `serve` does), print effective settings, compare the declared schedules with the database (missing, inactive, differing, undeclared), and report the stats rollup's lag |
 
@@ -250,7 +250,8 @@ runtime:
 ```
 
 ```bash
-flywheel stats                   # last 24h: per-kind attempts, success rate, p50/p95/p99, queue wait
+flywheel stats                   # last 24h: per-kind attempts, jobs enqueued, success rate, p50/p95/p99, queue wait
+flywheel stats --by queue        # one row per queue; --by kind_queue for one per kind on each queue
 flywheel stats --since 7d --kind exec
 flywheel stats --json            # the full result, including the slowest run per kind
 flywheel jobs running            # what is running now, and whether it is far slower than usual
