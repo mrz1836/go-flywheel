@@ -37,6 +37,7 @@ until it is done.
 | How deep is each queue, how far behind? | `QueueDepths` | `jobs_ready`, `jobs_state` | 2.4 ms |
 | What is in flight, per kind? | `CountActiveByKind` | `jobs_state` | 1.8 ms |
 | What just finished, and how? | `ListFinished`, `RecentFailures` | `jobs_finished` | 1–2.5 ms |
+| What finished since the last poll? | `ListRunFinishes` | `job_run_finishes` PK + `job_runs` PK | 3.5 ms¹ |
 | How did each kind do today? | `Stats` (24 h) | `job_stats_hourly` + the raw tail | 12.5 ms |
 | How did each kind do this month? | `Stats` (30 d) | `job_stats_hourly` + the raw tail | 78 ms |
 | How did each queue do today, and did it keep up? | `Stats` (24 h, `GroupBy: StatsByQueue`; `Enqueued` beside `Attempts`) | `job_stats_hourly` group rows + the raw tail | 14 ms¹ |
@@ -51,6 +52,8 @@ until it is done.
 | One job in full: args (bounded), metadata, keys, barrier, latest run | `GetJob` | `jobs` primary key + `job_runs_job_attempt` | 1.2 ms |
 | Which jobs match a filter, a page at a time? | `QueryJobs` | the primary key (newest, oldest, a created window); `jobs_finished`, `jobs_ready`, `jobs_parent_state`; an [explorer index](#the-explorer-index-set-opt-in) for a kind, queue, state, or tag | 2–9 ms; 95 ms for the scheduled sort over a deep queue |
 | How many match, honestly? | `CountJobs` | the filter's index; exact to 10,000, then the cap and an estimate | 1–14 ms |
+| Which jobs' latest attempt failed this way? | `QueryJobs` with `ErrorClasses`, `Fingerprint`, or `ErrorContains` | each candidate's latest run, by `job_runs_job_attempt` | 4–19 ms¹ |
+| A fan-out's children, or its whole tree? | `ListChildren`, `JobTree` | `jobs_parent_state` | 48 ms for a 2,000-node tree¹ |
 | Has this job finished yet? | `WaitForJob` | `jobs` primary key | sub-ms per poll |
 
 The [measured latencies](#measured-cost) are at the end. Everything above is bounded — by a window, a
@@ -1020,8 +1023,9 @@ refused for day buckets.
 Every read takes a `context.Context` and the `*gorm.DB` to read through — a replica is fine, except for
 `WaitForJob` — and returns JSON-tagged values. None writes.
 
-Every list read returns at most `MaxReadLimit` (200) rows: `QueryJobs`, `ListJobs`, `ListFinished`,
-`ListRunning`, `SlowRuns`, `RecentFailures`, `ListRuns`, `ListAudit`, `ListLimiters`, and `ListNodes`. A larger `Limit` is clamped rather than refused, so a handler
+Every list read returns at most `MaxReadLimit` (200) rows: `QueryJobs`, `ListChildren`, `ListRunFinishes`,
+`ListJobs`, `ListFinished`, `ListRunning`, `SlowRuns`, `RecentFailures`, `ListRuns`, `ListAudit`,
+`ListLimiters`, and `ListNodes`. A larger `Limit` is clamped rather than refused, so a handler
 can pass a request's limit through; one that asks for a row more than its page, to learn whether another
 follows, keeps its page below 200. `ListKinds` and `ListQueues` return every row: they list your kinds
 and queues, which your code and configuration bound, and a cut list would hide one.
@@ -1097,6 +1101,32 @@ carries no args or metadata.
 short window (24 hours by default), any outcome — a timeout is a slow run. A range of `job_run_finishes`;
 for slow runs further back, read the hourly `SlowestRunID` from `Stats`.
 
+### The feed: every finish, once
+
+**`ListRunFinishes(ctx, db, ListRunFinishesParams{After, Since, Settle, Kinds, Queues, Limit})`** — the
+finish log read in order, ascending by `(finished_at, run_id)`, a page at a time: the feed an activity view
+polls for what just finished. Each `RunFinish` is one finished run: when it finished, its run and job ids,
+kind, queue, and attempt, its outcome, the job state its finalize applied, its error class, its duration,
+and whether it was superseded. Start with `Since` (a finish at `Since` is included), or with neither
+`Since` nor `After` to start at the horizon, then poll with `After` set to the previous page's
+`NextCursor`, which is always set: every finish is read once, in order, and a poll with nothing new
+returns an empty page and the same cursor. The cursor is opaque, prefixed `rf1.`, and exact to the
+nanosecond.
+
+A finalize stamps its finish before it commits, so a commit can land behind a reader that has already read
+past its time. A page therefore stops at the horizon, the context clock's now minus `Settle`
+(`DefaultFeedSettle`, 5 s, at zero), and reports it as `Horizon`: a finish younger than that waits for a
+later poll, so a finalize that commits within `Settle` of its finish is never passed by the cursor. A host
+whose commits can lag longer raises `Settle`, and every finish reaches the feed that much later.
+
+A page scans at most 1,000 finish-log entries: one range of `job_run_finishes`' primary key, each entry
+joined to its run by key. `Kinds` and `Queues` (any of, on the run's kind and queue) filter the entries
+scanned, and the cursor moves past every one of them, so a narrow filter returns a short or empty page
+rather than a long scan; polled again from its cursor, it catches up 1,000 entries a poll. `Limit` caps the
+finishes returned (100 at zero, 200 at most), and a full page's cursor follows its last finish. An entry
+whose run retention has deleted is scanned and skipped. A cursor the feed did not issue is refused with a
+`*ValidationError` naming `after`, and a negative `Settle` with one naming `settle`.
+
 ### Finding jobs
 
 **`QueryJobs(ctx, db, JobQuery{…})`** — the jobs a filter matches, one page at a time: the read behind a
@@ -1112,10 +1142,22 @@ filtered job list. Every field narrows the match, and the values within a field 
 | `CreatedFrom`, `CreatedTo` | `[from, to)` by insert time, applied to the UUIDv7 id at millisecond precision, so the primary key serves it and a job inserted under a simulated clock is found where its id puts it |
 | `ScheduledFrom`, `ScheduledTo`, `FinalizedFrom`, `FinalizedTo` | `[from, to)` on `scheduled_at` or `finalized_at` |
 | `ArgsContains`, `MetadataContains` | a job whose args or metadata contain this JSON object (PostgreSQL's `@>`), within a created window of at most `MaxContainmentWindow` (7 days; `CreatedTo` zero means now) |
+| `ErrorClasses` | a job whose latest attempt failed with any of these error classes |
+| `Fingerprint` | a job whose latest attempt stored this error fingerprint, 16 lowercase hex characters, as [error groups](#error-groups-what-is-failing) name them |
+| `ErrorContains` | a job whose latest attempt's error message contains this text, in any case, with `%`, `_`, and `\` matching only themselves; within a created window of at most `MaxContainmentWindow`, on PostgreSQL |
 
 Soft-deleted jobs never match. Each `JobListItem` is the job's `JobView`, its metadata as stored, and
 `LatestRun`, a `RunSummary` of the run of the attempt the job names: its outcome, error class, and the
 error's first line, cut at 256 bytes. No list loads args.
+
+The last three are the latest-run filters: they match a job by the run of the attempt it names, so an
+earlier attempt's failure never matches, and neither does a job never claimed or one whose current attempt
+is still running. A run written before fingerprints were stored never matches `Fingerprint`. Set together,
+they are one `EXISTS` over each candidate's latest run, a probe of `job_runs_job_attempt` per job the other
+filters let through, and no index serves the error columns themselves, so they cost what the candidates
+cost. A filter that matches few jobs, or none, can read every run on PostgreSQL to learn so; beside a
+created window, a kind, or a state that narrows the candidates first, it reads a short stretch.
+[Measured cost](#reads) has each at a million jobs.
 
 Four sorts, each broken by the id so a page boundary never falls between two rows it cannot tell apart:
 
@@ -1132,9 +1174,11 @@ not to the filter: a cursor used with a changed filter reads that filter's rows 
 Before any statement runs, a query is refused with a `*ValidationError` naming its field: an unknown
 state or sort, a minimum above its maximum, an empty or inverted window, more than 200 ids, the finished
 sort without terminal states or the scheduled sort without waiting ones (`states`), a containment filter
-that is not an object or searches more than seven days, and a cursor that is malformed or from another
-sort. A containment filter on SQLite returns `ErrUnsupportedDialect`; [`CONTRACT.md`](CONTRACT.md#what-sqlite-does-differently)
-lists what else SQLite does differently.
+that is not an object or searches more than seven days, an unknown error class (`error_classes`), a
+fingerprint that is not 16 lowercase hex characters (`fingerprint`), an `ErrorContains` that searches no
+created window or one wider than seven days (`error_contains`), and a cursor that is malformed or from
+another sort. A containment filter or `ErrorContains` on SQLite returns `ErrUnsupportedDialect`;
+[`CONTRACT.md`](CONTRACT.md#what-sqlite-does-differently) lists what else SQLite does differently.
 
 **`CountJobs(ctx, db, q)` / `CountJobsWithOptions(ctx, db, q, CountOpts{Cap})`** — how many jobs `q`
 matches, counted honestly and cheaply: exact up to the cap (`DefaultCountCap`, 10,000, at zero; at most
@@ -1189,6 +1233,35 @@ drift, err := flywheel.InspectIndexesWithOptions(ctx, db, flywheel.InspectIndexO
 
 An entry you did not install is never drift until you pass it. An extra index whose name `IndexSet`
 declares, or a name given twice, is refused with a `*ValidationError` naming `extra_indexes`.
+
+### Children and trees
+
+**`ListChildren(ctx, db, parentJobID, ListChildrenParams{States, Cursor, Limit})`** — one job's children,
+newest first by id, a page at a time, each a `JobListItem` as `QueryJobs` builds it: its view, its
+metadata, and its latest run. `States` keeps any of its states; `Limit` is 50 at zero and 200 at most;
+`NextCursor`, prefixed `jc1.`, is set while another page exists. Soft-deleted children never appear, and a
+parent with none, or one that does not exist, reads an empty page. Each page is one range of
+`jobs_parent_state`.
+
+**`JobTree(ctx, db, rootJobID, JobTreeParams{MaxDepth, MaxNodes})`** — a job and its descendants, breadth
+first, each node's children newest first by id. It lists at most `MaxDepth` levels below the root
+(`DefaultTreeDepth`, 5, at zero; `MaxTreeDepth`, 10, at most) and `MaxNodes` nodes in all, the root
+included (`DefaultTreeNodes`, 500; `MaxTreeNodes`, 2,000). Each `JobTreeNode` is the job's `JobView`, its
+`Depth`, its `ChildCount` (every child, listed or not), and the `Children` it listed; `Nodes` counts the
+nodes listed, and `Truncated` says a bound left a child unlisted. The node budget takes each parent's
+children in level order, the newest first, so a cut tree shows the newest work. A job whose parent chain
+loops is listed once, and an unknown or soft-deleted root returns `ErrJobNotFound`. The walk reads one
+level at a time, the same statements on PostgreSQL and SQLite, so both return the same tree: a grouped
+count of the level's children, then the children that fit the budget, at most three statements a level
+and each served by `jobs_parent_state`. A fan-out of any width costs what the bounds allow.
+
+**`ChildOutputsWithOptions(ctx, db, parentJobID, ChildOutputsOpts{States, Before, Limit})`** —
+`ChildOutputs` for any states: each matching child with its latest recorded attempt's number and output,
+newest first by `created_at`, `Before` a `created_at` cursor. With `States` set to succeeded, retryable,
+and running, a batch's view shows what its children have produced before the batch has finished; a running
+child reports its current attempt, whose output is empty until it finishes. Zero `States` reads the
+terminal states, as `ChildOutputs` does, and a zero `Limit` reads every match, so a display page passes
+one.
 
 ### History: how it has been going
 
@@ -1368,8 +1441,10 @@ paused queue out of its claims.
 | One job, until it finishes | `WaitForJob` | 0.5 s doubling to 5 s (built in) | one primary-key read |
 | Queue depth | `QueueDepths` | 10–30 s | three grouped index reads + one ordered read per queue with ready work |
 | Recently finished | `ListFinished` | 10–30 s | three `LIMIT n` index range scans |
+| An activity feed | `ListRunFinishes`, from its cursor | the view's refresh, 5–60 s | one range of the finish log, at most 1,000 entries, each joined to its run by key |
 | A filtered job list | `QueryJobs` | on demand, or 10–30 s | one page: a `LIMIT 51` read (one per state for the finished sort), each job joined to its run by key |
 | A lens's count | `CountJobs` | 30–60 s | at most 10,001 index entries, plus one `EXPLAIN` past the cap |
+| A job's children or tree | `ListChildren`, `JobTree` | on demand | one `jobs_parent_state` range a page; a tree, at most three bounded statements a level |
 | Today's stats | `Stats` (24 h) | 30–60 s | 24 × kinds rollup rows by primary key + the open hour raw |
 | Trends | `StatsSeries` (30 d) | 5–15 min | 720 rollup rows (one per hour) + the open hour raw |
 | Anomalies | `Anomalies` | hourly, after the rollup | ~190 × kinds rollup rows |
@@ -1458,9 +1533,11 @@ for _, g := range res.Groups {
 }
 ```
 
-To open the jobs behind a group, its runs are the starting point: `LastRunID` and `FirstRunID` name two
-of them, and `QueryJobs` lists the kind's jobs in the window (`JobQuery{Kinds, CreatedFrom, CreatedTo,
-States}`), each with its latest run, whose `ErrorFingerprint` says which group it belongs to.
+To open the jobs behind a group, filter by its fingerprint: `QueryJobs` with
+`JobQuery{Fingerprint: g.Fingerprint, Kinds: []string{g.Kind}, CreatedFrom: from}` lists the jobs whose
+latest attempt failed in it, newest first, and `CountJobs` counts them. A job retried since, whose latest
+attempt succeeded or failed another way, has left the group. The created window keeps the read short
+([the latest-run filters](#finding-jobs) say why).
 
 ### An embeddable JSON API
 
@@ -1661,6 +1738,20 @@ different machine, with the previous release beside them ([BENCHMARKS.md](BENCHM
 
 On that machine, rolling up an hour of ~1.4k runs, with its enqueue counts and error groups, went from
 14.2 to 20.4 ms, and an hour of 100k runs from 330 to 434 ms.
+
+The finish feed, the tree walk, and the latest-run filters were measured on the same machine, at the same
+scale:
+
+| Read | Median |
+|---|---|
+| `ListRunFinishes`, a page from mid-history | 3.5 ms |
+| `ListRunFinishes`, one kind in twenty (1,000 entries scanned) | 3.4 ms |
+| `JobTree`, 2,000 nodes | 47.6 ms |
+| `QueryJobs`, a fingerprint; with a kind | 6.4 ms; 9.6 ms |
+| `QueryJobs`, an error class; with a state | 4.0 ms; 3.7 ms |
+| `QueryJobs`, error text over 7 days; with a kind | 6.7 ms; 18.9 ms |
+
+A fingerprint that matches no job reads every run to learn so: 137 ms there.
 
 The job query, at 1,000,000 jobs over 30 days with every explorer index installed — the plans, and each
 shape without its index, are in [`benchmarks/explorer-plans-1m.txt`](benchmarks/explorer-plans-1m.txt):
