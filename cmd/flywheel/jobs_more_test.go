@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
+	flywheel "github.com/mrz1836/go-flywheel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // enqueueOne enqueues a single exec job through the CLI and returns its ID.
@@ -153,4 +157,71 @@ func TestOrDash(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, "-", orDash(""), "the wildcard executor class renders as a dash")
 	assert.Equal(t, "local", orDash("local"))
+}
+
+// insertTreeJob writes one jobs row directly, a child of parent when it is set.
+func insertTreeJob(t *testing.T, db *gorm.DB, id, parent, kind, state string, at time.Time) {
+	t.Helper()
+	var parentID any
+	if parent != "" {
+		parentID = parent
+	}
+	require.NoError(t, db.Exec(
+		`INSERT INTO jobs(id, kind, queue, args, priority, state, attempt, max_attempts, scheduled_at, parent_job_id, executor_class, tags, created_at, updated_at, metadata)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, kind, "default", "{}", 100, state, 0, 25, at, parentID, "", "[]", at, at, "{}",
+	).Error)
+}
+
+// TestCLIJobsTreePrintsTheTreeIndented proves `jobs tree` prints one line per
+// node, indented by depth, newest child first, each with its kind, state, and
+// child count; a final truncated line when --depth or --nodes cut the walk; the
+// JobTreeResult with --json; and a not-found error for an unknown root.
+func TestCLIJobsTreePrintsTheTreeIndented(t *testing.T) {
+	t.Parallel()
+	cfg := migratedCLIConfig(t)
+	db, _ := openCLIConfigDB(t, cfg)
+	at := statusAnchor
+	insertTreeJob(t, db, "t-root", "", "batch", "running", at)
+	insertTreeJob(t, db, "t-a", "t-root", "item", "succeeded", at)
+	insertTreeJob(t, db, "t-b", "t-root", "item", "running", at)
+	insertTreeJob(t, db, "t-b1", "t-b", "part", "available", at)
+	insertTreeJob(t, db, "t-b2", "t-b", "part", "retryable", at)
+	ctx := context.Background()
+
+	out, err := runRoot(ctx, "--config", cfg, "jobs", "tree", "t-root")
+	require.NoError(t, err)
+	assert.Equal(t, strings.Join([]string{
+		"t-root  batch  running  children: 2",
+		"  t-b  item  running  children: 2",
+		"    t-b2  part  retryable  children: 0",
+		"    t-b1  part  available  children: 0",
+		"  t-a  item  succeeded  children: 0",
+	}, "\n")+"\n", out)
+
+	out, err = runRoot(ctx, "--config", cfg, "jobs", "tree", "t-root", "--depth", "1")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "t-b1", "--depth stops the walk")
+	assert.Contains(t, out, "  t-b  item  running  children: 2", "a node past the depth is still counted")
+	assert.Regexp(t, `(?m)^truncated: .*--depth.*--nodes`, out)
+
+	out, err = runRoot(ctx, "--config", cfg, "jobs", "tree", "t-root", "--nodes", "2")
+	require.NoError(t, err)
+	assert.Contains(t, out, "  t-b  ")
+	assert.NotContains(t, out, "t-a", "--nodes stops the walk at the newest child")
+	assert.Contains(t, out, "truncated: ")
+
+	out, err = runRoot(ctx, "--config", cfg, "jobs", "tree", "t-root", "--json")
+	require.NoError(t, err)
+	var res flywheel.JobTreeResult
+	require.NoError(t, json.Unmarshal([]byte(out), &res))
+	assert.Equal(t, 5, res.Nodes)
+	assert.False(t, res.Truncated)
+	assert.Equal(t, "t-root", res.Root.ID)
+	assert.Equal(t, int64(2), res.Root.ChildCount)
+	require.Len(t, res.Root.Children, 2)
+	assert.Equal(t, "t-b", res.Root.Children[0].ID)
+
+	_, err = runRoot(ctx, "--config", cfg, "jobs", "tree", "no-such-job")
+	require.ErrorIs(t, err, flywheel.ErrJobNotFound)
 }

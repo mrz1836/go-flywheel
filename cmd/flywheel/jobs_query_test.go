@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -136,4 +137,72 @@ func TestCLIJobsCountPrintsTheCap(t *testing.T) {
 	_, err = runRoot(ctx, "--config", cfg, "jobs", "count", "--state", "sideways")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "states")
+}
+
+// failAttempt records attempt n of a job as a failure with class, fingerprint,
+// and message, and makes it the attempt the job names.
+func failAttempt(t *testing.T, db *gorm.DB, jobID string, n int, class, fingerprint, message string) {
+	t.Helper()
+	at := time.Now().UTC()
+	require.NoError(t, db.Exec(
+		`INSERT INTO job_runs(id, job_id, attempt, kind, queue, executor_class, executor_id, started_at, finished_at, outcome, error_class, error_message, error_fingerprint, superseded, enqueued_children, created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		fmt.Sprintf("%s-%d", jobID, n), jobID, n, "a", "default", "", "host", at, at, "error", class, message, fingerprint,
+		false, 0, at,
+	).Error)
+	require.NoError(t, db.Exec(`UPDATE jobs SET attempt = ? WHERE id = ?`, n, jobID).Error)
+}
+
+// TestCLIJobsLsFiltersByTheLatestRun proves `jobs ls` and `jobs count` take
+// the latest-run filters: a repeated --error-class matching any of its classes,
+// --fingerprint, and --error-contains, each passed to the query, which matches
+// a job's latest attempt only and prints its own refusals.
+func TestCLIJobsLsFiltersByTheLatestRun(t *testing.T) {
+	t.Parallel()
+	cfg := migratedCLIConfig(t)
+	db, _ := openCLIConfigDB(t, cfg)
+	ctx := context.Background()
+	const fp, other = "abcdef0123456789", "0123456789abcdef"
+
+	permanent := enqueueInState(t, db, "a", "discarded")
+	failAttempt(t, db, permanent, 1, "permanent", fp, "bad input")
+	timeout := enqueueInState(t, db, "a", "retryable")
+	failAttempt(t, db, timeout, 1, "timeout", other, "deadline exceeded")
+	retried := enqueueInState(t, db, "a", "retryable")
+	failAttempt(t, db, retried, 1, "permanent", fp, "bad input")
+	failAttempt(t, db, retried, 2, "transient", other, "connection refused")
+	never := enqueueInState(t, db, "a", "available")
+
+	out, err := runRoot(ctx, "--config", cfg, "jobs", "ls", "--error-class", "permanent", "--error-class", "timeout")
+	require.NoError(t, err)
+	assert.Contains(t, out, permanent)
+	assert.Contains(t, out, timeout)
+	assert.NotContains(t, out, retried, "only the latest attempt's class counts")
+	assert.NotContains(t, out, never)
+
+	out, err = runRoot(ctx, "--config", cfg, "jobs", "ls", "--fingerprint", fp)
+	require.NoError(t, err)
+	assert.Contains(t, out, permanent)
+	assert.NotContains(t, out, retried)
+	assert.NotContains(t, out, timeout)
+
+	out, err = runRoot(ctx, "--config", cfg, "jobs", "count", "--fingerprint", other)
+	require.NoError(t, err)
+	assert.Equal(t, "2\n", out, "jobs count takes the same filters")
+	out, err = runRoot(ctx, "--config", cfg, "jobs", "count", "--error-class", "permanent")
+	require.NoError(t, err)
+	assert.Equal(t, "1\n", out)
+
+	recent := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	_, err = runRoot(ctx, "--config", cfg, "jobs", "ls", "--error-contains", "refused", "--created-after", recent)
+	require.ErrorIs(t, err, flywheel.ErrUnsupportedDialect, "the text search reaches the query, which SQLite refuses")
+	_, err = runRoot(ctx, "--config", cfg, "jobs", "ls", "--error-contains", "refused")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "error_contains", "a search without a created window is refused")
+	_, err = runRoot(ctx, "--config", cfg, "jobs", "ls", "--error-class", "fatal")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "error_classes")
+	_, err = runRoot(ctx, "--config", cfg, "jobs", "count", "--fingerprint", "ABC")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fingerprint")
 }
