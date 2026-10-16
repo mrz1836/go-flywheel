@@ -163,10 +163,11 @@ type rollWalk struct {
 	done bool
 }
 
-// rollForward rolls up every hour with runs in [lo, hi), oldest first, each in
-// its own transaction that extends the covered range up across it and the
-// empty hours before it, then extends the range across the empty rest of the
-// stretch. An empty stretch costs one probe of job_run_finishes, however long.
+// rollForward rolls up every hour with runs or inserts in [lo, hi), oldest
+// first, each in its own transaction that extends the covered range up across
+// it and the empty hours before it, then extends the range across the empty
+// rest of the stretch. An empty stretch costs one probe of job_run_finishes and
+// one of the jobs primary key (nextActivityAt), however long.
 //
 // budget caps the hours rolled (zero is no cap); a walk that stops on it
 // reports done false with the range extended as far as it got.
@@ -181,7 +182,7 @@ func rollForward(
 		if err := ctx.Err(); err != nil {
 			return w, fmt.Errorf("cancelled after %d hours: %w", len(w.rolled), err)
 		}
-		next, found, err := nextFinishedAt(ctx, db, w.reached)
+		next, found, err := nextActivityAt(ctx, db, w.reached, hi)
 		if err != nil {
 			return w, err
 		}
@@ -205,9 +206,10 @@ func rollForward(
 	return w, nil
 }
 
-// rollBackward is rollForward's mirror: it rolls up every hour with runs in
-// [lo, hi), newest first, each extending the covered range down across it and
-// the empty hours above it, then extends the range down across the empty rest.
+// rollBackward is rollForward's mirror: it rolls up every hour with runs or
+// inserts in [lo, hi), newest first, each extending the covered range down
+// across it and the empty hours above it, then extends the range down across
+// the empty rest.
 // It is how the range reaches back to the retention when it starts above it —
 // after a RebuildStats created it, or a longer StatsRetention.
 func rollBackward(
@@ -221,7 +223,7 @@ func rollBackward(
 		if err := ctx.Err(); err != nil {
 			return w, fmt.Errorf("cancelled after %d hours: %w", len(w.rolled), err)
 		}
-		prev, found, err := prevFinishedAt(ctx, db, lo, w.reached)
+		prev, found, err := prevActivityAt(ctx, db, lo, w.reached)
 		if err != nil {
 			return w, err
 		}

@@ -221,11 +221,16 @@ func Anomalies(ctx context.Context, db *gorm.DB, p AnomalyParams) ([]Anomaly, er
 }
 
 // indexHoursByKind reshapes rolled hours into kind → hour start (unix) → the
-// kind's aggregate for that hour, merged across queues.
+// kind's aggregate for that hour, merged across queues. An aggregate with no
+// finished attempt — an hour that only received inserts — is skipped, so it
+// is never a sample.
 func indexHoursByKind(hours []rolledHour) map[string]map[int64]*runAgg {
 	idx := map[string]map[int64]*runAgg{}
 	for _, h := range hours {
 		for _, a := range h.aggs {
+			if a.Attempts+a.Superseded == 0 {
+				continue
+			}
 			byHour, ok := idx[a.Kind]
 			if !ok {
 				byHour = map[int64]*runAgg{}

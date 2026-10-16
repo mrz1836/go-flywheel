@@ -43,6 +43,9 @@ type RunSeed struct {
 	Output any
 	// ErrorMessage, when non-empty, is truncated and stored with its JSON
 	// payload, exactly as a failed attempt's error is, flagged when it was cut.
+	// A seed whose Outcome is OutcomeError or OutcomeTimeout also stores the
+	// fingerprint a failed attempt does, over its job's kind and the stored
+	// message, with an empty error class: a seed carries none.
 	ErrorMessage string
 	// Tx, when set, writes the row on the caller's transaction.
 	Tx *gorm.DB
@@ -141,6 +144,14 @@ func SeedRun(ctx context.Context, db *gorm.DB, seed RunSeed) (string, error) {
 		}
 		row.ErrorMessage = &message
 		row.ErrorPayload = payload
+	}
+	if failedOutcome(outcome) {
+		var stored string
+		if row.ErrorMessage != nil {
+			stored = *row.ErrorMessage
+		}
+		fingerprint := fingerprintOf(job.Kind, "", stored, nil)
+		row.ErrorFingerprint = &fingerprint
 	}
 	output, marshalErr := marshalRunOutput(seed.Output, defaultMaxOutputBytes)
 	if marshalErr != nil {

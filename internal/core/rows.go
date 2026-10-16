@@ -108,6 +108,13 @@ type jobRunRow struct {
 	QueueWaitMs      *int           `gorm:"column:queue_wait_ms"`
 	CostMicros       *int64         `gorm:"column:cost_micros"`
 	EnqueuedChildren int            `gorm:"column:enqueued_children;not null;default:0"`
+	// ErrorFingerprint groups a failed attempt with the others that failed the
+	// same way: 16 hex characters over the kind, the error class, and the stored
+	// message with its ids and numbers masked (see ErrorFingerprint), or over the
+	// value the worker's error supplies through ErrorFingerprinter. Only an
+	// attempt whose outcome is error or timeout carries one. Nullable, so a row
+	// an older binary writes is valid; a read computes it for such a row.
+	ErrorFingerprint *string `gorm:"column:error_fingerprint"`
 	// JobState is the job state this attempt's finalize applied: retryable versus
 	// discarded is what splits a retried failure from a final one, so job-level
 	// outcomes are countable from runs alone. It is NULL while the attempt runs,
@@ -195,9 +202,10 @@ func (jobRunFinishRow) TableName() string { return "job_run_finishes" }
 // back into a time with to_timestamp(bucket_start_unix) on PostgreSQL and
 // datetime(bucket_start_unix, 'unixepoch') on SQLite.
 //
-// No field carries a default: tag. GORM omits a zero-valued field that has one
-// from the INSERT, and a counter that is legitimately zero must be written as
-// zero, not left to whatever the column default happens to be.
+// No field but Enqueued carries a default: tag. GORM omits a zero-valued field
+// that has one from the INSERT, and a counter that is legitimately zero must be
+// written as zero, not left to whatever the column default happens to be.
+// Enqueued's comment says why it is the exception.
 //
 // An hour with no runs has no rows. Which hours the table speaks for — so that a
 // missing hour means "nothing ran" rather than "not rolled up yet" — is recorded
@@ -221,6 +229,13 @@ type jobStatsHourlyRow struct {
 	// Discarded counts the attempts that discarded their job — the job-level
 	// failures, as distinct from the retried errors.
 	Discarded int64 `gorm:"column:discarded;not null"`
+	// Enqueued counts the jobs inserted in the hour, by the insert time their
+	// UUIDv7 ids carry: arrivals, to set against the attempts that finished. An
+	// hour that only received inserts has rows too. It is the one field with a
+	// default: tag, because AutoMigrate adds it to a populated table, which a
+	// NOT NULL column without a default refuses, and a zero GORM leaves to the
+	// default reads the same as one it writes.
+	Enqueued int64 `gorm:"column:enqueued;not null;default:0"`
 
 	// The success-duration distribution, over successful attempts only, so a burst
 	// of fast failures cannot read as a speed-up.
@@ -343,6 +358,50 @@ type jobKindRow struct {
 
 // TableName binds jobKindRow to the job_kinds table.
 func (jobKindRow) TableName() string { return "job_kinds" }
+
+// jobErrorGroupHourlyRow is one hour of one error group: the failed attempts of
+// one kind that share a fingerprint, among the runs that finished in the UTC
+// hour starting at BucketStartUnix. The stats rollup writes it in the same
+// transaction as the hour's job_stats_hourly rows, replaces it with them, and
+// prunes it with them, so the two tables always cover the same hours.
+//
+// A failure is an attempt whose outcome is error or timeout and that was not
+// superseded. Discarded counts the failures that discarded their job.
+// FirstRunID and LastRunID are the hour's earliest and latest failing runs, and
+// SampleMessage is the latest one's stored message, cut at 512 bytes.
+type jobErrorGroupHourlyRow struct {
+	BucketStartUnix int64     `gorm:"column:bucket_start_unix;primaryKey;autoIncrement:false"`
+	Kind            string    `gorm:"column:kind;primaryKey"`
+	Fingerprint     string    `gorm:"column:fingerprint;primaryKey"`
+	ErrorClass      string    `gorm:"column:error_class;not null"`
+	Failures        int64     `gorm:"column:failures;not null"`
+	Discarded       int64     `gorm:"column:discarded;not null"`
+	FirstRunID      *string   `gorm:"column:first_run_id"`
+	LastRunID       *string   `gorm:"column:last_run_id"`
+	SampleMessage   string    `gorm:"column:sample_message;not null"`
+	RolledAt        time.Time `gorm:"column:rolled_at;not null"`
+}
+
+// TableName binds jobErrorGroupHourlyRow to the job_error_groups_hourly table.
+func (jobErrorGroupHourlyRow) TableName() string { return "job_error_groups_hourly" }
+
+// jobQueueSampleRow is one reading of one queue's depth, taken by the
+// Scheduler's queue-sample activity at SampledAt (UTC): the counts QueueDepth
+// reports, and the oldest ready job's age in milliseconds. A Scheduler writes
+// samples only with SchedulerConfig.QueueSampleInterval set, and prunes those
+// older than QueueSampleRetention.
+type jobQueueSampleRow struct {
+	Queue          string    `gorm:"column:queue;primaryKey"`
+	SampledAt      time.Time `gorm:"column:sampled_at;primaryKey"`
+	Ready          int64     `gorm:"column:ready;not null"`
+	ScheduledAhead int64     `gorm:"column:scheduled_ahead;not null"`
+	Running        int64     `gorm:"column:running;not null"`
+	Paused         int64     `gorm:"column:paused;not null"`
+	OldestReadyMs  int64     `gorm:"column:oldest_ready_ms;not null"`
+}
+
+// TableName binds jobQueueSampleRow to the job_queue_samples table.
+func (jobQueueSampleRow) TableName() string { return "job_queue_samples" }
 
 // limiterBucketRow is the DBLimiter's per-resource rate reservoir. The resource
 // string is the primary key — one bucket per protected dependency — and the row

@@ -40,6 +40,11 @@ type Scheduler struct {
 	retentionOpts        RetentionOpts
 	healthSampleInterval time.Duration
 
+	// The queue-depth history (queue_history.go). queueSampleInterval is zero
+	// when sampling is off.
+	queueSampleInterval  time.Duration
+	queueSampleRetention time.Duration
+
 	// The stats rollup (stats_scheduler.go). statsInterval is zero when it is off.
 	statsInterval   time.Duration
 	statsCfg        rollupConfig
@@ -154,6 +159,21 @@ type SchedulerConfig struct {
 	// p99 + 1m). The first time an attempt crosses that line it is logged once,
 	// at warn.
 	HealthSampleInterval time.Duration
+	// QueueSampleInterval enables the queue-depth history: when > 0 the
+	// Scheduler samples every queue's depth on this cadence — what QueueDepths
+	// reports for each queue with a live job: ready, scheduled ahead, running,
+	// paused, and the oldest ready job's age — into job_queue_samples, one row
+	// per queue per sample, which QueueDepthHistory reads. Zero (the default)
+	// writes no samples, and the Scheduler then needs no table for them; set, it
+	// refuses to start, with ErrSchemaOutdated, against a schema without
+	// job_queue_samples. A minute is a sensible cadence: a sample is the reads
+	// QueueDepths makes and one insert of a row per queue. Run it on one
+	// Scheduler per database; a duplicate's sample at the same instant is kept
+	// once.
+	QueueSampleInterval time.Duration
+	// QueueSampleRetention is how long queue samples are kept: each sampling pass
+	// deletes those older. Zero (or negative) selects 30 days.
+	QueueSampleRetention time.Duration
 
 	// StatsRollupInterval enables the hourly stats rollup: when > 0 the Scheduler
 	// rolls each closed hour of job_runs into job_stats_hourly on this cadence,
@@ -317,6 +337,8 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 			BatchSize: cfg.RetentionBatchSize, MaxBatches: cfg.RetentionMaxBatches,
 		},
 		healthSampleInterval: cfg.HealthSampleInterval,
+		queueSampleInterval:  max(cfg.QueueSampleInterval, 0),
+		queueSampleRetention: cfg.QueueSampleRetention,
 	}
 	if s.logger == nil {
 		s.logger = slog.Default()
@@ -326,6 +348,9 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 	}
 	if s.backfillCap <= 0 {
 		s.backfillCap = defaultBackfillCap
+	}
+	if s.queueSampleRetention <= 0 {
+		s.queueSampleRetention = defaultQueueSampleRetention
 	}
 	if s.tickInterval <= 0 {
 		s.tickInterval = defaultTickInterval
@@ -422,8 +447,9 @@ func (a *activity) tick(ctx context.Context, logger *slog.Logger) {
 // cancelled. The sweep runs on a 30-second cadence — frequent enough that a
 // crashed executor's jobs come back promptly, cheap enough to be a single
 // indexed scan. When retention is enabled (RetentionMaxAge > 0) it also runs a
-// retention sweep on its own cadence, and when HealthSampleInterval is set it
-// logs a queue-health pulse on that cadence.
+// retention sweep on its own cadence, when HealthSampleInterval is set it logs a
+// queue-health pulse on that cadence, and when QueueSampleInterval is set it
+// samples every queue's depth on that one.
 //
 // With Periodics declared, Run first applies them, before any activity starts, so
 // the first tick already sees them; then the reconcile activity keeps them
@@ -443,8 +469,9 @@ func (a *activity) tick(ctx context.Context, logger *slog.Logger) {
 //
 // The one early return is a schema older than the binary: before starting any
 // activity, Run checks that the tables its sweep writes, job_periodics (which its
-// tick reads), and, with the stats rollup on, the rollup's tables carry every
-// column, and returns ErrSchemaOutdated naming what is missing.
+// tick reads), with the stats rollup on, the rollup's tables, and, with
+// QueueSampleInterval set, job_queue_samples carry every column, and returns
+// ErrSchemaOutdated naming what is missing.
 func (s *Scheduler) Run(ctx context.Context) error {
 	if err := s.checkSchema(ctx); err != nil {
 		return err
@@ -477,7 +504,7 @@ func (s *Scheduler) runActivities(ctx context.Context, activities []*activity) {
 
 // activities builds the maintenance set for this Scheduler's configuration.
 //
-// Retention and the health heartbeat stay opt-in structurally rather than by a
+// Retention, the health heartbeat, and the queue samples stay opt-in structurally rather than by a
 // disabled ticker: no interval, no goroutine. A capability that is off should
 // cost nothing, not tick into a branch that returns early. The reconcile
 // activity follows the same rule: it runs only with Periodics declared, and with
@@ -501,6 +528,11 @@ func (s *Scheduler) activities() []*activity {
 	if s.statsInterval > 0 {
 		acts = append(acts, &activity{
 			name: "stats", interval: s.statsInterval, run: s.rollupOnce,
+		})
+	}
+	if s.queueSampleInterval > 0 {
+		acts = append(acts, &activity{
+			name: "queue samples", interval: s.queueSampleInterval, run: s.sampleQueuesOnce,
 		})
 	}
 	if s.reconcileEnabled() {

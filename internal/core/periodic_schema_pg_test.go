@@ -21,7 +21,7 @@ func TestInspectSchemaReportsWhatThePreviousReleaseLacksPostgres(t *testing.T) {
 // deploy-order guard on PostgreSQL.
 func TestSchedulerRefusesToStartWithoutThePausedAtColumnPostgres(t *testing.T) {
 	t.Parallel()
-	schedulerRefusesWithoutPausedAtSuite(t, newBarePostgres(t))
+	schedulerRefusesWithoutPausedAtSuite(t, NewPostgresIsolatedDB(t))
 }
 
 // TestMigrateUpgradesThePreviousReleaseSchemaPostgres is the library-owned

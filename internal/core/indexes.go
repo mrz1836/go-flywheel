@@ -608,7 +608,8 @@ func readInstalledIndexDefs(ctx context.Context, db *gorm.DB, extraNames []strin
 			Indisvalid bool
 		}
 		tables := `i.tablename IN ('jobs', 'job_runs', 'job_periodics', 'limiter_buckets', 'limiter_holds',
-			                      'job_run_finishes', 'job_stats_hourly', 'job_audit')`
+			                      'job_run_finishes', 'job_stats_hourly', 'job_audit', 'job_error_groups_hourly',
+			                      'job_queue_samples')`
 		var args []any
 		if len(extraNames) > 0 {
 			tables = "(" + tables + " OR i.indexname IN ?)"
@@ -878,6 +879,19 @@ func runtimeIndexes() []Index {
 			// oldest-first batches, whose range ends at the cutoff.
 			Name: "job_audit_created", Kind: IndexPerformance, Table: "job_audit",
 			DDL: `CREATE INDEX IF NOT EXISTS job_audit_created ON job_audit (created_at, id)`,
+		},
+		{
+			// Performance: one error group across hours — the earliest retained hour
+			// ErrorGroups reads for a group's first sighting, and its fingerprint
+			// filter — which the table's key, led by the hour, cannot serve.
+			Name: "job_error_groups_fingerprint", Kind: IndexPerformance, Table: "job_error_groups_hourly",
+			DDL: `CREATE INDEX IF NOT EXISTS job_error_groups_fingerprint ON job_error_groups_hourly (kind, fingerprint, bucket_start_unix)`,
+		},
+		{
+			// Performance: the queue-sample prune, a range delete below a cutoff across
+			// every queue, which the table's key, led by the queue, cannot serve.
+			Name: "job_queue_samples_time", Kind: IndexPerformance, Table: "job_queue_samples",
+			DDL: `CREATE INDEX IF NOT EXISTS job_queue_samples_time ON job_queue_samples (sampled_at)`,
 		},
 	}
 }

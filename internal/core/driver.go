@@ -606,9 +606,15 @@ func jobFinalizeUpdate(plan finalizePlan, finishedAt time.Time) map[string]any {
 // carrying a job state as the crash the sweep recorded, whatever outcome the
 // late finalize writes beside it (see runAgg.observe), so the late finalize
 // changes no hour the rollup has already counted.
+//
+// error_fingerprint is written for an attempt whose outcome is error or timeout,
+// superseded or not — the failure is real either way — over kind, the job's, and
+// the message as stored, or the value an ErrorFingerprinter in workErr's chain
+// supplies (see fingerprintOf). Every other outcome leaves it NULL, a snooze
+// that carries an error included.
 func runFinalizeUpdate(
-	plan finalizePlan, result Result, workErr error, finishedAt time.Time, durationMs, enqueued int, superseded bool,
-	maxOutputBytes int,
+	plan finalizePlan, result Result, workErr error, kind string, finishedAt time.Time,
+	durationMs, enqueued int, superseded bool, maxOutputBytes int,
 ) (map[string]any, error) {
 	upd := map[string]any{
 		"outcome":           string(plan.runOutcome),
@@ -636,6 +642,9 @@ func runFinalizeUpdate(
 		}
 		upd["error_message"] = message
 		upd["error_payload"] = payload
+		if failedOutcome(plan.runOutcome) && plan.errorClass != nil {
+			upd["error_fingerprint"] = fingerprintOf(kind, *plan.errorClass, message, workErr)
+		}
 	}
 	if result.Output != nil {
 		out, err := marshalRunOutput(result.Output, maxOutputBytes)
@@ -834,7 +843,7 @@ func (d *baseDriver) Finalize(
 		}
 
 		runUpd, err := runFinalizeUpdate(
-			plan, result, workErr, finishedAt, durationMs, enqueued, out.Superseded, d.opts.maxOutputBytes(),
+			plan, result, workErr, raw.Kind, finishedAt, durationMs, enqueued, out.Superseded, d.opts.maxOutputBytes(),
 		)
 		if err != nil {
 			return err

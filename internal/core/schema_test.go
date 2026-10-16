@@ -68,21 +68,29 @@ type legacyJobPeriodicRow struct {
 func (legacyJobPeriodicRow) TableName() string { return "job_periodics" }
 
 // legacyIndexNames are the indexes added since a release before the stats
-// tables: the analytics release's, and the two on the audit history's table. A
-// legacy schema is the current IndexSet minus these — derived, never
-// hand-written.
+// tables: the analytics release's, the two on the audit history's table, and
+// the two on the error-group and queue-sample tables. A legacy schema is the
+// current IndexSet minus these — derived, never hand-written.
 //
 //nolint:gochecknoglobals // shared fixture
-var legacyIndexNames = []string{"jobs_finished", "job_audit_target", "job_audit_created"}
+var legacyIndexNames = []string{
+	"jobs_finished", "job_audit_target", "job_audit_created", "job_error_groups_fingerprint", "job_queue_samples_time",
+}
 
-// previousReleaseTableNames and previousReleaseIndexNames are what this release
-// adds: the previous release's schema is Models and IndexSet minus these —
-// derived, never hand-written. This release adds one table and no index.
+// previousReleaseTableNames, previousReleaseIndexNames, and
+// previousReleaseColumns are what this release adds: the previous release's
+// schema is Models and IndexSet minus these — derived, never hand-written. This
+// release adds two tables, an index on each, and a column to two existing
+// tables.
 //
 //nolint:gochecknoglobals // shared fixture
 var (
-	previousReleaseTableNames = []string{"job_kinds"}
-	previousReleaseIndexNames []string
+	previousReleaseTableNames = []string{"job_error_groups_hourly", "job_queue_samples"}
+	previousReleaseIndexNames = []string{"job_error_groups_fingerprint", "job_queue_samples_time"}
+	previousReleaseColumns    = []SchemaDrift{
+		{Table: "job_runs", Column: "error_fingerprint"},
+		{Table: "job_stats_hourly", Column: "enqueued"},
+	}
 )
 
 // installLegacySchema builds, on a bare database, the schema a release before
@@ -106,8 +114,8 @@ func installLegacySchema(t *testing.T, db *gorm.DB) {
 
 // installPreviousReleaseSchema builds, on a bare database, the schema the
 // previous release installed: every table Models returns but
-// previousReleaseTableNames, and every index in IndexSet but
-// previousReleaseIndexNames.
+// previousReleaseTableNames, without previousReleaseColumns, and every index in
+// IndexSet but previousReleaseIndexNames.
 func installPreviousReleaseSchema(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	var tables []any
@@ -119,6 +127,12 @@ func installPreviousReleaseSchema(t *testing.T, db *gorm.DB) {
 		}
 	}
 	require.NoError(t, db.AutoMigrate(tables...))
+	for _, col := range previousReleaseColumns {
+		if db.Migrator().HasColumn(col.Table, col.Column) {
+			require.NoError(t, db.Exec("ALTER TABLE "+col.Table+" DROP COLUMN "+col.Column).Error,
+				"previous-release column %s", col)
+		}
+	}
 	set, err := IndexSet(db.Name())
 	require.NoError(t, err)
 	for _, idx := range set {
@@ -177,8 +191,9 @@ func schemaDriftNames(drift []SchemaDrift) []string {
 
 // TestInspectSchemaReportsWhatAnOlderSchemaLacks proves the parity check names
 // exactly the columns and tables added since a release before the stats
-// tables — the analytics release's, the pause's, the audit history's, and the
-// kind catalog's — and nothing on a current schema.
+// tables — the analytics release's, the pause's, the audit history's, the kind
+// catalog's, and the error groups' and queue samples' — and nothing on a
+// current schema.
 func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -189,8 +204,9 @@ func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{
 		"job_runs.kind", "job_runs.queue", "job_runs.queue_wait_ms", "job_runs.job_state",
-		"job_runs.superseded", "job_periodics.paused_at", "job_run_finishes (table)",
+		"job_runs.superseded", "job_runs.error_fingerprint", "job_periodics.paused_at", "job_run_finishes (table)",
 		"job_stats_hourly (table)", "job_stats_progress (table)", "job_audit (table)", "job_kinds (table)",
+		"job_error_groups_hourly (table)", "job_queue_samples (table)",
 	}, schemaDriftNames(drift))
 
 	current, err := InspectSchema(ctx, newDB(t))
@@ -243,6 +259,66 @@ func TestSchedulerWithStatsFailsFastOnAnOutdatedSchema(t *testing.T) {
 	require.ErrorIs(t, err, ErrSchemaOutdated, "the sweep alone writes the new job_runs columns")
 	assert.Contains(t, err.Error(), "job_runs.job_state")
 	assert.NotContains(t, err.Error(), "job_stats_hourly", "a Scheduler without stats does not need the rollup tables")
+}
+
+// runnerRefusesWithoutErrorFingerprintSuite is the deploy-order guard for the
+// fingerprint column: every failed attempt's finalize writes it, so a Runner
+// against a schema without it stops before it claims anything, naming the
+// column and the fix. db carries the current schema; the suite drops the column.
+func runnerRefusesWithoutErrorFingerprintSuite(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.Exec("ALTER TABLE job_runs DROP COLUMN error_fingerprint").Error)
+	ctx := context.Background()
+	id, err := Enqueue(ctx, NewClient(db), "stats.write", []byte(`{}`), InsertOpts{})
+	require.NoError(t, err)
+
+	err = rwRunner(t, db, NewRegistry()).RunUntilIdle(ctx)
+	require.ErrorIs(t, err, ErrSchemaOutdated)
+	assert.Contains(t, err.Error(), "job_runs.error_fingerprint", "the error names the missing column")
+	assert.Contains(t, err.Error(), "flywheel migrate", "and how to fix it")
+	assert.Equal(t, string(StateAvailable), jobState(t, db, id), "nothing was claimed")
+}
+
+// TestRunnerRefusesToStartWithoutTheErrorFingerprintColumn runs the guard on
+// SQLite.
+func TestRunnerRefusesToStartWithoutTheErrorFingerprintColumn(t *testing.T) {
+	t.Parallel()
+	runnerRefusesWithoutErrorFingerprintSuite(t, newDB(t))
+}
+
+// schedulerRefusesWithoutRollupTablesSuite is the guard for the Scheduler: its
+// lease sweep writes job_runs, so it always needs the fingerprint column, and
+// with the rollup on it also needs the enqueue counts and the error groups the
+// rollup writes. db carries the current schema; the suite drops all three.
+func schedulerRefusesWithoutRollupTablesSuite(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.Exec("ALTER TABLE job_runs DROP COLUMN error_fingerprint").Error)
+	require.NoError(t, db.Exec("ALTER TABLE job_stats_hourly DROP COLUMN enqueued").Error)
+	require.NoError(t, db.Exec("DROP TABLE job_error_groups_hourly").Error)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	s := newSchedulerCfg(t, SchedulerConfig{
+		DB: db, Client: NewClient(db), Driver: driverForTest(t, db), StatsRollupInterval: time.Minute,
+	})
+	err := s.Run(ctx)
+	require.ErrorIs(t, err, ErrSchemaOutdated)
+	assert.Contains(t, err.Error(), "job_stats_hourly.enqueued")
+	assert.Contains(t, err.Error(), "job_error_groups_hourly (table)")
+
+	plain := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db), Driver: driverForTest(t, db)})
+	err = plain.Run(ctx)
+	require.ErrorIs(t, err, ErrSchemaOutdated, "the sweep alone writes job_runs")
+	assert.Contains(t, err.Error(), "job_runs.error_fingerprint")
+	assert.NotContains(t, err.Error(), "job_stats_hourly.enqueued", "a Scheduler without stats does not need the rollup's column")
+	assert.NotContains(t, err.Error(), "job_error_groups_hourly", "or its table")
+}
+
+// TestSchedulerRefusesToStartWithoutTheRollupsNewTables runs the guard on
+// SQLite.
+func TestSchedulerRefusesToStartWithoutTheRollupsNewTables(t *testing.T) {
+	t.Parallel()
+	schedulerRefusesWithoutRollupTablesSuite(t, newDB(t))
 }
 
 // TestSchemaProbeIsNotAVerdictOnAnUnreachableDatabase proves a database that is
@@ -360,8 +436,9 @@ func TestOldRowsAreAcceptedByTheNewSchemaDefaults(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	for model, columns := range map[any][]string{
-		&jobRunRow{}:      {"kind", "queue", "queue_wait_ms", "job_state", "superseded"},
-		&jobPeriodicRow{}: {"paused_at"},
+		&jobRunRow{}:         {"kind", "queue", "queue_wait_ms", "job_state", "superseded", "error_fingerprint"},
+		&jobPeriodicRow{}:    {"paused_at"},
+		&jobStatsHourlyRow{}: {"enqueued"},
 	} {
 		stmt := &gorm.Statement{DB: db}
 		require.NoError(t, stmt.Parse(model))

@@ -28,8 +28,11 @@ func sqliteOpener(t *testing.T) *gorm.DB {
 // histRun describes one finished run to seed directly, bypassing the runtime so
 // a test controls exactly which hour it lands in.
 type histRun struct {
-	ID         string // minted when empty
-	JobID      string // minted when empty
+	ID    string // minted when empty
+	JobID string // minted when empty: at EnqueuedAt when that is set, else now
+	// EnqueuedAt is when the job was inserted, as its id records it; zero mints
+	// the id at the wall clock, as the runtime does.
+	EnqueuedAt time.Time
 	Kind       string
 	Queue      string
 	Outcome    RunOutcome
@@ -39,6 +42,12 @@ type histRun struct {
 	WaitMs     int // negative records none
 	Superseded bool
 	CostMicros int64
+	// ErrorClass and ErrorMessage are the attempt's error, stored when set, and
+	// Fingerprint its stored error_fingerprint; empty stores none, as a run an
+	// older release wrote has none.
+	ErrorClass   ErrorClass
+	ErrorMessage string
+	Fingerprint  string
 	// Legacy writes the row as an older binary did: kind and queue left at the
 	// column default, for the read path to resolve through the job.
 	Legacy bool
@@ -72,7 +81,11 @@ func writeHistory(t testing.TB, db *gorm.DB, runs []histRun) {
 		if r.ID == "" {
 			r.ID = models.NewID()
 		}
-		if r.JobID == "" {
+		switch {
+		case r.JobID != "":
+		case !r.EnqueuedAt.IsZero():
+			r.JobID = mintIDAt(r.EnqueuedAt)
+		default:
 			r.JobID = models.NewID()
 		}
 		if r.Queue == "" {
@@ -113,6 +126,18 @@ func writeHistory(t testing.TB, db *gorm.DB, runs []histRun) {
 			c := r.CostMicros
 			row.CostMicros = &c
 		}
+		if r.ErrorClass != "" {
+			c := string(r.ErrorClass)
+			row.ErrorClass = &c
+		}
+		if r.ErrorMessage != "" {
+			m := r.ErrorMessage
+			row.ErrorMessage = &m
+		}
+		if r.Fingerprint != "" {
+			fp := r.Fingerprint
+			row.ErrorFingerprint = &fp
+		}
 		rows = append(rows, row)
 	}
 	require.NoError(t, db.CreateInBatches(jobs, 200).Error)
@@ -151,6 +176,11 @@ func discardRun(kind string, finishedAt time.Time) histRun {
 // rows mixed in — the oracle's input. A crashed row records the state the sweep
 // applied, available or discarded, and some crashed rows finished late: their
 // superseded finalize wrote its own outcome beside the state the sweep recorded.
+// Each job was inserted up to three hours before its run finished, so the
+// enqueue counts fall in other hours than the finishes, some before the history.
+// Every error and timeout carries a class and a message of one of four shapes,
+// and one in five stores a fingerprint of the worker's own; a legacy row stores
+// none.
 //
 //nolint:gocognit // one random draw per column, with the combinations each outcome allows
 func randomHistory(rng *rand.Rand, n int, from time.Time, span time.Duration) []histRun {
@@ -175,6 +205,7 @@ func randomHistory(rng *rand.Rand, n int, from time.Time, span time.Duration) []
 			Superseded: rng.IntN(25) == 0,
 			Legacy:     rng.IntN(10) == 0,
 		}
+		r.EnqueuedAt = r.FinishedAt.Add(-time.Duration(rng.Int64N(int64(3 * time.Hour))))
 		switch o {
 		case OutcomeSuccess:
 			r.JobState = StateSucceeded
@@ -216,9 +247,34 @@ func randomHistory(rng *rand.Rand, n int, from time.Time, span time.Duration) []
 			// a custom Driver).
 			r.WaitMs = -1
 		}
+		if r.Outcome == OutcomeError || r.Outcome == OutcomeTimeout {
+			r.ErrorClass = []ErrorClass{ErrorTransient, ErrorPermanent}[rng.IntN(2)]
+			if r.Outcome == OutcomeTimeout {
+				r.ErrorClass = ErrorTimeout
+			}
+			r.ErrorMessage = randomErrorMessage(rng)
+			if rng.IntN(5) == 0 && !r.Legacy {
+				r.Fingerprint = fmt.Sprintf("%016x", 0xfeed0+rng.IntN(3))
+			}
+		}
 		runs[i] = r
 	}
 	return runs
+}
+
+// randomErrorMessage is a failure's message in one of four shapes, its values
+// drawn at random, so each shape normalizes to one text.
+func randomErrorMessage(rng *rand.Rand) string {
+	switch rng.IntN(4) {
+	case 0:
+		return fmt.Sprintf("upstream returned %d for item %d", 500+rng.IntN(4), rng.IntN(10_000))
+	case 1:
+		return fmt.Sprintf("dial tcp 10.0.%d.%d:5432: connect: connection refused", rng.IntN(255), rng.IntN(255))
+	case 2:
+		return fmt.Sprintf("context deadline exceeded after %ds waiting on 'warehouse-%d'", rng.IntN(60), rng.IntN(9))
+	default:
+		return fmt.Sprintf(`row %d rejected: field "amount" = "%d.%02d USD"`, rng.IntN(5000), rng.IntN(100), rng.IntN(100))
+	}
 }
 
 // legacyState keeps only what the seeder needs to make a legacy row's discard
@@ -235,24 +291,48 @@ func legacyState(s JobState) JobState {
 // rollup involved.
 func rawKindStats(t *testing.T, db *gorm.DB, from, to time.Time, f statsFilter) ([]KindStats, KindStats) {
 	t.Helper()
+	return rawGroupedStats(t, db, from, to, f, StatsByKind)
+}
+
+// rawGroupedStats is the oracle for one grouping: the raw aggregate merged per
+// kind, per queue, or per kind and queue, each entry naming its group, sorted
+// as Stats sorts.
+func rawGroupedStats(
+	t *testing.T, db *gorm.DB, from, to time.Time, f statsFilter, groupBy StatsGroupBy,
+) ([]KindStats, KindStats) {
+	t.Helper()
 	aggs, err := aggregateRuns(fixedClockCtx(to), db, from, to, f)
 	require.NoError(t, err)
-	byKind := map[string]*runAgg{}
+	byGroup := map[[2]string]*runAgg{}
 	total := newRunAgg("", "")
 	for _, a := range aggs {
-		k, ok := byKind[a.Kind]
+		key := [2]string{a.Kind, ""}
+		switch groupBy {
+		case StatsByQueue:
+			key = [2]string{"", a.Queue}
+		case StatsByKindQueue:
+			key = [2]string{a.Kind, a.Queue}
+		}
+		k, ok := byGroup[key]
 		if !ok {
-			k = newRunAgg(a.Kind, "")
-			byKind[a.Kind] = k
+			k = newRunAgg(key[0], key[1])
+			byGroup[key] = k
 		}
 		k.merge(a)
 		total.merge(a)
 	}
-	out := make([]KindStats, 0, len(byKind))
-	for _, a := range byKind {
-		out = append(out, kindStatsFromAgg(a))
+	out := make([]KindStats, 0, len(byGroup))
+	for key, a := range byGroup {
+		ks := kindStatsFromAgg(a)
+		ks.Queue = key[1]
+		out = append(out, ks)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Kind < out[j].Kind })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+		return out[i].Queue < out[j].Queue
+	})
 	return out, kindStatsFromAgg(total)
 }
 

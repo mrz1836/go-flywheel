@@ -78,6 +78,12 @@ type JobRunView struct {
 	// Error is the worker error recorded for a failed attempt, if any, cut at
 	// 4,096 bytes; ErrorTruncated reports a cut.
 	Error *string `json:"error,omitempty"`
+	// ErrorFingerprint names the failure's error group: 16 hex characters for an
+	// attempt whose outcome is error or timeout (see ErrorFingerprint), and empty
+	// for any other. A run written before the runtime stored fingerprints has it
+	// computed on read from its recorded kind, class, and message, and has none
+	// when its kind is unrecorded.
+	ErrorFingerprint string `json:"error_fingerprint,omitempty"`
 	// CostMicros is the attempt's accumulated external-call cost, as the worker
 	// reported it in Result.CostMicros.
 	CostMicros       *int64 `json:"cost_micros,omitempty"`
@@ -544,6 +550,7 @@ func jobRunViewFromRow(r jobRunRow) JobRunView {
 	if r.JobState != nil {
 		v.JobState = *r.JobState
 	}
+	v.ErrorFingerprint = runViewFingerprint(r)
 	if len(r.Output) > 0 {
 		v.Output = json.RawMessage(r.Output)
 		v.OutputTruncated = isTruncatedOutput(r.Output)
@@ -562,6 +569,28 @@ func jobRunViewFromRow(r jobRunRow) JobRunView {
 		}
 	}
 	return v
+}
+
+// runViewFingerprint is a run's fingerprint as JobRunView reports it: the stored
+// one, or, for a failed run an older release wrote without one, the fingerprint
+// over its recorded kind, class, and stored message. A run with no recorded
+// kind has none: the stored value would have hashed its job's kind, which the
+// row does not carry.
+func runViewFingerprint(r jobRunRow) string {
+	if r.ErrorFingerprint != nil {
+		return *r.ErrorFingerprint
+	}
+	if !failedOutcome(RunOutcome(r.Outcome)) || r.Kind == "" {
+		return ""
+	}
+	var class, message string
+	if r.ErrorClass != nil {
+		class = *r.ErrorClass
+	}
+	if r.ErrorMessage != nil {
+		message = *r.ErrorMessage
+	}
+	return ErrorFingerprint(r.Kind, ErrorClass(class), message)
 }
 
 // isTruncatedOutput reports whether a stored output is a TruncatedOutput: an
