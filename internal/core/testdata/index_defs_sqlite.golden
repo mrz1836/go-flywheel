@@ -3,6 +3,7 @@ idx_jobs_deleted_at	CREATE INDEX idx_jobs_deleted_at ON jobs (deleted_at) WHERE 
 job_audit_created	CREATE INDEX job_audit_created ON job_audit (created_at, id)
 job_audit_target	CREATE INDEX job_audit_target ON job_audit (target_type, target_id, created_at, id)
 job_error_groups_fingerprint	CREATE INDEX job_error_groups_fingerprint ON job_error_groups_hourly (kind, fingerprint, bucket_start_unix)
+job_nodes_heartbeat	CREATE INDEX job_nodes_heartbeat ON job_nodes (heartbeat_at)
 job_queue_samples_time	CREATE INDEX job_queue_samples_time ON job_queue_samples (sampled_at)
 job_runs_job_attempt	CREATE UNIQUE INDEX job_runs_job_attempt ON job_runs (job_id, attempt)
 jobs_finished	CREATE INDEX jobs_finished ON jobs (state, finalized_at, id) WHERE finalized_at IS NOT NULL

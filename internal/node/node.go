@@ -80,6 +80,31 @@ type NodeConfig struct {
 	// in bounded transactions, so neither can hold shutdown open for the length
 	// of whatever it happened to be draining.
 	DrainTimeout time.Duration
+	// Version and Commit are recorded on the node's job_nodes row, for a host to
+	// tell which build each node runs. Both are optional and unused unless the
+	// node registers.
+	Version string
+	Commit  string
+	// RegistryInterval registers the node in job_nodes. Zero leaves it
+	// unregistered. Positive makes Run, before it starts any component, check
+	// that job_nodes carries every column the runtime declares (ErrSchemaOutdated
+	// names the gaps), write the node's row — a new id for this process
+	// lifetime, its host:pid (the job_runs.executor_id its runners write), host,
+	// Version, Commit, runners, and the kinds their registries register — and
+	// heartbeat it at this cadence with its runners' in-flight counts. Run
+	// writes the row's stop time once its runners have stopped, before it
+	// returns. ListNodes reads the rows.
+	//
+	// A registering node honors RequestDrain within one heartbeat: it stops
+	// every runner's claims and reports draining, then drained once nothing is in
+	// flight, and keeps running and heartbeating until its context ends. With a
+	// Scheduler it also deletes the rows of nodes whose heartbeat is older than
+	// the Scheduler's NodeRetention, at start and then hourly. Keep the interval
+	// well below ListNodesParams.StaleAfter (a minute by default), or a healthy
+	// node reads stale between beats; fifteen seconds is a sensible cadence. Run
+	// one registering Node per process: a run joins its node by executor identity
+	// and lifetime, and two in one process would share both.
+	RegistryInterval time.Duration
 }
 
 // Node is a self-contained job-runtime process: it owns its runners, an optional
@@ -91,6 +116,9 @@ type Node struct {
 	runners   []*core.Runner
 	scheduler *core.Scheduler
 	logger    *slog.Logger
+	// registry is the node's job_nodes row and its upkeep; nil when the node
+	// does not register.
+	registry *registration
 }
 
 // NewNode validates cfg and constructs the Node. Each runner is built through
@@ -130,7 +158,12 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		cfg.Health.Readiness = dbPinger(cfg.Runners[0].DB)
 	}
 
-	return &Node{cfg: cfg, runners: runners, scheduler: scheduler, logger: logger}, nil
+	registry, err := newRegistration(cfg, runners, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Node{cfg: cfg, runners: runners, scheduler: scheduler, logger: logger, registry: registry}, nil
 }
 
 // Run starts every component and blocks until ctx is cancelled and all components
@@ -142,6 +175,16 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 // claiming, then drained; only once the drain has finished — or run out of
 // DrainTimeout — is the rest of the node torn down.
 func (n *Node) Run(ctx context.Context) error {
+	// A registering node checks its table and writes its row before anything
+	// starts, so a node that cannot register claims nothing, and one that can is
+	// listed from its first claim.
+	if n.registry != nil {
+		if err := n.registry.checkSchema(ctx); err != nil {
+			return err
+		}
+		n.registry.start(ctx)
+	}
+
 	// The components run on a context detached from the caller's. That is what
 	// makes the drain above real: a runner's run context reaches every worker it
 	// dispatches, so deriving it from ctx would abort in-flight work the instant
@@ -150,7 +193,7 @@ func (n *Node) Run(ctx context.Context) error {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, len(n.runners)+2)
+	errCh := make(chan error, len(n.runners)+3)
 	// fail records a component's first real (non-cancellation) error and tears
 	// down its siblings by cancelling the shared run context.
 	fail := func(err error) {
@@ -182,6 +225,13 @@ func (n *Node) Run(ctx context.Context) error {
 			fail(n.serveHealth(runCtx))
 		}()
 	}
+	if n.registry != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fail(n.registry.run(runCtx))
+		}()
+	}
 
 	n.logger.InfoContext(ctx, "flywheel: node started",
 		"runners", len(n.runners),
@@ -203,6 +253,11 @@ func (n *Node) Run(ctx context.Context) error {
 		// in-flight work to protect and stop on the run context.
 		cancel()
 		n.awaitComponents(drainCtx, done)
+	}
+
+	// The runners have stopped, so the row's last word is its stop time.
+	if n.registry != nil {
+		n.registry.stop(ctx)
 	}
 
 	if firstErr := drainErrors(errCh); firstErr != nil {

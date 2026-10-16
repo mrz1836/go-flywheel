@@ -116,6 +116,21 @@ type RunnerConfig struct {
 	UnknownKindGrace time.Duration
 	// Queues are the logical queues this Runner claims from.
 	Queues []string
+	// QueueStateRefresh is how often the Runner reads which of its queues an
+	// operator paused (PauseQueue): one primary-key read of job_queues, at most
+	// once per refresh, before it reserves a slot or asks its Limiter. It leaves
+	// a paused queue out of its claims, so a pause takes hold within one refresh
+	// on every Runner, and with every queue paused it claims nothing, holds no
+	// slot, and waits for the next refresh. An attempt already running on a
+	// paused queue finishes. A read that fails keeps the paused set the last one
+	// returned, with a warning; until a read succeeds, the Runner claims every
+	// queue.
+	//
+	// Zero selects five seconds. A negative value turns the check off: the
+	// Runner claims every queue, reads nothing, and does not need job_queues.
+	// Otherwise Run refuses to start, with ErrSchemaOutdated, on a database
+	// without job_queues.
+	QueueStateRefresh time.Duration
 	// ExecutorClass is the routing label this Runner serves: it claims jobs whose
 	// executor_class equals it (or is the empty wildcard) unless ClaimAnyClass is
 	// set, and stamps it on every job_runs row this Runner writes.
@@ -292,6 +307,10 @@ type Runner struct {
 	// schemaChecked records that the startup schema probe ran and found every
 	// column the run path writes, so a Runner reused across invocations probes once.
 	schemaChecked atomic.Bool
+	// queueState is the paused set the Runner last read, and when. Its zero
+	// value is ready, which keeps a Runner built as a bare struct literal
+	// working.
+	queueState queueState
 	// unknownKindsWarned maps each kind this Runner has warned it is deferring to
 	// when it last warned (a time.Time), so a deploy's worth of deferrals logs one
 	// line per kind rather than one per claim, and a later episode, a rollback
@@ -760,6 +779,18 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			return r.stopResult(untilIdle)
 		}
 
+		// The paused set comes first, before a slot or a permit is taken: a
+		// Runner whose every queue is paused holds neither, and its iteration is
+		// an empty claim that reached no database, which waits for the next
+		// refresh — and for RunUntilIdle, ends it when nothing is pending.
+		queues := r.claimable(ctx)
+		if len(queues) == 0 {
+			if done, err := r.idle(ctx, loopCtx, &backoff, untilIdle, r.untilQueueStateRefresh()); done {
+				return err
+			}
+			continue
+		}
+
 		reserved, err := r.pool.reserve(loopCtx, r.claimLimit())
 		if err != nil {
 			return r.ended(ctx, untilIdle)
@@ -805,7 +836,7 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 		// progress, so any starvation streak is over.
 		starvation.granted()
 
-		claimed, claimErr := r.claimAndDispatch(ctx, adm.toClaim, adm.grant)
+		claimed, claimErr := r.claimAndDispatch(ctx, queues, adm.toClaim, adm.grant)
 		if stop := r.drainDispatchErr(ctx, untilIdle); stop != nil {
 			return stop
 		}
@@ -819,67 +850,82 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			backoff.reset()
 			continue
 		}
-
-		// An empty claim reached the database, but for RunUntilIdle the iteration
-		// is not over: the pending count is part of the same poll. Resetting the
-		// ladder here instead of after the count would mean a queue that is always
-		// empty and a count that always fails never climb a rung — the ladder would
-		// reset on every claim and the loop would spin forever.
-		if !untilIdle {
-			backoff.reset()
-		} else {
-			// "No job is in a non-terminal state" includes this runner's
-			// own in-flight jobs, and with independent slots the claim going empty
-			// no longer implies the pool is empty. Waiting for it here makes the
-			// guarantee hold by construction rather than by the accident that
-			// 'running' happens to be one of nonTerminalStates — and it also pins
-			// down the narrower window where a worker body has returned but its
-			// Finalize has not committed.
-			//
-			// It costs nothing in the common case: the pool is already empty.
-			if waitErr := r.pool.waitIdle(loopCtx); waitErr != nil {
-				return r.ended(ctx, untilIdle)
-			}
-			if dispatchErr := r.pool.takeErr(); dispatchErr != nil {
-				return dispatchErr
-			}
-
-			// The count hits the same database the claim does, so a blip on it is as
-			// transient as a blip on the claim and takes the same ladder.
-			pending, countErr := r.pendingCount(ctx)
-			if countErr != nil {
-				if stop := r.onPollError(ctx, loopCtx, &backoff, untilIdle, countErr); stop != nil {
-					return stop
-				}
-				continue
-			}
-			backoff.reset()
-			if pending == 0 {
-				return nil
-			}
-			// Jobs remain but none are claimable yet (retry/snooze backoff);
-			// wait one interval and poll again.
-		}
-
-		if err := r.sleep(loopCtx, r.cfg.PollInterval); err != nil {
-			return r.ended(ctx, untilIdle)
+		if done, err := r.idle(ctx, loopCtx, &backoff, untilIdle, r.cfg.PollInterval); done {
+			return err
 		}
 	}
+}
+
+// idle ends an iteration that claimed nothing — an empty claim, or a Runner
+// whose every queue is paused — and reports whether the loop is done, with the
+// error run returns (nil when RunUntilIdle found nothing pending). Otherwise it
+// waits out wait before the next iteration.
+func (r *Runner) idle(ctx, loopCtx context.Context, backoff *pollBackoff, untilIdle bool, wait time.Duration) (bool, error) {
+	// An empty claim reached the database, but for RunUntilIdle the iteration
+	// is not over: the pending count is part of the same poll. Resetting the
+	// ladder here instead of after the count would mean a queue that is always
+	// empty and a count that always fails never climb a rung — the ladder would
+	// reset on every claim and the loop would spin forever.
+	if !untilIdle {
+		backoff.reset()
+	} else {
+		// "No job is in a non-terminal state" includes this runner's
+		// own in-flight jobs, and with independent slots the claim going empty
+		// no longer implies the pool is empty. Waiting for it here makes the
+		// guarantee hold by construction rather than by the accident that
+		// 'running' happens to be one of nonTerminalStates — and it also pins
+		// down the narrower window where a worker body has returned but its
+		// Finalize has not committed.
+		//
+		// It costs nothing in the common case: the pool is already empty.
+		if waitErr := r.pool.waitIdle(loopCtx); waitErr != nil {
+			return true, r.ended(ctx, untilIdle)
+		}
+		if dispatchErr := r.pool.takeErr(); dispatchErr != nil {
+			return true, dispatchErr
+		}
+
+		// The count hits the same database the claim does, so a blip on it is as
+		// transient as a blip on the claim and takes the same ladder.
+		pending, countErr := r.pendingCount(ctx)
+		if countErr != nil {
+			if stop := r.onPollError(ctx, loopCtx, backoff, untilIdle, countErr); stop != nil {
+				return true, stop
+			}
+			return false, nil
+		}
+		backoff.reset()
+		if pending == 0 {
+			return true, nil
+		}
+		// Jobs remain but none are claimable yet (retry/snooze backoff, or a
+		// paused queue); wait and poll again.
+	}
+
+	if err := r.sleep(loopCtx, wait); err != nil {
+		return true, r.ended(ctx, untilIdle)
+	}
+	return false, nil
 }
 
 // checkSchema runs the startup schema probe over the tables the run path writes,
 // once per Runner: jobs and job_runs, which the claim, the stub insert, and the
 // finalize update write, and job_run_finishes, which every finalize logs to in
-// the same transaction. A database missing any of them fails the run before
-// anything is claimed: claiming first would lease a job, fail its stub insert or
-// its finalize, and leave the lease sweep to reclaim the same jobs forever. A
-// probe that cannot reach the database is not a verdict and is retried on the
-// next run — see probeSchema.
+// the same transaction; and, unless QueueStateRefresh is negative, job_queues,
+// whose paused set every iteration reads before it claims. A database missing
+// any of them fails the run before anything is claimed: claiming first would
+// lease a job, fail its stub insert or its finalize, and leave the lease sweep
+// to reclaim the same jobs forever. A probe that cannot reach the database is
+// not a verdict and is retried on the next run — see probeSchema.
 func (r *Runner) checkSchema(ctx context.Context) error {
 	if r.schemaChecked.Load() {
 		return nil
 	}
-	checked, err := probeSchema(ctx, r.cfg.DB, runPathModels()...)
+	models := runPathModels()
+	if r.cfg.QueueStateRefresh >= 0 {
+		models = append(models, &jobQueueRow{})
+	}
+	checked, err := probeSchema(ctx, r.cfg.DB, models...)
 	if err != nil {
 		return fmt.Errorf("jobs: runner schema check: %w", err)
 	}
@@ -1219,10 +1265,15 @@ func (r *Runner) releasePermits(ctx context.Context, grant Grant, n int) {
 // are released across this function — the unused remainder up front, then one per
 // dispatched job when it finishes. A job dispatched past grant.N (a Driver that
 // over-served the reservation, holding no permit) gets a no-op releaser.
-func (r *Runner) claimAndDispatch(ctx context.Context, reserved int, grant Grant) (int, error) {
+func (r *Runner) claimAndDispatch(ctx context.Context, queues []string, reserved int, grant Grant) (int, error) {
+	if len(queues) == 0 {
+		r.pool.release(reserved)
+		r.releasePermits(ctx, grant, grant.N)
+		return 0, nil
+	}
 	claimStart := models.ClockFrom(ctx).Now(ctx)
 	batch, err := r.cfg.Driver.Dequeue(
-		ctx, r.cfg.Queues, r.cfg.ExecutorClass, r.cfg.ClaimAnyClass, reserved, r.cfg.LeaseDuration,
+		ctx, queues, r.cfg.ExecutorClass, r.cfg.ClaimAnyClass, reserved, r.cfg.LeaseDuration,
 	)
 	claimDuration := models.ClockFrom(ctx).Now(ctx).Sub(claimStart)
 	if err != nil {
@@ -1288,7 +1339,7 @@ func (r *Runner) pollOnce(ctx context.Context) (int, error) {
 	// pollOnce is limiter-agnostic: it is a test seam for one claim-to-completion,
 	// and a Grant would need its own accounting here for no gain. It passes a zero
 	// grant, so no permit is attached and releasePermits is a no-op throughout.
-	claimed, claimErr := r.claimAndDispatch(ctx, reserved, Grant{})
+	claimed, claimErr := r.claimAndDispatch(ctx, r.claimable(ctx), reserved, Grant{})
 	if waitErr := r.pool.waitIdle(ctx); waitErr != nil {
 		return claimed, waitErr
 	}

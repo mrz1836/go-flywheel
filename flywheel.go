@@ -120,11 +120,14 @@ type (
 	ListAuditParams       = core.ListAuditParams
 	ListFinishedParams    = core.ListFinishedParams
 	ListJobsParams        = core.ListJobsParams
+	ListNodesParams       = core.ListNodesParams
 	ListRunningParams     = core.ListRunningParams
 	ListRunsParams        = core.ListRunsParams
 	MigrateOpts           = core.MigrateOpts
 	Node                  = node.Node
 	NodeConfig            = node.NodeConfig
+	NodeInfo              = core.NodeInfo
+	NodeRunner            = core.NodeRunner
 	Observer              = core.Observer
 	OutcomeCounts         = core.OutcomeCounts
 	OverviewParams        = core.OverviewParams
@@ -135,6 +138,7 @@ type (
 	QueueDepthPoint       = core.QueueDepthPoint
 	QueueHealth           = core.QueueHealth
 	QueueHistoryParams    = core.QueueHistoryParams
+	QueueInfo             = core.QueueInfo
 	RawJob                = core.RawJob
 	RebuildOpts           = core.RebuildOpts
 	RebuildResult         = core.RebuildResult
@@ -189,6 +193,7 @@ const (
 	AuditCancelled           = core.AuditCancelled
 	AuditDeactivated         = core.AuditDeactivated
 	AuditDeleted             = core.AuditDeleted
+	AuditDrainRequested      = core.AuditDrainRequested
 	AuditNewest              = core.AuditNewest
 	AuditOldest              = core.AuditOldest
 	AuditPaused              = core.AuditPaused
@@ -264,6 +269,7 @@ var (
 	ErrJobRunning         = core.ErrJobRunning
 	ErrJobTerminal        = core.ErrJobTerminal
 	ErrMissingKind        = core.ErrMissingKind
+	ErrNodeNotFound       = core.ErrNodeNotFound
 	ErrPeriodicNotFound   = core.ErrPeriodicNotFound
 	ErrReplayUnbounded    = core.ErrReplayUnbounded
 	ErrRunAlreadyRecorded = core.ErrRunAlreadyRecorded
@@ -458,8 +464,16 @@ func ListLimiters(ctx context.Context, db *gorm.DB) ([]LimiterInfo, error) {
 	return core.ListLimiters(ctx, db)
 }
 
+func ListNodes(ctx context.Context, db *gorm.DB, p ListNodesParams) ([]NodeInfo, error) {
+	return core.ListNodes(ctx, db, p)
+}
+
 func ListPeriodics(ctx context.Context, db *gorm.DB) ([]PeriodicView, error) {
 	return core.ListPeriodics(ctx, db)
+}
+
+func ListQueues(ctx context.Context, db *gorm.DB) ([]QueueInfo, error) {
+	return core.ListQueues(ctx, db)
 }
 
 func ListRunning(ctx context.Context, db *gorm.DB, p ListRunningParams) ([]RunningJob, error) {
@@ -566,6 +580,10 @@ func PausePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
 	return core.PausePeriodic(ctx, db, slug)
 }
 
+func PauseQueue(ctx context.Context, db *gorm.DB, queue string) error {
+	return core.PauseQueue(ctx, db, queue)
+}
+
 func Progress(ctx context.Context, db *gorm.DB, parentJobID string) (BatchProgress, error) {
 	return core.Progress(ctx, db, parentJobID)
 }
@@ -614,6 +632,10 @@ func ReplayByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts R
 	return core.ReplayByParent(ctx, db, parentJobID, opts)
 }
 
+func RequestDrain(ctx context.Context, db *gorm.DB, nodeID string) error {
+	return core.RequestDrain(ctx, db, nodeID)
+}
+
 func RescheduleJob(ctx context.Context, db *gorm.DB, id string, at time.Time) error {
 	return core.RescheduleJob(ctx, db, id, at)
 }
@@ -628,6 +650,10 @@ func ResumeJob(ctx context.Context, db *gorm.DB, id string) error {
 
 func ResumePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
 	return core.ResumePeriodic(ctx, db, slug)
+}
+
+func ResumeQueue(ctx context.Context, db *gorm.DB, queue string) error {
+	return core.ResumeQueue(ctx, db, queue)
 }
 
 func RetryJob(ctx context.Context, db *gorm.DB, id string) error {

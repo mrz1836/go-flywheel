@@ -73,6 +73,8 @@ func newRootCmd() *cobra.Command {
 		newJobsCmd(&configPath),
 		newScheduleCmd(&configPath),
 		newKindsCmd(&configPath),
+		newQueuesCmd(&configPath),
+		newNodesCmd(&configPath),
 		newPruneCmd(&configPath),
 		newStatusCmd(&configPath),
 		newStatsCmd(&configPath),

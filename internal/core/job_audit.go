@@ -125,9 +125,11 @@ const (
 	AuditReplayed AuditAction = "replayed"
 	// AuditCancelled is a job cancelled by CancelJob or CancelByParent.
 	AuditCancelled AuditAction = "cancelled"
-	// AuditPaused is a job paused by PauseByParent or PauseJob.
+	// AuditPaused is a job paused by PauseByParent or PauseJob, or a queue
+	// paused by PauseQueue.
 	AuditPaused AuditAction = "paused"
-	// AuditResumed is a job resumed by ResumeByParent or ResumeJob.
+	// AuditResumed is a job resumed by ResumeByParent or ResumeJob, or a queue
+	// resumed by ResumeQueue.
 	AuditResumed AuditAction = "resumed"
 	// AuditActivated is a periodic definition SetPeriodicActive turned on.
 	AuditActivated AuditAction = "activated"
@@ -140,6 +142,8 @@ const (
 	AuditRescheduled AuditAction = "rescheduled"
 	// AuditReprioritized is a waiting job SetJobPriority gave another priority.
 	AuditReprioritized AuditAction = "reprioritized"
+	// AuditDrainRequested is a node RequestDrain asked to stop taking work.
+	AuditDrainRequested AuditAction = "drain_requested"
 )
 
 // AuditEntry is one entry of the control history: one change one control made

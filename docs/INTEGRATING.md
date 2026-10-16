@@ -73,19 +73,19 @@ default — and changes and removes nothing, so:
 
 **So the order is always: migrate the database, then deploy the binaries.**
 
-This section is the upgrade from the previous release: two columns, `job_runs.error_fingerprint` and
-`job_stats_hourly.enqueued`, and two tables, `job_error_groups_hourly` and `job_queue_samples`, each with
-one index. A Runner refuses to start without `job_runs.error_fingerprint`, which every failed attempt's
-finalize writes, and so does a Scheduler, whose lease sweep writes `job_runs` too. A Scheduler with the
-stats rollup on also refuses to start without `job_stats_hourly.enqueued` and `job_error_groups_hourly`,
-which the rollup writes with each hour, and one with `QueueSampleInterval` set without
-`job_queue_samples`. Each refusal is `ErrSchemaOutdated`, naming what is missing.
+This section is the upgrade from the previous release: two tables, `job_nodes` and `job_queues`, and one
+index on `job_nodes`. A Runner refuses to start without `job_queues`, whose paused set it reads before it
+claims, unless its `QueueStateRefresh` is negative, which turns the check off; and a Node with
+`RegistryInterval` set refuses to start without `job_nodes`, the table it registers in. Each refusal is
+`ErrSchemaOutdated`, naming what is missing. A Scheduler, and a Node without `RegistryInterval`, read
+neither table.
 
 A database several releases behind applies each older upgrade first, oldest first —
 [from a release before the stats tables](#from-a-release-before-the-stats-tables), then
 [from a release before the schedule pause](#from-a-release-before-the-schedule-pause), then
 [from a release before the audit history](#from-a-release-before-the-audit-history), then
-[from a release before the kind catalog](#from-a-release-before-the-kind-catalog) — and then this
+[from a release before the kind catalog](#from-a-release-before-the-kind-catalog), then
+[from a release before the error groups](#from-a-release-before-the-error-groups) — and then this
 one. `InspectSchema` names every gap, whichever release left it, and `Migrate` closes them all in one
 call.
 
@@ -93,16 +93,12 @@ call.
 
 | Object | Kind | Purpose |
 |---|---|---|
-| `job_runs.error_fingerprint` | column, nullable `text` | the failure's group: 16 hex characters over the kind, the error class, and the message with its ids and numbers masked, written for an attempt that ends in `error` or `timeout` |
-| `job_stats_hourly.enqueued` | column, `bigint NOT NULL DEFAULT 0` | the jobs inserted in each rolled hour, by the insert time their ids carry |
-| `job_error_groups_hourly` | table | the error groups: one row per hour, kind, and fingerprint, written by the stats rollup with the hour's stats |
-| `job_queue_samples` | table | each queue's depth over time: one row per queue per sample, written by a Scheduler with `QueueSampleInterval` set |
-| `job_error_groups_fingerprint` | index on `job_error_groups_hourly` | one group across hours: its first sighting, and the fingerprint filter |
-| `job_queue_samples_time` | index on `job_queue_samples` | the sample prune |
+| `job_nodes` | table | the node registry: one row per process lifetime of a Node with `RegistryInterval` set — its executor identity, host, version, commit, runners, and kinds, its heartbeat and drain state, and when it stopped |
+| `job_queues` | table | the queue state: one row per queue an operator has paused — when, by whom, and why, while it is paused — kept after a resume |
+| `job_nodes_heartbeat` | index on `job_nodes` | the node-row prune and the stale scan |
 
-Nothing is backfilled at migration time. Runs finalized before the upgrade carry no stored fingerprint,
-and the reads compute one from their stored message; hours rolled before the upgrade carry no enqueue
-counts and no error groups until a rebuild re-rolls them, as below.
+Nothing is backfilled: no queue is paused until an operator pauses one, and no node is listed until a
+Node with `RegistryInterval` set starts.
 
 ### Library-owned install (`Migrate`, `flywheel migrate`)
 
@@ -121,7 +117,7 @@ err := flywheel.MigrateWithOptions(db, flywheel.MigrateOpts{
 })
 ```
 
-`flywheel migrate` prints each addition (`added: job_runs.error_fingerprint`, …), and a re-run prints
+`flywheel migrate` prints each addition (`added: job_nodes (table)`, …), and a re-run prints
 nothing new — an up-to-date schema issues no DDL at all. Both options are no-ops on SQLite. Each step
 commits on its own, so a lock timeout fails only the statement that could not get its lock: everything
 before it is applied, and a re-run completes the rest. Two migrations of one schema run one after the
@@ -142,11 +138,161 @@ exactly the statements below. To write it by hand, use these — they are the st
 `Models()`, and a test runs this file's blocks against the previous release's schema to prove they produce
 one with no drift.
 
+PostgreSQL — both tables are new, so the statements lock nothing that already holds rows, and need no lock
+timeout:
+
+<!-- upgrade-ddl:postgres -->
+```sql
+CREATE TABLE IF NOT EXISTS job_nodes (
+  id                 text        NOT NULL,
+  executor_id        text        NOT NULL,
+  host               text        NOT NULL DEFAULT '',
+  version            text        NOT NULL DEFAULT '',
+  commit_hash        text        NOT NULL DEFAULT '',
+  started_at         timestamptz NOT NULL,
+  heartbeat_at       timestamptz NOT NULL,
+  stopped_at         timestamptz,
+  scheduler          boolean     NOT NULL DEFAULT false,
+  draining           boolean     NOT NULL DEFAULT false,
+  drain_requested_at timestamptz,
+  runners            jsonb       NOT NULL DEFAULT '[]',
+  kinds              jsonb       NOT NULL DEFAULT '[]',
+  PRIMARY KEY (id)
+);
+CREATE TABLE IF NOT EXISTS job_queues (
+  queue          text        NOT NULL,
+  paused_at      timestamptz,
+  paused_by_type text        NOT NULL DEFAULT '',
+  paused_by_id   text        NOT NULL DEFAULT '',
+  paused_reason  text        NOT NULL DEFAULT '',
+  updated_at     timestamptz NOT NULL,
+  PRIMARY KEY (queue)
+);
+```
+
+SQLite:
+
+<!-- upgrade-ddl:sqlite -->
+```sql
+CREATE TABLE IF NOT EXISTS job_nodes (
+  id                 text     NOT NULL,
+  executor_id        text     NOT NULL,
+  host               text     NOT NULL DEFAULT '',
+  version            text     NOT NULL DEFAULT '',
+  commit_hash        text     NOT NULL DEFAULT '',
+  started_at         datetime NOT NULL,
+  heartbeat_at       datetime NOT NULL,
+  stopped_at         datetime,
+  scheduler          numeric  NOT NULL DEFAULT false,
+  draining           numeric  NOT NULL DEFAULT false,
+  drain_requested_at datetime,
+  runners            JSON     NOT NULL DEFAULT '[]',
+  kinds              JSON     NOT NULL DEFAULT '[]',
+  PRIMARY KEY (id)
+);
+CREATE TABLE IF NOT EXISTS job_queues (
+  queue          text     NOT NULL,
+  paused_at      datetime,
+  paused_by_type text     NOT NULL DEFAULT '',
+  paused_by_id   text     NOT NULL DEFAULT '',
+  paused_reason  text     NOT NULL DEFAULT '',
+  updated_at     datetime NOT NULL,
+  PRIMARY KEY (queue)
+);
+```
+
+**2. Install the indexes at deploy, the way you already do.** This release adds one, `job_nodes_heartbeat`,
+on a new, empty table, so building it takes no time and blocks no writer. On a live PostgreSQL database,
+build any missing one concurrently:
+
+```go
+err := flywheel.InstallIndexesWithOptions(ctx, db, flywheel.IndexOpts{
+	Concurrently: true,            // no lock on the table's writers while an index builds
+	LockTimeout:  5 * time.Second, // bounds the plain (non-concurrent) path if you leave Concurrently off
+})
+```
+
+A concurrent build waits for the transactions already open when it starts — it blocks no one, but it
+cannot finish before a long-running transaction does. If a concurrent build is interrupted it leaves an
+*invalid* index behind; `InspectIndexes` reports it (`IndexDrift.Invalid`), and re-running
+`InstallIndexesWithOptions` with `Concurrently` replaces it. `InstallStorageParameters` has nothing new to
+apply this release.
+
+**3. Keep the parity check in CI.** Both reports are empty for a schema that matches this release:
+
+```go
+schemaGaps, _ := flywheel.InspectSchema(ctx, db)  // missing tables and columns
+indexDrift, _ := flywheel.InspectIndexes(ctx, db) // missing, drifted, or invalid indexes
+```
+
+### After the deploy
+
+Nothing runs differently until you use it. Every Runner reads the paused set once per
+`QueueStateRefresh` (5 seconds by default), one indexed read of `job_queues`, and claims every queue until
+an operator pauses one with `PauseQueue` (`flywheel queues pause`). A Node registers once you set
+`NodeConfig.RegistryInterval` (with `Version` and `Commit`, if you want them on its row), and a
+registering Node that runs a Scheduler prunes the rows of nodes that stopped heartbeating more than
+`SchedulerConfig.NodeRetention` ago (7 days by default). [Nodes and queue state](#nodes-and-queue-state)
+describes the reads.
+
+### Rolling deploys
+
+During a rolling deploy both releases run against the migrated database. A process of the previous
+release never reads or writes the new tables: its Runners do not read the paused set, so they keep
+claiming a paused queue's jobs, and its Nodes do not register. Pause a queue only once no Runner of the
+previous release is running, which is once the deploy has replaced them; until then `ListNodes` lists only
+this release's registering Nodes.
+
+A deploy that adds a job kind has its own overlap to plan for: a runner of the previous release can claim
+a job of the new kind. See **Rolling deploys and new job kinds** in the [README](../README.md).
+
+### Verifying
+
+```bash
+flywheel doctor # schema: up to date · indexes: in sync · …
+flywheel queues # every queue with a job or a pause, and whether it is paused
+flywheel nodes  # every registering Node that has not stopped
+```
+
+### Rolling back
+
+Deploy the previous release's binaries: they run unchanged against the migrated schema, and never read
+or write what this release added. They do not read the paused set, so a queue paused under this release
+is claimed again under them. Nothing needs to be dropped. If you want the schema back as it was, drop
+`job_nodes` (its index goes with it) and `job_queues` — but only after no process of this release is
+running, since its Runners refuse to start without `job_queues`, and its registering Nodes without
+`job_nodes`.
+
+### From a release before the error groups
+
+A database a release before the error groups installed lacks two columns and two tables more than the
+later releases add, with an index on each table. `Migrate` adds all of it in one call. A hand-written
+migration applies the statements below first, then [this release's](#host-owned-install-your-migration-tool).
+
+| Object | Kind | Purpose |
+|---|---|---|
+| `job_runs.error_fingerprint` | column, nullable `text` | the failure's group: 16 hex characters over the kind, the error class, and the message with its ids and numbers masked, written for an attempt that ends in `error` or `timeout` |
+| `job_stats_hourly.enqueued` | column, `bigint NOT NULL DEFAULT 0` | the jobs inserted in each rolled hour, by the insert time their ids carry |
+| `job_error_groups_hourly` | table | the error groups: one row per hour, kind, and fingerprint, written by the stats rollup with the hour's stats |
+| `job_queue_samples` | table | each queue's depth over time: one row per queue per sample, written by a Scheduler with `QueueSampleInterval` set |
+| `job_error_groups_fingerprint` | index on `job_error_groups_hourly` | one group across hours: its first sighting, and the fingerprint filter |
+| `job_queue_samples_time` | index on `job_queue_samples` | the sample prune |
+
+Nothing is backfilled at migration time. Runs finalized before the upgrade carry no stored fingerprint,
+and the reads compute one from their stored message; hours rolled before the upgrade carry no enqueue
+counts and no error groups until a rebuild re-rolls them, as below.
+
+A Runner refuses to start without `job_runs.error_fingerprint`, which every failed attempt's finalize
+writes, and so does a Scheduler, whose lease sweep writes `job_runs` too. A Scheduler with the stats
+rollup on also refuses to start without `job_stats_hourly.enqueued` and `job_error_groups_hourly`, which
+the rollup writes with each hour, and one with `QueueSampleInterval` set without `job_queue_samples`.
+Each refusal is `ErrSchemaOutdated`, naming what is missing.
+
 PostgreSQL — both `ADD COLUMN`s are catalog-only changes on PostgreSQL 11+ (a constant default rewrites
 no rows), but each takes a brief `ACCESS EXCLUSIVE` lock on its table, so run them with a lock timeout;
 the two tables are new and lock nothing that already holds rows:
 
-<!-- upgrade-ddl:postgres -->
+<!-- upgrade-ddl:postgres:errors -->
 ```sql
 SET lock_timeout = '5s';
 ALTER TABLE job_runs ADD COLUMN IF NOT EXISTS error_fingerprint text;
@@ -178,7 +324,7 @@ CREATE TABLE IF NOT EXISTS job_queue_samples (
 
 SQLite — `ADD COLUMN` has no `IF NOT EXISTS` there, so this block is for a migration tool that runs it once:
 
-<!-- upgrade-ddl:sqlite -->
+<!-- upgrade-ddl:sqlite:errors -->
 ```sql
 ALTER TABLE job_runs ADD COLUMN error_fingerprint text;
 ALTER TABLE job_stats_hourly ADD COLUMN enqueued integer NOT NULL DEFAULT 0;
@@ -207,50 +353,26 @@ CREATE TABLE IF NOT EXISTS job_queue_samples (
 );
 ```
 
-**2. Install the indexes at deploy, the way you already do.** This release adds two,
-`job_error_groups_fingerprint` and `job_queue_samples_time`, each on a new, empty table, so building them
-takes no time and blocks no writer. On a live PostgreSQL database, build any missing one concurrently:
+The two indexes, `job_error_groups_fingerprint` and `job_queue_samples_time`, are each on a new, empty
+table, so building them takes no time and blocks no writer; install them at deploy, as step 2 of
+[the host-owned install](#host-owned-install-your-migration-tool) does.
 
-```go
-err := flywheel.InstallIndexesWithOptions(ctx, db, flywheel.IndexOpts{
-	Concurrently: true,            // no lock on the table's writers while an index builds
-	LockTimeout:  5 * time.Second, // bounds the plain (non-concurrent) path if you leave Concurrently off
-})
-```
-
-A concurrent build waits for the transactions already open when it starts — it blocks no one, but it
-cannot finish before a long-running transaction does. If a concurrent build is interrupted it leaves an
-*invalid* index behind; `InspectIndexes` reports it (`IndexDrift.Invalid`), and re-running
-`InstallIndexesWithOptions` with `Concurrently` replaces it. `InstallStorageParameters` has nothing new to
-apply this release.
-
-**3. Keep the parity check in CI.** Both reports are empty for a schema that matches this release:
-
-```go
-schemaGaps, _ := flywheel.InspectSchema(ctx, db)  // missing tables and columns
-indexDrift, _ := flywheel.InspectIndexes(ctx, db) // missing, drifted, or invalid indexes
-```
-
-### After the deploy
-
-Every attempt that fails from now on stores its fingerprint, and every hour the rollup closes from now on
-carries its enqueue counts and its error groups. Hours rolled before the upgrade carry neither until they
-are rolled again: rebuild them with `flywheel stats rebuild --from <the oldest hour whose runs are kept>
---to <now>` (or `RebuildStats`). Only hours whose raw runs retention still keeps can be rebuilt — the last
-`RetentionMaxAge` — and the rebuild refuses an hour whose runs retention has already pruned, rather than
-replace its counts with smaller ones. An hour older than that keeps its stats and reads with no enqueue
-counts and no error groups.
+**After the deploy**, every attempt that fails from now on stores its fingerprint, and every hour the
+rollup closes from now on carries its enqueue counts and its error groups. Hours rolled before the
+upgrade carry neither until they are rolled again: rebuild them with `flywheel stats rebuild --from <the
+oldest hour whose runs are kept> --to <now>` (or `RebuildStats`). Only hours whose raw runs retention
+still keeps can be rebuilt — the last `RetentionMaxAge` — and the rebuild refuses an hour whose runs
+retention has already pruned, rather than replace its counts with smaller ones. An hour older than that
+keeps its stats and reads with no enqueue counts and no error groups.
 
 Queue history starts once a Scheduler samples: set `SchedulerConfig.QueueSampleInterval` (a minute is
 typical) on the Scheduler that runs your maintenance, as [Polling intervals and their
 cost](#polling-intervals-and-their-cost) describes. Without it the table stays empty.
 
-### Rolling deploys
-
-During a rolling deploy both releases run against the migrated database. A process of the previous
+**During a rolling deploy** both releases run against the migrated database. A process of the older
 release never reads or writes the new columns or tables: its runners store failed attempts without a
 fingerprint, which every read of them computes from the stored message instead, so their failures still
-join the right groups. If the rollup runs on a Scheduler of the previous release during the deploy, the
+join the right groups. If the rollup runs on a Scheduler of the older release during the deploy, the
 hours it closes carry no enqueue counts and no error groups; rebuild them afterwards, as above.
 
 Right after the migration, an older-release process on PostgreSQL may fail one statement on a table the
@@ -258,29 +380,26 @@ migration changed with `cached plan must not change result type` (SQLSTATE `0A00
 `SELECT *` plan before the column was added. The driver drops the plan and the retry succeeds; the error
 is a one-off per connection, not a sign the migration went wrong.
 
-A deploy that adds a job kind has its own overlap to plan for: a runner of the previous release can claim
-a job of the new kind. See **Rolling deploys and new job kinds** in the [README](../README.md).
-
-### Verifying
+**To verify:**
 
 ```bash
 flywheel doctor           # schema: up to date · indexes: in sync · stats: rolled up through … (lag …)
 flywheel stats --by queue # one line per queue, with ENQUEUED beside ATTEMPTS
 ```
 
-### Rolling back
-
-Deploy the previous release's binaries: they run unchanged against the migrated schema, and never read
-or write what this release added. Nothing needs to be dropped. If you want the schema back as it was,
-drop `job_error_groups_hourly` and `job_queue_samples` (their indexes go with them),
-`job_stats_hourly.enqueued`, and `job_runs.error_fingerprint` — but only after no process of this
-release is running, since its Runners and Schedulers refuse to start without them.
+**To roll back** to the older release, deploy its binaries: they run unchanged against the migrated
+schema, and never read or write what the later releases added. Nothing needs to be dropped. If you want
+the schema back as it was, drop `job_error_groups_hourly` and `job_queue_samples` (their indexes go with
+them), `job_stats_hourly.enqueued`, `job_runs.error_fingerprint`, and what the later releases added — but
+only after no process of a newer release is running, since its Runners and Schedulers refuse to start
+without them.
 
 ### From a release before the kind catalog
 
-A database a release before the kind catalog installed lacks one table more than this release's upgrade
-adds. `Migrate` adds all of it in one call. A hand-written migration applies the statements below first,
-then [this release's](#host-owned-install-your-migration-tool).
+A database a release before the kind catalog installed lacks one table more than the later releases add.
+`Migrate` adds all of it in one call. A hand-written migration applies the statements below first, then
+[the error groups'](#from-a-release-before-the-error-groups), then
+[this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
 |---|---|---|
@@ -365,6 +484,7 @@ publishes or reads the catalog, since both fail without the table.
 A database a release before the audit history installed lacks one table more than the later releases add,
 with its two indexes. `Migrate` adds all of it in one call. A hand-written migration applies the
 statements below first, then [the kind catalog's](#from-a-release-before-the-kind-catalog), then
+[the error groups'](#from-a-release-before-the-error-groups), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -449,6 +569,7 @@ A database a release before the schedule pause installed lacks one column more t
 add. `Migrate` adds all of it in one call. A hand-written migration applies the statements below
 first, then [the audit history's](#from-a-release-before-the-audit-history), then
 [the kind catalog's](#from-a-release-before-the-kind-catalog), then
+[the error groups'](#from-a-release-before-the-error-groups), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -505,6 +626,7 @@ later releases' additions, in one call. A hand-written migration applies the sta
 [the schedule pause's](#from-a-release-before-the-schedule-pause), then
 [the audit history's](#from-a-release-before-the-audit-history), then
 [the kind catalog's](#from-a-release-before-the-kind-catalog), then
+[the error groups'](#from-a-release-before-the-error-groups), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -671,8 +793,8 @@ over the deploy window afterwards — a rebuild backfills before it recomputes.
 **To roll back** to the older release, deploy its binaries: they run unchanged against the migrated
 schema. To restore its schema as well, drop `job_stats_progress`, `job_stats_hourly`, `job_run_finishes`,
 the `jobs_finished` index, the five `job_runs` columns, `job_periodics.paused_at`, `job_audit`,
-`job_kinds`, `job_error_groups_hourly`, `job_queue_samples`, and `job_runs.error_fingerprint` — but only
-after no binary of a newer release is running.
+`job_kinds`, `job_error_groups_hourly`, `job_queue_samples`, `job_runs.error_fingerprint`, `job_nodes`,
+and `job_queues` — but only after no binary of a newer release is running.
 
 <br>
 
@@ -808,11 +930,11 @@ made the change, and never updated. Rows outlive the jobs and schedules they nam
 |---|---|
 | `id` | the entry's id |
 | `created_at` | when the control made the change, in UTC; the entries one transaction wrote share it and order by `id` |
-| `target_type`, `target_id` | what changed: `job` and the job's id, or `periodic` and the schedule's slug. `target_id` is text whatever type your schema gives `jobs.id`: compare it with bound values, never join it to another table's key |
-| `action` | `retried`, `replayed`, `cancelled`, `paused`, `resumed`, `activated`, `deactivated`, or `deleted` |
+| `target_type`, `target_id` | what changed: `job` and the job's id, `periodic` and the schedule's slug, `queue` and the queue's name, or `node` and the node's id. `target_id` is text whatever type your schema gives `jobs.id`: compare it with bound values, never join it to another table's key |
+| `action` | `retried`, `replayed`, `cancelled`, `paused`, `resumed`, `activated`, `deactivated`, `deleted`, or, on a node, `drain_requested` |
 | `actor_type`, `actor_id` | who ran the control: `user`, `agent`, or `system` (a control called with no actor), and the host's id for them |
 | `reason`, `source`, `request_id` | why they ran it, the channel they used (`cli` from the CLI), and the request it came from; `''` when absent |
-| `details` | a JSON object: `from_state` on every job entry; the retry options (`force`, `allow_running`, `reset_attempts`, `budget`, `delay_ms`) on `retried` and `replayed`; `was_running` on `cancelled`; `via` (`parent` or `replay`) and `parent_job_id` (with `via: parent`) on the entries a batched control wrote; `{}` on a schedule's |
+| `details` | a JSON object: `from_state` on every job entry; the retry options (`force`, `allow_running`, `reset_attempts`, `budget`, `delay_ms`) on `retried` and `replayed`; `was_running` on `cancelled`; `via` (`parent` or `replay`) and `parent_job_id` (with `via: parent`) on the entries a batched control wrote; `{}` on a schedule's, a queue's, or a node's |
 
 **`job_kinds`** — the published kind catalog: one row per kind `PublishKinds` has published, upserted
 by each publish and never deleted, so a kind no release registers any more keeps its row with an old
@@ -853,10 +975,36 @@ Stable for SQL; `QueueDepthHistory` reads them in buckets:
 | `ready`, `scheduled_ahead`, `running`, `paused` | what `QueueDepths` reported for the queue at that instant |
 | `oldest_ready_ms` | how long the queue's oldest ready job had been claimable, in milliseconds; 0 when nothing was ready |
 
+**`job_nodes`** — the node registry: one row per process lifetime of a Node with `RegistryInterval` set,
+written by the node when it starts, updated at each heartbeat, stamped when it stops, and deleted once its
+heartbeat is older than `SchedulerConfig.NodeRetention` by a registering Node that runs a Scheduler.
+Stable for SQL; `ListNodes` reads it:
+
+| Column | Meaning |
+|---|---|
+| `id` | the node's id, minted when it starts; the primary key |
+| `executor_id` | the node's `host:pid`: the `job_runs.executor_id` of its runs |
+| `host`, `version`, `commit_hash` | the hostname, and the `Version` and `Commit` the host set; `''` when unset |
+| `started_at`, `heartbeat_at`, `stopped_at` | when the node started, last heartbeated, and stopped, in UTC; `stopped_at` is NULL while it runs, and for a node that died |
+| `scheduler` | whether the node runs a Scheduler |
+| `draining`, `drain_requested_at` | whether the node has stopped its runners' claims, and when `RequestDrain` asked it to; NULL until then |
+| `runners` | a JSON array, one object per runner: its `queues`, `executor_class`, `concurrency`, and `in_flight` at the last heartbeat |
+| `kinds` | a JSON array: every kind the node's runners' registries register, sorted |
+
+**`job_queues`** — the queue state: one row per queue an operator has paused, created by `PauseQueue` and
+kept after `ResumeQueue`. Stable for SQL; `ListQueues` reads it:
+
+| Column | Meaning |
+|---|---|
+| `queue` | the queue; the primary key |
+| `paused_at` | when the queue was paused, in UTC; NULL while it is not paused |
+| `paused_by_type`, `paused_by_id`, `paused_reason` | the type, id, and reason of the actor who paused it; `''` while it is not paused |
+| `updated_at` | when a pause or a resume last changed the row, in UTC |
+
 ### Time and zones
 
-`job_runs`, `job_run_finishes`, `job_audit`, `job_kinds`, `job_error_groups_hourly`, and
-`job_queue_samples` timestamps are stored in UTC. On PostgreSQL every timestamp column is
+`job_runs`, `job_run_finishes`, `job_audit`, `job_kinds`, `job_error_groups_hourly`, `job_queue_samples`,
+`job_nodes`, and `job_queues` timestamps are stored in UTC. On PostgreSQL every timestamp column is
 `timestamptz`, so this is invisible. On SQLite timestamps are text and compared as text, which is only a
 time comparison within one zone: pass `job_runs` and `job_audit` bounds in UTC (the Go API does it for you). `jobs`
 timestamps keep the zone of the clock that wrote them, as they always have; compare them in that zone.
@@ -873,10 +1021,10 @@ Every read takes a `context.Context` and the `*gorm.DB` to read through — a re
 `WaitForJob` — and returns JSON-tagged values. None writes.
 
 Every list read returns at most `MaxReadLimit` (200) rows: `QueryJobs`, `ListJobs`, `ListFinished`,
-`ListRunning`, `SlowRuns`, `RecentFailures`, `ListRuns`, `ListAudit`, and `ListLimiters`. A larger `Limit` is clamped rather than refused, so a handler
+`ListRunning`, `SlowRuns`, `RecentFailures`, `ListRuns`, `ListAudit`, `ListLimiters`, and `ListNodes`. A larger `Limit` is clamped rather than refused, so a handler
 can pass a request's limit through; one that asks for a row more than its page, to learn whether another
-follows, keeps its page below 200. `ListKinds` returns every row: it lists your kinds, which your code
-bounds, and a cut catalog would hide one.
+follows, keeps its page below 200. `ListKinds` and `ListQueues` return every row: they list your kinds
+and queues, which your code and configuration bound, and a cut list would hide one.
 
 ### Live: what is happening now
 
@@ -1170,6 +1318,35 @@ reads: the buckets by primary key, one grouped sum over those resources' live ho
 lock and leaves an expired hold for `Acquire` or the sweeper to reclaim. A limiter with neither a rate nor
 a concurrency cap admits without a round trip and writes no bucket, so it is not listed. A resource's
 configured budget is your `DBLimiterConfig`, so the result carries none.
+
+### Nodes and queue state
+
+**`ListNodes(ctx, db, ListNodesParams{StoppedSince, StaleAfter, Limit})`** — the nodes that register
+themselves (`NodeConfig.RegistryInterval`) and have not stopped, then, with a non-zero `StoppedSince`, those
+that stopped at or after it; each group newest start first, 100 by default and `MaxReadLimit` at most.
+Each `NodeInfo` carries the node's id (one per process lifetime), its executor identity (`host:pid`), host,
+`Version`, and `Commit`, when it started, last heartbeated, and stopped, whether it runs a Scheduler, its
+drain state, its runners (each one's queues, executor class, slots, and jobs in flight at the last
+heartbeat), and the kinds its runners' registries register. `Stale` flags a node that has not stopped and
+has not heartbeated within `StaleAfter` (a minute by default), by the context's clock. A node that died
+wrote no stop time, so it stays listed, stale, until node retention (`SchedulerConfig.NodeRetention`, 7
+days by default) prunes its row. It is one read of `job_nodes`, which holds a row per registering process
+lifetime within the retention.
+
+**Joining runs to nodes.** A run belongs to the node whose `ExecutorID` equals the run's `executor_id`
+(`JobRunView.ExecutorID`) and whose span — `[StartedAt, StoppedAt]`, or `[StartedAt, HeartbeatAt]` while
+it has not stopped — covers the run's `started_at`. A host and process id repeat across restarts, so the
+executor identity alone can match several nodes; the span picks one. The rule holds for one registering
+Node per process. To take a node out of service, `RequestDrain(ctx, db, nodeID)` asks it to stop claiming,
+recording who asked and why in the control history; the node reports `Draining`, then `Drained`.
+
+**`ListQueues(ctx, db)`** — every queue that holds an unfinished job or has ever been paused, sorted by
+name: `QueueDepths`' figures (ready, scheduled ahead, running, paused jobs, and the oldest ready job's
+age), zero for a queue no job holds, and the queue's own pause: `IsPaused`, `PausedAt`, and `PausedBy`, the
+type, id, and reason of the actor who paused it. It costs what `QueueDepths` costs, plus one read of
+`job_queues`, a row per queue ever paused. `PauseQueue` and `ResumeQueue` change the pause, each recorded
+in the control history; every Runner reads it once per `RunnerConfig.QueueStateRefresh` and leaves a
+paused queue out of its claims.
 
 ### Maintenance
 
