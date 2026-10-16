@@ -270,6 +270,91 @@ nothing and records nothing.
 
 <br>
 
+## Pausing a queue
+
+Pause a queue when what its jobs call is down — a provider outage, a downstream migration — and its jobs
+should wait rather than spend their retries:
+
+```bash
+flywheel queues pause mail --reason "provider outage"   # every runner stops claiming it
+flywheel queues                                         # PAUSED yes, with BY and REASON
+flywheel queues resume mail --reason "provider is back"  # claimed again
+```
+
+In code they are `PauseQueue`, `ResumeQueue`, and `ListQueues`. Each pause and resume records who ran it
+and why in the history (`ListAudit` with `AuditTargetQueue` and the queue's name). Pausing a paused queue,
+or resuming one that isn't paused, changes nothing and records nothing. A queue no job has used yet can be
+paused, and stays paused for the jobs that arrive.
+
+- **What stops, and when.** Every runner reads the paused set once per `RunnerConfig.QueueStateRefresh`
+  (five seconds by default) and leaves a paused queue out of its claims, so a pause holds on every runner
+  within one refresh, and a resume takes as long. A runner whose every queue is paused claims nothing and
+  holds no slot and no limiter permit.
+- **What keeps running.** An attempt already running on the queue finishes: a pause holds the queue, it
+  does not drain it. The queue's jobs keep their states, and its depth grows as producers enqueue. To hold
+  one job, use `flywheel jobs pause`; to stop a running one, `flywheel jobs cancel`.
+- **`RunUntilIdle` waits.** A paused queue's jobs are unfinished work, so `RunUntilIdle` waits for the
+  resume while the queue holds jobs. It returns once nothing is pending anywhere.
+- **A runner logs `jobs: queue state refresh failed; keeping the last paused set`.** It could not read
+  `job_queues`, so it keeps the paused set it last read, and warns once per run of failures; a runner that
+  has never read the set claims every queue. The read recovers on its own once the database answers.
+- **A runner refuses to start with `ErrSchemaOutdated` naming `job_queues (table)`.** The release was
+  deployed before its migration. Migrate (`flywheel migrate`, or the statements in
+  [`INTEGRATING.md`](INTEGRATING.md#upgrading-an-existing-database) for a host-owned schema). A host that
+  cannot migrate first sets `QueueStateRefresh` negative, which turns the check off, and queue pause with
+  it.
+- **During a rolling deploy** a runner of a release without queue pause still claims a paused queue's
+  jobs. Pause a queue once the deploy has replaced those runners.
+
+<br>
+
+## Draining a node
+
+Drain a node to retire a host, or to take a bad build out of service, without killing its jobs mid-run.
+The node must register itself (`NodeConfig.RegistryInterval`):
+
+```bash
+flywheel nodes                                          # its ID, among the nodes that have not stopped
+flywheel nodes drain <node-id> --reason "retire host"
+flywheel nodes                                          # STATE draining, then drained
+```
+
+In code it is `RequestDrain`, recorded in the history (`ListAudit` with `AuditTargetNode` and the node's
+id). Within one heartbeat the node stops every runner's claims and reports `draining`; once its jobs in
+flight finish it reports `drained`. It keeps running — its health server answers, its Scheduler keeps
+ticking, and it keeps heartbeating — until you stop it. A stopped runner cannot restart, so a drained node
+takes work again only after a restart. A drain already requested changes nothing; a stopped or unknown
+node is refused with `flywheel: node not found` (`ErrNodeNotFound`).
+
+A node with `RegistryInterval` set refuses to start with `ErrSchemaOutdated` naming `job_nodes (table)`
+until the table exists: migrate first, as for `job_queues` above.
+
+<br>
+
+## Symptom: a node is stale
+
+`flywheel nodes` shows `stale` (`NodeInfo.Stale`) for a node that has not stopped and has not heartbeated
+within `ListNodesParams.StaleAfter`, a minute by default:
+
+- **The process died.** A killed or crashed process writes no stop time, so its row stays as it last
+  heartbeated. The lease sweep reclaims its jobs in flight, as after any crash. Nothing else is needed:
+  retention prunes the row, below.
+- **The heartbeat stalled.** A node logs `flywheel: node registry heartbeat failed` when a heartbeat
+  write fails, and tries again at the next beat; while its database is out of reach it reads stale. Its
+  runners keep working meanwhile: the registry never stops a node.
+- **The interval is too long.** A `RegistryInterval` at or above `StaleAfter` makes a healthy node read
+  stale between beats. Keep it well below; see [TUNING](TUNING.md#queue-pause-and-the-node-registry).
+- **The clocks disagree.** A node stamps its heartbeat by its own clock, and `ListNodes` judges it by the
+  reader's, so a reader whose clock runs ahead of the node's by more than `StaleAfter` sees it stale.
+
+**How long node rows are kept.** A registering Node that runs a Scheduler deletes the rows of nodes whose
+last heartbeat is older than `SchedulerConfig.NodeRetention` (7 days by default), at start and then
+hourly. A Node without a Scheduler prunes nothing, so the setting on the node that runs your Scheduler
+governs the fleet. A stale node stays listed until then; `flywheel nodes --stopped-since 24h` also lists
+the nodes that stopped in the last day, as far back as retention keeps them.
+
+<br>
+
 ## Symptom: jobs deferred or discarded as `jobs: unknown job kind`
 
 A runner that claims a job of a kind its `Registry` does not register runs nothing. While the job is

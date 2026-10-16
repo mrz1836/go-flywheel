@@ -76,6 +76,29 @@ the claim's shape.
 
 <br>
 
+## Queue pause and the node registry
+
+Neither has a benchmark: each is one small read or write per interval, against a table that holds a row
+per paused queue or per node, so the levers are how fast each takes hold.
+
+- **`RunnerConfig.QueueStateRefresh` (5 s): how fast a pause holds.** Each runner reads the paused set
+  once per refresh, before it claims: one primary-key read of `job_queues` over its queues. A pause or a
+  resume takes hold on every runner within one refresh. Lowering it buys a faster pause at one read per
+  runner per refresh — fifty runners at one second are fifty reads a second. A negative value turns the
+  check off: the runner reads nothing, claims every queue, needs no `job_queues`, and ignores a pause.
+- **`NodeConfig.RegistryInterval`: the heartbeat.** A registering node writes one update of its row per
+  interval, after one read of whether a drain was requested, plus an insert at start and an update at
+  stop. It bounds how fast a drain takes hold (one heartbeat) and how fresh the in-flight counts are. Keep
+  it well below `ListNodesParams.StaleAfter` (a minute by default) or a healthy node reads stale between
+  beats: fifteen seconds is a quarter of the default.
+- **`SchedulerConfig.NodeRetention` (7 days): how far back node rows reach.** A registering Node that
+  runs a Scheduler deletes the rows of nodes silent for longer, at start and hourly, in batches of 1,000
+  through `job_nodes_heartbeat`. A row is one process lifetime, so the table holds about your node count
+  times your restarts within the retention. Size it to how far back you read stopped nodes
+  (`ListNodesParams.StoppedSince`): a stopped node older than it is gone.
+
+<br>
+
 ## Enqueue batch size
 
 `InsertMany` writes N jobs in bounded, dialect-aware chunks — one multi-row `INSERT` per chunk — where
