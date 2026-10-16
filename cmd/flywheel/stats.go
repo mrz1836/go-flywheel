@@ -18,20 +18,21 @@ import (
 // unset.
 const defaultStatsWindow = "24h"
 
-// newStatsCmd builds `flywheel stats`: per-kind attempt outcomes, job success
-// rate, duration percentiles, and queue wait over a recent window, read from the
-// hourly rollups plus the raw tail. `stats rebuild` repairs or backfills the
-// rollups for a range.
+// newStatsCmd builds `flywheel stats`: attempt outcomes, jobs enqueued, job
+// success rate, duration percentiles, and queue wait over a recent window, per
+// kind, per queue, or per kind and queue, read from the hourly rollups plus the
+// raw tail. `stats rebuild` repairs or backfills the rollups for a range.
 func newStatsCmd(configPath *string) *cobra.Command {
 	var (
 		since  string
 		kind   string
 		queue  string
+		by     string
 		asJSON bool
 	)
 	cmd := &cobra.Command{
 		Use:   "stats",
-		Short: "Show per-kind job statistics (outcomes, success rate, durations) over a recent window",
+		Short: "Show job statistics (outcomes, enqueued, success rate, durations) per kind or queue over a recent window",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			window, err := parseHumanDuration(since)
@@ -40,6 +41,13 @@ func newStatsCmd(configPath *string) *cobra.Command {
 			}
 			if window <= 0 {
 				return fmt.Errorf("invalid --since %q: must be positive", since)
+			}
+			groupBy := flywheel.StatsGroupBy(by)
+			switch groupBy {
+			case flywheel.StatsByKind, flywheel.StatsByQueue, flywheel.StatsByKindQueue:
+			default:
+				return fmt.Errorf("invalid --by %q: want %s, %s, or %s", by,
+					flywheel.StatsByKind, flywheel.StatsByQueue, flywheel.StatsByKindQueue)
 			}
 			_, db, _, err := loadAndOpen(*configPath)
 			if err != nil {
@@ -50,13 +58,14 @@ func newStatsCmd(configPath *string) *cobra.Command {
 			ctx := cmd.Context()
 			now := models.ClockFrom(ctx).Now(ctx)
 			return runStats(ctx, cmd.OutOrStdout(), db, flywheel.StatsParams{
-				From: now.Add(-window), To: now, Kind: kind, Queue: queue,
+				From: now.Add(-window), To: now, Kind: kind, Queue: queue, GroupBy: groupBy,
 			}, asJSON)
 		},
 	}
 	cmd.Flags().StringVar(&since, "since", defaultStatsWindow, "window to report, ending now (e.g. 1h, 24h, 7d, 30d)")
 	cmd.Flags().StringVar(&kind, "kind", "", "restrict to one job kind")
 	cmd.Flags().StringVar(&queue, "queue", "", "restrict to one queue")
+	cmd.Flags().StringVar(&by, "by", string(flywheel.StatsByKind), "group the rows by kind, queue, or kind_queue")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the full StatsResult as JSON")
 	cmd.AddCommand(newStatsRebuildCmd(configPath))
 	return cmd
@@ -73,20 +82,31 @@ func runStats(ctx context.Context, w io.Writer, db *gorm.DB, p flywheel.StatsPar
 	if asJSON {
 		return writeJSON(w, res)
 	}
-	return renderStatsText(w, res)
+	return renderStatsText(w, res, p.GroupBy)
 }
 
-// renderStatsText writes a StatsResult as one table row per kind, a TOTAL row,
-// and a line saying how the window was served.
-func renderStatsText(w io.Writer, res flywheel.StatsResult) error {
+// renderStatsText writes a StatsResult as one table row per group — kind,
+// queue, or kind and queue, as groupBy says — a TOTAL row, and a line saying
+// how the window was served.
+func renderStatsText(w io.Writer, res flywheel.StatsResult, groupBy flywheel.StatsGroupBy) error {
 	_, _ = fmt.Fprintf(w, "flywheel stats: %s → %s\n",
 		res.From.Format(time.RFC3339), res.To.Format(time.RFC3339))
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "KIND\tATTEMPTS\tSUCCEEDED\tDISCARDED\tRETRIES\tSUCCESS%\tP50\tP95\tP99\tMAX\tWAIT P95")
-	for i := range res.Kinds {
-		writeStatsRow(tw, res.Kinds[i].Kind, res.Kinds[i])
+	label := func(k flywheel.KindStats) string { return k.Kind }
+	header, total := "KIND", "TOTAL"
+	switch groupBy {
+	case flywheel.StatsByQueue:
+		label = func(k flywheel.KindStats) string { return k.Queue }
+		header = "QUEUE"
+	case flywheel.StatsByKindQueue:
+		label = func(k flywheel.KindStats) string { return k.Kind + "\t" + k.Queue }
+		header, total = "KIND\tQUEUE", "TOTAL\t"
 	}
-	writeStatsRow(tw, "TOTAL", res.Total)
+	_, _ = fmt.Fprintln(tw, header+"\tATTEMPTS\tENQUEUED\tSUCCEEDED\tDISCARDED\tRETRIES\tSUCCESS%\tP50\tP95\tP99\tMAX\tWAIT P95")
+	for i := range res.Kinds {
+		writeStatsRow(tw, label(res.Kinds[i]), res.Kinds[i])
+	}
+	writeStatsRow(tw, total, res.Total)
 	if err := tw.Flush(); err != nil {
 		return err
 	}
@@ -94,10 +114,11 @@ func renderStatsText(w io.Writer, res flywheel.StatsResult) error {
 	return nil
 }
 
-// writeStatsRow writes one kind's (or the total's) row.
+// writeStatsRow writes one group's (or the total's) row after its label
+// cells.
 func writeStatsRow(w io.Writer, label string, k flywheel.KindStats) {
-	_, _ = fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
-		label, k.Attempts, k.Succeeded, k.Discarded, k.Retries, formatSuccessRate(k),
+	_, _ = fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		label, k.Attempts, k.Enqueued, k.Succeeded, k.Discarded, k.Retries, formatSuccessRate(k),
 		summaryDuration(k.Duration, k.Duration.P50), summaryDuration(k.Duration, k.Duration.P95),
 		summaryDuration(k.Duration, k.Duration.P99), summaryDuration(k.Duration, k.Duration.Max),
 		summaryDuration(k.QueueWait, k.QueueWait.P95))
