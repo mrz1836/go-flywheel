@@ -260,13 +260,15 @@ Each section below is self-contained; open the ones you need.
 <summary><strong><code>Schema setup — pick exactly one install path</code></strong></summary>
 <br>
 
-`go-flywheel` owns twelve tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
+`go-flywheel` owns fourteen tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
 `limiter_buckets` and `limiter_holds` for the shared database-backed limiter (additive: empty unless you
 construct a `DBLimiter`); `job_run_finishes`, `job_stats_hourly`, and `job_stats_progress`, the finish
 log every finalize writes and the stats rollup's tables; `job_audit`, the history every control
 writes; `job_kinds`, the kind catalog `PublishKinds` writes (empty unless you publish one);
-`job_error_groups_hourly`, the error groups the stats rollup writes beside its hours; and
-`job_queue_samples`, each queue's depth over time (empty unless a Scheduler samples queues) — and there
+`job_error_groups_hourly`, the error groups the stats rollup writes beside its hours;
+`job_queue_samples`, each queue's depth over time (empty unless a Scheduler samples queues);
+`job_nodes`, one row per process lifetime of a registering Node (empty unless a Node sets
+`RegistryInterval`); and `job_queues`, the queues an operator paused, by whom, and why — and there
 are **two ways to install them. Pick exactly one.** They are not layers; running both means two
 migration authorities against one database.
 
@@ -277,11 +279,11 @@ migration authorities against one database.
 | Who sets the storage parameters? | `Migrate(db)` | you, from `InstallStorageParameters` |
 | Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
 | Does the runtime run DDL at startup? | yes, every start | no |
-| Is a co-located host schema safe? | only if the host's tooling excludes all twelve tables | yes — the tables are in your loader |
+| Is a co-located host schema safe? | only if the host's tooling excludes all fourteen tables | yes — the tables are in your loader |
 | **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
 
 **The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
-same database, your migration tool must know about all twelve — a tool that cannot see them will happily
+same database, your migration tool must know about all fourteen — a tool that cannot see them will happily
 propose dropping them. A tool told to leave the runtime's tables alone by name needs every name above.
 
 **Library-owned** — one call, no external tooling:
@@ -302,7 +304,7 @@ up-to-date schema — a re-run creates nothing and changes nothing — so it is 
 
 ```go
 // 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
-//    so your migration tool knows all twelve tables exist and never proposes dropping them.
+//    so your migration tool knows all fourteen tables exist and never proposes dropping them.
 stmts, err := gormschema.New("postgres").Load(
     append(myapp.AllModels(), flywheel.Models()...)...,
 )
@@ -318,7 +320,7 @@ if err := flywheel.InstallStorageParameters(ctx, db); err != nil {
 
 Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
 it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
-GORM struct tag cannot express. `IndexSet` declares sixteen indexes, and four of them are
+GORM struct tag cannot express. `IndexSet` declares seventeen indexes, and four of them are
 correctness-bearing: `jobs_unique_key`, `jobs_unique_active_key`, `job_runs_job_attempt`, and
 `idx_job_periodics_slug`. Without `jobs_unique_key` and `jobs_unique_active_key` the database accepts
 duplicate enqueues and **`ErrAlreadyEnqueued` is never returned.** Use `flywheel.IndexSet(dialect)` when
@@ -1802,6 +1804,67 @@ and `JobRunView.ErrorFingerprint` reports a run's. The masking rules are version
 
 [`docs/INTEGRATING.md`](docs/INTEGRATING.md#error-groups-what-is-failing) covers each read's cost, the
 tables behind them for direct SQL, and the upgrade.
+
+</details>
+
+<details>
+<summary><strong><code>Nodes and queue pause — seeing the fleet and holding a queue</code></strong></summary>
+<br>
+
+**The node registry.** Set `NodeConfig.RegistryInterval` and a `Node` registers itself in `job_nodes`.
+Before it starts anything it writes a row for this process lifetime — a new id, its `host:pid` (the
+`executor_id` its runners stamp on every run), its host, the `Version` and `Commit` you give it, its
+runners' queues, executor classes, and slots, and every kind their registries register — then heartbeats
+it with each runner's jobs in flight, and stamps its stop time when `Run` returns:
+
+```go
+node, err := flywheel.NewNode(flywheel.NodeConfig{
+    Runners:          runners,
+    Scheduler:        &schedulerCfg, // its NodeRetention prunes old node rows: 7 days by default
+    Version:          buildVersion,
+    Commit:           buildCommit,
+    RegistryInterval: 15 * time.Second,
+})
+```
+
+`ListNodes` lists the nodes that have not stopped, then, with `StoppedSince`, those that stopped since,
+each flagged `Stale` once it has gone `StaleAfter` (a minute by default) without a heartbeat — which is
+how a process that died looks, since it never wrote a stop time. A run belongs to the node whose
+`ExecutorID` matches the run's `executor_id` and whose span covers the run's start. A registering Node that
+runs a Scheduler deletes the rows of nodes silent for longer than `SchedulerConfig.NodeRetention`, at
+start and hourly. With `RegistryInterval` set, `Run` refuses to start, with `ErrSchemaOutdated`, until
+`job_nodes` exists; keep the interval well below `StaleAfter`.
+
+**Draining a node.** `RequestDrain(ctx, db, nodeID)` asks one node to stop taking work, and records the
+request, with its actor and reason, in the control history. Within one heartbeat the node stops every
+runner's claims and reports `Draining`, then `Drained` once its jobs in flight finish. It keeps running —
+its health server and its Scheduler — until its context ends, and takes work again only after a restart.
+
+**Pausing a queue across the fleet.** `PauseQueue(ctx, db, queue)` holds a queue for every Runner: each
+reads the paused set once per `RunnerConfig.QueueStateRefresh` (five seconds by default), before it
+reserves a slot or asks its limiter, and leaves a paused queue out of its claims. Attempts already running
+finish, the queue's jobs keep their states, and `ResumeQueue` lets them be claimed again. Each pause and
+resume records who ran it and why:
+
+```go
+ctx = flywheel.WithActor(ctx, flywheel.Actor{Type: flywheel.ActorUser, ID: userID, Reason: "provider outage"})
+if err := flywheel.PauseQueue(ctx, db, "mail"); err != nil {
+    return err
+}
+queues, err := flywheel.ListQueues(ctx, db) // every queue: its depth, IsPaused, PausedAt, PausedBy
+```
+
+A queue no job has used can be paused, and stays paused for the jobs that arrive. A Runner whose every
+queue is paused claims nothing and holds no slot; `RunUntilIdle` waits for a resume while a paused queue
+holds jobs, and returns once nothing is pending anywhere. A Runner that cannot read the paused set keeps
+the set it last read, with a warning; one that has never read it claims every queue. A Runner refuses to
+start, with `ErrSchemaOutdated`, until `job_queues` exists — unless `QueueStateRefresh` is negative, which
+turns the check off and claims every queue.
+
+`flywheel nodes`, `flywheel nodes drain`, `flywheel queues`, and `flywheel queues pause|resume` do the same
+from the [CLI](cmd/flywheel/README.md). [`docs/INTEGRATING.md`](docs/INTEGRATING.md#nodes-and-queue-state)
+covers the reads, the tables, and the rule that joins a run to its node, and the
+[runbook](docs/RUNBOOK.md) the operations.
 
 </details>
 

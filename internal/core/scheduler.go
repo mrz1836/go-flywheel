@@ -174,6 +174,13 @@ type SchedulerConfig struct {
 	// QueueSampleRetention is how long queue samples are kept: each sampling pass
 	// deletes those older. Zero (or negative) selects 30 days.
 	QueueSampleRetention time.Duration
+	// NodeRetention is how long a node's job_nodes row is kept after its last
+	// heartbeat; zero (or negative) selects 7 days. The Scheduler of a
+	// registering Node (NodeConfig.RegistryInterval) applies it: that Node
+	// deletes the older rows at start and then hourly. A Scheduler run on its
+	// own, or in a Node that does not register, ignores it, so a fleet's node
+	// rows are kept as long as its registering Scheduler's setting says.
+	NodeRetention time.Duration
 
 	// StatsRollupInterval enables the hourly stats rollup: when > 0 the Scheduler
 	// rolls each closed hour of job_runs into job_stats_hourly on this cadence,

@@ -403,6 +403,54 @@ type jobQueueSampleRow struct {
 // TableName binds jobQueueSampleRow to the job_queue_samples table.
 func (jobQueueSampleRow) TableName() string { return "job_queue_samples" }
 
+// jobNodeRow is one process lifetime of a registering Node: the id it mints at
+// start, the executor identity its runners write into job_runs.executor_id, the
+// host, version, and commit it reports, when it started, last heartbeat, and
+// stopped, whether it runs a Scheduler, its drain state, and, as JSON, its
+// runners and the kinds their registries register.
+//
+// The Node inserts it, heartbeats it, and stamps stopped_at when Run returns;
+// RequestDrain stamps drain_requested_at; and a registering Node that runs a
+// Scheduler prunes rows whose heartbeat is older than its NodeRetention. The
+// node package writes it through its own model, which a test holds column for
+// column to this one. The times are UTC, so SQLite's text comparison of them is
+// a time comparison.
+type jobNodeRow struct {
+	ID               string         `gorm:"column:id;primaryKey"`
+	ExecutorID       string         `gorm:"column:executor_id;not null"`
+	Host             string         `gorm:"column:host;not null;default:''"`
+	Version          string         `gorm:"column:version;not null;default:''"`
+	CommitHash       string         `gorm:"column:commit_hash;not null;default:''"`
+	StartedAt        time.Time      `gorm:"column:started_at;not null"`
+	HeartbeatAt      time.Time      `gorm:"column:heartbeat_at;not null"`
+	StoppedAt        *time.Time     `gorm:"column:stopped_at"`
+	Scheduler        bool           `gorm:"column:scheduler;not null;default:false"`
+	Draining         bool           `gorm:"column:draining;not null;default:false"`
+	DrainRequestedAt *time.Time     `gorm:"column:drain_requested_at"`
+	Runners          datatypes.JSON `gorm:"column:runners;type:jsonb;not null;default:'[]'"`
+	Kinds            datatypes.JSON `gorm:"column:kinds;type:jsonb;not null;default:'[]'"`
+}
+
+// TableName binds jobNodeRow to the job_nodes table.
+func (jobNodeRow) TableName() string { return "job_nodes" }
+
+// jobQueueRow is the state of one queue an operator has paused: when it was
+// paused, and the type, id, and reason of the actor who paused it, while it is
+// paused. PauseQueue creates it; ResumeQueue clears its pause columns and keeps
+// it, so a queue once paused stays listed. Every Runner reads the paused set
+// from it once per RunnerConfig.QueueStateRefresh. The times are UTC.
+type jobQueueRow struct {
+	Queue        string     `gorm:"column:queue;primaryKey"`
+	PausedAt     *time.Time `gorm:"column:paused_at"`
+	PausedByType string     `gorm:"column:paused_by_type;not null;default:''"`
+	PausedByID   string     `gorm:"column:paused_by_id;not null;default:''"`
+	PausedReason string     `gorm:"column:paused_reason;not null;default:''"`
+	UpdatedAt    time.Time  `gorm:"column:updated_at;not null"`
+}
+
+// TableName binds jobQueueRow to the job_queues table.
+func (jobQueueRow) TableName() string { return "job_queues" }
+
 // limiterBucketRow is the DBLimiter's per-resource rate reservoir. The resource
 // string is the primary key — one bucket per protected dependency — and the row
 // doubles as the per-resource mutex a shared Acquire locks. It carries no

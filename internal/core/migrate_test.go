@@ -18,7 +18,7 @@ import (
 var (
 	migrateTables = []string{
 		"jobs", "job_runs", "job_periodics", "limiter_buckets", "limiter_holds", "job_run_finishes", "job_stats_hourly",
-		"job_audit", "job_kinds", "job_error_groups_hourly", "job_queue_samples",
+		"job_audit", "job_kinds", "job_error_groups_hourly", "job_queue_samples", "job_nodes", "job_queues",
 	}
 	// migrateJobColumns are jobs columns whose absence is silent rather than
 	// loud: the runtime writes them through a map-valued Updates, which a missing
@@ -43,6 +43,7 @@ var (
 		"job_audit_created",
 		"job_error_groups_fingerprint",
 		"job_queue_samples_time",
+		"job_nodes_heartbeat",
 	}
 )
 
@@ -114,16 +115,17 @@ func TestModelsCarryJobColumns(t *testing.T) {
 	}
 }
 
-// TestModelsListsEveryTableInOrder pins Models to the twelve tables, in the
+// TestModelsListsEveryTableInOrder pins Models to the fourteen tables, in the
 // order a host's loader creates them: the job tables, the limiter tables, the
-// stats tables, the audit history, the kind catalog, then the error groups and
-// the queue samples. The list is literal, not derived from the package.
+// stats tables, the audit history, the kind catalog, the error groups and the
+// queue samples, then the node registry and the queue state. The list is
+// literal, not derived from the package.
 func TestModelsListsEveryTableInOrder(t *testing.T) {
 	t.Parallel()
 	want := []string{
 		"jobs", "job_runs", "job_periodics", "limiter_buckets", "limiter_holds",
 		"job_run_finishes", "job_stats_hourly", "job_stats_progress", "job_audit", "job_kinds",
-		"job_error_groups_hourly", "job_queue_samples",
+		"job_error_groups_hourly", "job_queue_samples", "job_nodes", "job_queues",
 	}
 	models := Models()
 	if len(models) != len(want) {

@@ -68,29 +68,28 @@ type legacyJobPeriodicRow struct {
 func (legacyJobPeriodicRow) TableName() string { return "job_periodics" }
 
 // legacyIndexNames are the indexes added since a release before the stats
-// tables: the analytics release's, the two on the audit history's table, and
-// the two on the error-group and queue-sample tables. A legacy schema is the
-// current IndexSet minus these — derived, never hand-written.
+// tables: the analytics release's, the two on the audit history's table, the
+// two on the error-group and queue-sample tables, and the one on the node
+// registry's. A legacy schema is the current IndexSet minus these — derived,
+// never hand-written.
 //
 //nolint:gochecknoglobals // shared fixture
 var legacyIndexNames = []string{
 	"jobs_finished", "job_audit_target", "job_audit_created", "job_error_groups_fingerprint", "job_queue_samples_time",
+	"job_nodes_heartbeat",
 }
 
 // previousReleaseTableNames, previousReleaseIndexNames, and
 // previousReleaseColumns are what this release adds: the previous release's
 // schema is Models and IndexSet minus these — derived, never hand-written. This
-// release adds two tables, an index on each, and a column to two existing
-// tables.
+// release adds two tables, the node registry and the queue state, and an index
+// on the first; it adds no column to an existing table.
 //
 //nolint:gochecknoglobals // shared fixture
 var (
-	previousReleaseTableNames = []string{"job_error_groups_hourly", "job_queue_samples"}
-	previousReleaseIndexNames = []string{"job_error_groups_fingerprint", "job_queue_samples_time"}
-	previousReleaseColumns    = []SchemaDrift{
-		{Table: "job_runs", Column: "error_fingerprint"},
-		{Table: "job_stats_hourly", Column: "enqueued"},
-	}
+	previousReleaseTableNames = []string{"job_nodes", "job_queues"}
+	previousReleaseIndexNames = []string{"job_nodes_heartbeat"}
+	previousReleaseColumns    = []SchemaDrift{}
 )
 
 // installLegacySchema builds, on a bare database, the schema a release before
@@ -192,8 +191,8 @@ func schemaDriftNames(drift []SchemaDrift) []string {
 // TestInspectSchemaReportsWhatAnOlderSchemaLacks proves the parity check names
 // exactly the columns and tables added since a release before the stats
 // tables — the analytics release's, the pause's, the audit history's, the kind
-// catalog's, and the error groups' and queue samples' — and nothing on a
-// current schema.
+// catalog's, the error groups' and queue samples', and the node registry's and
+// queue state's — and nothing on a current schema.
 func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -206,7 +205,7 @@ func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 		"job_runs.kind", "job_runs.queue", "job_runs.queue_wait_ms", "job_runs.job_state",
 		"job_runs.superseded", "job_runs.error_fingerprint", "job_periodics.paused_at", "job_run_finishes (table)",
 		"job_stats_hourly (table)", "job_stats_progress (table)", "job_audit (table)", "job_kinds (table)",
-		"job_error_groups_hourly (table)", "job_queue_samples (table)",
+		"job_error_groups_hourly (table)", "job_queue_samples (table)", "job_nodes (table)", "job_queues (table)",
 	}, schemaDriftNames(drift))
 
 	current, err := InspectSchema(ctx, newDB(t))
