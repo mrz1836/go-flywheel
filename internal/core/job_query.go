@@ -36,7 +36,8 @@ const (
 )
 
 // MaxContainmentWindow is the widest created window a containment filter
-// (JobQuery.ArgsContains, JobQuery.MetadataContains) may search.
+// (JobQuery.ArgsContains, JobQuery.MetadataContains) or a text search
+// (JobQuery.ErrorContains) may search.
 const MaxContainmentWindow = 7 * 24 * time.Hour
 
 // JobQuery filters, orders, and pages a QueryJobs read. Fields combine with
@@ -87,6 +88,20 @@ type JobQuery struct {
 	// MetadataContains matches a job whose metadata contains this JSON object,
 	// under ArgsContains' rules. A NULL metadata never matches.
 	MetadataContains json.RawMessage
+	// ErrorClasses matches a job whose latest attempt failed with any of these
+	// error classes. A job's latest attempt is the run of the attempt its counter
+	// names (jobs.attempt), so a job never claimed, or whose current attempt is
+	// still running, matches none of the latest-run filters.
+	ErrorClasses []ErrorClass
+	// Fingerprint matches a job whose latest attempt stored this error
+	// fingerprint (see ErrorFingerprint): 16 lowercase hex characters. A run
+	// written before the runtime stored fingerprints never matches.
+	Fingerprint string
+	// ErrorContains matches a job whose latest attempt's error message contains
+	// this text, in any case; %, _, and \ in it match only themselves. It needs
+	// CreatedFrom, and a created window of at most MaxContainmentWindow, under
+	// ArgsContains' rules; on SQLite it returns ErrUnsupportedDialect.
+	ErrorContains string
 	// Sort is the order of the page; empty is JobSortNewest.
 	Sort JobSort
 	// Cursor is the NextCursor of the previous page; empty reads the first page.
@@ -161,6 +176,11 @@ const maxRunErrorBytes = 256
 // statement timeout bounds the read. docs/BENCHMARKS.md measures each shape at
 // a million jobs.
 //
+// The latest-run filters (ErrorClasses, Fingerprint, ErrorContains) are one
+// EXISTS over each candidate's latest run, a probe of job_runs_job_attempt per
+// job the other filters let through, so they are cheapest beside a created
+// window, a kind, or a state that narrows the candidates first.
+//
 // # Pages
 //
 // A page holds at most q.Limit items (50 when zero, never more than
@@ -177,16 +197,19 @@ const maxRunErrorBytes = 256
 // non-empty and terminal only, or JobSortScheduled unless it is non-empty and
 // non-terminal only (states); a containment filter that is not a JSON object, or
 // whose created window is open or wider than MaxContainmentWindow
-// (args_contains, metadata_contains); and a cursor that is malformed or from
-// another sort (cursor).
+// (args_contains, metadata_contains); an unknown error class (error_classes); a
+// fingerprint that is not 16 lowercase hex characters (fingerprint); an
+// ErrorContains whose created window is open or wider than MaxContainmentWindow
+// (error_contains); and a cursor that is malformed or from another sort
+// (cursor).
 //
 // # SQLite
 //
-// The containment filters return ErrUnsupportedDialect. A tag filter reads
-// json_each with no index. Scheduled and finalized windows, the time sorts, and
-// their cursors compare as text, in the zone the jobs rows were written in, as
-// ListFinished's do: rows written in another offset can order out of time order.
-// PostgreSQL compares instants.
+// The containment filters and ErrorContains return ErrUnsupportedDialect. A tag
+// filter reads json_each with no index. Scheduled and finalized windows, the
+// time sorts, and their cursors compare as text, in the zone the jobs rows were
+// written in, as ListFinished's do: rows written in another offset can order out
+// of time order. PostgreSQL compares instants.
 func QueryJobs(ctx context.Context, db *gorm.DB, q JobQuery) (JobPage, error) {
 	if err := validateJobFilter(ctx, q, db.Name()); err != nil {
 		return JobPage{}, err
@@ -406,7 +429,43 @@ func applyJobFilter(stmt *gorm.DB, q JobQuery, dialect string) *gorm.DB {
 	if len(q.MetadataContains) > 0 {
 		stmt = stmt.Where("jobs.metadata @> CAST(? AS jsonb)", string(q.MetadataContains))
 	}
+	if len(q.ErrorClasses) > 0 || q.Fingerprint != "" || q.ErrorContains != "" {
+		stmt = applyLatestRunFilter(stmt, q)
+	}
 	return stmt
+}
+
+// likeEscaper escapes the characters LIKE treats as special, so a text search
+// matches the text as written under ESCAPE '\'.
+//
+//nolint:gochecknoglobals // a stateless replacer, built once
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// applyLatestRunFilter matches a job by the run of the attempt it names: one
+// EXISTS whose every condition applies to that one row, found through
+// job_runs_job_attempt, so a candidate costs one index probe and a job with no
+// run matches nothing. Its alias, lr, is its own: a page's statement already
+// joins the same run as r.
+func applyLatestRunFilter(stmt *gorm.DB, q JobQuery) *gorm.DB {
+	conds := []string{"lr.job_id = jobs.id", "lr.attempt = jobs.attempt"}
+	var args []any
+	if len(q.ErrorClasses) > 0 {
+		classes := make([]string, len(q.ErrorClasses))
+		for i, c := range q.ErrorClasses {
+			classes[i] = string(c)
+		}
+		conds = append(conds, "lr.error_class IN ?")
+		args = append(args, classes)
+	}
+	if q.Fingerprint != "" {
+		conds = append(conds, "lr.error_fingerprint = ?")
+		args = append(args, q.Fingerprint)
+	}
+	if q.ErrorContains != "" {
+		conds = append(conds, `lr.error_message ILIKE ? ESCAPE '\'`)
+		args = append(args, "%"+likeEscaper.Replace(q.ErrorContains)+"%")
+	}
+	return stmt.Where("EXISTS (SELECT 1 FROM job_runs lr WHERE "+strings.Join(conds, " AND ")+")", args...)
 }
 
 // applyTagFilter matches a job carrying any of tags. On PostgreSQL each tag is a
@@ -515,22 +574,38 @@ func validateJobFilter(ctx context.Context, q JobQuery, dialect string) error {
 	if len(q.IDs) > MaxReadLimit {
 		return newValidationError("ids", fmt.Sprintf("has more than %d entries", MaxReadLimit))
 	}
+	for _, c := range q.ErrorClasses {
+		if !c.Valid() {
+			return newValidationError("error_classes", fmt.Sprintf("%q is not an error class", c))
+		}
+	}
+	if q.Fingerprint != "" && !validFingerprint(q.Fingerprint) {
+		return newValidationError("fingerprint",
+			fmt.Sprintf("%q is not %d lowercase hex characters", q.Fingerprint, fingerprintLen))
+	}
 	if err := validateContainment(ctx, "args_contains", q.ArgsContains, q); err != nil {
 		return err
 	}
 	if err := validateContainment(ctx, "metadata_contains", q.MetadataContains, q); err != nil {
 		return err
 	}
+	if q.ErrorContains != "" {
+		if err := validateSearchWindow(ctx, "error_contains", q); err != nil {
+			return err
+		}
+	}
 	if dialect != "postgres" && (len(q.ArgsContains) > 0 || len(q.MetadataContains) > 0) {
 		return fmt.Errorf("flywheel: containment filters need PostgreSQL: %w", ErrUnsupportedDialect)
+	}
+	if dialect != "postgres" && q.ErrorContains != "" {
+		return fmt.Errorf("flywheel: error_contains needs PostgreSQL: %w", ErrUnsupportedDialect)
 	}
 	return nil
 }
 
 // validateContainment refuses a containment filter that is not a JSON object, or
-// that would search more than MaxContainmentWindow of created jobs: it needs
-// CreatedFrom, and reads a zero CreatedTo as the context clock's now. An empty
-// value is no filter.
+// that would search more than MaxContainmentWindow of created jobs (see
+// validateSearchWindow). An empty value is no filter.
 func validateContainment(ctx context.Context, field string, value json.RawMessage, q JobQuery) error {
 	if len(value) == 0 {
 		return nil
@@ -539,8 +614,16 @@ func validateContainment(ctx context.Context, field string, value json.RawMessag
 	if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
 		return newValidationError(field, "must be a JSON object")
 	}
+	return validateSearchWindow(ctx, field, q)
+}
+
+// validateSearchWindow refuses a filter, named field, that would search more
+// than MaxContainmentWindow of created jobs: it needs CreatedFrom, and reads a
+// zero CreatedTo as the context clock's now. The containment filters and
+// ErrorContains share it.
+func validateSearchWindow(ctx context.Context, field string, q JobQuery) error {
 	if q.CreatedFrom.IsZero() {
-		return newValidationError(field, "needs CreatedFrom: a containment filter searches a bounded created window")
+		return newValidationError(field, "needs CreatedFrom: it searches a bounded created window")
 	}
 	to := q.CreatedTo
 	if to.IsZero() {

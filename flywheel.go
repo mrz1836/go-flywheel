@@ -60,6 +60,7 @@ type (
 	BatchProgress         = core.BatchProgress
 	BatchResult           = core.BatchResult
 	ChildOutput           = core.ChildOutput
+	ChildOutputsOpts      = core.ChildOutputsOpts
 	ClaimEvent            = core.ClaimEvent
 	Classifier            = core.Classifier
 	Client                = core.Client
@@ -109,6 +110,9 @@ type (
 	JobRunView            = core.JobRunView
 	JobSort               = core.JobSort
 	JobState              = core.JobState
+	JobTreeNode           = core.JobTreeNode
+	JobTreeParams         = core.JobTreeParams
+	JobTreeResult         = core.JobTreeResult
 	JobView               = core.JobView
 	JobsOverview          = core.JobsOverview
 	KindInfo              = core.KindInfo
@@ -118,9 +122,11 @@ type (
 	Limiter               = core.Limiter
 	LimiterInfo           = core.LimiterInfo
 	ListAuditParams       = core.ListAuditParams
+	ListChildrenParams    = core.ListChildrenParams
 	ListFinishedParams    = core.ListFinishedParams
 	ListJobsParams        = core.ListJobsParams
 	ListNodesParams       = core.ListNodesParams
+	ListRunFinishesParams = core.ListRunFinishesParams
 	ListRunningParams     = core.ListRunningParams
 	ListRunsParams        = core.ListRunsParams
 	MigrateOpts           = core.MigrateOpts
@@ -151,6 +157,8 @@ type (
 	RetryOpts             = core.RetryOpts
 	Retryable             = core.Retryable
 	RollupResult          = core.RollupResult
+	RunFinish             = core.RunFinish
+	RunFinishPage         = core.RunFinishPage
 	RunOutcome            = core.RunOutcome
 	RunSummary            = core.RunSummary
 	RunSeed               = core.RunSeed
@@ -208,6 +216,9 @@ const (
 	AuditTargetPeriodic      = core.AuditTargetPeriodic
 	AuditTargetQueue         = core.AuditTargetQueue
 	DefaultCountCap          = core.DefaultCountCap
+	DefaultFeedSettle        = core.DefaultFeedSettle
+	DefaultTreeDepth         = core.DefaultTreeDepth
+	DefaultTreeNodes         = core.DefaultTreeNodes
 	ErrorFingerprintVersion  = core.ErrorFingerprintVersion
 	ErrorPermanent           = core.ErrorPermanent
 	ErrorTimeout             = core.ErrorTimeout
@@ -234,6 +245,8 @@ const (
 	MaxReasonBytes           = core.MaxReasonBytes
 	MaxTagBytes              = core.MaxTagBytes
 	MaxTags                  = core.MaxTags
+	MaxTreeDepth             = core.MaxTreeDepth
+	MaxTreeNodes             = core.MaxTreeNodes
 	OutcomeCancelled         = core.OutcomeCancelled
 	OutcomeCrashed           = core.OutcomeCrashed
 	OutcomeError             = core.OutcomeError
@@ -309,6 +322,10 @@ func CancelJob(ctx context.Context, db *gorm.DB, id string) error {
 
 func ChildOutputs(ctx context.Context, db *gorm.DB, parentJobID string, p ListRunsParams) ([]ChildOutput, error) {
 	return core.ChildOutputs(ctx, db, parentJobID, p)
+}
+
+func ChildOutputsWithOptions(ctx context.Context, db *gorm.DB, parentJobID string, opts ChildOutputsOpts) ([]ChildOutput, error) {
+	return core.ChildOutputsWithOptions(ctx, db, parentJobID, opts)
 }
 
 func CountActiveByKind(ctx context.Context, db *gorm.DB) ([]ActiveCount, error) {
@@ -431,6 +448,10 @@ func InstallStorageParameters(ctx context.Context, db *gorm.DB) error {
 	return core.InstallStorageParameters(ctx, db)
 }
 
+func JobTree(ctx context.Context, db *gorm.DB, rootJobID string, p JobTreeParams) (JobTreeResult, error) {
+	return core.JobTree(ctx, db, rootJobID, p)
+}
+
 func LatestRun(ctx context.Context, db *gorm.DB, jobID string) (JobRunView, bool, error) {
 	return core.LatestRun(ctx, db, jobID)
 }
@@ -446,6 +467,10 @@ func ListActiveByKind(ctx context.Context, db *gorm.DB, kind string) ([]JobArgsV
 
 func ListAudit(ctx context.Context, db *gorm.DB, p ListAuditParams) (AuditPage, error) {
 	return core.ListAudit(ctx, db, p)
+}
+
+func ListChildren(ctx context.Context, db *gorm.DB, parentJobID string, p ListChildrenParams) (JobPage, error) {
+	return core.ListChildren(ctx, db, parentJobID, p)
 }
 
 func ListFinished(ctx context.Context, db *gorm.DB, p ListFinishedParams) ([]JobView, error) {
@@ -474,6 +499,10 @@ func ListPeriodics(ctx context.Context, db *gorm.DB) ([]PeriodicView, error) {
 
 func ListQueues(ctx context.Context, db *gorm.DB) ([]QueueInfo, error) {
 	return core.ListQueues(ctx, db)
+}
+
+func ListRunFinishes(ctx context.Context, db *gorm.DB, p ListRunFinishesParams) (RunFinishPage, error) {
+	return core.ListRunFinishes(ctx, db, p)
 }
 
 func ListRunning(ctx context.Context, db *gorm.DB, p ListRunningParams) ([]RunningJob, error) {

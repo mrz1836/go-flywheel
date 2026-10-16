@@ -257,22 +257,39 @@ func isTerminalStateString(s string) bool {
 	}
 }
 
-// ChildOutput is one terminal child of a parent, paired with the recorded output
-// of its last attempt. It is the fold a barrier continuation reads: the barrier
-// fires when the generation is complete, and this is how the continuation sees what
-// the generation produced.
+// ChildOutput is one child of a parent, paired with the recorded output of its
+// latest attempt. ChildOutputs reads the terminal children: the fold a barrier
+// continuation reads, since the barrier fires when the generation is complete,
+// and this is how the continuation sees what the generation produced.
+// ChildOutputsWithOptions reads the children in any states.
 type ChildOutput struct {
 	JobID string `json:"job_id"`
-	// State is the child's final state — succeeded, cancelled, or discarded.
+	// State is the child's state when read: from ChildOutputs, its final state,
+	// succeeded, cancelled, or discarded.
 	State JobState `json:"state"`
 	// Attempt is the attempt number of the recorded run this output came from. It is
 	// zero for a child that never ran (a child cancelled before it was claimed has a
-	// terminal state but no attempt and no output).
+	// terminal state but no attempt and no output, and one still waiting for its
+	// first claim has neither).
 	Attempt int `json:"attempt"`
-	// Output is the child's last attempt's recorded Result.Output, empty when the
-	// child produced none or never ran, and a TruncatedOutput when its JSON was
-	// larger than DriverOpts.MaxOutputBytes.
+	// Output is the child's latest attempt's recorded Result.Output, empty when the
+	// child produced none, never ran, or is still running that attempt, and a
+	// TruncatedOutput when its JSON was larger than DriverOpts.MaxOutputBytes.
 	Output json.RawMessage `json:"output,omitempty"`
+}
+
+// ChildOutputsOpts configures ChildOutputsWithOptions. The zero value reads what
+// ChildOutputs reads: every terminal child.
+type ChildOutputsOpts struct {
+	// States keeps the children in any of these states; empty selects the
+	// terminal states, ChildOutputs' set.
+	States []JobState
+	// Before is a created_at cursor, as ChildOutputs': only children created
+	// strictly before it are read. Zero means newest.
+	Before time.Time
+	// Limit caps the read when positive; zero reads every matching child, as
+	// ChildOutputs does.
+	Limit int
 }
 
 // ChildOutputs returns the recorded output of each terminal child of a parent,
@@ -294,14 +311,43 @@ type ChildOutput struct {
 // the last row seen per child — the highest attempt — is the one that reached the
 // terminal state. A terminal child with no recorded run (cancelled before it was
 // claimed) still gets an entry, with a zero Attempt and an empty Output.
+//
+// It is ChildOutputsWithOptions with the terminal states and p's Before and
+// Limit.
 func ChildOutputs(ctx context.Context, db *gorm.DB, parentJobID string, p ListRunsParams) ([]ChildOutput, error) {
-	query := db.WithContext(ctx).Model(&jobRow{}).
-		Where("parent_job_id = ? AND state IN ?", parentJobID, terminalStateStrings())
-	if !p.Before.IsZero() {
-		query = query.Where("created_at < ?", p.Before)
+	return ChildOutputsWithOptions(ctx, db, parentJobID, ChildOutputsOpts{Before: p.Before, Limit: p.Limit})
+}
+
+// ChildOutputsWithOptions returns each child of a parent in opts.States, paired
+// with its latest recorded attempt's number and output, reading through db. It
+// reads what ChildOutputs reads, children newest first by created_at and id,
+// opts.Before and opts.Limit applied the same way, but in any states: with the
+// running and retryable states, a caller sees what a generation has produced
+// before the whole of it has finished. A running child reports its current
+// attempt, whose output is empty until it finishes; a child never claimed
+// reports a zero Attempt.
+//
+// Like ChildOutputs, a zero opts.Limit reads every matching child, which
+// MaxReadLimit does not cap; a caller listing children for display passes a
+// Limit. An unknown state is a *ValidationError naming states, returned before
+// any statement runs.
+func ChildOutputsWithOptions(ctx context.Context, db *gorm.DB, parentJobID string, opts ChildOutputsOpts) ([]ChildOutput, error) {
+	states := terminalStateStrings()
+	if len(opts.States) > 0 {
+		for _, s := range opts.States {
+			if !s.Valid() {
+				return nil, newValidationError("states", fmt.Sprintf("%q is not a job state", s))
+			}
+		}
+		states = stateStrings(opts.States)
 	}
-	if p.Limit > 0 {
-		query = query.Limit(p.Limit)
+	query := db.WithContext(ctx).Model(&jobRow{}).
+		Where("parent_job_id = ? AND state IN ?", parentJobID, states)
+	if !opts.Before.IsZero() {
+		query = query.Where("created_at < ?", opts.Before)
+	}
+	if opts.Limit > 0 {
+		query = query.Limit(opts.Limit)
 	}
 	var children []jobRow
 	if err := query.Order("created_at desc, id desc").Find(&children).Error; err != nil {
