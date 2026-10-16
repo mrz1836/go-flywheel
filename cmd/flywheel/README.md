@@ -113,6 +113,7 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel schedule rm <slug>` | Remove a schedule (warns when the config declares it: `serve` re-creates it; `--reason`, recorded in its history) |
 | `flywheel schedule enable <slug>` / `disable <slug>` | Reactivate or deactivate a schedule, keeping its row (`--reason`, recorded in its history). This is the config's own switch: for a schedule the file declares, the next `serve` start re-applies the file's setting |
 | `flywheel schedule pause <slug>` / `resume <slug>` | Hold a schedule through every `serve` start until it is resumed; a resume fires it next at its first fire time after now, without running the fires it missed |
+| `flywheel kinds` | List the kind catalog a host's processes published with `PublishKinds`, sorted by kind: each kind's default queue, priority, attempts, and timeout (`-` for none), and when it was last published (`--json` prints the records, with each kind's description, args schema and example, and publisher). The CLI publishes no catalog of its own |
 | `flywheel prune` | Delete finished jobs and their runs older than a cutoff, holding for the stats rollup when it is on (`--older-than 14d --ignore-stats-rollup`) |
 | `flywheel status` | Show queue health, schedules, and recent failures (`--json --watch`) |
 | `flywheel stats` | Per-kind outcomes, success rate, duration percentiles, and queue wait (`--since 24h --kind --queue --json`) |

@@ -318,6 +318,32 @@ type jobAuditRow struct {
 // TableName binds jobAuditRow to the job_audit table.
 func (jobAuditRow) TableName() string { return "job_audit" }
 
+// jobKindRow is one kind of the published catalog: the KindInfo a node's
+// registry reported for it, who published it last and when, and when it was
+// first published. PublishKinds upserts it and never deletes it, so a kind no
+// release registers any more stays listed with an old published_at. TimeoutMs
+// is NULL when the kind declares no timeout. The times are UTC.
+type jobKindRow struct {
+	Kind             string         `gorm:"column:kind;primaryKey"`
+	Description      string         `gorm:"column:description;not null;default:''"`
+	ArgsSchema       datatypes.JSON `gorm:"column:args_schema;type:jsonb"`
+	ExampleArgs      datatypes.JSON `gorm:"column:example_args;type:jsonb"`
+	Queue            string         `gorm:"column:queue;not null;default:''"`
+	Priority         int            `gorm:"column:priority;not null;default:0"`
+	MaxAttempts      int            `gorm:"column:max_attempts;not null;default:0"`
+	TimeoutMs        *int           `gorm:"column:timeout_ms"`
+	ExecutorClass    string         `gorm:"column:executor_class;not null;default:''"`
+	ValidatesArgs    bool           `gorm:"column:validates_args;not null;default:false"`
+	CustomBackoff    bool           `gorm:"column:custom_backoff;not null;default:false"`
+	ClassifiesErrors bool           `gorm:"column:classifies_errors;not null;default:false"`
+	PublishedBy      string         `gorm:"column:published_by;not null;default:''"`
+	FirstPublishedAt time.Time      `gorm:"column:first_published_at;not null"`
+	PublishedAt      time.Time      `gorm:"column:published_at;not null"`
+}
+
+// TableName binds jobKindRow to the job_kinds table.
+func (jobKindRow) TableName() string { return "job_kinds" }
+
 // limiterBucketRow is the DBLimiter's per-resource rate reservoir. The resource
 // string is the primary key — one bucket per protected dependency — and the row
 // doubles as the per-resource mutex a shared Acquire locks. It carries no

@@ -2,9 +2,9 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 )
@@ -33,13 +33,16 @@ type dispatchFunc func(ctx context.Context, in dispatchInput) (Result, error)
 // registryEntry is one registered worker: its dispatch closure plus any
 // optional interfaces it implements, captured once at registration so the
 // Runner need not re-assert. defaults is nil when the worker implements no
-// Defaults.
+// Defaults. info is what Kinds reports for the kind, and validate is the check
+// Validate runs on its args.
 type registryEntry struct {
 	dispatch   dispatchFunc
 	classifier Classifier
 	retryable  Retryable
 	defaults   *kindDefaults
 	timeouter  Timeouter
+	info       KindInfo
+	validate   func(args []byte) error
 }
 
 // kindDefaults is the part of a worker's Defaults() an insert applies: read
@@ -50,9 +53,11 @@ type kindDefaults struct {
 	maxAttempts   int
 	timeout       time.Duration
 	executorClass ExecutorClass
+	tags          []string
 }
 
-// kindDefaultsOf keeps the fields of opts an insert reads from Defaults.
+// kindDefaultsOf keeps the fields of opts an insert reads from Defaults. The
+// tags are copied, so a worker that reuses its slice cannot change them later.
 func kindDefaultsOf(opts InsertOpts) *kindDefaults {
 	return &kindDefaults{
 		queue:         opts.Queue,
@@ -60,6 +65,7 @@ func kindDefaultsOf(opts InsertOpts) *kindDefaults {
 		maxAttempts:   opts.MaxAttempts,
 		timeout:       opts.Timeout,
 		executorClass: opts.ExecutorClass,
+		tags:          slices.Clone(opts.Tags),
 	}
 }
 
@@ -84,6 +90,9 @@ func (d *kindDefaults) applyTo(opts InsertOpts) InsertOpts {
 	if opts.ExecutorClass == AnyClass {
 		opts.ExecutorClass = d.executorClass
 	}
+	if len(opts.Tags) == 0 {
+		opts.Tags = d.tags
+	}
 	return opts
 }
 
@@ -104,6 +113,13 @@ func NewRegistry() *Registry {
 // one kind is a programming error with no correct resolution — silently keeping
 // either one would route live jobs to a worker the author did not intend — so it
 // fails at startup rather than at dispatch.
+//
+// It reads each optional interface w implements once, here: Classifier,
+// Retryable, Defaults, Timeouter, and the ones that describe the kind
+// (Describer, ArgsSchemer, ArgsExampler, ArgsValidator). It panics the same way,
+// naming the kind and what failed, when w's args schema fails to build or is not
+// valid JSON, or its example args are not valid JSON, and the kind is not
+// registered.
 func Register[A Args](reg *Registry, w Worker[A]) {
 	kind := w.Kind()
 
@@ -115,13 +131,11 @@ func Register[A Args](reg *Registry, w Worker[A]) {
 
 	entry := registryEntry{
 		dispatch: func(ctx context.Context, in dispatchInput) (Result, error) {
-			var args A
-			if len(in.RawArgs) > 0 {
-				if err := json.Unmarshal(in.RawArgs, &args); err != nil {
-					// Args that do not decode never will: the error is a validation
-					// failure the Runner discards on, not one it retries.
-					return Result{}, &decodeArgsError{kind: kind, err: err}
-				}
+			args, err := decodeJobArgs[A](in.RawArgs)
+			if err != nil {
+				// Args that do not decode never will: the error is a validation
+				// failure the Runner discards on, not one it retries.
+				return Result{}, &decodeArgsError{kind: kind, err: err}
 			}
 			job := &Job[A]{
 				ID:          in.ID,
@@ -151,6 +165,8 @@ func Register[A Args](reg *Registry, w Worker[A]) {
 	if to, ok := any(w).(Timeouter); ok {
 		entry.timeouter = to
 	}
+	entry.info = describeKind(kind, w, entry.defaults)
+	entry.validate = argsValidation(w)
 	reg.entries[kind] = entry
 }
 

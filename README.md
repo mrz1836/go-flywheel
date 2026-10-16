@@ -260,11 +260,11 @@ Each section below is self-contained; open the ones you need.
 <summary><strong><code>Schema setup — pick exactly one install path</code></strong></summary>
 <br>
 
-`go-flywheel` owns nine tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
+`go-flywheel` owns ten tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
 `limiter_buckets` and `limiter_holds` for the shared database-backed limiter (additive: empty unless you
 construct a `DBLimiter`); `job_run_finishes`, `job_stats_hourly`, and `job_stats_progress`, the finish
-log every finalize writes and the stats rollup's tables; and `job_audit`, the history every control
-writes — and there are **two ways to install them. Pick exactly one.** They are not layers; running both means two migration authorities against one
+log every finalize writes and the stats rollup's tables; `job_audit`, the history every control
+writes; and `job_kinds`, the kind catalog `PublishKinds` writes (empty unless you publish one) — and there are **two ways to install them. Pick exactly one.** They are not layers; running both means two migration authorities against one
 database.
 
 | Question | **Library-owned** | **Host-owned** |
@@ -274,11 +274,11 @@ database.
 | Who sets the storage parameters? | `Migrate(db)` | you, from `InstallStorageParameters` |
 | Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
 | Does the runtime run DDL at startup? | yes, every start | no |
-| Is a co-located host schema safe? | only if the host's tooling excludes all nine tables | yes — the tables are in your loader |
+| Is a co-located host schema safe? | only if the host's tooling excludes all ten tables | yes — the tables are in your loader |
 | **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
 
 **The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
-same database, your migration tool must know about all nine — a tool that cannot see them will happily
+same database, your migration tool must know about all ten — a tool that cannot see them will happily
 propose dropping them. A tool told to leave the runtime's tables alone by name needs every name above.
 
 **Library-owned** — one call, no external tooling:
@@ -299,7 +299,7 @@ up-to-date schema — a re-run creates nothing and changes nothing — so it is 
 
 ```go
 // 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
-//    so your migration tool knows all nine tables exist and never proposes dropping them.
+//    so your migration tool knows all ten tables exist and never proposes dropping them.
 stmts, err := gormschema.New("postgres").Load(
     append(myapp.AllModels(), flywheel.Models()...)...,
 )
@@ -562,25 +562,112 @@ runs until its context ends. A test that enqueues a kind it deliberately leaves 
 </details>
 
 <details>
+<summary><strong><code>Describing kinds — a catalog, validated enqueue, and worker defaults</code></strong></summary>
+<br>
+
+A worker can describe its kind beside the code that runs it, so an operator tool reads one catalog
+instead of a hand-kept list that drifts from the code. Four optional interfaces declare it, and
+`Register` reads each one once:
+
+| Interface | Declares |
+|---|---|
+| `Describer` — `Description() string` | a one-line description |
+| `ArgsSchemer` — `ArgsSchema() (json.RawMessage, error)` | a JSON Schema for the args, from any generator you use |
+| `ArgsExampler` — `ExampleArgs() json.RawMessage` | an example of the args |
+| `ArgsValidator[A]` — `ValidateArgs(args A) error` | a check the decoded args must pass before a validated enqueue |
+
+`Register` panics, naming the kind, when the schema fails to build or the schema or the example is not
+valid JSON, as it does for a duplicate kind, so a bad declaration fails at startup. It does not check the
+example against the schema or the validator; prove that in your own test.
+
+```go
+func (WelcomeMailer) Description() string { return "Send the welcome email" }
+
+func (WelcomeMailer) ArgsSchema() (json.RawMessage, error) {
+    return json.RawMessage(`{"type":"object","required":["user_id"]}`), nil
+}
+
+func (WelcomeMailer) ExampleArgs() json.RawMessage { return json.RawMessage(`{"user_id":"u1"}`) }
+
+func (WelcomeMailer) ValidateArgs(args WelcomeMail) error {
+    if args.UserID == "" {
+        return errors.New("user_id is required")
+    }
+    return nil
+}
+```
+
+**`Registry.Kinds` is the catalog.** It returns one `KindInfo` per registered kind, sorted by kind: what
+the worker declares; the queue, priority, attempts, and timeout an insert of it defaults to (its
+`Defaults`, else the runtime's, with a `Timeouter`'s timeout when `Defaults` names none); and whether it
+validates its args, sets its own retry backoff, or classifies its errors.
+
+**A validated enqueue refuses a bad request at once.** `Enqueue` writes any kind it is given: it is the
+seed seam, so a mistyped kind waits out a runner's unknown-kind grace and is then discarded.
+`Registry.Validate` checks a kind and its args first: an unregistered kind is `ErrUnknownKind`, and args
+that do not decode into the kind's type (decoded exactly as the worker receives them) or that its
+`ArgsValidator` refuses are a `*ValidationError` on `args`, carrying the reason. `Registry.Enqueue`
+validates, fills the fields the call leaves zero from the kind's `Defaults`, and enqueues through the
+Client you pass, so the Client's own options, its `InsertHook` among them, apply as on any insert. A
+refused call writes nothing.
+
+```go
+id, err := reg.Enqueue(ctx, client, kind, args, flywheel.InsertOpts{Priority: 5})
+switch {
+case errors.Is(err, flywheel.ErrUnknownKind): // no such kind
+case errors.Is(err, flywheel.ErrValidation):  // the args are refused; the error says why
+}
+```
+
+**Where a kind's defaults apply, and in what order,** is **Worker defaults — declare a kind's routing
+once**, below: `Registry.Enqueue`, a Client built with `ClientOpts.Registry`, and a Runner's follow-ups
+fill each field a call leaves zero, a caller's value always wins, and a barrier's continuation takes the
+`Barrier`'s own field, then the kind's default, then the spawning job's.
+
+**Publish the catalog for a process without the registry.** An API or an operator tool often runs where
+no worker is registered. A node calls `PublishKinds` at startup, and any process reads the catalog back
+with `ListKinds`, or `flywheel kinds` from a shell:
+
+```go
+// In the process that registers the workers, after Register:
+if err := flywheel.PublishKinds(ctx, db, reg); err != nil {
+    return err
+}
+
+// Anywhere:
+kinds, err := flywheel.ListKinds(ctx, db) // []flywheel.KindRecord, sorted by kind
+```
+
+A `KindRecord` is the kind's `KindInfo`, its last publisher (`PublishKindsOpts.Publisher`, else the
+process's `host:pid`), and when it was first and last published. A publish upserts and never deletes: a
+kind a release stops registering stays listed with an old `PublishedAt`, and a kind's first publish time
+never moves. The catalog is the `job_kinds` table, which nothing else reads, so a Runner, a Scheduler,
+and a Node start without it; [the upgrade](docs/INTEGRATING.md#upgrading-an-existing-database) adds it.
+
+</details>
+
+<details>
 <summary><strong><code>Worker defaults — declare a kind's routing once</code></strong></summary>
 <br>
 
 A worker can declare where its jobs run and how often they retry, so no producer has to repeat it.
-Implement `Defaults`, and `Register` reads five fields from it, once: `Queue`, `Priority`, `MaxAttempts`,
-`Timeout`, and `ExecutorClass`. Every other `InsertOpts` field it returns is ignored.
+Implement `Defaults`, and `Register` reads six fields from it, once: `Queue`, `Priority`, `MaxAttempts`,
+`Timeout`, `ExecutorClass`, and `Tags`. Every other `InsertOpts` field it returns is ignored.
 
 ```go
 func (WelcomeMailer) Defaults() flywheel.InsertOpts {
-    return flywheel.InsertOpts{Queue: "mail", MaxAttempts: 4, Timeout: 30 * time.Second}
+    return flywheel.InsertOpts{Queue: "mail", MaxAttempts: 4, Timeout: 30 * time.Second, Tags: []string{"mail"}}
 }
 ```
 
 **They apply wherever an insert knows the registry.** Each field the call leaves zero takes the kind's
-default, then the runtime's (queue `default`, priority 100, 25 attempts, no timeout, any executor class).
-A field the call sets always wins.
+default, then the runtime's (queue `default`, priority 100, 25 attempts, no timeout, any executor class,
+no tags). A field the call sets always wins. Tags count as unset when the call names none, and the kind's
+then stand in whole: they are never merged with the call's.
 
 | Insert | Takes the kind's `Defaults` |
 |---|---|
+| `Registry.Enqueue`, through any Client | yes, once the kind and its args pass `Registry.Validate` |
 | `Insert`, `Enqueue`, `InsertMany`, `InsertManyTyped` on a Client built with `ClientOpts.Registry` | yes |
 | A Scheduler's periodic fires through such a Client | yes, on the periodic's queue |
 | A worker's `Result.FollowUps`, inserted by a Runner's finalize | yes, from `RunnerConfig.Registry` |
@@ -599,17 +686,19 @@ _, err = flywheel.Insert(ctx, client, WelcomeMail{UserID: id}, flywheel.InsertOp
 ```
 
 **Follow-ups and barrier continuations take the Runner's registry.** A follow-up's empty queue,
-priority, and executor class take its kind's defaults, and so do its attempts and timeout, which a
+priority, executor class, and tags take its kind's defaults, and so do its attempts and timeout, which a
 `FollowUp` does not name. A kind the Runner does not register takes none. A barrier's continuation is
 resolved in the finalize that declares it: each of its queue, executor class, and priority takes the
-`Barrier`'s own value, then the continuation kind's default, then the spawning job's, and its attempts
-and timeout take the kind's default. All of it is stored with the barrier, so a child's finalize, a
+`Barrier`'s own value, then the continuation kind's default, then the spawning job's, and its attempts,
+timeout, and tags take the kind's default. All of it is stored with the barrier, so a child's finalize, a
 cancel, and the sweep's discard enqueue the same continuation. A continuation kind without `Defaults`
-inherits the spawning job's routing, with 25 attempts and no timeout.
+inherits the spawning job's routing, with 25 attempts, no timeout, and no tags.
 
 **A timeout from `Defaults` is stored on the job**, like `InsertOpts.Timeout`, so it overrides the
 worker's `Timeouter`. Since a zero field means "unset", a call cannot ask for the any-class wildcard on
-a kind whose `Defaults` name an `ExecutorClass`.
+a kind whose `Defaults` name an `ExecutorClass`, or for no tags on a kind whose `Defaults` name some.
+The kind's tags meet the same limits as `InsertOpts.Tags` (see **Tags, metadata, and who enqueued a
+job**), checked at each insert, so a tag the limits refuse fails every insert of the kind.
 
 </details>
 

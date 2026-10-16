@@ -13,7 +13,7 @@ import (
 
 // previousReleaseGapSuite proves the parity checks name exactly what this
 // release adds to a schema the previous release installed: the one table, and
-// its two indexes, absent.
+// no index.
 func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
@@ -21,7 +21,7 @@ func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 
 	drift, err := InspectSchema(ctx, db)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"job_audit (table)"}, schemaDriftNames(drift))
+	assert.Equal(t, []string{"job_kinds (table)"}, schemaDriftNames(drift))
 	idx, err := InspectIndexes(ctx, db)
 	require.NoError(t, err)
 	missing := make([]string, len(idx))
@@ -29,7 +29,7 @@ func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 		missing[i] = d.Name
 		assert.Empty(t, d.Installed, "%s is absent", d.Name)
 	}
-	assert.ElementsMatch(t, previousReleaseIndexNames, missing, "the release's indexes are the new table's")
+	assert.ElementsMatch(t, previousReleaseIndexNames, missing, "the release adds no index")
 }
 
 // TestInspectSchemaReportsWhatThePreviousReleaseLacks is the parity check

@@ -77,12 +77,12 @@ var legacyIndexNames = []string{"jobs_finished", "job_audit_target", "job_audit_
 
 // previousReleaseTableNames and previousReleaseIndexNames are what this release
 // adds: the previous release's schema is Models and IndexSet minus these —
-// derived, never hand-written.
+// derived, never hand-written. This release adds one table and no index.
 //
 //nolint:gochecknoglobals // shared fixture
 var (
-	previousReleaseTableNames = []string{"job_audit"}
-	previousReleaseIndexNames = []string{"job_audit_target", "job_audit_created"}
+	previousReleaseTableNames = []string{"job_kinds"}
+	previousReleaseIndexNames []string
 )
 
 // installLegacySchema builds, on a bare database, the schema a release before
@@ -177,8 +177,8 @@ func schemaDriftNames(drift []SchemaDrift) []string {
 
 // TestInspectSchemaReportsWhatAnOlderSchemaLacks proves the parity check names
 // exactly the columns and tables added since a release before the stats
-// tables — the analytics release's, the pause's, and the audit history's — and
-// nothing on a current schema.
+// tables — the analytics release's, the pause's, the audit history's, and the
+// kind catalog's — and nothing on a current schema.
 func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -190,7 +190,7 @@ func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	assert.ElementsMatch(t, []string{
 		"job_runs.kind", "job_runs.queue", "job_runs.queue_wait_ms", "job_runs.job_state",
 		"job_runs.superseded", "job_periodics.paused_at", "job_run_finishes (table)",
-		"job_stats_hourly (table)", "job_stats_progress (table)", "job_audit (table)",
+		"job_stats_hourly (table)", "job_stats_progress (table)", "job_audit (table)", "job_kinds (table)",
 	}, schemaDriftNames(drift))
 
 	current, err := InspectSchema(ctx, newDB(t))

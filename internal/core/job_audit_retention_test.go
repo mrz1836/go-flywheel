@@ -228,11 +228,14 @@ func TestSchedulerPrunesAuditEntriesOnlyWithAuditRetention(t *testing.T) {
 
 // TestSchedulerWithAuditRetentionRefusesASchemaWithoutTheAuditTable is the
 // deploy-order guard for the prune: a Scheduler that would delete entries stops
-// before starting any activity on a schema without the table, naming it.
+// before starting any activity on a schema without the table, naming it. The
+// schema is the previous release's without the table, as a release before the
+// audit history left it.
 func TestSchedulerWithAuditRetentionRefusesASchemaWithoutTheAuditTable(t *testing.T) {
 	t.Parallel()
 	db := newBareSQLite(t)
 	installPreviousReleaseSchema(t, db)
+	require.NoError(t, db.Exec("DROP TABLE job_audit").Error)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -247,12 +250,14 @@ func TestSchedulerWithAuditRetentionRefusesASchemaWithoutTheAuditTable(t *testin
 }
 
 // TestTheRuntimeStartsWithoutTheAuditTable guards the other side: a Runner, and
-// a Scheduler without AuditRetention, start and run a job on the previous
-// release's schema, since neither writes the history.
+// a Scheduler without AuditRetention, start and run a job on a schema without
+// the table, as a release before the audit history left it, since neither
+// writes the history.
 func TestTheRuntimeStartsWithoutTheAuditTable(t *testing.T) {
 	t.Parallel()
 	db := newBareSQLite(t)
 	installPreviousReleaseSchema(t, db)
+	require.NoError(t, db.Exec("DROP TABLE job_audit").Error)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
