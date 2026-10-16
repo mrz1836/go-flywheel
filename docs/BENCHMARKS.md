@@ -799,6 +799,52 @@ up one hour got faster — **−70% on SQLite** (2.59 → 0.77 ms) and **−27% 
 because the empty-hour marker rows, and the delete that cleared stale ones by scanning every older rollup
 row, are gone. The finalize path is unchanged by it, so the write-cost numbers above stand.
 
+**Stats by queue, enqueue counts, queue history, and error groups, measured.** The release that added
+them was measured at the same million runs against the one before it (`909c0c2`, in a worktree), back to
+back, on one machine: an **Apple M1 Max, 10 cores, 32 GB, macOS 15.7**, with **PostgreSQL 17.10 in Docker
+Desktop** (10 CPUs, 8 GB, the `postgres:17-alpine` image's default server parameters) and Go 1.27.2 — the
+machine of the bounded-reads pair below, not the table's, so compare these numbers with each other. The
+after report is [`benchmarks/stats-plans-1m.txt`](benchmarks/stats-plans-1m.txt). Its fixture also mints
+each job's id as a UUIDv7 of its insert time, gives every failure a message and a stored fingerprint, and
+holds a month of minute samples for three queues.
+
+| Read | Before | After |
+|---|---|---|
+| `Stats`, 24 h, every kind | 8.1 ms | 9.8 ms |
+| `Stats`, 24 h, one kind | 4.1 ms | 5.0 ms |
+| `Stats`, 30 d, every kind | 99.8 ms | 103.9 ms |
+| `StatsSeries`, 30 d hourly | 18.3 ms | 21.8 ms |
+| `StatsSeries`, 30 d daily | 16.9 ms | 19.2 ms |
+| `Anomalies`, latest hour | 29.5 ms | 32.7 ms |
+| `Stats`, 24 h, by queue | | 14.2 ms |
+| `Stats`, 30 d, by queue | | 228 ms |
+| `ErrorGroups`, 24 h | | 27.7 ms |
+| `ErrorGroups`, 7 d, with hourly counts | | 41.9 ms |
+| `ErrorGroups`, 30 d | | 90.3 ms |
+| `QueueDepthHistory`, 30 d of minute samples | | 33.8 ms |
+| Roll up one hour of ~1.4k runs | 14.2 ms | **20.4 ms** |
+| Roll up one hour of 100,000 runs | 330 ms | **434 ms** (target < 2 s) |
+| Roll up all 719 closed hours from scratch | 14.2 s | 22.4 s |
+
+- **Each rolled hour does more**: its window read also carries each error's and timeout's class, stored
+  fingerprint, and message, it counts the hour's inserts with one range of the `jobs` primary key, and it
+  replaces the hour's `job_error_groups_hourly` rows in its transaction. A raw read pays the same count,
+  which is most of what `Stats` gained.
+- **By queue** reads the (kind, queue) group rows the rollup already stores: 60 groups an hour here, so
+  30 days is 43,200 rows, which costs what a per-kind read cost before the per-kind totals existed.
+- **`ErrorGroups`** is 55 statements: the rolled hours, the raw hour, one probe of
+  `job_error_groups_fingerprint` per group returned (the default 50) for its first sighting, and one
+  primary-key read of the sighting runs' finish times. **`QueueDepthHistory`** is one range of 43,200
+  samples.
+- **Both arms analyze the seed before rolling it up**, a step this release adds to the characterization.
+  Without it, the rollup's first window reads are planned before the freshly seeded tables have
+  statistics, and the pool's connections keep the read's generic plan for every later call: estimated at
+  5,500 rows, it is a parallel plan costed above `jit_above_cost`, so each raw read pays a JIT compile —
+  about 13 ms with the previous release's columns and 25 ms with this one's. The first, unanalyzed runs
+  measured that cache rather than the code: `Stats` 24 h at 8.4 ms before, whose pool happened to keep
+  custom plans, and 33 ms after, whose pool did not. On a fresh pool the same read was 6.4 ms. The
+  unanalyzed before also rolled the 100k-run hour in 185 ms and the whole month in 29.3 s.
+
 **Bounded reads, measured.** `SampleQueueHealth` and `RecentFailures` were measured at the same million
 runs before and after they were narrowed, back to back, in two interleaved pairs, on one machine: an
 **Apple M1 Max, 10 cores, 32 GB, macOS 15.7**, with **PostgreSQL 17.10 in Docker Desktop** (10 CPUs, 8 GB,
