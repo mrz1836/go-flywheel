@@ -23,6 +23,9 @@ const (
 	statsExplainDenseHour = 100_000
 	statsExplainRunning   = 200
 	statsExplainReady     = 5_000
+	// statsExplainSampleQueues is how many queues the queue-depth history holds
+	// a sample a minute for, over the whole seeded range.
+	statsExplainSampleQueues = 3
 	// statsTimingRuns is how many timed calls each read gets after one warm-up;
 	// the report publishes the median.
 	statsTimingRuns = 7
@@ -44,6 +47,10 @@ type StatsExplainReport struct {
 	JobsBytes   int64
 	StatsRows   int64
 	StatsBytes  int64
+	GroupRows   int64
+	GroupBytes  int64
+	SampleRows  int64
+	SampleBytes int64
 	RollupAll   time.Duration
 	RollupHours int
 	Reads       []StatsExplainRead
@@ -66,7 +73,9 @@ type statsRead struct {
 }
 
 // ExplainStats seeds cfg.Jobs job_runs (with a job each) across thirty days and
-// twenty kinds, rolls every closed hour up, and then — for every read API the
+// twenty kinds, with a month of queue samples, rolls every closed hour up — the
+// stats rows, their enqueue counts, and the error groups — and then — for every
+// read API the
 // analytics surface exposes — captures the SQL it emits through a recording
 // logger, explains each statement with EXPLAIN (ANALYZE, BUFFERS), and times the
 // call. The artifact is docs/benchmarks/stats-plans-1m.txt.
@@ -116,6 +125,17 @@ func ExplainStats(ctx context.Context, cfg ExplainConfig) (StatsExplainReport, e
 	if err = seedStatsHistory(ctx, db, cfg.Jobs, end); err != nil {
 		return report, err
 	}
+	// Analyze the seed before the rollup reads it, as a database that has been
+	// running carries statistics. Planned without them, the rollup's first
+	// window reads cost more than the read's generic plan, so the pool's
+	// connections keep that generic plan for every later read — one that pays a
+	// JIT compile per call — and the measured reads would describe the cache's
+	// history rather than the code.
+	for _, table := range []string{"jobs", "job_runs", "job_run_finishes", "job_queue_samples"} {
+		if err = db.WithContext(ctx).Exec(`ANALYZE ` + table).Error; err != nil {
+			return report, fmt.Errorf("loadtest: analyze %s: %w", table, err)
+		}
+	}
 	clockCtx := models.WithClock(ctx, models.NewFixedClock(end))
 
 	start := time.Now()
@@ -128,7 +148,9 @@ func ExplainStats(ctx context.Context, cfg ExplainConfig) (StatsExplainReport, e
 	report.RollupAll = time.Since(start)
 	report.RollupHours = rebuilt.Hours
 
-	for _, table := range []string{"jobs", "job_runs", "job_run_finishes", "job_stats_hourly"} {
+	for _, table := range []string{
+		"jobs", "job_runs", "job_run_finishes", "job_stats_hourly", "job_error_groups_hourly", "job_queue_samples",
+	} {
 		if err = db.WithContext(ctx).Exec(`VACUUM (ANALYZE) ` + table).Error; err != nil {
 			return report, fmt.Errorf("loadtest: vacuum %s: %w", table, err)
 		}
@@ -140,6 +162,10 @@ func ExplainStats(ctx context.Context, cfg ExplainConfig) (StatsExplainReport, e
 	report.JobsBytes = scalarInt(ctx, db, `SELECT pg_total_relation_size('jobs')`)
 	report.StatsRows = scalarInt(ctx, db, `SELECT count(*) FROM job_stats_hourly`)
 	report.StatsBytes = scalarInt(ctx, db, `SELECT pg_total_relation_size('job_stats_hourly')`)
+	report.GroupRows = scalarInt(ctx, db, `SELECT count(*) FROM job_error_groups_hourly`)
+	report.GroupBytes = scalarInt(ctx, db, `SELECT pg_total_relation_size('job_error_groups_hourly')`)
+	report.SampleRows = scalarInt(ctx, db, `SELECT count(*) FROM job_queue_samples`)
+	report.SampleBytes = scalarInt(ctx, db, `SELECT pg_total_relation_size('job_queue_samples')`)
 
 	// The Scheduler the rollup-pass row times has made its start-up pass — the
 	// backfill check and the retention boundary — so what it times is the pass
@@ -186,6 +212,16 @@ func statsReads(now, typicalHour, denseHour time.Time, sched *flywheel.Scheduler
 			_, err := flywheel.Stats(ctx, db, flywheel.StatsParams{From: now.Add(-day), To: now, Kind: "kind-7"})
 			return err
 		}},
+		{"Stats 24h by queue", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.Stats(ctx, db, flywheel.StatsParams{From: now.Add(-day), To: now, GroupBy: flywheel.StatsByQueue})
+			return err
+		}},
+		{"Stats 30d by queue", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.Stats(ctx, db, flywheel.StatsParams{
+				From: now.Add(-statsExplainDays * day), To: now, GroupBy: flywheel.StatsByQueue,
+			})
+			return err
+		}},
 		{"StatsSeries 30d hourly", func(ctx context.Context, db *gorm.DB) error {
 			_, err := flywheel.StatsSeries(ctx, db, flywheel.SeriesParams{From: now.Add(-statsExplainDays * day), To: now})
 			return err
@@ -202,6 +238,20 @@ func statsReads(now, typicalHour, denseHour time.Time, sched *flywheel.Scheduler
 		}},
 		{"Anomalies (latest hour)", func(ctx context.Context, db *gorm.DB) error {
 			_, err := flywheel.Anomalies(ctx, db, flywheel.AnomalyParams{})
+			return err
+		}},
+		{"ErrorGroups 24h", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.ErrorGroups(ctx, db, flywheel.ErrorGroupsParams{From: now.Add(-day), To: now})
+			return err
+		}},
+		{"ErrorGroups 7d hourly", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.ErrorGroups(ctx, db, flywheel.ErrorGroupsParams{
+				From: now.Add(-7 * day), To: now, WithHourly: true,
+			})
+			return err
+		}},
+		{"ErrorGroups 30d", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.ErrorGroups(ctx, db, flywheel.ErrorGroupsParams{From: now.Add(-statsExplainDays * day), To: now})
 			return err
 		}},
 		{"ListRunning (with baseline)", func(ctx context.Context, db *gorm.DB) error {
@@ -222,6 +272,12 @@ func statsReads(now, typicalHour, denseHour time.Time, sched *flywheel.Scheduler
 		}},
 		{"QueueDepths", func(ctx context.Context, db *gorm.DB) error {
 			_, err := flywheel.QueueDepths(ctx, db)
+			return err
+		}},
+		{"QueueDepthHistory 30d", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.QueueDepthHistory(ctx, db, flywheel.QueueHistoryParams{
+				Queue: "default", From: now.Add(-statsExplainDays * day), To: now,
+			})
 			return err
 		}},
 		{"SampleQueueHealth", func(ctx context.Context, db *gorm.DB) error {
@@ -301,8 +357,14 @@ func measureStatsRead(ctx context.Context, db *gorm.DB, r statsRead) (StatsExpla
 //     snoozes;
 //   - a dense hour of statsExplainDenseHour more runs of one kind, the rollup's
 //     per-hour bound;
+//   - each of those jobs' ids a UUIDv7 of its insert time, a minute before its
+//     run finished (seedJobIDSQL), so the enqueue counts read the seed as they
+//     read a live history; each error and timeout a message of one of seven
+//     shapes and a stored fingerprint, so the error groups have groups to read;
 //   - statsExplainRunning running jobs with their stubs, and statsExplainReady
-//     ready jobs across three queues, for the live reads.
+//     ready jobs across three queues, for the live reads;
+//   - a queue sample a minute for statsExplainSampleQueues queues over the whole
+//     range, as a Scheduler with QueueSampleInterval set writes them.
 //
 // It is fixture, not a measured insert, so it goes through generate_series like
 // the progress characterization's seed. setseed makes random() reproducible.
@@ -322,23 +384,26 @@ func seedStatsHistory(ctx context.Context, db *gorm.DB, runs int, end time.Time)
 	// outcome, and timing.
 	if err := exec("plan", `
 		CREATE TEMP TABLE stats_seed AS
-		SELECT g,
-		       'sr-' || lpad(g::text, 8, '0') AS id,
-		       'kind-' || (g % ?) AS kind,
-		       (ARRAY['default','bulk','priority'])[1 + (g % 3)] AS queue,
-		       g % 100 AS bucket,
-		       ?::timestamptz + make_interval(secs => (g::float8 / ?) * ?) AS finished_at,
-		       exp(ln(40 * power(1.35, g % ?)) + 0.6 * sqrt(-2 * ln(1 - random())) * cos(2 * pi() * random())) AS dur
-		FROM generate_series(1, ?) AS g`,
+		SELECT s.*, `+seedJobIDSQL("s.finished_at - interval '1 minute'", "s.g")+` AS id
+		FROM (SELECT g,
+		             'kind-' || (g % ?) AS kind,
+		             (ARRAY['default','bulk','priority'])[1 + (g % 3)] AS queue,
+		             g % 100 AS bucket,
+		             ?::timestamptz + make_interval(secs => (g::float8 / ?) * ?) AS finished_at,
+		             exp(ln(40 * power(1.35, g % ?)) + 0.6 * sqrt(-2 * ln(1 - random())) * cos(2 * pi() * random())) AS dur
+		      FROM generate_series(1, ?) AS g) s`,
 		statsExplainKinds, from, runs, spanSeconds, statsExplainKinds, runs); err != nil {
 		return err
 	}
+	// The dense hour's ids take row numbers past every main row's, so no two
+	// jobs inserted in one millisecond share an id.
 	if err := exec("dense hour", `
-		INSERT INTO stats_seed
-		SELECT g, 'sd-' || lpad(g::text, 8, '0'), 'kind-dense', 'default', g % 100,
-		       ?::timestamptz + make_interval(secs => (g::float8 / ?) * 3600),
-		       exp(ln(200) + 0.5 * sqrt(-2 * ln(1 - random())) * cos(2 * pi() * random()))
-		FROM generate_series(1, ?) AS g`,
+		INSERT INTO stats_seed (g, kind, queue, bucket, finished_at, dur, id)
+		SELECT s.*, `+seedJobIDSQL("s.finished_at - interval '1 minute'", "s.g + 4294967296")+`
+		FROM (SELECT g, 'kind-dense', 'default', g % 100,
+		             ?::timestamptz + make_interval(secs => (g::float8 / ?) * 3600),
+		             exp(ln(200) + 0.5 * sqrt(-2 * ln(1 - random())) * cos(2 * pi() * random()))
+		      FROM generate_series(1, ?) AS g) s (g, kind, queue, bucket, finished_at, dur)`,
 		from.Add(15*24*time.Hour+12*time.Hour), statsExplainDenseHour, statsExplainDenseHour); err != nil {
 		return err
 	}
@@ -355,13 +420,15 @@ func seedStatsHistory(ctx context.Context, db *gorm.DB, runs int, end time.Time)
 	}
 	if err := exec("runs", `
 		INSERT INTO job_runs (id, job_id, attempt, kind, queue, executor_class, executor_id, started_at,
-		                      finished_at, outcome, error_class, duration_ms, queue_wait_ms, cost_micros,
-		                      enqueued_children, job_state, superseded, created_at)
+		                      finished_at, outcome, error_class, error_message, error_fingerprint, duration_ms,
+		                      queue_wait_ms, cost_micros, enqueued_children, job_state, superseded, created_at)
 		SELECT id || '-r', id, 1, kind, queue, '', 'seed', finished_at - make_interval(secs => dur / 1000),
 		       finished_at,
 		       CASE WHEN bucket < 90 THEN 'success' WHEN bucket < 97 THEN 'error' WHEN bucket = 97 THEN 'timeout'
 		            WHEN bucket = 98 THEN 'crashed' ELSE 'snooze' END,
 		       CASE WHEN bucket BETWEEN 90 AND 97 THEN 'transient' END,
+		       CASE WHEN bucket BETWEEN 90 AND 97 THEN `+seedErrorMessageSQL+` END,
+		       CASE WHEN bucket BETWEEN 90 AND 97 THEN substr(md5(kind || ':' || (g % 7)), 1, 16) END,
 		       CASE WHEN bucket = 98 THEN NULL ELSE round(dur)::int END,
 		       (random() * 2000)::int, (random() * 500)::bigint, 0,
 		       CASE WHEN bucket < 90 THEN 'succeeded' WHEN bucket BETWEEN 95 AND 96 THEN 'discarded'
@@ -396,14 +463,43 @@ func seedStatsHistory(ctx context.Context, db *gorm.DB, runs int, end time.Time)
 		statsExplainKinds, end, end, statsExplainRunning); err != nil {
 		return err
 	}
-	return exec("ready jobs", `
+	if err := exec("ready jobs", `
 		INSERT INTO jobs (id, created_at, updated_at, metadata, kind, queue, args, priority, state,
 		                  attempt, max_attempts, scheduled_at, executor_class, tags)
 		SELECT 'ready-' || g, ?, ?, '{}'::jsonb, 'kind-' || (g % ?), (ARRAY['default','bulk','priority'])[1 + (g % 3)],
 		       '{}'::jsonb, 100, 'available', 0, 25, ?::timestamptz - make_interval(secs => g), '', '[]'::jsonb
 		FROM generate_series(1, ?) AS g`,
-		end, end, statsExplainKinds, end, statsExplainReady)
+		end, end, statsExplainKinds, end, statsExplainReady); err != nil {
+		return err
+	}
+	return exec("queue samples", `
+		INSERT INTO job_queue_samples (queue, sampled_at, ready, scheduled_ahead, running, paused, oldest_ready_ms)
+		SELECT q, ?::timestamptz + make_interval(mins => m), (random() * 2000)::bigint, (random() * 500)::bigint,
+		       (random() * 200)::bigint, 0, (random() * 60000)::bigint
+		FROM generate_series(0, ? - 1) AS m, unnest((ARRAY['default','bulk','priority'])[1:?]) AS q`,
+		from, statsExplainDays*24*60, statsExplainSampleQueues)
 }
+
+// seedJobIDSQL is the SQL of a UUIDv7-shaped id for a job inserted at
+// insertedAt, a timestamptz expression, its tail the row number row: the
+// insert's millisecond in the first 12 hex digits, then -7000-8000-, then row
+// in 12 hex digits — the shape the runtime mints, so a range of ids is a range
+// of insert times.
+func seedJobIDSQL(insertedAt, row string) string {
+	ms := `lpad(to_hex(floor(extract(epoch FROM ` + insertedAt + `) * 1000)::bigint), 12, '0')`
+	return `substr(` + ms + `, 1, 8) || '-' || substr(` + ms + `, 9, 4) || '-7000-8000-' || lpad(to_hex(` + row + `), 12, '0')`
+}
+
+// seedErrorMessageSQL is a seeded failure's message, one of seven shapes by row
+// number, each carrying values a fingerprint masks.
+const seedErrorMessageSQL = `(CASE g % 7
+	WHEN 0 THEN 'upstream returned ' || (500 + g % 4) || ' for item ' || g
+	WHEN 1 THEN 'dial tcp 10.0.' || (g % 255) || '.' || (g % 7) || ':5432: connect: connection refused'
+	WHEN 2 THEN 'context deadline exceeded after ' || (g % 60) || 's waiting on ''warehouse-' || (g % 9) || ''''
+	WHEN 3 THEN 'row ' || g || ' rejected: field "amount" = "' || (g % 100) || '.00 USD"'
+	WHEN 4 THEN 'lock timeout on order ' || g
+	WHEN 5 THEN 'rate limited: retry after ' || (g % 30) || 's'
+	ELSE 'connection reset by peer after ' || (g % 1000) || ' bytes' END)`
 
 // Text renders the stats-explain artifact: the fixture, a latency table, then
 // every captured statement and its plan.
@@ -414,20 +510,24 @@ func (r StatsExplainReport) Text() string {
 		fmt.Fprintf(&b, "server: %s\n", strings.TrimSpace(r.Server))
 	}
 	fmt.Fprintf(&b, "schema: %s\n", r.Schema)
-	fmt.Fprintf(&b, "fixture: %d runs over %d days across %d kinds, plus one hour of %d runs; %d running, %d ready\n",
-		r.Runs, r.Days, r.Kinds, statsExplainDenseHour, statsExplainRunning, statsExplainReady)
+	fmt.Fprintf(&b, "fixture: %d runs over %d days across %d kinds, plus one hour of %d runs; %d running, %d ready; "+
+		"UUIDv7 job ids; failures with messages and fingerprints; a queue sample a minute for %d queues\n",
+		r.Runs, r.Days, r.Kinds, statsExplainDenseHour, statsExplainRunning, statsExplainReady, statsExplainSampleQueues)
 	fmt.Fprintf(&b, "job_runs: %.1f MB total, %.1f MB of indexes; job_run_finishes: %.1f MB; jobs: %.1f MB total\n",
 		mb(r.RunsBytes), mb(r.RunsIndex), mb(r.LogBytes), mb(r.JobsBytes))
 	fmt.Fprintf(&b, "job_stats_hourly: %d rows, %.1f MB, rolled up from scratch in %s (%d hours)\n",
 		r.StatsRows, mb(r.StatsBytes), r.RollupAll.Round(time.Millisecond), r.RollupHours)
+	fmt.Fprintf(&b, "job_error_groups_hourly: %d rows, %.1f MB; job_queue_samples: %d rows, %.1f MB\n",
+		r.GroupRows, mb(r.GroupBytes), r.SampleRows, mb(r.SampleBytes))
 	b.WriteString(
 		"\nEvery statement was captured from the flywheel read API named above it through a recording GORM\n" +
-			"logger and explained verbatim with EXPLAIN (ANALYZE, BUFFERS), after VACUUM (ANALYZE). The clock is\n" +
+			"logger and explained verbatim with EXPLAIN (ANALYZE, BUFFERS), after VACUUM (ANALYZE); the seed is\n" +
+			"analyzed before the rollup too, so the rollup plans with statistics. The clock is\n" +
 			"fixed at the end of the seeded range: the rollups cover every closed hour, and the hour in\n" +
 			"progress is read raw. Latency is the wall time of the whole API call — every statement plus the\n" +
 			"Go-side merge — as the median of 7 calls after a warm-up. The rollup pass runs through a Scheduler\n" +
 			"that has made its start-up pass, on its own handle, so its statements (primary-key reads of\n" +
-			"job_stats_progress and an empty range delete) are not captured.\n\n",
+			"job_stats_progress and an empty range delete of each rollup table) are not captured.\n\n",
 	)
 	fmt.Fprintf(&b, "%-36s %10s %10s %10s %6s\n", "read", "median", "min", "max", "stmts")
 	for _, read := range r.Reads {

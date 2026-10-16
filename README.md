@@ -260,12 +260,15 @@ Each section below is self-contained; open the ones you need.
 <summary><strong><code>Schema setup — pick exactly one install path</code></strong></summary>
 <br>
 
-`go-flywheel` owns ten tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
+`go-flywheel` owns twelve tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
 `limiter_buckets` and `limiter_holds` for the shared database-backed limiter (additive: empty unless you
 construct a `DBLimiter`); `job_run_finishes`, `job_stats_hourly`, and `job_stats_progress`, the finish
 log every finalize writes and the stats rollup's tables; `job_audit`, the history every control
-writes; and `job_kinds`, the kind catalog `PublishKinds` writes (empty unless you publish one) — and there are **two ways to install them. Pick exactly one.** They are not layers; running both means two migration authorities against one
-database.
+writes; `job_kinds`, the kind catalog `PublishKinds` writes (empty unless you publish one);
+`job_error_groups_hourly`, the error groups the stats rollup writes beside its hours; and
+`job_queue_samples`, each queue's depth over time (empty unless a Scheduler samples queues) — and there
+are **two ways to install them. Pick exactly one.** They are not layers; running both means two
+migration authorities against one database.
 
 | Question | **Library-owned** | **Host-owned** |
 |---|---|---|
@@ -274,11 +277,11 @@ database.
 | Who sets the storage parameters? | `Migrate(db)` | you, from `InstallStorageParameters` |
 | Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
 | Does the runtime run DDL at startup? | yes, every start | no |
-| Is a co-located host schema safe? | only if the host's tooling excludes all ten tables | yes — the tables are in your loader |
+| Is a co-located host schema safe? | only if the host's tooling excludes all twelve tables | yes — the tables are in your loader |
 | **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
 
 **The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
-same database, your migration tool must know about all ten — a tool that cannot see them will happily
+same database, your migration tool must know about all twelve — a tool that cannot see them will happily
 propose dropping them. A tool told to leave the runtime's tables alone by name needs every name above.
 
 **Library-owned** — one call, no external tooling:
@@ -299,7 +302,7 @@ up-to-date schema — a re-run creates nothing and changes nothing — so it is 
 
 ```go
 // 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
-//    so your migration tool knows all ten tables exist and never proposes dropping them.
+//    so your migration tool knows all twelve tables exist and never proposes dropping them.
 stmts, err := gormschema.New("postgres").Load(
     append(myapp.AllModels(), flywheel.Models()...)...,
 )
@@ -315,7 +318,7 @@ if err := flywheel.InstallStorageParameters(ctx, db); err != nil {
 
 Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
 it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
-GORM struct tag cannot express. `IndexSet` declares fourteen indexes, and four of them are
+GORM struct tag cannot express. `IndexSet` declares sixteen indexes, and four of them are
 correctness-bearing: `jobs_unique_key`, `jobs_unique_active_key`, `job_runs_job_attempt`, and
 `idx_job_periodics_slug`. Without `jobs_unique_key` and `jobs_unique_active_key` the database accepts
 duplicate enqueues and **`ErrAlreadyEnqueued` is never returned.** Use `flywheel.IndexSet(dialect)` when
@@ -1732,10 +1735,12 @@ for an at-a-glance report of queue health, schedules, and recent failures.
 **Dashboards over the database.** For history rather than this minute, set the scheduler's
 `StatsRollupInterval` and read the runtime's own tables: `ListRunning` (what is running now, slow runs
 flagged), `ListFinished`, `QueryJobs` and `CountJobs` (any filter, paged, with an honest count), `GetJob`
-(one job in full, args bounded), `QueueDepths`, `Stats` and
-`StatsSeries` (per-kind outcomes, success rate, duration and queue-wait percentiles over any window,
-from hourly rollups that outlive retention), `Baselines`, and `Anomalies` (a low-noise "this kind got
-slower / started failing"). Every read is bounded and indexed — tens of milliseconds at a million runs.
+(one job in full, args bounded), `QueueDepths` and `QueueDepthHistory` (a queue's depth now and over
+time), `Stats` and `StatsSeries` (outcomes, jobs enqueued, success rate, duration and queue-wait
+percentiles per kind or per queue over any window, from hourly rollups that outlive retention),
+`ErrorGroups` (what is failing, grouped by fingerprint), `Baselines`, and `Anomalies` (a low-noise "this
+kind got slower / started failing"). Every read is bounded and indexed — tens of milliseconds at a million
+runs; the next guide covers the queue and failure views.
 [`docs/INTEGRATING.md`](docs/INTEGRATING.md) covers the data contract, each API's cost, recipes, direct
 SQL, and the upgrade for an existing database; [`examples/dashboard-api`](examples/dashboard-api/main.go)
 is a read-only JSON API over all of it.
@@ -1743,13 +1748,71 @@ is a read-only JSON API over all of it.
 </details>
 
 <details>
+<summary><strong><code>Stats by queue, queue history, and error groups</code></strong></summary>
+<br>
+
+`Stats` reports a window per kind by default. `StatsParams.GroupBy` reports it per queue
+(`StatsByQueue`) or per kind on each queue (`StatsByKindQueue`), from the same hourly rollups and raw
+tail, and every entry's `Enqueued` counts the jobs inserted in the window beside the attempts that
+finished — a queue whose inserts outrun its finishes, hour after hour, is falling behind:
+
+```go
+res, err := flywheel.Stats(ctx, db, flywheel.StatsParams{
+    From: now.Add(-24 * time.Hour), To: now, GroupBy: flywheel.StatsByQueue,
+})
+for _, q := range res.Kinds {
+    // q.Queue, q.Enqueued, q.Attempts, q.Discarded, q.SuccessRate, q.QueueWait.P95 …
+}
+```
+
+`Enqueued` reads the insert time a job's UUIDv7 id carries, not `created_at`, so a job a fixed clock
+stamped with another time counts where its id says, and a job inserted with an id of your own counts in
+the hour its leading 48 bits name. An hour the rollup closed before it counted inserts reads zero until
+`RebuildStats` re-rolls it. `flywheel stats --by queue` prints the same table.
+
+**A queue's depth over time.** `QueueDepths` is this instant. Set `SchedulerConfig.QueueSampleInterval`
+(a minute is typical) and the scheduler samples every queue's depth into `job_queue_samples`, keeping
+`QueueSampleRetention` (30 days by default). `QueueDepthHistory` reads one queue's buckets, each count the
+bucket's maximum so a spike shows, at most `MaxHistoryPoints` (1,440) of them:
+
+```go
+points, err := flywheel.QueueDepthHistory(ctx, db, flywheel.QueueHistoryParams{
+    Queue: "default", From: now.Add(-7 * 24 * time.Hour), // Step zero: the smallest whole minute that fits
+})
+```
+
+**Error groups.** Every attempt that ends in `error` or `timeout` stores a fingerprint: 16 hex characters
+over its kind, its error class, and its message with the values that differ between occurrences masked —
+UUIDs, email addresses, URLs, hex runs, quoted values, numbers (`NormalizeErrorMessage`). The stats rollup
+groups each hour's failures by kind and fingerprint, and `ErrorGroups` reads any window, most failures
+first, with when each group was first and last seen and a sample of its message:
+
+```go
+res, err := flywheel.ErrorGroups(ctx, db, flywheel.ErrorGroupsParams{From: now.Add(-24 * time.Hour), To: now})
+for _, g := range res.Groups {
+    // g.Kind, g.Message, g.Failures, g.Retried, g.Discarded, g.FirstSeen, g.LastSeen …
+}
+```
+
+A worker whose messages vary while its failure is one thing — an upstream's error code — names the
+failure by returning an error that implements `ErrorFingerprinter`; every attempt that returns the same
+value joins one group. `ErrorFingerprint(kind, class, message)` computes the fingerprint a message gets,
+and `JobRunView.ErrorFingerprint` reports a run's. The masking rules are versioned
+(`ErrorFingerprintVersion`): a change to any of them is a new version, after which groups restart.
+
+[`docs/INTEGRATING.md`](docs/INTEGRATING.md#error-groups-what-is-failing) covers each read's cost, the
+tables behind them for direct SQL, and the upgrade.
+
+</details>
+
+<details>
 <summary><strong><code>Retention and scheduler maintenance</code></strong></summary>
 <br/>
 
-The `Scheduler` runs up to six maintenance activities, each on its own goroutine and its own
+The `Scheduler` runs up to seven maintenance activities, each on its own goroutine and its own
 cadence: the periodic tick, the lease sweep, and — when you enable them — a retention prune, a
-queue-health heartbeat, the hourly stats rollup, and the reconcile that keeps declared periodics
-present.
+queue-health heartbeat, the hourly stats rollup, the queue-depth sampler, and the reconcile that keeps
+declared periodics present.
 
 Independence is the point. A slow retention prune must not delay the lease sweep, because the sweep is
 the only path by which work lost to a crashed process comes back. An activity also never overlaps

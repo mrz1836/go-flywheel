@@ -76,15 +76,19 @@ func rowsFor(f statsFilter, perKind bool) rollupRows {
 // or to backfill the range with RebuildStats.
 var ErrStatsNotRolledUp = errors.New("flywheel: stats window is not covered by hourly rollups")
 
-// runAgg is the aggregate of one (kind, queue)'s finished runs over a window: the
-// shape both the hourly rollup stores and the stats reads merge. It is built by
-// one function, aggregateRuns, whichever of the two is asking — which is what
-// makes a window served from rollups identical to the same window served raw.
+// runAgg is the aggregate of one (kind, queue)'s finished runs over a window,
+// and of its jobs inserted in it: the shape both the hourly rollup stores and
+// the stats reads merge. It is built by one function, aggregateRuns, whichever
+// of the two is asking — which is what makes a window served from rollups
+// identical to the same window served raw.
 type runAgg struct {
 	Kind, Queue string
 
 	Attempts, Success, Error, Timeout, Snooze, Cancelled, Crashed int64
 	Superseded, Discarded                                         int64
+	// Enqueued is the jobs inserted in the window, by their ids (see
+	// countEnqueued); a group can hold inserts and no finished run.
+	Enqueued int64
 
 	DurCount, DurSumMs, DurMaxMs int64
 	DurHist                      histogram
@@ -115,6 +119,7 @@ func (a *runAgg) merge(other *runAgg) {
 	a.Crashed += other.Crashed
 	a.Superseded += other.Superseded
 	a.Discarded += other.Discarded
+	a.Enqueued += other.Enqueued
 
 	if other.DurCount > 0 && (other.DurMaxMs > a.DurMaxMs ||
 		(other.DurMaxMs == a.DurMaxMs && other.SlowestRunID > a.SlowestRunID)) {
@@ -168,8 +173,10 @@ const (
 )
 
 // runWindowSQL is the derived table every aggregate reads: one row per run
-// finished in [from, to), with its kind and queue resolved and the flags the
-// counters need precomputed.
+// finished in [from, to), with its kind and queue resolved, the flags the
+// counters need precomputed, and what an error group needs of a failure — its
+// finish, class, stored fingerprint, and message, the message read for an error
+// or a timeout only.
 //
 // The window is a range of job_run_finishes' primary key — the finish log is
 // what makes job_runs searchable by finish time — and each entry reaches its run
@@ -181,7 +188,9 @@ const runWindowSQL = `SELECT ` +
 	`r.id AS id, r.outcome AS outcome, ` +
 	`CASE WHEN r.superseded THEN 1 ELSE 0 END AS sup, ` +
 	resolvedJobStateExpr + ` AS job_state, ` +
-	`r.duration_ms AS duration_ms, r.queue_wait_ms AS queue_wait_ms, r.cost_micros AS cost_micros ` +
+	`r.duration_ms AS duration_ms, r.queue_wait_ms AS queue_wait_ms, r.cost_micros AS cost_micros, ` +
+	`f.finished_at AS finished_at, r.error_class AS error_class, r.error_fingerprint AS error_fingerprint, ` +
+	`CASE WHEN r.outcome IN ('error', 'timeout') THEN r.error_message END AS error_message ` +
 	`FROM job_run_finishes f JOIN job_runs r ON r.id = f.run_id ` +
 	`WHERE f.finished_at >= ? AND f.finished_at < ?`
 
@@ -203,10 +212,36 @@ func filterSQL(f statsFilter) (string, []any) {
 	return ` WHERE ` + strings.Join(conds, " AND "), args
 }
 
-// aggregateRuns aggregates the runs finished in [from, to) per (kind, queue),
-// finding them through the job_run_finishes log. It is the one aggregate code
-// path: the hourly rollup stores its result, and the stats reads call it directly
-// for the part of a window the rollups do not cover yet.
+// aggregateRuns is aggregateWindow's per-(kind, queue) half: the runs finished
+// in [from, to) and the jobs inserted in it. The stats reads call it for the
+// part of a window the rollups do not cover yet.
+func aggregateRuns(ctx context.Context, db *gorm.DB, from, to time.Time, f statsFilter) (map[statsGroup]*runAgg, error) {
+	win, err := aggregateWindow(ctx, db, from, to, f)
+	if err != nil {
+		return nil, err
+	}
+	return win.runs, nil
+}
+
+// windowAgg is one window's aggregates: per (kind, queue), its finished runs
+// and inserted jobs; and per error group, its failures.
+type windowAgg struct {
+	runs   map[statsGroup]*runAgg
+	groups map[errorGroupKey]*errorGroupAgg
+}
+
+// aggregateWindow aggregates the runs finished in [from, to) per (kind, queue),
+// finding them through the job_run_finishes log, adds each group's jobs inserted
+// in the window (countEnqueued), and groups the window's failures by kind and
+// fingerprint. It is the one aggregate code path: the hourly rollup stores its
+// result, and the stats and error-group reads aggregate the part of a window the
+// rollups do not cover yet with it.
+//
+// A failure is an attempt whose outcome is error or timeout and that was not
+// superseded, the stats' own rule, so a group never counts more failures than
+// the kind's error and timeout counters. Its group is its resolved kind and its
+// stored fingerprint, or, for a run written before fingerprints were stored, the
+// one ErrorFingerprint computes from the run's class and message.
 //
 // It reads the window once and aggregates in Go. Each run in the window costs
 // the database one primary-key probe of job_runs, and that probe is the whole
@@ -218,39 +253,147 @@ func filterSQL(f statsFilter) (string, []any) {
 //
 // Bounds are bound in UTC, the zone every job_runs timestamp is stamped in, so
 // the comparison is right on SQLite, where it is textual.
-func aggregateRuns(ctx context.Context, db *gorm.DB, from, to time.Time, f statsFilter) (map[statsGroup]*runAgg, error) {
-	out := map[statsGroup]*runAgg{}
+func aggregateWindow(ctx context.Context, db *gorm.DB, from, to time.Time, f statsFilter) (windowAgg, error) {
+	out := windowAgg{runs: map[statsGroup]*runAgg{}, groups: map[errorGroupKey]*errorGroupAgg{}}
 	if !from.Before(to) {
 		return out, nil
 	}
 	where, filterArgs := filterSQL(f)
 	rows, err := db.WithContext(ctx).Raw(`SELECT t.kind, t.queue, t.id, t.outcome, t.sup, t.job_state, `+
-		`t.duration_ms, t.queue_wait_ms, t.cost_micros FROM (`+runWindowSQL+`) t`+where,
+		`t.duration_ms, t.queue_wait_ms, t.cost_micros, t.finished_at, t.error_class, t.error_fingerprint, `+
+		`t.error_message FROM (`+runWindowSQL+`) t`+where,
 		append([]any{from.UTC(), to.UTC()}, filterArgs...)...).Rows()
 	if err != nil {
-		return nil, fmt.Errorf("aggregate runs: %w", err)
+		return out, fmt.Errorf("aggregate runs: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var (
-			kind, queue, id, outcome string
-			sup                      int64
-			jobState                 *string
-			duration, wait, cost     *int64
+			kind, queue, id, outcome    string
+			sup                         int64
+			jobState                    *string
+			duration, wait, cost        *int64
+			finished                    any
+			class, fingerprint, message *string
 		)
-		if err := rows.Scan(&kind, &queue, &id, &outcome, &sup, &jobState, &duration, &wait, &cost); err != nil {
-			return nil, fmt.Errorf("aggregate runs: scan: %w", err)
+		if err := rows.Scan(&kind, &queue, &id, &outcome, &sup, &jobState, &duration, &wait, &cost,
+			&finished, &class, &fingerprint, &message); err != nil {
+			return out, fmt.Errorf("aggregate runs: scan: %w", err)
 		}
 		g := statsGroup{Kind: kind, Queue: queue}
-		a, ok := out[g]
+		a, ok := out.runs[g]
 		if !ok {
 			a = newRunAgg(kind, queue)
-			out[g] = a
+			out.runs[g] = a
 		}
 		a.observe(id, RunOutcome(outcome), sup != 0, jobState, duration, wait, cost)
+		if sup == 0 && failedOutcome(RunOutcome(outcome)) {
+			finishedAt, err := scannedTime(finished)
+			if err != nil {
+				return out, fmt.Errorf("aggregate runs: %w", err)
+			}
+			out.observeFailure(kind, id, finishedAt, class, fingerprint, message, jobState)
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("aggregate runs: %w", err)
+		return out, fmt.Errorf("aggregate runs: %w", err)
+	}
+	counts, err := countEnqueued(ctx, db, from, to, f)
+	if err != nil {
+		return out, err
+	}
+	for g, n := range counts {
+		a, ok := out.runs[g]
+		if !ok {
+			a = newRunAgg(g.Kind, g.Queue)
+			out.runs[g] = a
+		}
+		a.Enqueued += n
+	}
+	return out, nil
+}
+
+// scannedTime is a timestamp a raw read scanned into an any, in UTC. Both
+// dialects' drivers hand back a time.Time there. A *time.Time destination
+// instead has PostgreSQL's driver plan the conversion for every row, which over
+// an hour of runs cost more than the rest of the read.
+func scannedTime(v any) (time.Time, error) {
+	t, ok := v.(time.Time)
+	if !ok {
+		return time.Time{}, fmt.Errorf("read a %T where a timestamp was expected", v)
+	}
+	return t.UTC(), nil
+}
+
+// observeFailure counts one failure into its error group: by the stored
+// fingerprint, or by the one computed from its class and message when the run
+// stores none.
+func (w windowAgg) observeFailure(
+	kind, id string, finishedAt time.Time, class, fingerprint, message, jobState *string,
+) {
+	var c, msg string
+	if class != nil {
+		c = *class
+	}
+	if message != nil {
+		msg = *message
+	}
+	fp := ""
+	if fingerprint != nil {
+		fp = *fingerprint
+	}
+	if fp == "" {
+		fp = ErrorFingerprint(kind, ErrorClass(c), msg)
+	}
+	key := errorGroupKey{Kind: kind, Fingerprint: fp}
+	g, ok := w.groups[key]
+	if !ok {
+		g = newErrorGroupAgg(key)
+		w.groups[key] = g
+	}
+	g.observe(runRef{At: finishedAt.UTC(), ID: id, exact: true}, c, msg, jobState != nil && *jobState == string(StateDiscarded))
+}
+
+// countEnqueued counts the jobs inserted in [from, to) per (kind, queue), by
+// the insert time their ids carry: the jobs whose id is in [idFloor(from),
+// idFloor(to)), one range of the jobs primary key. It counts by the id rather
+// than created_at, which a fixed or simulated clock can stamp with another
+// time, and counts soft-deleted jobs too — the insert happened. A job a host
+// inserted with an id of its own counts in the hour its leading 48 bits name.
+func countEnqueued(
+	ctx context.Context, db *gorm.DB, from, to time.Time, f statsFilter,
+) (map[statsGroup]int64, error) {
+	out := map[statsGroup]int64{}
+	if !from.Before(to) {
+		return out, nil
+	}
+	query := `SELECT kind, queue, count(*) FROM jobs WHERE id >= ? AND id < ?`
+	args := []any{idFloor(from), idFloor(to)}
+	if f.Kind != "" {
+		query += ` AND kind = ?`
+		args = append(args, f.Kind)
+	}
+	if f.Queue != "" {
+		query += ` AND queue = ?`
+		args = append(args, f.Queue)
+	}
+	rows, err := db.WithContext(ctx).Raw(query+` GROUP BY kind, queue`, args...).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("count enqueued jobs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			g statsGroup
+			n int64
+		)
+		if err := rows.Scan(&g.Kind, &g.Queue, &n); err != nil {
+			return nil, fmt.Errorf("count enqueued jobs: scan: %w", err)
+		}
+		out[g] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("count enqueued jobs: %w", err)
 	}
 	return out, nil
 }
@@ -327,8 +470,8 @@ type statsGroup struct {
 // hourRows renders one hour's aggregates as the rows the rollup stores: one per
 // (kind, queue) group, one per-kind total, and the hour's total (see
 // statsTotalKey), each with the percentile columns a direct-SQL trend chart reads.
-// An hour with no aggregates renders as no rows: job_stats_progress, not a row,
-// records that it was rolled.
+// An hour with no aggregates — no finished run and no insert — renders as no
+// rows: job_stats_progress, not a row, records that it was rolled.
 func hourRows(bucket time.Time, aggs map[statsGroup]*runAgg, rolledAt time.Time) []jobStatsHourlyRow {
 	if len(aggs) == 0 {
 		return nil
@@ -376,6 +519,7 @@ func rowFromAgg(bucket time.Time, a *runAgg, rolledAt time.Time) jobStatsHourlyR
 		Crashed:         a.Crashed,
 		Superseded:      a.Superseded,
 		Discarded:       a.Discarded,
+		Enqueued:        a.Enqueued,
 		DurCount:        a.DurCount,
 		DurSumMs:        a.DurSumMs,
 		DurMaxMs:        a.DurMaxMs,
@@ -400,9 +544,10 @@ func rowFromAgg(bucket time.Time, a *runAgg, rolledAt time.Time) jobStatsHourlyR
 }
 
 // errRollupWouldShrink is returned by a guarded rollupHour when the recompute
-// counts fewer runs than the rollup already stores for the hour — the signature
-// of raw history retention has pruned since the hour was rolled.
-var errRollupWouldShrink = errors.New("recompute counts fewer runs than the stored rollup")
+// counts fewer runs, or fewer enqueued jobs, than the rollup already stores for
+// the hour — the signature of raw history retention (or a host) has deleted
+// since the hour was rolled.
+var errRollupWouldShrink = errors.New("recompute counts fewer than the stored rollup")
 
 // rollupHour recomputes one closed hour and replaces its rollup rows, in one
 // transaction: delete the hour, then upsert what the recompute produced. The
@@ -412,8 +557,9 @@ var errRollupWouldShrink = errors.New("recompute counts fewer runs than the stor
 // hour harmless: both compute the same rows, and whichever commits second
 // overwrites the first with identical values.
 //
-// guard refuses a recompute that would count fewer runs than the stored rows,
-// returning errRollupWouldShrink and leaving the hour untouched. RebuildStats
+// guard refuses a recompute that would count fewer runs or fewer enqueued jobs
+// than the stored rows, returning errRollupWouldShrink and leaving the hour
+// untouched. RebuildStats
 // sets it, and so does the re-roll after a backfill; the rollup activity, which
 // rolls hours no rollup has covered yet, does not need it.
 //
@@ -422,24 +568,29 @@ var errRollupWouldShrink = errors.New("recompute counts fewer runs than the stor
 // Either way the transaction bumps job_stats_progress's version, which is what
 // tells every process's Baselines memo that a rolled hour changed.
 //
-// An hour with no runs writes no rows; it is still recorded as rolled, by the
-// step.
+// An hour with no runs and no inserts writes no rows; it is still recorded as
+// rolled, by the step.
+//
+// The hour's error groups are part of the hour: replaced in the same
+// transaction, after its stats rows, so the two tables always hold the same
+// hours.
 //
 // It reports the number of (kind, queue) groups written.
 func rollupHour(
 	ctx context.Context, db *gorm.DB, hour, rolledAt time.Time, guard bool, step coverageStep,
 ) (int, error) {
-	aggs, err := aggregateRuns(ctx, db, hour, hour.Add(time.Hour), statsFilter{})
+	win, err := aggregateWindow(ctx, db, hour, hour.Add(time.Hour), statsFilter{})
 	if err != nil {
 		return 0, err
 	}
-	rows := hourRows(hour, aggs, rolledAt)
+	rows := hourRows(hour, win.runs, rolledAt)
+	groups := errorGroupHourRows(hour, win.groups, rolledAt)
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := lockStatsHour(tx, hour); err != nil {
 			return err
 		}
 		if guard {
-			if err := refuseShrink(tx, hour, aggs); err != nil {
+			if err := refuseShrink(tx, hour, win.runs); err != nil {
 				return err
 			}
 		}
@@ -451,12 +602,20 @@ func rollupHour(
 				return fmt.Errorf("write hour: %w", err)
 			}
 		}
+		if err := tx.Where("bucket_start_unix = ?", hour.Unix()).Delete(&jobErrorGroupHourlyRow{}).Error; err != nil {
+			return fmt.Errorf("clear hour's error groups: %w", err)
+		}
+		if len(groups) > 0 {
+			if err := tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(&groups).Error; err != nil {
+				return fmt.Errorf("write hour's error groups: %w", err)
+			}
+		}
 		return applyCoverageStep(tx, step, rolledAt)
 	})
 	if err != nil {
 		return 0, fmt.Errorf("roll up hour %s: %w", hour.UTC().Format(time.RFC3339), err)
 	}
-	return len(aggs), nil
+	return len(win.runs), nil
 }
 
 // statsLockClass is the first key of the advisory lock that serializes writers
@@ -483,22 +642,28 @@ func lockStatsHour(tx *gorm.DB, hour time.Time) error {
 	return nil
 }
 
-// refuseShrink compares a recompute's run count for hour against what the
-// stored rollup rows count, inside the replacing transaction.
+// refuseShrink compares a recompute's run count and enqueue count for hour
+// against what the stored hour-total row counts, inside the replacing
+// transaction, and refuses when either is fewer.
 func refuseShrink(tx *gorm.DB, hour time.Time, aggs map[statsGroup]*runAgg) error {
-	var stored struct{ N int64 }
+	var stored struct{ Runs, Enqueued int64 }
 	if err := tx.Model(&jobStatsHourlyRow{}).
-		Select("CAST(COALESCE(SUM(attempts + superseded), 0) AS BIGINT) AS n").
+		Select("CAST(COALESCE(SUM(attempts + superseded), 0) AS BIGINT) AS runs, "+
+			"CAST(COALESCE(SUM(enqueued), 0) AS BIGINT) AS enqueued").
 		Where("bucket_start_unix = ? AND kind = ? AND queue = ?", hour.Unix(), statsTotalKey, statsTotalKey).
 		Scan(&stored).Error; err != nil {
 		return fmt.Errorf("read stored hour: %w", err)
 	}
-	var recomputed int64
+	var runs, enqueued int64
 	for _, a := range aggs {
-		recomputed += a.Attempts + a.Superseded
+		runs += a.Attempts + a.Superseded
+		enqueued += a.Enqueued
 	}
-	if recomputed < stored.N {
-		return fmt.Errorf("%w (%d stored, %d recomputed)", errRollupWouldShrink, stored.N, recomputed)
+	if runs < stored.Runs {
+		return fmt.Errorf("%w: runs (%d stored, %d recomputed)", errRollupWouldShrink, stored.Runs, runs)
+	}
+	if enqueued < stored.Enqueued {
+		return fmt.Errorf("%w: enqueued jobs (%d stored, %d recomputed)", errRollupWouldShrink, stored.Enqueued, enqueued)
 	}
 	return nil
 }
@@ -534,6 +699,78 @@ func prevFinishedAt(ctx context.Context, db *gorm.DB, lo, hi time.Time) (time.Ti
 	return at[0].UTC(), true, nil
 }
 
+// nextActivityAt returns the earliest activity at or after from: the earlier of
+// the next finish (nextFinishedAt) and the insert time of the next job inserted
+// in [from, hi), or ok false when there is neither. It is how the rollup walk
+// and the raw-span trim skip a quiet stretch, now that an hour holding only
+// inserts has rows to roll: one more ordered probe, of the jobs primary key. A
+// next id whose time idTime cannot read returns from itself, so a walk rolls the
+// hour it is at and advances an hour at a time.
+func nextActivityAt(ctx context.Context, db *gorm.DB, from, hi time.Time) (time.Time, bool, error) {
+	next, found, err := nextFinishedAt(ctx, db, from)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	bound := hi
+	if found && next.Before(bound) {
+		bound = next
+	}
+	ids, err := probeJobIDs(ctx, db, from, bound, "id")
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if len(ids) == 0 {
+		return next, found, nil
+	}
+	at, ok := idTime(ids[0])
+	if !ok {
+		return from.UTC(), true, nil
+	}
+	return at, true, nil
+}
+
+// prevActivityAt is nextActivityAt's mirror: the later of the latest finish in
+// [lo, hi) and the insert time of the last job inserted in it, or ok false when
+// there is neither. A last id whose time idTime cannot read returns an instant
+// of the hour just below hi.
+func prevActivityAt(ctx context.Context, db *gorm.DB, lo, hi time.Time) (time.Time, bool, error) {
+	prev, found, err := prevFinishedAt(ctx, db, lo, hi)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	floor := lo
+	if found && prev.After(floor) {
+		floor = prev
+	}
+	ids, err := probeJobIDs(ctx, db, floor, hi, "id DESC")
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if len(ids) == 0 {
+		return prev, found, nil
+	}
+	at, ok := idTime(ids[0])
+	if !ok {
+		return hi.UTC().Add(-time.Hour), true, nil
+	}
+	return at, true, nil
+}
+
+// probeJobIDs reads at most one id of a job inserted in [from, to), in order, by
+// the ids' range (see countEnqueued) — one ordered probe of the jobs primary key,
+// soft-deleted jobs included.
+func probeJobIDs(ctx context.Context, db *gorm.DB, from, to time.Time, order string) ([]string, error) {
+	var ids []string
+	if !from.Before(to) {
+		return ids, nil
+	}
+	if err := db.WithContext(ctx).Raw(`SELECT id FROM jobs WHERE id >= ? AND id < ? ORDER BY `+order+` LIMIT 1`,
+		idFloor(from), idFloor(to)).Scan(&ids).Error; err != nil {
+		return nil, fmt.Errorf("probe inserted jobs: %w", err)
+	}
+	return ids, nil
+}
+
 // nextFinishedAt returns the earliest finish at or after from, or ok false when
 // no run has finished since. It is one ordered probe of job_run_finishes' primary
 // key — an ordered read of the typed column rather than MIN(), which SQLite
@@ -561,8 +798,8 @@ type rollupConfig struct {
 
 // RollupResult reports what one stats rollup pass did.
 type RollupResult struct {
-	// Hours is the closed hours rolled up with runs in them. Empty hours, skipped
-	// in one probe per quiet stretch, are not counted.
+	// Hours is the closed hours rolled up with runs or inserts in them. Empty
+	// hours, skipped in one probe per quiet stretch, are not counted.
 	Hours int `json:"hours"`
 	// Rolled lists the start of each hour written, in hour order.
 	Rolled []time.Time `json:"rolled"`
@@ -574,13 +811,15 @@ type RollupResult struct {
 	// covered range reaches back to the retention; false when it stopped on its
 	// per-pass ceiling with hours still to roll.
 	CaughtUp bool `json:"caught_up"`
-	// Pruned is the rollup rows deleted for being older than the retention.
+	// Pruned is the rollup rows — stats and error groups — deleted for being
+	// older than the retention.
 	Pruned int64 `json:"pruned"`
 }
 
-// rollupPass rolls up closed hours into job_stats_hourly, at most cfg.maxHours
-// of them, extending the covered range recorded in job_stats_progress, then
-// prunes rollup rows older than the retention.
+// rollupPass rolls up closed hours into job_stats_hourly and
+// job_error_groups_hourly, at most cfg.maxHours of them, extending the covered
+// range recorded in job_stats_progress, then prunes both tables' rows older than
+// the retention.
 //
 // An hour is closed once its end plus the grace is in the past. The pass first
 // raises the range to the retention boundary (now minus cfg.retention), creating
@@ -628,12 +867,14 @@ func rollupPass(ctx context.Context, db *gorm.DB, now time.Time, cfg rollupConfi
 	res.RolledFrom, res.Watermark = p.From, p.To
 
 	// Prune by primary-key range: the hours below the retention boundary, which
-	// the range was raised past above.
-	pruned := db.WithContext(ctx).Where("bucket_start_unix < ?", earliest.Unix()).Delete(&jobStatsHourlyRow{})
-	if pruned.Error != nil {
-		return res, fmt.Errorf("prune stats rollups: %w", pruned.Error)
+	// the range was raised past above, in both tables.
+	for _, model := range []any{&jobStatsHourlyRow{}, &jobErrorGroupHourlyRow{}} {
+		pruned := db.WithContext(ctx).Where("bucket_start_unix < ?", earliest.Unix()).Delete(model)
+		if pruned.Error != nil {
+			return res, fmt.Errorf("prune stats rollups: %w", pruned.Error)
+		}
+		res.Pruned += pruned.RowsAffected
 	}
-	res.Pruned = pruned.RowsAffected
 	return res, nil
 }
 
@@ -647,11 +888,11 @@ type RebuildOpts struct {
 	// Grace is the closing grace the clamp uses. Zero selects the rollup's
 	// default (5m); pass the Scheduler's StatsRollupGrace when it differs.
 	Grace time.Duration
-	// Force rebuilds an hour even when the recompute counts fewer runs than the
-	// stored rollup. Without it such an hour stops the rebuild: fewer raw runs than
-	// were rolled up means retention (or a host) has deleted some since, and the
-	// recompute would replace a complete rollup with a partial one. Set it only to
-	// repair a rollup you know is wrong.
+	// Force rebuilds an hour even when the recompute counts fewer runs, or fewer
+	// enqueued jobs, than the stored rollup. Without it such an hour stops the
+	// rebuild: fewer raw runs or jobs than were rolled up means retention (or a
+	// host) has deleted some since, and the recompute would replace a complete
+	// rollup with a partial one. Set it only to repair a rollup you know is wrong.
 	Force bool
 }
 
@@ -661,8 +902,8 @@ type RebuildResult struct {
 	From time.Time `json:"from"`
 	To   time.Time `json:"to"`
 	// Hours is the number of hours recomputed — the requested range's, and any
-	// with runs in a gap rolled to keep the covered range contiguous; Groups the
-	// (kind, queue) rollup rows written across them.
+	// with runs or inserts in a gap rolled to keep the covered range contiguous;
+	// Groups the (kind, queue) rollup rows written across them.
 	Hours  int `json:"hours"`
 	Groups int `json:"groups"`
 	// RolledFrom and RolledThrough bound the hours the rollups cover after the
@@ -701,9 +942,11 @@ type RebuildResult struct {
 // any covered hour it adds runs to, so the order of the two does not matter.
 //
 // Without Force it refuses to shrink an hour: when the recompute counts fewer
-// runs than the stored rollup, the rebuild stops at that hour with an error
-// wrapping ErrValidation, leaving it and every hour not yet reached as they
-// were. Raw history is what retention prunes; the rollup is what outlives it.
+// runs, or fewer enqueued jobs, than the stored rollup, the rebuild stops at
+// that hour with an error wrapping ErrValidation, leaving it and every hour not
+// yet reached as they were. Raw history is what retention prunes; the rollup is
+// what outlives it. An hour rolled before the rollup counted inserts stores
+// zero enqueued jobs, so a rebuild fills it in.
 func RebuildStats(ctx context.Context, db *gorm.DB, opts RebuildOpts) (RebuildResult, error) {
 	if db == nil {
 		return RebuildResult{}, fmt.Errorf("flywheel: RebuildStats: db is nil")
@@ -727,7 +970,7 @@ func RebuildStats(ctx context.Context, db *gorm.DB, opts RebuildOpts) (RebuildRe
 			if errors.Is(err, errRollupWouldShrink) {
 				return res, fmt.Errorf("flywheel: RebuildStats: %w", &ValidationError{
 					Field: "rebuild range",
-					Message: fmt.Sprintf("%v; its raw runs were pruned after it was rolled up "+
+					Message: fmt.Sprintf("%v; its raw runs or jobs were deleted after it was rolled up "+
 						"(set Force to rebuild it anyway)", err),
 				})
 			}

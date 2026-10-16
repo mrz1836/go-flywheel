@@ -35,6 +35,14 @@ func TestStatsHybridReadEqualsRawOraclePostgres(t *testing.T) {
 	oracleSuite(t, postgresOpener)
 }
 
+// TestErrorGroupsMatchAcrossRollupAndRawPostgres is the PostgreSQL half of the
+// error-group oracle, where the window read's message column, the stored
+// fingerprints, and the finish times take their PostgreSQL types.
+func TestErrorGroupsMatchAcrossRollupAndRawPostgres(t *testing.T) {
+	t.Parallel()
+	errorGroupsOracleSuite(t, postgresOpener)
+}
+
 // TestConcurrentRollupsConvergePostgres proves a duplicate Scheduler is
 // harmless: several passes racing over the same hours — each a delete then an
 // upsert per hour — leave exactly the rows one pass leaves alone.

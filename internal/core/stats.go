@@ -41,11 +41,15 @@ type OutcomeCounts struct {
 }
 
 // KindStats is one job kind's activity over a window, counted by the instant
-// each attempt finished.
+// each attempt finished — or, with StatsParams.GroupBy, one queue's, or one
+// kind's on one queue.
 type KindStats struct {
-	// Kind is the job kind; empty on StatsResult.Total and on a series point that
-	// spans every kind.
+	// Kind is the job kind; empty on StatsResult.Total, on a series point that
+	// spans every kind, and on an entry grouped by queue alone.
 	Kind string `json:"kind"`
+	// Queue is the entry's queue when Stats groups by queue (StatsByQueue or
+	// StatsByKindQueue), and empty otherwise.
+	Queue string `json:"queue,omitempty"`
 	// Attempts is every finished, non-superseded attempt, by outcome below.
 	Attempts int64         `json:"attempts"`
 	Outcomes OutcomeCounts `json:"outcomes"`
@@ -61,6 +65,13 @@ type KindStats struct {
 	// Superseded counts attempts that finished after their claim was gone — a
 	// cancel or a lease reclaim underneath them — so the work may have run twice.
 	Superseded int64 `json:"superseded"`
+	// Enqueued counts the jobs inserted in the window, the arrivals to set
+	// against the attempts that finished. A job counts by the insert time its
+	// UUIDv7 id carries, not created_at, soft-deleted jobs included; a job a
+	// host inserted with an id of its own counts where its id's leading 48 bits
+	// put it. Hours the rollup closed before it counted inserts read zero until
+	// RebuildStats re-rolls them.
+	Enqueued int64 `json:"enqueued"`
 	// SuccessRate is Succeeded / (Succeeded + Discarded): the share of jobs that
 	// ended well among those that ended. It is zero when none ended.
 	SuccessRate float64 `json:"success_rate"`
@@ -93,11 +104,24 @@ type StatsCoverage struct {
 	// RawSpan is the total raw span aggregated: the tail, the partial hour at the
 	// window's start when From is not on an hour boundary, and any part of the
 	// window older than RolledFrom. When that would exceed MaxRawSpan, each raw
-	// part is first trimmed to start at the first run that finished in it — a
-	// stretch with no runs costs nothing to read — and RawSpan is the trimmed
-	// total.
+	// part is first trimmed to start at its first activity — the first run that
+	// finished in it, or the first job inserted — since a stretch with neither
+	// costs nothing to read, and RawSpan is the trimmed total.
 	RawSpan time.Duration `json:"raw_span"`
 }
+
+// StatsGroupBy is how Stats keys the entries of StatsResult.Kinds.
+type StatsGroupBy string
+
+// The supported groupings.
+const (
+	// StatsByKind is one entry per kind, Queue empty: the zero GroupBy.
+	StatsByKind StatsGroupBy = "kind"
+	// StatsByQueue is one entry per queue, Kind empty.
+	StatsByQueue StatsGroupBy = "queue"
+	// StatsByKindQueue is one entry per kind on each queue, both set.
+	StatsByKindQueue StatsGroupBy = "kind_queue"
+)
 
 // StatsParams scopes a Stats read. From and To are required.
 type StatsParams struct {
@@ -109,9 +133,14 @@ type StatsParams struct {
 	// MaxRawSpan caps the raw job_runs history one read aggregates. Zero selects
 	// 7 days; a negative value removes the cap. A window that would exceed it
 	// fails with ErrStatsNotRolledUp rather than scanning a month of raw runs.
-	// A stretch with no runs does not count against it (see
+	// A stretch with no runs and no inserts does not count against it (see
 	// StatsCoverage.RawSpan).
 	MaxRawSpan time.Duration
+	// GroupBy keys StatsResult.Kinds: one entry per kind (StatsByKind, the zero
+	// value), per queue (StatsByQueue), or per kind on each queue
+	// (StatsByKindQueue). Any other value is refused with a ValidationError
+	// naming group_by.
+	GroupBy StatsGroupBy
 }
 
 // StatsResult is Stats' answer: per-kind statistics, their total, and how the
@@ -119,9 +148,11 @@ type StatsParams struct {
 type StatsResult struct {
 	From time.Time `json:"from"`
 	To   time.Time `json:"to"`
-	// Kinds holds one entry per kind with activity in the window, sorted by kind.
+	// Kinds holds one entry per group with activity in the window: per kind,
+	// sorted by kind; or, with StatsParams.GroupBy, per queue, sorted by queue,
+	// or per kind and queue, sorted by kind and then queue.
 	Kinds []KindStats `json:"kinds"`
-	// Total sums every kind in Kinds.
+	// Total sums every entry in Kinds, whatever the grouping.
 	Total    KindStats     `json:"total"`
 	Coverage StatsCoverage `json:"coverage"`
 }
@@ -129,6 +160,7 @@ type StatsResult struct {
 // Stats returns per-kind job statistics for a window: attempts by outcome, jobs
 // succeeded and discarded, retries and superseded attempts, the success rate,
 // success-duration and queue-wait distributions, cost, and the slowest run.
+// StatsParams.GroupBy groups them by queue, or by kind and queue, instead.
 //
 // # A hybrid read
 //
@@ -154,33 +186,67 @@ func Stats(ctx context.Context, db *gorm.DB, p StatsParams) (StatsResult, error)
 	if db == nil {
 		return StatsResult{}, fmt.Errorf("flywheel: Stats: db is nil")
 	}
+	groupBy := p.GroupBy
+	switch groupBy {
+	case "":
+		groupBy = StatsByKind
+	case StatsByKind, StatsByQueue, StatsByKindQueue:
+	default:
+		return StatsResult{}, newValidationError("group_by",
+			fmt.Sprintf("%q is not %s, %s, or %s", groupBy, StatsByKind, StatsByQueue, StatsByKindQueue))
+	}
 	if p.From.IsZero() || p.To.IsZero() || !p.From.Before(p.To) {
 		return StatsResult{}, newValidationError("stats window", "requires From before To")
 	}
 	f := statsFilter{Kind: p.Kind, Queue: p.Queue}
-	merged, cov, err := windowAggs(ctx, db, p.From, p.To, f, rowsFor(f, true), p.MaxRawSpan)
+	class := rowsFor(f, true)
+	if groupBy != StatsByKind {
+		class = groupRows
+	}
+	merged, cov, err := windowAggs(ctx, db, p.From, p.To, f, class, p.MaxRawSpan)
 	if err != nil {
 		return StatsResult{}, fmt.Errorf("flywheel: Stats: %w", err)
 	}
 
-	byKind := map[string]*runAgg{}
-	for _, a := range merged {
-		k, ok := byKind[a.Kind]
+	res := StatsResult{From: p.From, To: p.To, Coverage: cov}
+	res.Kinds, res.Total = groupKindStats(merged, groupBy)
+	return res, nil
+}
+
+// groupKindStats merges per-(kind, queue) aggregates into one entry per group
+// of groupBy, sorted, and their total.
+func groupKindStats(aggs map[statsGroup]*runAgg, groupBy StatsGroupBy) ([]KindStats, KindStats) {
+	groups := map[statsGroup]*runAgg{}
+	total := newRunAgg("", "")
+	for g, a := range aggs {
+		key := statsGroup{Kind: g.Kind}
+		switch groupBy {
+		case StatsByQueue:
+			key = statsGroup{Queue: g.Queue}
+		case StatsByKindQueue:
+			key = g
+		}
+		k, ok := groups[key]
 		if !ok {
-			k = newRunAgg(a.Kind, "")
-			byKind[a.Kind] = k
+			k = newRunAgg(key.Kind, key.Queue)
+			groups[key] = k
 		}
 		k.merge(a)
-	}
-	total := newRunAgg("", "")
-	res := StatsResult{From: p.From, To: p.To, Kinds: make([]KindStats, 0, len(byKind)), Coverage: cov}
-	for _, a := range byKind {
-		res.Kinds = append(res.Kinds, kindStatsFromAgg(a))
 		total.merge(a)
 	}
-	sort.Slice(res.Kinds, func(i, j int) bool { return res.Kinds[i].Kind < res.Kinds[j].Kind })
-	res.Total = kindStatsFromAgg(total)
-	return res, nil
+	out := make([]KindStats, 0, len(groups))
+	for key, a := range groups {
+		ks := kindStatsFromAgg(a)
+		ks.Queue = key.Queue
+		out = append(out, ks)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+		return out[i].Queue < out[j].Queue
+	})
+	return out, kindStatsFromAgg(total)
 }
 
 // windowAggs aggregates [from, to) per (kind, queue), serving whole rolled hours
@@ -273,9 +339,10 @@ func planWindow(from, to time.Time, p statsProgress) windowPlan {
 // The cap bounds work, and a raw stretch before the first run in it is no work:
 // the aggregate is a range of job_run_finishes, and an empty range reads
 // nothing. So when the planned raw spans exceed the cap, every raw segment is
-// first trimmed to start at the first run finished at or after it, and a
-// segment with no run in it is dropped — one probe of the finish log, paid only
-// by a read that would otherwise be refused. A window reaching back past the
+// first trimmed to start at its first activity — the first run finished, or the
+// first job inserted, at or after it — and a segment with neither is dropped:
+// one probe of the finish log and one of the jobs primary key, paid only by a
+// read that would otherwise be refused. A window reaching back past the
 // oldest run, or past the rollups' coverage into hours with no runs, is then
 // served; one that would really read more than the cap of raw runs fails with
 // ErrStatsNotRolledUp.
@@ -283,19 +350,20 @@ func fitRawSpan(ctx context.Context, db *gorm.DB, plans []*windowPlan, p statsPr
 	if maxRaw == 0 {
 		maxRaw = defaultMaxRawSpan
 	}
-	span, start := time.Duration(0), time.Time{}
+	span, start, end := time.Duration(0), time.Time{}, time.Time{}
 	for _, plan := range plans {
 		span += plan.rawSpan()
 		for _, seg := range plan.raw {
 			if start.IsZero() || seg[0].Before(start) {
 				start = seg[0]
 			}
+			end = maxTime(end, seg[1])
 		}
 	}
 	if maxRaw < 0 || span <= maxRaw {
 		return nil
 	}
-	first, found, err := nextFinishedAt(ctx, db, start)
+	first, found, err := nextActivityAt(ctx, db, start, end)
 	if err != nil {
 		return err
 	}
@@ -349,7 +417,7 @@ type rolledHour struct {
 // direct SQL and are recomputed from the merged histograms here.
 const rolledColumns = `bucket_start_unix, kind, queue, attempts, success, error, timeout, snooze, cancelled, crashed, ` +
 	`superseded, discarded, dur_count, dur_sum_ms, dur_max_ms, dur_hist, slowest_run_id, ` +
-	`wait_count, wait_sum_ms, wait_max_ms, wait_hist, cost_micros_sum, hist_version`
+	`wait_count, wait_sum_ms, wait_max_ms, wait_hist, cost_micros_sum, hist_version, enqueued`
 
 // loadRolledHours reads one class of rollup rows for hours in [from, to),
 // filtered, in hour order. It is one primary-key range read.
@@ -400,7 +468,7 @@ func loadRolledHours(
 		if err := rows.Scan(&bucket, &a.Kind, &a.Queue, &a.Attempts, &a.Success, &a.Error, &a.Timeout,
 			&a.Snooze, &a.Cancelled, &a.Crashed, &a.Superseded, &a.Discarded,
 			&a.DurCount, &a.DurSumMs, &a.DurMaxMs, &durHist, &slowest,
-			&a.WaitCount, &a.WaitSumMs, &a.WaitMaxMs, &waitHist, &a.CostMicrosSum, &version); err != nil {
+			&a.WaitCount, &a.WaitSumMs, &a.WaitMaxMs, &waitHist, &a.CostMicrosSum, &version, &a.Enqueued); err != nil {
 			return nil, fmt.Errorf("read stats rollups: scan: %w", err)
 		}
 		if version != histVersion {
@@ -440,6 +508,7 @@ func kindStatsFromAgg(a *runAgg) KindStats {
 		Discarded:    a.Discarded,
 		Retries:      max(a.Error+a.Timeout+a.Crashed-a.Discarded, 0),
 		Superseded:   a.Superseded,
+		Enqueued:     a.Enqueued,
 		Duration:     summarize(a.DurHist, a.DurCount, a.DurSumMs, a.DurMaxMs),
 		QueueWait:    summarize(a.WaitHist, a.WaitCount, a.WaitSumMs, a.WaitMaxMs),
 		CostMicros:   a.CostMicrosSum,
@@ -771,11 +840,16 @@ func (c *baselineCache) put(key baselineKey, p statsProgress, baselines []Baseli
 	c.entries[key] = baselineMemoEntry{progress: p, baselines: append([]Baseline(nil), baselines...)}
 }
 
-// baselinesFrom merges hours per kind into baselines.
+// baselinesFrom merges hours per kind into baselines. An aggregate with no
+// finished attempt — an hour that only received inserts — is skipped, so a kind
+// that only had jobs inserted has no baseline.
 func baselinesFrom(hours []rolledHour, from, to time.Time) []Baseline {
 	byKind := map[string]*runAgg{}
 	for _, h := range hours {
 		for _, a := range h.aggs {
+			if a.Attempts+a.Superseded == 0 {
+				continue
+			}
 			k, ok := byKind[a.Kind]
 			if !ok {
 				k = newRunAgg(a.Kind, "")

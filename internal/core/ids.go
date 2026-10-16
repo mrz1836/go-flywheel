@@ -19,3 +19,31 @@ func idFloor(t time.Time) string {
 	h := fmt.Sprintf("%012x", ms)
 	return h[:8] + "-" + h[8:] + "-0000-0000-000000000000"
 }
+
+// idTime reads back the insert time an id carries in its first 48 bits, as
+// idFloor writes them and the runtime's UUIDv7 ids hold them, in UTC to the
+// millisecond. ok is false when the id's first 13 characters are not 8
+// lowercase hex digits, a hyphen, and 4 lowercase hex digits — an id a host
+// minted in some other shape.
+func idTime(id string) (time.Time, bool) {
+	const timeChars = 13
+	if len(id) < timeChars || id[8] != '-' {
+		return time.Time{}, false
+	}
+	var ms int64
+	for i := range timeChars {
+		if i == 8 {
+			continue
+		}
+		c := id[i]
+		switch {
+		case c >= '0' && c <= '9':
+			ms = ms<<4 | int64(c-'0')
+		case c >= 'a' && c <= 'f':
+			ms = ms<<4 | int64(c-'a'+10)
+		default:
+			return time.Time{}, false
+		}
+	}
+	return time.UnixMilli(ms).UTC(), true
+}

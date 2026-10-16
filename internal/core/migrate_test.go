@@ -18,7 +18,7 @@ import (
 var (
 	migrateTables = []string{
 		"jobs", "job_runs", "job_periodics", "limiter_buckets", "limiter_holds", "job_run_finishes", "job_stats_hourly",
-		"job_audit", "job_kinds",
+		"job_audit", "job_kinds", "job_error_groups_hourly", "job_queue_samples",
 	}
 	// migrateJobColumns are jobs columns whose absence is silent rather than
 	// loud: the runtime writes them through a map-valued Updates, which a missing
@@ -41,6 +41,8 @@ var (
 		"limiter_holds_expiry",
 		"job_audit_target",
 		"job_audit_created",
+		"job_error_groups_fingerprint",
+		"job_queue_samples_time",
 	}
 )
 
@@ -108,6 +110,32 @@ func TestModelsCarryJobColumns(t *testing.T) {
 	for _, col := range migrateJobColumns {
 		if !db.Migrator().HasColumn("jobs", col) {
 			t.Errorf("expected column jobs.%s to reach a host-owned schema through Models()", col)
+		}
+	}
+}
+
+// TestModelsListsEveryTableInOrder pins Models to the twelve tables, in the
+// order a host's loader creates them: the job tables, the limiter tables, the
+// stats tables, the audit history, the kind catalog, then the error groups and
+// the queue samples. The list is literal, not derived from the package.
+func TestModelsListsEveryTableInOrder(t *testing.T) {
+	t.Parallel()
+	want := []string{
+		"jobs", "job_runs", "job_periodics", "limiter_buckets", "limiter_holds",
+		"job_run_finishes", "job_stats_hourly", "job_stats_progress", "job_audit", "job_kinds",
+		"job_error_groups_hourly", "job_queue_samples",
+	}
+	models := Models()
+	if len(models) != len(want) {
+		t.Fatalf("Models() returns %d tables, want %d", len(models), len(want))
+	}
+	for i, m := range models {
+		named, ok := m.(interface{ TableName() string })
+		if !ok {
+			t.Fatalf("Models()[%d] (%T) does not name its table", i, m)
+		}
+		if named.TableName() != want[i] {
+			t.Errorf("Models()[%d] = %q, want %q", i, named.TableName(), want[i])
 		}
 	}
 }

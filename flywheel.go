@@ -74,6 +74,10 @@ type (
 	DriverOpts            = core.DriverOpts
 	DurationSummary       = core.DurationSummary
 	ErrorClass            = core.ErrorClass
+	ErrorFingerprinter    = core.ErrorFingerprinter
+	ErrorGroup            = core.ErrorGroup
+	ErrorGroupsParams     = core.ErrorGroupsParams
+	ErrorGroupsResult     = core.ErrorGroupsResult
 	ExecutorClass         = core.ExecutorClass
 	FailureView           = core.FailureView
 	FakeHTTPDoer          = testutil.FakeHTTPDoer
@@ -128,7 +132,9 @@ type (
 	PeriodicView          = core.PeriodicView
 	PublishKindsOpts      = core.PublishKindsOpts
 	QueueDepth            = core.QueueDepth
+	QueueDepthPoint       = core.QueueDepthPoint
 	QueueHealth           = core.QueueHealth
+	QueueHistoryParams    = core.QueueHistoryParams
 	RawJob                = core.RawJob
 	RebuildOpts           = core.RebuildOpts
 	RebuildResult         = core.RebuildResult
@@ -157,6 +163,7 @@ type (
 	SeriesParams          = core.SeriesParams
 	SlowRunsParams        = core.SlowRunsParams
 	StatsCoverage         = core.StatsCoverage
+	StatsGroupBy          = core.StatsGroupBy
 	StatsParams           = core.StatsParams
 	StatsPoint            = core.StatsPoint
 	StatsResult           = core.StatsResult
@@ -196,6 +203,7 @@ const (
 	AuditTargetPeriodic      = core.AuditTargetPeriodic
 	AuditTargetQueue         = core.AuditTargetQueue
 	DefaultCountCap          = core.DefaultCountCap
+	ErrorFingerprintVersion  = core.ErrorFingerprintVersion
 	ErrorPermanent           = core.ErrorPermanent
 	ErrorTimeout             = core.ErrorTimeout
 	ErrorTransient           = core.ErrorTransient
@@ -215,6 +223,7 @@ const (
 	MaxActorSourceBytes      = core.MaxActorSourceBytes
 	MaxContainmentWindow     = core.MaxContainmentWindow
 	MaxCountCap              = core.MaxCountCap
+	MaxHistoryPoints         = core.MaxHistoryPoints
 	MaxMetadataBytes         = core.MaxMetadataBytes
 	MaxReadLimit             = core.MaxReadLimit
 	MaxReasonBytes           = core.MaxReasonBytes
@@ -237,6 +246,9 @@ const (
 	StateRunning             = core.StateRunning
 	StateScheduled           = core.StateScheduled
 	StateSucceeded           = core.StateSucceeded
+	StatsByKind              = core.StatsByKind
+	StatsByKindQueue         = core.StatsByKindQueue
+	StatsByQueue             = core.StatsByQueue
 )
 
 var (
@@ -343,6 +355,14 @@ func DeletePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
 
 func Enqueue(ctx context.Context, c *Client, kind string, args []byte, opts InsertOpts) (string, error) {
 	return core.Enqueue(ctx, c, kind, args, opts)
+}
+
+func ErrorFingerprint(kind string, class ErrorClass, message string) string {
+	return core.ErrorFingerprint(kind, class, message)
+}
+
+func ErrorGroups(ctx context.Context, db *gorm.DB, p ErrorGroupsParams) (ErrorGroupsResult, error) {
+	return core.ErrorGroups(ctx, db, p)
 }
 
 func ExplorerIndexSet(dialect string) ([]Index, error) {
@@ -522,6 +542,10 @@ func NonTerminalStates() []JobState {
 	return core.NonTerminalStates()
 }
 
+func NormalizeErrorMessage(message string) string {
+	return core.NormalizeErrorMessage(message)
+}
+
 func NormalizeRunTimestamps(ctx context.Context, db *gorm.DB) (int64, error) {
 	return core.NormalizeRunTimestamps(ctx, db)
 }
@@ -564,6 +588,10 @@ func PublishKindsWithOptions(ctx context.Context, db *gorm.DB, reg *Registry, op
 
 func QueryJobs(ctx context.Context, db *gorm.DB, q JobQuery) (JobPage, error) {
 	return core.QueryJobs(ctx, db, q)
+}
+
+func QueueDepthHistory(ctx context.Context, db *gorm.DB, p QueueHistoryParams) ([]QueueDepthPoint, error) {
+	return core.QueueDepthHistory(ctx, db, p)
 }
 
 func QueueDepths(ctx context.Context, db *gorm.DB) ([]QueueDepth, error) {

@@ -39,6 +39,9 @@ until it is done.
 | What just finished, and how? | `ListFinished`, `RecentFailures` | `jobs_finished` | 1–2.5 ms |
 | How did each kind do today? | `Stats` (24 h) | `job_stats_hourly` + the raw tail | 12.5 ms |
 | How did each kind do this month? | `Stats` (30 d) | `job_stats_hourly` + the raw tail | 78 ms |
+| How did each queue do today, and did it keep up? | `Stats` (24 h, `GroupBy: StatsByQueue`; `Enqueued` beside `Attempts`) | `job_stats_hourly` group rows + the raw tail | 14 ms¹ |
+| What is failing, grouped by cause? | `ErrorGroups` (24 h) | `job_error_groups_hourly` + the raw tail | 28 ms¹ |
+| How has a queue's depth moved this month? | `QueueDepthHistory` (30 d) | `job_queue_samples` | 34 ms¹ |
 | How is it trending over weeks? | `StatsSeries` (30 d, hourly or daily) | `job_stats_hourly` | 19–21 ms |
 | What is normal for kind X? | `Baselines` | `job_stats_hourly` | sub-ms, memoized |
 | Is anything regressing? | `Anomalies` | `job_stats_hourly` | 21 ms |
@@ -51,7 +54,8 @@ until it is done.
 | Has this job finished yet? | `WaitForJob` | `jobs` primary key | sub-ms per poll |
 
 The [measured latencies](#measured-cost) are at the end. Everything above is bounded — by a window, a
-`LIMIT`, or both — so no read's cost grows with the history the database holds.
+`LIMIT`, or both — so no read's cost grows with the history the database holds. ¹ Measured on a different
+machine from the other rows; see [Measured cost](#reads).
 
 <br>
 
@@ -69,15 +73,19 @@ default — and changes and removes nothing, so:
 
 **So the order is always: migrate the database, then deploy the binaries.**
 
-This section is the upgrade from the previous release: one table, `job_kinds`, and nothing else changes.
-`PublishKinds` writes the table and `ListKinds` (and `flywheel kinds`) reads it, so against a database
-without it each fails naming the missing relation. No Runner, Scheduler, or Node reads the table, and
-all of them start either way.
+This section is the upgrade from the previous release: two columns, `job_runs.error_fingerprint` and
+`job_stats_hourly.enqueued`, and two tables, `job_error_groups_hourly` and `job_queue_samples`, each with
+one index. A Runner refuses to start without `job_runs.error_fingerprint`, which every failed attempt's
+finalize writes, and so does a Scheduler, whose lease sweep writes `job_runs` too. A Scheduler with the
+stats rollup on also refuses to start without `job_stats_hourly.enqueued` and `job_error_groups_hourly`,
+which the rollup writes with each hour, and one with `QueueSampleInterval` set without
+`job_queue_samples`. Each refusal is `ErrSchemaOutdated`, naming what is missing.
 
 A database several releases behind applies each older upgrade first, oldest first —
 [from a release before the stats tables](#from-a-release-before-the-stats-tables), then
 [from a release before the schedule pause](#from-a-release-before-the-schedule-pause), then
-[from a release before the audit history](#from-a-release-before-the-audit-history) — and then this
+[from a release before the audit history](#from-a-release-before-the-audit-history), then
+[from a release before the kind catalog](#from-a-release-before-the-kind-catalog) — and then this
 one. `InspectSchema` names every gap, whichever release left it, and `Migrate` closes them all in one
 call.
 
@@ -85,10 +93,16 @@ call.
 
 | Object | Kind | Purpose |
 |---|---|---|
-| `job_kinds` | table | the published kind catalog: one row per kind a node publishes — its description, args schema, example, and defaults — and when and by whom it was first and last published |
+| `job_runs.error_fingerprint` | column, nullable `text` | the failure's group: 16 hex characters over the kind, the error class, and the message with its ids and numbers masked, written for an attempt that ends in `error` or `timeout` |
+| `job_stats_hourly.enqueued` | column, `bigint NOT NULL DEFAULT 0` | the jobs inserted in each rolled hour, by the insert time their ids carry |
+| `job_error_groups_hourly` | table | the error groups: one row per hour, kind, and fingerprint, written by the stats rollup with the hour's stats |
+| `job_queue_samples` | table | each queue's depth over time: one row per queue per sample, written by a Scheduler with `QueueSampleInterval` set |
+| `job_error_groups_fingerprint` | index on `job_error_groups_hourly` | one group across hours: its first sighting, and the fingerprint filter |
+| `job_queue_samples_time` | index on `job_queue_samples` | the sample prune |
 
-Nothing is backfilled: the catalog fills the first time a process calls `PublishKinds`. The table has no
-index beyond its primary key, so the release adds no index.
+Nothing is backfilled at migration time. Runs finalized before the upgrade carry no stored fingerprint,
+and the reads compute one from their stored message; hours rolled before the upgrade carry no enqueue
+counts and no error groups until a rebuild re-rolls them, as below.
 
 ### Library-owned install (`Migrate`, `flywheel migrate`)
 
@@ -107,10 +121,11 @@ err := flywheel.MigrateWithOptions(db, flywheel.MigrateOpts{
 })
 ```
 
-`flywheel migrate` prints what it added (`added: job_kinds (table)`), and a re-run prints nothing
-new — an up-to-date schema issues no DDL at all. Both options are no-ops on SQLite. Each step commits on
-its own, so a lock timeout fails only the statement that could not get its lock: everything before it is
-applied, and a re-run completes the rest. Two migrations of one schema run one after the other.
+`flywheel migrate` prints each addition (`added: job_runs.error_fingerprint`, …), and a re-run prints
+nothing new — an up-to-date schema issues no DDL at all. Both options are no-ops on SQLite. Each step
+commits on its own, so a lock timeout fails only the statement that could not get its lock: everything
+before it is applied, and a re-run completes the rest. Two migrations of one schema run one after the
+other.
 
 `flywheel serve` and `flywheel doctor` migrate too, with concurrent index builds, so either can be the
 first thing to touch a live database without blocking the queue's writers; both also repair an index an
@@ -127,58 +142,74 @@ exactly the statements below. To write it by hand, use these — they are the st
 `Models()`, and a test runs this file's blocks against the previous release's schema to prove they produce
 one with no drift.
 
-PostgreSQL — the table is new, so the statement locks nothing that already holds rows, and needs no lock
-timeout:
+PostgreSQL — both `ADD COLUMN`s are catalog-only changes on PostgreSQL 11+ (a constant default rewrites
+no rows), but each takes a brief `ACCESS EXCLUSIVE` lock on its table, so run them with a lock timeout;
+the two tables are new and lock nothing that already holds rows:
 
 <!-- upgrade-ddl:postgres -->
 ```sql
-CREATE TABLE IF NOT EXISTS job_kinds (
-  kind               text        NOT NULL,
-  description        text        NOT NULL DEFAULT '',
-  args_schema        jsonb,
-  example_args       jsonb,
-  queue              text        NOT NULL DEFAULT '',
-  priority           bigint      NOT NULL DEFAULT 0,
-  max_attempts       bigint      NOT NULL DEFAULT 0,
-  timeout_ms         bigint,
-  executor_class     text        NOT NULL DEFAULT '',
-  validates_args     boolean     NOT NULL DEFAULT false,
-  custom_backoff     boolean     NOT NULL DEFAULT false,
-  classifies_errors  boolean     NOT NULL DEFAULT false,
-  published_by       text        NOT NULL DEFAULT '',
-  first_published_at timestamptz NOT NULL,
-  published_at       timestamptz NOT NULL,
-  PRIMARY KEY (kind)
+SET lock_timeout = '5s';
+ALTER TABLE job_runs ADD COLUMN IF NOT EXISTS error_fingerprint text;
+ALTER TABLE job_stats_hourly ADD COLUMN IF NOT EXISTS enqueued bigint NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS job_error_groups_hourly (
+  bucket_start_unix bigint      NOT NULL,
+  kind              text        NOT NULL,
+  fingerprint       text        NOT NULL,
+  error_class       text        NOT NULL,
+  failures          bigint      NOT NULL,
+  discarded         bigint      NOT NULL,
+  first_run_id      text,
+  last_run_id       text,
+  sample_message    text        NOT NULL,
+  rolled_at         timestamptz NOT NULL,
+  PRIMARY KEY (bucket_start_unix, kind, fingerprint)
+);
+CREATE TABLE IF NOT EXISTS job_queue_samples (
+  queue           text        NOT NULL,
+  sampled_at      timestamptz NOT NULL,
+  ready           bigint      NOT NULL,
+  scheduled_ahead bigint      NOT NULL,
+  running         bigint      NOT NULL,
+  paused          bigint      NOT NULL,
+  oldest_ready_ms bigint      NOT NULL,
+  PRIMARY KEY (queue, sampled_at)
 );
 ```
 
-SQLite:
+SQLite — `ADD COLUMN` has no `IF NOT EXISTS` there, so this block is for a migration tool that runs it once:
 
 <!-- upgrade-ddl:sqlite -->
 ```sql
-CREATE TABLE IF NOT EXISTS job_kinds (
-  kind               text     NOT NULL,
-  description        text     NOT NULL DEFAULT '',
-  args_schema        JSON,
-  example_args       JSON,
-  queue              text     NOT NULL DEFAULT '',
-  priority           integer  NOT NULL DEFAULT 0,
-  max_attempts       integer  NOT NULL DEFAULT 0,
-  timeout_ms         integer,
-  executor_class     text     NOT NULL DEFAULT '',
-  validates_args     numeric  NOT NULL DEFAULT false,
-  custom_backoff     numeric  NOT NULL DEFAULT false,
-  classifies_errors  numeric  NOT NULL DEFAULT false,
-  published_by       text     NOT NULL DEFAULT '',
-  first_published_at datetime NOT NULL,
-  published_at       datetime NOT NULL,
-  PRIMARY KEY (kind)
+ALTER TABLE job_runs ADD COLUMN error_fingerprint text;
+ALTER TABLE job_stats_hourly ADD COLUMN enqueued integer NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS job_error_groups_hourly (
+  bucket_start_unix integer  NOT NULL,
+  kind              text     NOT NULL,
+  fingerprint       text     NOT NULL,
+  error_class       text     NOT NULL,
+  failures          integer  NOT NULL,
+  discarded         integer  NOT NULL,
+  first_run_id      text,
+  last_run_id       text,
+  sample_message    text     NOT NULL,
+  rolled_at         datetime NOT NULL,
+  PRIMARY KEY (bucket_start_unix, kind, fingerprint)
+);
+CREATE TABLE IF NOT EXISTS job_queue_samples (
+  queue           text     NOT NULL,
+  sampled_at      datetime NOT NULL,
+  ready           integer  NOT NULL,
+  scheduled_ahead integer  NOT NULL,
+  running         integer  NOT NULL,
+  paused          integer  NOT NULL,
+  oldest_ready_ms integer  NOT NULL,
+  PRIMARY KEY (queue, sampled_at)
 );
 ```
 
-**2. Install the indexes at deploy, the way you already do.** This release adds no index, so against
-indexes that are already in sync the call changes nothing. On a live PostgreSQL database, build any
-missing one concurrently:
+**2. Install the indexes at deploy, the way you already do.** This release adds two,
+`job_error_groups_fingerprint` and `job_queue_samples_time`, each on a new, empty table, so building them
+takes no time and blocks no writer. On a live PostgreSQL database, build any missing one concurrently:
 
 ```go
 err := flywheel.InstallIndexesWithOptions(ctx, db, flywheel.IndexOpts{
@@ -202,17 +233,30 @@ indexDrift, _ := flywheel.InspectIndexes(ctx, db) // missing, drifted, or invali
 
 ### After the deploy
 
-The catalog stays empty until a process publishes it. Call `PublishKinds` at startup in the process that
-holds the registry — a node — and read the catalog anywhere with `ListKinds` or `flywheel kinds`, as
-[the catalog's read API](#the-kind-catalog-and-limiter-state) describes. A publish never deletes a row,
-so a kind no release registers any more stays listed with an old `published_at`.
+Every attempt that fails from now on stores its fingerprint, and every hour the rollup closes from now on
+carries its enqueue counts and its error groups. Hours rolled before the upgrade carry neither until they
+are rolled again: rebuild them with `flywheel stats rebuild --from <the oldest hour whose runs are kept>
+--to <now>` (or `RebuildStats`). Only hours whose raw runs retention still keeps can be rebuilt — the last
+`RetentionMaxAge` — and the rebuild refuses an hour whose runs retention has already pruned, rather than
+replace its counts with smaller ones. An hour older than that keeps its stats and reads with no enqueue
+counts and no error groups.
+
+Queue history starts once a Scheduler samples: set `SchedulerConfig.QueueSampleInterval` (a minute is
+typical) on the Scheduler that runs your maintenance, as [Polling intervals and their
+cost](#polling-intervals-and-their-cost) describes. Without it the table stays empty.
 
 ### Rolling deploys
 
 During a rolling deploy both releases run against the migrated database. A process of the previous
-release never reads or writes `job_kinds`. Two processes of this release that publish at once each upsert
-their own kinds; for a kind both register, the last publisher's metadata wins, and its first publish
-time never moves.
+release never reads or writes the new columns or tables: its runners store failed attempts without a
+fingerprint, which every read of them computes from the stored message instead, so their failures still
+join the right groups. If the rollup runs on a Scheduler of the previous release during the deploy, the
+hours it closes carry no enqueue counts and no error groups; rebuild them afterwards, as above.
+
+Right after the migration, an older-release process on PostgreSQL may fail one statement on a table the
+migration changed with `cached plan must not change result type` (SQLSTATE `0A000`): its driver cached a
+`SELECT *` plan before the column was added. The driver drops the plan and the retry succeeds; the error
+is a one-off per connection, not a sign the migration went wrong.
 
 A deploy that adds a job kind has its own overlap to plan for: a runner of the previous release can claim
 a job of the new kind. See **Rolling deploys and new job kinds** in the [README](../README.md).
@@ -220,22 +264,108 @@ a job of the new kind. See **Rolling deploys and new job kinds** in the [README]
 ### Verifying
 
 ```bash
-flywheel doctor   # schema: up to date · indexes: in sync · stats: rolled up through … (lag …)
-flywheel kinds    # after a publish: one line per kind, with its queue, priority, attempts, timeout, and publish time
+flywheel doctor           # schema: up to date · indexes: in sync · stats: rolled up through … (lag …)
+flywheel stats --by queue # one line per queue, with ENQUEUED beside ATTEMPTS
 ```
 
 ### Rolling back
 
 Deploy the previous release's binaries: they run unchanged against the migrated schema, and never read
-or write `job_kinds`. Nothing needs to be dropped. If you want the schema back as it was, drop
-`job_kinds` — but only after no process of this release publishes or reads the catalog, since both fail
-without the table.
+or write what this release added. Nothing needs to be dropped. If you want the schema back as it was,
+drop `job_error_groups_hourly` and `job_queue_samples` (their indexes go with them),
+`job_stats_hourly.enqueued`, and `job_runs.error_fingerprint` — but only after no process of this
+release is running, since its Runners and Schedulers refuse to start without them.
+
+### From a release before the kind catalog
+
+A database a release before the kind catalog installed lacks one table more than this release's upgrade
+adds. `Migrate` adds all of it in one call. A hand-written migration applies the statements below first,
+then [this release's](#host-owned-install-your-migration-tool).
+
+| Object | Kind | Purpose |
+|---|---|---|
+| `job_kinds` | table | the published kind catalog: one row per kind a node publishes — its description, args schema, example, and defaults — and when and by whom it was first and last published |
+
+Nothing is backfilled: the catalog fills the first time a process calls `PublishKinds`. The table has no
+index beyond its primary key, so the release adds no index.
+
+`PublishKinds` writes the table and `ListKinds` (and `flywheel kinds`) reads it, so against a database
+without it each fails naming the missing relation. No Runner, Scheduler, or Node reads the table, and
+all of them start either way.
+
+PostgreSQL — the table is new, so the statement locks nothing that already holds rows, and needs no lock
+timeout:
+
+<!-- upgrade-ddl:postgres:kinds -->
+```sql
+CREATE TABLE IF NOT EXISTS job_kinds (
+  kind               text        NOT NULL,
+  description        text        NOT NULL DEFAULT '',
+  args_schema        jsonb,
+  example_args       jsonb,
+  queue              text        NOT NULL DEFAULT '',
+  priority           bigint      NOT NULL DEFAULT 0,
+  max_attempts       bigint      NOT NULL DEFAULT 0,
+  timeout_ms         bigint,
+  executor_class     text        NOT NULL DEFAULT '',
+  validates_args     boolean     NOT NULL DEFAULT false,
+  custom_backoff     boolean     NOT NULL DEFAULT false,
+  classifies_errors  boolean     NOT NULL DEFAULT false,
+  published_by       text        NOT NULL DEFAULT '',
+  first_published_at timestamptz NOT NULL,
+  published_at       timestamptz NOT NULL,
+  PRIMARY KEY (kind)
+);
+```
+
+SQLite:
+
+<!-- upgrade-ddl:sqlite:kinds -->
+```sql
+CREATE TABLE IF NOT EXISTS job_kinds (
+  kind               text     NOT NULL,
+  description        text     NOT NULL DEFAULT '',
+  args_schema        JSON,
+  example_args       JSON,
+  queue              text     NOT NULL DEFAULT '',
+  priority           integer  NOT NULL DEFAULT 0,
+  max_attempts       integer  NOT NULL DEFAULT 0,
+  timeout_ms         integer,
+  executor_class     text     NOT NULL DEFAULT '',
+  validates_args     numeric  NOT NULL DEFAULT false,
+  custom_backoff     numeric  NOT NULL DEFAULT false,
+  classifies_errors  numeric  NOT NULL DEFAULT false,
+  published_by       text     NOT NULL DEFAULT '',
+  first_published_at datetime NOT NULL,
+  published_at       datetime NOT NULL,
+  PRIMARY KEY (kind)
+);
+```
+
+**After the deploy**, the catalog stays empty until a process publishes it. Call `PublishKinds` at startup
+in the process that holds the registry — a node — and read the catalog anywhere with `ListKinds` or
+`flywheel kinds`, as [the catalog's read API](#the-kind-catalog-and-limiter-state) describes. A publish
+never deletes a row, so a kind no release registers any more stays listed with an old `published_at`.
+
+**During a rolling deploy** both releases run against the migrated database. A process of the older
+release never reads or writes `job_kinds`. Two processes of a newer release that publish at once each
+upsert their own kinds; for a kind both register, the last publisher's metadata wins, and its first
+publish time never moves.
+
+**To verify**, `flywheel kinds` after a publish prints one line per kind, with its queue, priority,
+attempts, timeout, and publish time.
+
+**To roll back** to the older release, deploy its binaries: they run unchanged against the migrated
+schema, and never read or write `job_kinds`. Nothing needs to be dropped. If you want the schema back as
+it was, drop `job_kinds` and what the later releases added — but only after no process of a newer release
+publishes or reads the catalog, since both fail without the table.
 
 ### From a release before the audit history
 
-A database a release before the audit history installed lacks one table more than this release's upgrade
-adds, with its two indexes. `Migrate` adds all of it in one call. A hand-written migration applies the
-statements below first, then [this release's](#host-owned-install-your-migration-tool).
+A database a release before the audit history installed lacks one table more than the later releases add,
+with its two indexes. `Migrate` adds all of it in one call. A hand-written migration applies the
+statements below first, then [the kind catalog's](#from-a-release-before-the-kind-catalog), then
+[this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
 |---|---|---|
@@ -318,6 +448,7 @@ the table, and only once the history is no longer wanted.
 A database a release before the schedule pause installed lacks one column more than the later releases
 add. `Migrate` adds all of it in one call. A hand-written migration applies the statements below
 first, then [the audit history's](#from-a-release-before-the-audit-history), then
+[the kind catalog's](#from-a-release-before-the-kind-catalog), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -373,6 +504,7 @@ analytics columns on `job_runs`, the three stats tables, and one index. `Migrate
 later releases' additions, in one call. A hand-written migration applies the statements below first, then
 [the schedule pause's](#from-a-release-before-the-schedule-pause), then
 [the audit history's](#from-a-release-before-the-audit-history), then
+[the kind catalog's](#from-a-release-before-the-kind-catalog), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -538,15 +670,17 @@ over the deploy window afterwards — a rebuild backfills before it recomputes.
 
 **To roll back** to the older release, deploy its binaries: they run unchanged against the migrated
 schema. To restore its schema as well, drop `job_stats_progress`, `job_stats_hourly`, `job_run_finishes`,
-the `jobs_finished` index, the five `job_runs` columns, `job_periodics.paused_at`, `job_audit`, and
-`job_kinds` — but only after no binary of a newer release is running.
+the `jobs_finished` index, the five `job_runs` columns, `job_periodics.paused_at`, `job_audit`,
+`job_kinds`, `job_error_groups_hourly`, `job_queue_samples`, and `job_runs.error_fingerprint` — but only
+after no binary of a newer release is running.
 
 <br>
 
 ## Turning the stats on
 
 The live reads — `ListRunning`, `QueueDepths`, `ListFinished`, `SlowRuns` — need nothing turned on. The
-history reads need the hourly rollup, which a Scheduler runs when `StatsRollupInterval` is set:
+history reads need the hourly rollup, which a Scheduler runs when `StatsRollupInterval` is set, and a
+queue's depth over time needs the Scheduler to sample it, when `QueueSampleInterval` is set:
 
 ```go
 node, err := flywheel.NewNode(flywheel.NodeConfig{
@@ -556,17 +690,20 @@ node, err := flywheel.NewNode(flywheel.NodeConfig{
 		StatsRollupInterval:  time.Minute, // off when zero, like HealthSampleInterval
 		StatsAnomalyLog:      true,        // warn once when a kind regresses or starts failing
 		HealthSampleInterval: time.Minute, // the heartbeat gains slow_running
+		QueueSampleInterval:  time.Minute, // queue depth over time, for QueueDepthHistory
 	},
 })
 ```
 
 | Field | Default | What it does |
 |---|---|---|
-| `StatsRollupInterval` | 0 (off) | cadence of the rollup; a pass with nothing to do is two primary-key reads and an empty range delete, and writes nothing |
+| `StatsRollupInterval` | 0 (off) | cadence of the rollup, which writes each closed hour's stats rows, enqueue counts, and error groups; a pass with nothing to do is two primary-key reads and an empty range delete of each rollup table, and writes nothing |
 | `StatsRollupGrace` | 5m | how long past an hour's end before it is closed — absorbs clock skew between nodes |
 | `StatsMaxHoursPerPass` | 24 | bounds one pass's work during a catch-up |
 | `StatsRetention` | 400 days | how long rollup rows are kept |
 | `StatsAnomalyLog` | false | log each anomaly's onset once, at warn |
+| `QueueSampleInterval` | 0 (off) | cadence of the queue sampler: one `job_queue_samples` row per queue with live jobs, each pass |
+| `QueueSampleRetention` | 30 days | how long queue samples are kept; each sampling pass deletes the older ones |
 
 `flywheel serve` turns the rollup on at one minute (`runtime.stats_rollup`; a negative value disables it)
 and the anomaly log with it. Run the rollup on **one Scheduler per database** — a duplicate is harmless
@@ -610,6 +747,7 @@ once when it ends (by its finalize, or by the lease sweep if its process died).
 | `superseded` | true when the attempt finished after its claim was gone — its outcome was recorded but never applied, so the work may have run twice. An attempt the lease sweep crashed that then finished late keeps the `job_state` the sweep recorded and its sweep-time `finished_at` beside the late outcome. An older attempt the sweep left `started` records its own finish when it returns, superseded, with no `job_state` |
 | `error_class`, `error_message` | for a failed attempt. A `snooze` may carry an `error_message` with no `error_class`: a worker that returned an error alongside its snooze, or a job deferred because the runner that claimed it does not register its kind (`jobs: unknown job kind`). So may a superseded `cancelled` run: a worker that returned an error after its runner's cooperative cancel (`RunnerConfig.CooperativeCancel`) stopped it, recorded as `jobs: job cancelled while running: <its error>` |
 | `cost_micros`, `enqueued_children`, `output` | what the worker reported. An `output` whose JSON was larger than `DriverOpts.MaxOutputBytes` (64 KiB by default) holds the marker `{"$truncated": true, "$bytes": <its marshaled size>, "$head": "<its first 1,024 bytes>"}` instead — exactly those three keys — and `JobRunView.OutputTruncated` is true |
+| `error_fingerprint` | for an attempt whose outcome is `error` or `timeout`: its error group, 16 lowercase hex characters (see [error groups](#error-groups-what-is-failing)); NULL for every other outcome, and on a run written before the column existed, for which `JobRunView.ErrorFingerprint` computes it on read |
 | `error_payload` | for a failed attempt, `{"message": …}`, the stored message; plus `"truncated": true` and `"message_bytes"` (its length before the cut) when the message was cut at 4,096 bytes (`JobRunView.ErrorTruncated`); plus `"stack"`, at most 16 KiB, when the worker panicked (`JobRunView.ErrorStack`). `JobRunView.ErrorPayload` returns it as stored, nil when the run has none |
 
 **`job_run_finishes`** — the finish log: one `(finished_at, run_id)` per finished run, written in the same
@@ -628,9 +766,11 @@ Join it to `job_runs` on `run_id = id` to find runs by finish time.
 
 **Read exactly one class**, or you count every run two or three times. A per-kind chart reads
 `queue = ''`; an overview reads `kind = '' AND queue = ''`; only a per-queue view needs the groups
-(`kind <> '' AND queue <> ''`). An hour with no runs has no rows: within the hours the rollups cover, a
-missing hour means nothing ran (which hours those are, `Stats` reports in its `Coverage`). Runs whose kind
-or queue cannot be resolved — an old row whose job is gone — group under `(unknown)`.
+(`kind <> '' AND queue <> ''`), which is what `Stats` reads for `StatsByQueue`. An hour with no runs and
+no inserts has no rows: within the hours the rollups cover, a missing hour means nothing ran or arrived
+(which hours those are, `Stats` reports in its `Coverage`), and an hour that only received inserts has
+rows with `attempts` 0. Runs whose kind or queue cannot be resolved — an old row whose job is gone — group
+under `(unknown)`.
 
 | Column | Meaning |
 |---|---|
@@ -642,6 +782,7 @@ or queue cannot be resolved — an old row whose job is gone — group under `(u
 | `dur_p50_ms`, `dur_p95_ms`, `dur_p99_ms` | estimated within a few percent, never above the max |
 | `wait_count`, `wait_sum_ms`, `wait_max_ms`, `wait_p95_ms` | queue wait, over non-superseded attempts |
 | `cost_micros_sum` | summed `Result.CostMicros` |
+| `enqueued` | jobs inserted in the hour, counted by the insert time in their UUIDv7 ids, soft-deleted ones included; 0 in an hour rolled before the column existed, until `RebuildStats` re-rolls it |
 | `slowest_run_id` | the slowest successful attempt of the hour |
 | `dur_hist`, `wait_hist`, `hist_version` | sparse `[[bucket, count], …]` histograms; `HistogramBounds(hist_version)` gives the bounds |
 
@@ -686,9 +827,36 @@ by each publish and never deleted, so a kind no release registers any more keeps
 | `published_by` | the last publisher: `PublishKindsOpts.Publisher`, else the process's `host:pid` |
 | `first_published_at`, `published_at` | the kind's first publish, which never moves, and its last, in UTC |
 
+**`job_error_groups_hourly`** — the error groups: one row per hour, kind, and fingerprint, holding that
+hour's failed attempts of the kind that share the fingerprint. The stats rollup writes an hour's rows in
+the same transaction as its `job_stats_hourly` rows, replaces them with them, and prunes them with them
+(`StatsRetention`), so the two tables cover the same hours. A failure is an attempt whose outcome is
+`error` or `timeout` and that was not superseded. Stable for SQL; `ErrorGroups` reads them merged with the
+raw tail:
+
+| Column | Meaning |
+|---|---|
+| `bucket_start_unix`, `kind`, `fingerprint` | the hour (epoch seconds of the UTC hour), the kind, and the group; the primary key |
+| `error_class` | the hour's latest failure's class |
+| `failures`, `discarded` | the hour's failures, and those of them that discarded their job |
+| `first_run_id`, `last_run_id` | the hour's earliest and latest failing runs, by finish time and then id |
+| `sample_message` | the latest failure's stored message, cut at 512 bytes |
+| `rolled_at` | when the rollup wrote the row |
+
+**`job_queue_samples`** — each queue's depth over time: one row per queue per pass of the Scheduler's
+queue sampler (`QueueSampleInterval`), for every queue holding a live job, kept `QueueSampleRetention`.
+Stable for SQL; `QueueDepthHistory` reads them in buckets:
+
+| Column | Meaning |
+|---|---|
+| `queue`, `sampled_at` | the queue and the instant, in UTC; the primary key |
+| `ready`, `scheduled_ahead`, `running`, `paused` | what `QueueDepths` reported for the queue at that instant |
+| `oldest_ready_ms` | how long the queue's oldest ready job had been claimable, in milliseconds; 0 when nothing was ready |
+
 ### Time and zones
 
-`job_runs`, `job_run_finishes`, `job_audit`, and `job_kinds` timestamps are stored in UTC. On PostgreSQL every timestamp column is
+`job_runs`, `job_run_finishes`, `job_audit`, `job_kinds`, `job_error_groups_hourly`, and
+`job_queue_samples` timestamps are stored in UTC. On PostgreSQL every timestamp column is
 `timestamptz`, so this is invisible. On SQLite timestamps are text and compared as text, which is only a
 time comparison within one zone: pass `job_runs` and `job_audit` bounds in UTC (the Go API does it for you). `jobs`
 timestamps keep the zone of the clock that wrote them, as they always have; compare them in that zone.
@@ -876,10 +1044,19 @@ declares, or a name given twice, is refused with a `*ValidationError` naming `ex
 
 ### History: how it has been going
 
-**`Stats(ctx, db, StatsParams{From, To, Kind, Queue, MaxRawSpan})`** — per-kind `KindStats` for a window:
-attempts by outcome, jobs succeeded and discarded, retries, superseded attempts, success rate,
-`Duration` (successful attempts) and `QueueWait` as `{Count, Avg, P50, P95, P99, Max}`, cost, and the
-slowest run — plus a `Total` and a `Coverage` saying how it was served.
+**`Stats(ctx, db, StatsParams{From, To, Kind, Queue, MaxRawSpan, GroupBy})`** — per-kind `KindStats` for a
+window: attempts by outcome, jobs enqueued, jobs succeeded and discarded, retries, superseded attempts,
+success rate, `Duration` (successful attempts) and `QueueWait` as `{Count, Avg, P50, P95, P99, Max}`, cost,
+and the slowest run — plus a `Total` and a `Coverage` saying how it was served. `GroupBy` keys the entries
+instead by queue (`StatsByQueue`, each with `Queue` set and `Kind` empty) or by kind on each queue
+(`StatsByKindQueue`, both set), sorted by their keys; `Total` is the same whatever the grouping. A queue's
+throughput, failure rate, and wait need no summing on your side.
+
+`Enqueued` counts the jobs inserted in the window, by the insert time their UUIDv7 ids carry rather than
+`created_at` (which a fixed or simulated clock can stamp with another time), soft-deleted jobs included:
+the arrivals to set against the attempts that finished. A queue whose `Enqueued` outruns its `Attempts`,
+hour after hour, is falling behind. A job inserted with an id of your own counts in the hour its id's
+leading 48 bits name.
 
 It is a hybrid read. Whole hours the rollups cover — `[Coverage.RolledFrom, Coverage.RolledThrough)`, the
 range `job_stats_progress` records — come from `job_stats_hourly`; the rest — the hours past the rollup's
@@ -888,9 +1065,10 @@ watermark, a partial hour at either edge, and any hours older than the rollups r
 histograms, so the answer is identical whether an hour came from a rollup or from raw runs; a randomized
 oracle test holds this to equality. With the rollup off the whole window is read raw — correct, only
 slower — and a window that would read more than `MaxRawSpan` (7 days by default) of raw runs fails with
-`ErrStatsNotRolledUp`, naming the fix. The cap counts raw *runs*, not the clock: each raw part is measured
-from the first run in it, so a "last 90 days" window on a database with two weeks of history, or one
-reaching back past the rollups into hours retention has emptied, is served.
+`ErrStatsNotRolledUp`, naming the fix. The cap counts raw *activity*, not the clock: each raw part is
+measured from the first run that finished or job that was inserted in it, so a "last 90 days" window on a
+database with two weeks of history, or one reaching back past the rollups into hours retention has
+emptied, is served.
 
 **`StatsSeries(ctx, db, SeriesParams{From, To, Kind, Queue, Interval, Location})`** — one point per hour or
 per local day, empty buckets included, each a `KindStats` for the bucket. Served exactly like `Stats`.
@@ -902,6 +1080,52 @@ read.
 
 **`Anomalies(ctx, db, AnomalyParams{Hour, BaselineWindow, Thresholds})`** — the kinds behaving unlike
 their own baseline at an hour; see [What the anomaly detector catches](#what-the-anomaly-detector-catches).
+
+### Error groups: what is failing
+
+Every attempt that ends in `error` or `timeout` stores a fingerprint (`job_runs.error_fingerprint`): 16
+lowercase hex characters over its kind, its error class, and its message as stored, with the values that
+differ between two occurrences of one failure masked. `NormalizeErrorMessage` is that masking — UUIDs,
+email addresses, URLs, hex runs of eight or more, quoted values, and numbers become `<uuid>`, `<email>`,
+`<url>`, `<hex>`, `<q>`, and `<n>`, whitespace collapses, and the result is cut at 512 bytes — and
+`ErrorFingerprint(kind, class, message)` computes the fingerprint a message gets, so a host can match a
+fingerprint to a message of its own. The rules are `ErrorFingerprintVersion` 1, pinned by golden vectors;
+a change to any of them is a new version, after which groups restart.
+
+A worker whose messages vary while its failure is one thing — an upstream's error code — names the
+failure itself: an error in its chain that implements `ErrorFingerprinter` with a non-empty `Fingerprint()`
+replaces the message in the hash, so every attempt that returns it joins one group. A run written before
+fingerprints were stored has none in the column; `JobRunView.ErrorFingerprint` and `ErrorGroups` compute
+it from its kind, class, and message.
+
+**`ErrorGroups(ctx, db, ErrorGroupsParams{From, To, Kind, Fingerprint, Limit, WithHourly, MaxRawSpan})`** —
+a window's failures grouped by kind and fingerprint, most failures first (then by kind and fingerprint), at
+most `Limit` (50 by default, `MaxReadLimit` at most). Each `ErrorGroup` carries `Failures`, `Discarded`
+(those that ended their job), and `Retried`; the latest failure's `ErrorClass` and its message as
+`SampleMessage` (512 bytes at most) and normalized as `Message`; and `FirstSeen`, `FirstRunID`,
+`LastSeen`, and `LastRunID`. `LastSeen` is the window's latest failure; `FirstSeen` reaches back past the
+window over every retained rollup hour before `To`, so a group that started yesterday says so. Each time is
+the run's finish while the run is kept and the start of its rollup hour once retention has deleted it.
+`WithHourly` adds one count per UTC hour the window touches, for a window of at most seven days.
+
+It is served exactly as `Stats` is — rolled hours from `job_error_groups_hourly`, the rest raw, capped by
+`MaxRawSpan` — plus one indexed probe of `job_error_groups_fingerprint` per returned group for its first
+sighting and one primary-key read of the sighting runs' finish times. Hours the rollup closed before it
+wrote error groups hold none until `RebuildStats` re-rolls them.
+
+### Queue depth over time
+
+**`QueueDepthHistory(ctx, db, QueueHistoryParams{Queue, From, To, Step})`** — one queue's depth over
+`[From, To)` (`To` zero is now), one `QueueDepthPoint` per bucket, empty buckets included. Each point holds
+the bucket's `Start`, how many `Samples` fell in it, and the maximum of each of `Ready`, `ScheduledAhead`,
+`Running`, `Paused`, and `OldestReadyAge` over them, so a spike shows rather than averaging away. A
+bucket with no sample — the sampler was off, or the queue held no live job — has `Samples` 0. `Step` is a
+whole number of minutes; zero selects the smallest that keeps the points at or under `MaxHistoryPoints`
+(1,440): a day reads one-minute buckets, a month thirty-minute ones. Buckets start on `Step` boundaries of
+the Unix epoch, so two reads of overlapping windows agree on them.
+
+It reads `job_queue_samples`, which a Scheduler writes only with `SchedulerConfig.QueueSampleInterval`
+set: one primary-key range read of the queue's samples in the window.
 
 ### Who changed what: the control history
 
@@ -972,9 +1196,16 @@ configured budget is your `DBLimiterConfig`, so the result carries none.
 | Today's stats | `Stats` (24 h) | 30–60 s | 24 × kinds rollup rows by primary key + the open hour raw |
 | Trends | `StatsSeries` (30 d) | 5–15 min | 720 rollup rows (one per hour) + the open hour raw |
 | Anomalies | `Anomalies` | hourly, after the rollup | ~190 × kinds rollup rows |
+| Error groups | `ErrorGroups` (24 h) | 1–5 min | 24 × groups rollup rows + the open hour raw + one probe per group returned |
+| A queue's depth over time | `QueueDepthHistory` (24 h) | 1–5 min | one range of the queue's samples: 1,440 rows a day at one sample a minute |
 
 The rollups only change once an hour closes, so a trend chart polled more often than every few minutes is
 re-reading the same rows; cache it. For anything finer than an hour, use Prometheus.
+
+The queue sampler has a cost of its own, paid by the Scheduler whether or not anything reads the history:
+each pass is one `QueueDepths` read and one insert of a row per queue with live jobs, then a range delete
+of the samples past the retention (`job_queue_samples_time`). At one sample a minute that is 1,440 rows a
+day per queue, about 43,000 a month.
 
 <br>
 
@@ -1037,6 +1268,22 @@ for _, a := range found {
 ```
 
 Or set `StatsAnomalyLog` and alert on the `jobs: stats anomaly` log line, which fires once per onset.
+
+### An error-groups panel
+
+```go
+res, err := flywheel.ErrorGroups(ctx, db, flywheel.ErrorGroupsParams{
+	From: now.Add(-24 * time.Hour), To: now, WithHourly: true,
+})
+for _, g := range res.Groups {
+	// g.Kind, g.Message, g.Failures, g.Retried, g.Discarded, g.Hourly (a sparkline),
+	// g.FirstSeen (new today?), g.LastSeen, g.LastRunID …
+}
+```
+
+To open the jobs behind a group, its runs are the starting point: `LastRunID` and `FirstRunID` name two
+of them, and `QueryJobs` lists the kind's jobs in the window (`JobQuery{Kinds, CreatedFrom, CreatedTo,
+States}`), each with its latest run, whose `ErrorFingerprint` says which group it belongs to.
 
 ### An embeddable JSON API
 
@@ -1149,7 +1396,11 @@ rollup never loses data:
   off, with a warning, so a config written before this release keeps starting.
 - **Rebuilding pruned hours is refused** unless forced: `RebuildStats` will not replace a complete rollup
   with a recount of the runs retention left.
-- **Rollups have their own retention**, `StatsRetention` (400 days).
+- **Rollups have their own retention**, `StatsRetention` (400 days), and the error groups share it: the
+  rollup prunes `job_error_groups_hourly` with `job_stats_hourly`, hour for hour. A group's `FirstSeen`
+  reaches back as far as these rows do, so it outlives the runs it names; once retention has deleted the
+  run, the time is the start of its rollup hour.
+- **Queue samples have their own**, `QueueSampleRetention` (30 days), applied by each sampling pass.
 
 <br>
 
@@ -1218,6 +1469,21 @@ whole API call; the plans behind them are in
 
 On SQLite, the same reads over a 100k-run month (`go test -bench SQLite ./internal/core`) are all under
 15 ms; `Stats` for the last day is about 1 ms.
+
+The reads by queue, the error groups, and the queue history were measured at the same scale on a
+different machine, with the previous release beside them ([BENCHMARKS.md](BENCHMARKS.md#reads-at-1000000-runs)):
+
+| Read | Median |
+|---|---|
+| `Stats`, last 24 h, by queue | 14.2 ms |
+| `Stats`, last 30 d, by queue | 228 ms |
+| `ErrorGroups`, last 24 h | 27.7 ms |
+| `ErrorGroups`, last 7 d, with hourly counts | 41.9 ms |
+| `ErrorGroups`, last 30 d | 90.3 ms |
+| `QueueDepthHistory`, 30 d of minute samples | 33.8 ms |
+
+On that machine, rolling up an hour of ~1.4k runs, with its enqueue counts and error groups, went from
+14.2 to 20.4 ms, and an hour of 100k runs from 330 to 434 ms.
 
 The job query, at 1,000,000 jobs over 30 days with every explorer index installed — the plans, and each
 shape without its index, are in [`benchmarks/explorer-plans-1m.txt`](benchmarks/explorer-plans-1m.txt):

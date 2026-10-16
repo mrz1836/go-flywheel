@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"math/rand/v2"
+	"sort"
 	"testing"
 	"time"
 
@@ -15,11 +16,12 @@ import (
 const oracleSpan = 72 * time.Hour
 
 // oracleSuite is the main correctness gate for the hybrid read: for random
-// windows and filters, Stats and StatsSeries served from rollups plus a raw tail
-// must equal the same window aggregated entirely from raw job_runs. It runs
-// twice — with the watermark mid-history, so most windows straddle it, and fully
-// rolled — over seeded history with every outcome, superseded and crashed rows,
-// missing waits, and legacy rows that resolve their kind through jobs.
+// windows, filters, and groupings, Stats and StatsSeries served from rollups
+// plus a raw tail must equal the same window aggregated entirely from raw
+// job_runs. It runs twice — with the watermark mid-history, so most windows
+// straddle it, and fully rolled — over seeded history with every outcome,
+// superseded and crashed rows, missing waits, and legacy rows that resolve
+// their kind through jobs.
 func oracleSuite(t *testing.T, open dbOpener) {
 	db := open(t)
 	rng := rand.New(rand.NewPCG(42, 1)) //nolint:gosec // deterministic test data
@@ -56,11 +58,15 @@ func checkOracle(t *testing.T, db *gorm.DB, rng *rand.Rand, n int) {
 		to := from.Add(time.Duration(1+rng.Int64N(spanMin)) * time.Minute)
 		f := oracleFilters[i%len(oracleFilters)]
 
-		got, err := Stats(ctx, db, StatsParams{From: from, To: to, Kind: f.Kind, Queue: f.Queue, MaxRawSpan: -1})
-		require.NoError(t, err)
-		wantKinds, wantTotal := rawKindStats(t, db, from, to, f)
-		require.Equal(t, wantKinds, got.Kinds, "window %s..%s filter %+v", from, to, f)
-		require.Equal(t, wantTotal, got.Total, "window %s..%s filter %+v", from, to, f)
+		for _, groupBy := range []StatsGroupBy{"", StatsByQueue, StatsByKindQueue} {
+			got, err := Stats(ctx, db, StatsParams{
+				From: from, To: to, Kind: f.Kind, Queue: f.Queue, MaxRawSpan: -1, GroupBy: groupBy,
+			})
+			require.NoError(t, err)
+			wantKinds, wantTotal := rawGroupedStats(t, db, from, to, f, groupBy)
+			require.Equal(t, wantKinds, got.Kinds, "window %s..%s filter %+v grouped %q", from, to, f, groupBy)
+			require.Equal(t, wantTotal, got.Total, "window %s..%s filter %+v grouped %q", from, to, f, groupBy)
+		}
 
 		// Series are checked on a subset, over at most a day: each raw bucket is a
 		// query on both sides of the comparison, and a day of buckets already
@@ -290,4 +296,106 @@ func TestStatsWindowAcrossADSTChangeSQLite(t *testing.T) {
 	got, err = Stats(context.Background(), db, StatsParams{From: before.Add(5 * time.Second), To: after})
 	require.NoError(t, err)
 	assert.Zero(t, got.Total.Attempts, "and neither is in the hour between them")
+}
+
+// errorGroupsOracleSuite is the correctness gate for ErrorGroups: for random
+// windows and kind filters, the groups served from rolled hours plus the raw
+// segments must equal the groups aggregated entirely from raw job_runs, every
+// field — the first sighting over the rolled hours before To as well as the
+// window, the hourly counts included. It runs with the watermark mid-history
+// and fully rolled, over history with stored and computed fingerprints, legacy
+// rows, and every outcome.
+func errorGroupsOracleSuite(t *testing.T, open dbOpener) {
+	db := open(t)
+	rng := rand.New(rand.NewPCG(7, 3)) //nolint:gosec // deterministic test data
+	seedHistory(t, db, randomHistory(rng, 3000, rollupBase, oracleSpan))
+	end := rollupBase.Add(oracleSpan)
+
+	t.Run("watermark mid-history", func(t *testing.T) {
+		rollupAll(t, db, rollupBase.Add(40*time.Hour))
+		checkErrorGroupsOracle(t, db, rng, 30)
+	})
+	t.Run("fully rolled", func(t *testing.T) {
+		rollupAll(t, db, end.Add(2*time.Hour))
+		checkErrorGroupsOracle(t, db, rng, 30)
+	})
+}
+
+// checkErrorGroupsOracle compares n random windows (unaligned edges, reaching
+// past both ends of the history), every third filtered to one kind.
+func checkErrorGroupsOracle(t *testing.T, db *gorm.DB, rng *rand.Rand, n int) {
+	t.Helper()
+	ctx := context.Background()
+	p, _, err := readStatsProgress(ctx, db)
+	require.NoError(t, err)
+	spanMin := int64(oracleSpan / time.Minute)
+	groups, lookedBack := 0, 0
+	for i := range n {
+		from := rollupBase.Add(time.Duration(rng.Int64N(spanMin+240)-120) * time.Minute)
+		to := from.Add(time.Duration(1+rng.Int64N(spanMin)) * time.Minute)
+		kind := []string{"", "", "beta"}[i%3]
+		got, err := ErrorGroups(ctx, db, ErrorGroupsParams{
+			From: from, To: to, Kind: kind, Limit: MaxReadLimit, WithHourly: true, MaxRawSpan: -1,
+		})
+		require.NoError(t, err)
+		require.Less(t, len(got.Groups), MaxReadLimit, "the oracle compares every group")
+		require.Equal(t, rawErrorGroups(t, db, from, to, kind, p), got.Groups, "window %s..%s kind %q", from, to, kind)
+		groups += len(got.Groups)
+		for _, g := range got.Groups {
+			if g.FirstSeen.Before(from) {
+				lookedBack++
+			}
+		}
+	}
+	require.Positive(t, groups, "the windows held failures")
+	require.Positive(t, lookedBack, "and some groups were first seen before their window")
+}
+
+// rawErrorGroups is the oracle: the window's failures aggregated from raw
+// job_runs alone, each group's first sighting the earliest failure in the
+// window or in the rolled hours that start before to.
+func rawErrorGroups(t *testing.T, db *gorm.DB, from, to time.Time, kind string, p statsProgress) []ErrorGroup {
+	t.Helper()
+	ctx := context.Background()
+	win, err := aggregateWindow(ctx, db, from, to, statsFilter{Kind: kind})
+	require.NoError(t, err)
+	rolled := windowAgg{groups: map[errorGroupKey]*errorGroupAgg{}}
+	if p.covered() {
+		rolled, err = aggregateWindow(ctx, db, p.From, minTime(p.To, ceilHour(to)), statsFilter{Kind: kind})
+		require.NoError(t, err)
+	}
+	out := make([]ErrorGroup, 0, len(win.groups))
+	for key, g := range win.groups {
+		first := g.First
+		if r, ok := rolled.groups[key]; ok && r.First.before(first) {
+			first = r.First
+		}
+		eg := ErrorGroup{
+			Kind: key.Kind, Fingerprint: key.Fingerprint, ErrorClass: g.ErrorClass,
+			Failures: g.Failures, Discarded: g.Discarded, Retried: g.Failures - g.Discarded,
+			FirstSeen: first.At, LastSeen: g.Last.At, FirstRunID: first.ID, LastRunID: g.Last.ID,
+			SampleMessage: g.Sample, Message: NormalizeErrorMessage(g.Sample),
+		}
+		for h := floorHour(from); h.Before(to); h = h.Add(time.Hour) {
+			eg.Hourly = append(eg.Hourly, g.hourly[h.Unix()])
+		}
+		out = append(out, eg)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Failures != out[j].Failures {
+			return out[i].Failures > out[j].Failures
+		}
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+		return out[i].Fingerprint < out[j].Fingerprint
+	})
+	return out
+}
+
+// TestErrorGroupsMatchAcrossRollupAndRaw is the SQLite half of the error-group
+// oracle.
+func TestErrorGroupsMatchAcrossRollupAndRaw(t *testing.T) {
+	t.Parallel()
+	errorGroupsOracleSuite(t, sqliteOpener)
 }

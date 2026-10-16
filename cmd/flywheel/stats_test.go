@@ -115,8 +115,9 @@ func TestCLIStatsReportsRolledUpHistory(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out, "flywheel stats:")
 	assert.Contains(t, out, "SUCCESS%", "the table header is printed")
-	assert.Regexp(t, `exec\s+41\s+40\s+1\s+0\s+97\.6%\s+\d+ms\s+\d+ms\s+\d+ms\s+100ms\s+5ms`, out,
-		"the kind row carries attempts, outcomes, the success rate, the durations, and the queue wait")
+	assert.Regexp(t, `exec\s+41\s+0\s+40\s+1\s+0\s+97\.6%\s+\d+ms\s+\d+ms\s+\d+ms\s+100ms\s+5ms`, out,
+		"the kind row carries attempts, jobs enqueued (none of these ids is a UUIDv7), outcomes, the success rate, "+
+			"the durations, and the queue wait")
 	assert.Contains(t, out, "TOTAL")
 	assert.Contains(t, out, "coverage: rollups through 2026-06-22T11:00:00Z",
 		"the coverage line names the rollup watermark")
@@ -138,6 +139,69 @@ func TestCLIStatsReportsRolledUpHistory(t *testing.T) {
 	assert.NotContains(t, out, "exec ", "a kind filter excludes every other kind")
 }
 
+// uuidAt returns a UUIDv7-shaped id whose time is at's millisecond, n telling
+// apart ids of one millisecond: the id the runtime mints for a job inserted at
+// at, which is what the enqueue counts read.
+func uuidAt(at time.Time, n int) string {
+	h := fmt.Sprintf("%012x", at.UnixMilli())
+	return fmt.Sprintf("%s-%s-7000-8000-%012x", h[:8], h[8:], n)
+}
+
+func TestCLIStatsGroupsByQueue(t *testing.T) {
+	t.Parallel()
+	cfg := migratedCLIConfig(t)
+	db, _ := openCLIConfigDB(t, cfg)
+	hour := statusAnchor.Add(-2 * time.Hour)
+	for i, j := range []struct{ kind, queue, outcome, state string }{
+		{"exec", "default", "success", "succeeded"},
+		{"exec", "default", "success", "succeeded"},
+		{"exec", "default", "success", "succeeded"},
+		{"exec", "bulk", "success", "succeeded"},
+		{"mail", "bulk", "success", "succeeded"},
+		{"mail", "bulk", "error", "discarded"},
+	} {
+		at := hour.Add(time.Duration(i) * time.Minute)
+		id := uuidAt(at, i)
+		insertStatsJob(t, db, id, j.kind, j.queue, j.state, at, nil)
+		fin := at.Add(time.Second)
+		insertStatsRun(t, db, id+"-r", id, j.kind, j.queue, j.outcome, j.state, at, &fin, 1000)
+	}
+
+	out, err := runRoot(statusClockCtx(), "--config", cfg, "stats")
+	require.NoError(t, err)
+	assert.Regexp(t, `KIND\s+ATTEMPTS\s+ENQUEUED\s+SUCCEEDED`, out, "ENQUEUED follows ATTEMPTS")
+	assert.Regexp(t, `exec\s+4\s+4\s+4\s+0`, out, "each job counts as enqueued in its id's hour")
+
+	out, err = runRoot(statusClockCtx(), "--config", cfg, "stats", "--by", "queue")
+	require.NoError(t, err)
+	assert.Regexp(t, `QUEUE\s+ATTEMPTS\s+ENQUEUED`, out, "the first column names the grouping")
+	assert.NotContains(t, out, "KIND")
+	assert.Regexp(t, `bulk\s+3\s+3\s+2\s+1`, out)
+	assert.Regexp(t, `default\s+3\s+3\s+3\s+0`, out)
+	assert.Regexp(t, `TOTAL\s+6\s+6\s+5\s+1`, out)
+
+	out, err = runRoot(statusClockCtx(), "--config", cfg, "stats", "--by", "kind_queue")
+	require.NoError(t, err)
+	assert.Regexp(t, `KIND\s+QUEUE\s+ATTEMPTS\s+ENQUEUED`, out)
+	assert.Regexp(t, `exec\s+bulk\s+1\s+1`, out)
+	assert.Regexp(t, `exec\s+default\s+3\s+3`, out)
+	assert.Regexp(t, `mail\s+bulk\s+2\s+2`, out)
+	assert.Regexp(t, `TOTAL\s+6\s+6`, out, "the total row leaves the queue column empty")
+
+	out, err = runRoot(statusClockCtx(), "--config", cfg, "stats", "--by", "queue", "--json")
+	require.NoError(t, err)
+	var parsed flywheel.StatsResult
+	require.NoError(t, json.Unmarshal([]byte(out), &parsed))
+	require.Len(t, parsed.Kinds, 2)
+	assert.Equal(t, "bulk", parsed.Kinds[0].Queue)
+	assert.Empty(t, parsed.Kinds[0].Kind)
+	assert.EqualValues(t, 6, parsed.Total.Enqueued)
+
+	_, err = runRoot(statusClockCtx(), "--config", cfg, "stats", "--by", "lane")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `invalid --by "lane"`)
+}
+
 func TestCLIStatsWithoutRollupsReadsRawAndCapsTheWindow(t *testing.T) {
 	t.Parallel()
 	cfg := migratedCLIConfig(t)
@@ -145,7 +209,7 @@ func TestCLIStatsWithoutRollupsReadsRawAndCapsTheWindow(t *testing.T) {
 	out, err := runRoot(statusClockCtx(), "--config", cfg, "stats", "--since", "1h")
 	require.NoError(t, err)
 	assert.Contains(t, out, "no hourly rollups yet", "an unrolled database says the window was read raw")
-	assert.Regexp(t, `TOTAL\s+0\s+0\s+0\s+0\s+-`, out, "an empty window renders zeros and dashes")
+	assert.Regexp(t, `TOTAL\s+0\s+0\s+0\s+0\s+0\s+-`, out, "an empty window renders zeros and dashes")
 
 	out, err = runRoot(statusClockCtx(), "--config", cfg, "stats", "--since", "30d")
 	require.NoError(t, err, "a month with no runs in it costs nothing to read raw")
@@ -249,7 +313,7 @@ func TestRenderStatsTextSurfacesAWriteFailure(t *testing.T) {
 	t.Parallel()
 	err := renderStatsText(&failAfterWriter{okWrites: 1}, flywheel.StatsResult{
 		Kinds: []flywheel.KindStats{{Kind: "exec", Attempts: 1}},
-	})
+	}, flywheel.StatsByKind)
 	require.Error(t, err, "a failing writer surfaces from the table flush")
 }
 

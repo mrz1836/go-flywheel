@@ -154,13 +154,13 @@ func TestListKindsReturnsEveryKindSortedByKind(t *testing.T) {
 }
 
 // TestTheRuntimeStartsWithoutTheKindTable proves the catalog is the only thing
-// that needs job_kinds: on the previous release's schema, which lacks it, a
-// Runner runs a job and a Scheduler with the stats on runs until its context
-// ends, while PublishKinds and ListKinds fail, naming the table.
+// that needs job_kinds: on a schema without it, as a release before the catalog
+// left it, a Runner runs a job and a Scheduler with the stats on runs until its
+// context ends, while PublishKinds and ListKinds fail, naming the table.
 func TestTheRuntimeStartsWithoutTheKindTable(t *testing.T) {
 	t.Parallel()
-	db := newBareSQLite(t)
-	installPreviousReleaseSchema(t, db)
+	db := newDB(t)
+	require.NoError(t, db.Exec("DROP TABLE job_kinds").Error)
 	ctx := context.Background()
 
 	reg := NewRegistry()

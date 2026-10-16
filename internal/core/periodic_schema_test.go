@@ -12,8 +12,9 @@ import (
 )
 
 // previousReleaseGapSuite proves the parity checks name exactly what this
-// release adds to a schema the previous release installed: the one table, and
-// no index.
+// release adds to a schema the previous release installed: the fingerprint and
+// enqueue-count columns, the error-group and queue-sample tables, and the index
+// on each.
 func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
@@ -21,7 +22,10 @@ func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 
 	drift, err := InspectSchema(ctx, db)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"job_kinds (table)"}, schemaDriftNames(drift))
+	assert.Equal(t, []string{
+		"job_runs.error_fingerprint", "job_stats_hourly.enqueued",
+		"job_error_groups_hourly (table)", "job_queue_samples (table)",
+	}, schemaDriftNames(drift))
 	idx, err := InspectIndexes(ctx, db)
 	require.NoError(t, err)
 	missing := make([]string, len(idx))
@@ -29,7 +33,7 @@ func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 		missing[i] = d.Name
 		assert.Empty(t, d.Installed, "%s is absent", d.Name)
 	}
-	assert.ElementsMatch(t, previousReleaseIndexNames, missing, "the release adds no index")
+	assert.ElementsMatch(t, previousReleaseIndexNames, missing, "the release's two indexes are absent")
 }
 
 // TestInspectSchemaReportsWhatThePreviousReleaseLacks is the parity check
@@ -43,11 +47,10 @@ func TestInspectSchemaReportsWhatThePreviousReleaseLacks(t *testing.T) {
 // column: a Scheduler's tick filters on paused_at, so against a schema without
 // it Run stops before starting any activity, naming the column and the fix,
 // rather than failing every tick. A Runner never reads job_periodics, so it
-// runs against the same schema. The schema is the previous release's without
-// the column, as a release before the pause left it.
+// runs against the same schema. db carries the current schema, and the suite
+// drops the column, as a release before the pause left it.
 func schedulerRefusesWithoutPausedAtSuite(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	installPreviousReleaseSchema(t, db)
 	require.NoError(t, db.Exec("ALTER TABLE job_periodics DROP COLUMN paused_at").Error)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -68,7 +71,7 @@ func schedulerRefusesWithoutPausedAtSuite(t *testing.T, db *gorm.DB) {
 // TestSchedulerRefusesToStartWithoutThePausedAtColumn runs the guard on SQLite.
 func TestSchedulerRefusesToStartWithoutThePausedAtColumn(t *testing.T) {
 	t.Parallel()
-	schedulerRefusesWithoutPausedAtSuite(t, newBareSQLite(t))
+	schedulerRefusesWithoutPausedAtSuite(t, newDB(t))
 }
 
 // previousReleaseUpgradeSuite runs the upgrade from the previous release: a

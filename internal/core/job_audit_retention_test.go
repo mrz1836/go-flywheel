@@ -255,8 +255,7 @@ func TestSchedulerWithAuditRetentionRefusesASchemaWithoutTheAuditTable(t *testin
 // writes the history.
 func TestTheRuntimeStartsWithoutTheAuditTable(t *testing.T) {
 	t.Parallel()
-	db := newBareSQLite(t)
-	installPreviousReleaseSchema(t, db)
+	db := newDB(t)
 	require.NoError(t, db.Exec("DROP TABLE job_audit").Error)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

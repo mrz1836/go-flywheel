@@ -103,6 +103,40 @@ func TestIndexSetClassifiesEveryEntry(t *testing.T) {
 	}
 }
 
+// TestIndexSetDeclaresTheInsightIndexes pins the two indexes behind the error
+// groups and the queue samples: both are performance indexes, on both dialects,
+// with exactly this DDL — a group's first hour and the fingerprint filter read
+// the first, and the sample prune's range delete reads the second.
+func TestIndexSetDeclaresTheInsightIndexes(t *testing.T) {
+	t.Parallel()
+	want := map[string]Index{
+		"job_error_groups_fingerprint": {
+			Name: "job_error_groups_fingerprint", Kind: IndexPerformance, Table: "job_error_groups_hourly",
+			DDL: `CREATE INDEX IF NOT EXISTS job_error_groups_fingerprint ON job_error_groups_hourly (kind, fingerprint, bucket_start_unix)`,
+		},
+		"job_queue_samples_time": {
+			Name: "job_queue_samples_time", Kind: IndexPerformance, Table: "job_queue_samples",
+			DDL: `CREATE INDEX IF NOT EXISTS job_queue_samples_time ON job_queue_samples (sampled_at)`,
+		},
+	}
+
+	for _, dialect := range supportedDialects {
+		t.Run(dialect, func(t *testing.T) {
+			t.Parallel()
+
+			set, err := IndexSet(dialect)
+			require.NoError(t, err)
+			found := map[string]Index{}
+			for _, idx := range set {
+				if _, ok := want[idx.Name]; ok {
+					found[idx.Name] = idx
+				}
+			}
+			assert.Equal(t, want, found)
+		})
+	}
+}
+
 // TestIndexesMatchesIndexSetOrder proves the one-line form is the same set in
 // the same order, so a host that skips the classification installs no less.
 func TestIndexesMatchesIndexSetOrder(t *testing.T) {
