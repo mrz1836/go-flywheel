@@ -16,7 +16,8 @@ import (
 )
 
 // newJobsCmd builds the `flywheel jobs` command group: ls, count, running,
-// inspect, history, retry, cancel, reschedule, priority, pause, resume, delete.
+// inspect, tree, history, retry, cancel, reschedule, priority, pause, resume,
+// delete.
 func newJobsCmd(configPath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "jobs", Short: "Inspect and operate jobs"}
 	cmd.AddCommand(
@@ -24,6 +25,7 @@ func newJobsCmd(configPath *string) *cobra.Command {
 		newJobsCountCmd(configPath),
 		newJobsRunningCmd(configPath),
 		newJobsInspectCmd(configPath),
+		newJobsTreeCmd(configPath),
 		newJobsHistoryCmd(configPath),
 		newJobsRetryCmd(configPath),
 		newJobsCancelCmd(configPath),
@@ -41,6 +43,8 @@ func newJobsCmd(configPath *string) *cobra.Command {
 type jobFilterFlags struct {
 	states, kinds, queues, tags []string
 	createdAfter, createdBefore string
+	errorClasses                []string
+	fingerprint, errorContains  string
 }
 
 // register adds the filter flags to cmd.
@@ -52,14 +56,25 @@ func (f *jobFilterFlags) register(cmd *cobra.Command) {
 	cmd.Flags().StringArrayVar(&f.tags, "tag", nil, "filter by tag: a job carrying any of the repeated tags")
 	cmd.Flags().StringVar(&f.createdAfter, "created-after", "", "only jobs created at or after this RFC 3339 time")
 	cmd.Flags().StringVar(&f.createdBefore, "created-before", "", "only jobs created before this RFC 3339 time")
+	cmd.Flags().StringArrayVar(&f.errorClasses, "error-class", nil,
+		"filter by the latest attempt's error class (transient, permanent, validation, timeout); repeat for any of several")
+	cmd.Flags().StringVar(&f.fingerprint, "fingerprint", "",
+		"filter by the latest attempt's error fingerprint: 16 hex characters, as flywheel errors prints it")
+	cmd.Flags().StringVar(&f.errorContains, "error-contains", "",
+		"filter by text in the latest attempt's error message, in any case (PostgreSQL; needs --created-after, within 7 days)")
 }
 
 // query builds the JobQuery the flags describe. The library validates it; a
 // refusal prints as it comes.
 func (f *jobFilterFlags) query() (flywheel.JobQuery, error) {
-	q := flywheel.JobQuery{Kinds: f.kinds, Queues: f.queues, Tags: f.tags}
+	q := flywheel.JobQuery{
+		Kinds: f.kinds, Queues: f.queues, Tags: f.tags, Fingerprint: f.fingerprint, ErrorContains: f.errorContains,
+	}
 	for _, s := range f.states {
 		q.States = append(q.States, flywheel.JobState(s))
+	}
+	for _, c := range f.errorClasses {
+		q.ErrorClasses = append(q.ErrorClasses, flywheel.ErrorClass(c))
 	}
 	var err error
 	if q.CreatedFrom, err = parseCreatedFlag("--created-after", f.createdAfter); err != nil {
@@ -290,6 +305,54 @@ func newJobsInspectCmd(configPath *string) *cobra.Command {
 		"print args up to this many bytes, and only their size past it (0 selects 1 MiB; negative prints any size)")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON instead of text")
 	return cmd
+}
+
+// newJobsTreeCmd prints a job and its descendants through JobTree, one line per
+// node indented by its depth, within the walk's depth and node bounds.
+func newJobsTreeCmd(configPath *string) *cobra.Command {
+	var (
+		depth, nodes int
+		asJSON       bool
+	)
+	cmd := &cobra.Command{
+		Use:   "tree <job-id>",
+		Short: "Show a job and its descendants, newest child first",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, db, _, err := loadAndOpen(*configPath)
+			if err != nil {
+				return err
+			}
+			defer closeDB(db)
+
+			res, err := flywheel.JobTree(cmd.Context(), db, args[0], flywheel.JobTreeParams{MaxDepth: depth, MaxNodes: nodes})
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				return writeJSON(cmd.OutOrStdout(), res)
+			}
+			writeTreeNode(cmd.OutOrStdout(), res.Root)
+			if res.Truncated {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(),
+					"truncated: a bound left children unlisted; raise --depth or --nodes to see more")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().IntVar(&depth, "depth", 0, "levels below the job to list (0 selects 5; at most 10)")
+	cmd.Flags().IntVar(&nodes, "nodes", 0, "nodes to list, the job included (0 selects 500; at most 2000)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the tree as JSON (root, nodes, truncated) instead of text")
+	return cmd
+}
+
+// writeTreeNode writes n and the nodes listed under it, one line each, indented
+// two spaces a level: the job's id, kind, state, and how many children it has.
+func writeTreeNode(w io.Writer, n flywheel.JobTreeNode) {
+	_, _ = fmt.Fprintf(w, "%s%s  %s  %s  children: %d\n", strings.Repeat("  ", n.Depth), n.ID, n.Kind, n.State, n.ChildCount)
+	for _, c := range n.Children {
+		writeTreeNode(w, c)
+	}
 }
 
 // newJobsHistoryCmd prints a job's control history through ListAudit, newest

@@ -78,6 +78,7 @@ func newRootCmd() *cobra.Command {
 		newPruneCmd(&configPath),
 		newStatusCmd(&configPath),
 		newStatsCmd(&configPath),
+		newErrorsCmd(&configPath),
 		newDoctorCmd(&configPath),
 		newVersionCmd(),
 	)

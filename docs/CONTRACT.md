@@ -153,6 +153,7 @@ reads answer differently from PostgreSQL's.
 | Where | PostgreSQL | SQLite |
 |---|---|---|
 | `JobQuery.ArgsContains`, `JobQuery.MetadataContains` | match with `@>` | refused: `QueryJobs` and `CountJobs` return `ErrUnsupportedDialect` (after the same field checks, so a bad filter is a `*ValidationError` on both) |
+| `JobQuery.ErrorContains` | matches the latest attempt's error message with `ILIKE`, inside a created window of at most `MaxContainmentWindow` | refused the same way: `ErrUnsupportedDialect`, after the window checks |
 | A capped count (`CountJobs` past its cap) | `Estimate` is the planner's estimate of the full count | `Estimate` is 0 |
 | `JobQuery.Tags` | served by `jobs_explore_tags`, a GIN index, when installed | read through `json_each` with no index; `ExplorerIndexSet("sqlite")` has no tags entry |
 | `ScheduledFrom`/`To`, `FinalizedFrom`/`To`, and the `scheduled` and `finished` sorts and their cursors | compare instants | compare the stored text, in the zone the `jobs` rows were written in, as `ListFinished` does: bounds given in that zone compare exactly, and rows written in another offset, across a DST change included, can order out of time order |

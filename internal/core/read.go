@@ -205,9 +205,9 @@ func stateStrings(states []JobState) []string {
 // one row more than its page, to learn whether another page follows, keeps its
 // page below MaxReadLimit, or the extra row is clamped away.
 //
-// ChildOutputs is the one exception: at a zero Limit it reads every terminal
-// child, because a barrier continuation folds its whole generation, which
-// DriverOpts.BarrierMaxChildren bounds.
+// ChildOutputs is the one exception, with ChildOutputsWithOptions: at a zero
+// Limit it reads every terminal child, because a barrier continuation folds its
+// whole generation, which DriverOpts.BarrierMaxChildren bounds.
 const MaxReadLimit = 200
 
 // readLimit resolves a list read's page size: def when limit is not positive,

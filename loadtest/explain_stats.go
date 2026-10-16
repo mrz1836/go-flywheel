@@ -4,6 +4,8 @@ package loadtest
 
 import (
 	"context"
+	"crypto/md5" //nolint:gosec // reproduces the seed's fingerprints, which md5 derives; nothing here is a secret
+	"encoding/hex"
 	"fmt"
 	"slices"
 	"strings"
@@ -26,6 +28,11 @@ const (
 	// statsExplainSampleQueues is how many queues the queue-depth history holds
 	// a sample a minute for, over the whole seeded range.
 	statsExplainSampleQueues = 3
+	// statsExplainTreeChildren and statsExplainTreeGrandchildren shape the seeded
+	// job tree: a root with that many children, each with that many children of
+	// its own, more nodes than a JobTree walk lists.
+	statsExplainTreeChildren      = 50
+	statsExplainTreeGrandchildren = 40
 	// statsTimingRuns is how many timed calls each read gets after one warm-up;
 	// the report publishes the median.
 	statsTimingRuns = 7
@@ -74,8 +81,8 @@ type statsRead struct {
 
 // ExplainStats seeds cfg.Jobs job_runs (with a job each) across thirty days and
 // twenty kinds, with a month of queue samples, rolls every closed hour up — the
-// stats rows, their enqueue counts, and the error groups — and then — for every
-// read API the
+// stats rows, their enqueue counts, and the error groups — seeds a job tree, and
+// then — for every read API the
 // analytics surface exposes — captures the SQL it emits through a recording
 // logger, explains each statement with EXPLAIN (ANALYZE, BUFFERS), and times the
 // call. The artifact is docs/benchmarks/stats-plans-1m.txt.
@@ -147,6 +154,13 @@ func ExplainStats(ctx context.Context, cfg ExplainConfig) (StatsExplainReport, e
 	}
 	report.RollupAll = time.Since(start)
 	report.RollupHours = rebuilt.Hours
+	// The tree is seeded after the rollup, as terminal jobs in the middle of the
+	// range, so the stats rows and every other read see the history they saw
+	// without it.
+	treeRoot, err := seedStatsTree(ctx, db, seedEpoch.Add(10*24*time.Hour))
+	if err != nil {
+		return report, err
+	}
 
 	for _, table := range []string{
 		"jobs", "job_runs", "job_run_finishes", "job_stats_hourly", "job_error_groups_hourly", "job_queue_samples",
@@ -183,7 +197,7 @@ func ExplainStats(ctx context.Context, cfg ExplainConfig) (StatsExplainReport, e
 
 	denseHour := seedEpoch.Add(15*24*time.Hour + 12*time.Hour)
 	typicalHour := seedEpoch.Add(20*24*time.Hour + 9*time.Hour)
-	for _, r := range statsReads(end, typicalHour, denseHour, sched) {
+	for _, r := range statsReads(end, typicalHour, denseHour, treeRoot, sched) {
 		read, readErr := measureStatsRead(clockCtx, db, r)
 		if readErr != nil {
 			return report, readErr
@@ -196,9 +210,19 @@ func ExplainStats(ctx context.Context, cfg ExplainConfig) (StatsExplainReport, e
 // statsReads lists every read the characterization measures, as the APIs a
 // dashboard calls — nothing here retypes their SQL — and the two maintenance
 // calls a running Scheduler makes unprompted: its rollup pass, through sched,
-// and the backfill check every Scheduler start runs.
-func statsReads(now, typicalHour, denseHour time.Time, sched *flywheel.Scheduler) []statsRead {
+// and the backfill check every Scheduler start runs. treeRoot is the seeded
+// tree's root.
+//
+//nolint:funlen // one table of reads
+func statsReads(now, typicalHour, denseHour time.Time, treeRoot string, sched *flywheel.Scheduler) []statsRead {
 	day := 24 * time.Hour
+	midHistory := now.Add(-statsExplainDays * day / 2)
+	// The latest-run reads filter on kind-12, one of the kinds the seed fails
+	// (kind-10 through kind-17: its failure buckets are 90 to 97 of g % 100), and
+	// on a fingerprint the seed stores for it, its first message shape's.
+	const failingKind = "kind-12"
+	sum := md5.Sum([]byte(failingKind + ":0")) //nolint:gosec // the seed's own derivation
+	fingerprint := hex.EncodeToString(sum[:])[:16]
 	return []statsRead{
 		{"Stats 24h", func(ctx context.Context, db *gorm.DB) error {
 			_, err := flywheel.Stats(ctx, db, flywheel.StatsParams{From: now.Add(-day), To: now})
@@ -290,6 +314,53 @@ func statsReads(now, typicalHour, denseHour time.Time, sched *flywheel.Scheduler
 		}},
 		{"ListJobs", func(ctx context.Context, db *gorm.DB) error {
 			_, err := flywheel.ListJobs(ctx, db, flywheel.ListJobsParams{})
+			return err
+		}},
+		{"ListRunFinishes mid-history page", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.ListRunFinishes(ctx, db, flywheel.ListRunFinishesParams{Since: midHistory})
+			return err
+		}},
+		{"ListRunFinishes kind filter (1,000 scanned)", func(ctx context.Context, db *gorm.DB) error {
+			// One kind in twenty fills no 100-finish page in 1,000 entries.
+			_, err := flywheel.ListRunFinishes(ctx, db, flywheel.ListRunFinishesParams{
+				Since: midHistory, Kinds: []string{failingKind},
+			})
+			return err
+		}},
+		{"JobTree 2,000 nodes", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.JobTree(ctx, db, treeRoot, flywheel.JobTreeParams{
+				MaxDepth: flywheel.MaxTreeDepth, MaxNodes: flywheel.MaxTreeNodes,
+			})
+			return err
+		}},
+		{"QueryJobs fingerprint", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.QueryJobs(ctx, db, flywheel.JobQuery{Fingerprint: fingerprint})
+			return err
+		}},
+		{"QueryJobs fingerprint and kind", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.QueryJobs(ctx, db, flywheel.JobQuery{Fingerprint: fingerprint, Kinds: []string{failingKind}})
+			return err
+		}},
+		{"QueryJobs error class", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.QueryJobs(ctx, db, flywheel.JobQuery{ErrorClasses: []flywheel.ErrorClass{flywheel.ErrorTransient}})
+			return err
+		}},
+		{"QueryJobs error class and state", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.QueryJobs(ctx, db, flywheel.JobQuery{
+				ErrorClasses: []flywheel.ErrorClass{flywheel.ErrorTransient}, States: []flywheel.JobState{flywheel.StateDiscarded},
+			})
+			return err
+		}},
+		{"QueryJobs error contains 7d", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.QueryJobs(ctx, db, flywheel.JobQuery{
+				ErrorContains: "connection refused", CreatedFrom: now.Add(-7 * day),
+			})
+			return err
+		}},
+		{"QueryJobs error contains 7d and kind", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.QueryJobs(ctx, db, flywheel.JobQuery{
+				ErrorContains: "connection refused", CreatedFrom: now.Add(-7 * day), Kinds: []string{failingKind},
+			})
 			return err
 		}},
 		{"Rollup pass, caught up", func(ctx context.Context, _ *gorm.DB) error {
@@ -480,6 +551,39 @@ func seedStatsHistory(ctx context.Context, db *gorm.DB, runs int, end time.Time)
 		from, statsExplainDays*24*60, statsExplainSampleQueues)
 }
 
+// statsTreeRowBase is the first row number of the seeded tree's ids, past every
+// history row's, so no tree id repeats one.
+const statsTreeRowBase = 1 << 33
+
+// seedStatsTree writes a job tree inserted at at: a root with
+// statsExplainTreeChildren children, each with statsExplainTreeGrandchildren of
+// its own, every one succeeded, its id UUIDv7-shaped (seedJobIDSQL) so it sorts
+// among the history's. It returns the root's id.
+func seedStatsTree(ctx context.Context, db *gorm.DB, at time.Time) (string, error) {
+	err := db.WithContext(ctx).Exec(`
+		INSERT INTO jobs (id, created_at, updated_at, metadata, kind, queue, args, priority, state,
+		                  attempt, max_attempts, scheduled_at, executor_class, tags, finalized_at, parent_job_id)
+		SELECT `+seedJobIDSQL("t.at", "t.n + "+fmt.Sprint(statsTreeRowBase))+`, t.at, t.at, '{}'::jsonb,
+		       CASE WHEN t.parent_n IS NULL THEN 'tree.root' ELSE 'tree.node' END, 'default', '{}'::jsonb, 100,
+		       'succeeded', 1, 25, t.at, '', '[]'::jsonb, t.at,
+		       CASE WHEN t.parent_n IS NOT NULL THEN `+seedJobIDSQL("t.at", "t.parent_n + "+fmt.Sprint(statsTreeRowBase))+` END
+		FROM (SELECT ?::timestamptz AS at, s.n, s.parent_n FROM (
+		        SELECT 0::bigint AS n, NULL::bigint AS parent_n
+		        UNION ALL SELECT c, 0 FROM generate_series(1, ?) AS c
+		        UNION ALL SELECT ? + (c - 1) * ? + k, c FROM generate_series(1, ?) AS c, generate_series(1, ?) AS k
+		      ) s) t`,
+		at, statsExplainTreeChildren, statsExplainTreeChildren, statsExplainTreeGrandchildren,
+		statsExplainTreeChildren, statsExplainTreeGrandchildren).Error
+	if err != nil {
+		return "", fmt.Errorf("loadtest: seed the job tree: %w", err)
+	}
+	root := scalarString(ctx, db, `SELECT id FROM jobs WHERE kind = 'tree.root'`)
+	if root == "" {
+		return "", fmt.Errorf("loadtest: seed the job tree: no root")
+	}
+	return root, nil
+}
+
 // seedJobIDSQL is the SQL of a UUIDv7-shaped id for a job inserted at
 // insertedAt, a timestamptz expression, its tail the row number row: the
 // insert's millisecond in the first 12 hex digits, then -7000-8000-, then row
@@ -511,8 +615,10 @@ func (r StatsExplainReport) Text() string {
 	}
 	fmt.Fprintf(&b, "schema: %s\n", r.Schema)
 	fmt.Fprintf(&b, "fixture: %d runs over %d days across %d kinds, plus one hour of %d runs; %d running, %d ready; "+
-		"UUIDv7 job ids; failures with messages and fingerprints; a queue sample a minute for %d queues\n",
-		r.Runs, r.Days, r.Kinds, statsExplainDenseHour, statsExplainRunning, statsExplainReady, statsExplainSampleQueues)
+		"UUIDv7 job ids; failures with messages and fingerprints; a queue sample a minute for %d queues; "+
+		"a job tree of %d children with %d children each\n",
+		r.Runs, r.Days, r.Kinds, statsExplainDenseHour, statsExplainRunning, statsExplainReady, statsExplainSampleQueues,
+		statsExplainTreeChildren, statsExplainTreeGrandchildren)
 	fmt.Fprintf(&b, "job_runs: %.1f MB total, %.1f MB of indexes; job_run_finishes: %.1f MB; jobs: %.1f MB total\n",
 		mb(r.RunsBytes), mb(r.RunsIndex), mb(r.LogBytes), mb(r.JobsBytes))
 	fmt.Fprintf(&b, "job_stats_hourly: %d rows, %.1f MB, rolled up from scratch in %s (%d hours)\n",

@@ -869,3 +869,228 @@ func TestContainmentIsRefusedOnSQLite(t *testing.T) {
 	require.ErrorIs(t, err, ErrUnsupportedDialect)
 	assert.Empty(t, rec.stmt, "the refusal runs no statement")
 }
+
+// The latest-run fixture's stored fingerprints.
+const (
+	latestFPOne   = "aaaaaaaaaaaaaaaa"
+	latestFPTwo   = "bbbbbbbbbbbbbbbb"
+	latestFPThree = "cccccccccccccccc"
+)
+
+// latestRun is one attempt of a latest-run fixture job.
+type latestRun struct {
+	outcome     RunOutcome
+	class       ErrorClass
+	fingerprint string
+	message     string
+}
+
+// latestRunJob is one job of the latest-run fixture: its key, state, and
+// attempt counter, and its runs in attempt order from 1.
+type latestRunJob struct {
+	key     string
+	state   JobState
+	attempt int
+	runs    []latestRun
+}
+
+// latestRunFixture puts each filter's match on a job's latest attempt and its
+// decoys on earlier ones: a's first attempt failed as b's only one did, c's
+// first failed as the error text cases read, and running's earlier failures sit
+// under an attempt still running. legacy's failure was stored by a release
+// before fingerprints. The pairs pct/pct2, under/under2, and slash/slash2 differ
+// only where an unescaped %, _, or \ would match the other. Newest first, its
+// keys read running slash2 slash under2 under pct2 pct c ok legacy b a never.
+//
+//nolint:gochecknoglobals // shared fixture
+var latestRunFixture = []latestRunJob{
+	{key: "never", state: StateAvailable},
+	{key: "a", state: StateRetryable, attempt: 2, runs: []latestRun{
+		{OutcomeError, ErrorPermanent, latestFPOne, "connection refused by upstream"},
+		{OutcomeError, ErrorTransient, latestFPTwo, "Connection Refused: retry later"},
+	}},
+	{key: "b", state: StateDiscarded, attempt: 1, runs: []latestRun{
+		{OutcomeError, ErrorPermanent, latestFPOne, "deadline exceeded"},
+	}},
+	{key: "legacy", state: StateRetryable, attempt: 1, runs: []latestRun{
+		{OutcomeError, ErrorPermanent, "", "connection refused"},
+	}},
+	{key: "ok", state: StateSucceeded, attempt: 1, runs: []latestRun{{outcome: OutcomeSuccess}}},
+	{key: "c", state: StateRetryable, attempt: 2, runs: []latestRun{
+		{OutcomeError, ErrorPermanent, latestFPOne, "connection refused"},
+		{OutcomeTimeout, ErrorTimeout, latestFPThree, "deadline exceeded"},
+	}},
+	{key: "pct", state: StateRetryable, attempt: 1, runs: []latestRun{{OutcomeError, ErrorValidation, latestFPThree, "rate 100% reached"}}},
+	{key: "pct2", state: StateRetryable, attempt: 1, runs: []latestRun{{OutcomeError, ErrorValidation, latestFPThree, "rate 1000 reached"}}},
+	{key: "under", state: StateRetryable, attempt: 1, runs: []latestRun{{OutcomeError, ErrorValidation, latestFPThree, "a_b failed"}}},
+	{key: "under2", state: StateRetryable, attempt: 1, runs: []latestRun{{OutcomeError, ErrorValidation, latestFPThree, "axb failed"}}},
+	{key: "slash", state: StateRetryable, attempt: 1, runs: []latestRun{{OutcomeError, ErrorValidation, latestFPThree, `C:\temp failed`}}},
+	{key: "slash2", state: StateRetryable, attempt: 1, runs: []latestRun{{OutcomeError, ErrorValidation, latestFPThree, `C:temp failed`}}},
+	{key: "running", state: StateRunning, attempt: 3, runs: []latestRun{
+		{OutcomeError, ErrorPermanent, latestFPOne, "connection refused"},
+		{OutcomeError, ErrorPermanent, latestFPOne, "connection refused"},
+		{outcome: OutcomeStarted},
+	}},
+}
+
+// seedLatestRunFixture writes the latest-run fixture, each job a minute after
+// the last on the query fixture's first day, its runs beside it.
+func seedLatestRunFixture(t *testing.T, db *gorm.DB) queryIDs {
+	t.Helper()
+	ids := queryIDs{id: map[string]string{}, key: map[string]string{}}
+	for i, j := range latestRunFixture {
+		created := queryDay(0).Add(time.Duration(i) * time.Minute)
+		id := idAt(created, i)
+		ids.id[j.key], ids.key[id] = id, j.key
+		seedJob(t, db, jobRow{
+			ID: id, Kind: "latest", Queue: defaultQueue, State: string(j.state), Attempt: j.attempt, MaxAttempts: 25,
+			CreatedAt: created, UpdatedAt: created, ScheduledAt: created,
+		})
+		for n, r := range j.runs {
+			at := created.Add(time.Duration(n+1) * time.Second)
+			row := jobRunRow{
+				ID: fmt.Sprintf("latest-%s-%d", j.key, n+1), JobID: id, Attempt: n + 1, Kind: "latest", Queue: defaultQueue,
+				ExecutorID: "exec", StartedAt: at, Outcome: string(r.outcome), CreatedAt: at,
+			}
+			if r.class != "" {
+				c := string(r.class)
+				row.ErrorClass = &c
+			}
+			if r.fingerprint != "" {
+				fp := r.fingerprint
+				row.ErrorFingerprint = &fp
+			}
+			if r.message != "" {
+				m := r.message
+				row.ErrorMessage = &m
+			}
+			seedRun(t, db, row)
+		}
+	}
+	return ids
+}
+
+// latestRunFilterCases are the latest-run filters both dialects run, each
+// listing its keys newest first.
+func latestRunFilterCases() []queryFilterCase {
+	classes := func(cs ...ErrorClass) func(queryIDs) JobQuery {
+		return func(queryIDs) JobQuery { return JobQuery{ErrorClasses: cs} }
+	}
+	fingerprint := func(fp string) func(queryIDs) JobQuery {
+		return func(queryIDs) JobQuery { return JobQuery{Fingerprint: fp} }
+	}
+	return []queryFilterCase{
+		{"one_class", classes(ErrorPermanent), []string{"legacy", "b"}},
+		{"another_class", classes(ErrorTransient), []string{"a"}},
+		{"any_of_the_classes", classes(ErrorTransient, ErrorTimeout), []string{"c", "a"}},
+		{
+			"a_class_every_escape_case_shares", classes(ErrorValidation),
+			[]string{"slash2", "slash", "under2", "under", "pct2", "pct"},
+		},
+		{"a_fingerprint_only_an_earlier_attempt_or_a_running_job_also_had", fingerprint(latestFPOne), []string{"b"}},
+		{"a_latest_fingerprint", fingerprint(latestFPTwo), []string{"a"}},
+		{
+			"a_fingerprint_shared_by_many", fingerprint(latestFPThree),
+			[]string{"slash2", "slash", "under2", "under", "pct2", "pct", "c"},
+		},
+		{"a_fingerprint_no_run_stores", fingerprint("0123456789abcdef"), []string{}},
+		{
+			"a_fingerprint_the_legacy_run_would_have", fingerprint(ErrorFingerprint("latest", ErrorPermanent, "connection refused")),
+			[]string{},
+		},
+		{"a_class_and_a_fingerprint", func(queryIDs) JobQuery {
+			return JobQuery{ErrorClasses: []ErrorClass{ErrorPermanent}, Fingerprint: latestFPOne}
+		}, []string{"b"}},
+		{"a_class_and_a_state", func(queryIDs) JobQuery {
+			return JobQuery{ErrorClasses: []ErrorClass{ErrorPermanent}, States: []JobState{StateDiscarded}}
+		}, []string{"b"}},
+		{"a_fingerprint_and_a_kind", func(queryIDs) JobQuery {
+			return JobQuery{Fingerprint: latestFPTwo, Kinds: []string{"latest"}}
+		}, []string{"a"}},
+		{"a_fingerprint_and_another_kind", func(queryIDs) JobQuery {
+			return JobQuery{Fingerprint: latestFPTwo, Kinds: []string{"other"}}
+		}, []string{}},
+	}
+}
+
+// TestLatestRunFiltersMatchOnlyTheLatestAttempt proves ErrorClasses and
+// Fingerprint match a job by the run of the attempt it names: an earlier
+// attempt's failure never matches, a job never claimed or whose attempt still
+// runs matches none, and a run stored without a fingerprint never matches one.
+func TestLatestRunFiltersMatchOnlyTheLatestAttempt(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	runQueryFilterCases(t, db, seedLatestRunFixture(t, db), latestRunFilterCases())
+}
+
+// TestErrorContainsNeedsABoundedWindowAndIsRefusedOnSQLite proves ErrorContains
+// searches only a created window of at most MaxContainmentWindow, refused
+// before any statement as error_contains, and that SQLite, which cannot run it,
+// refuses it with ErrUnsupportedDialect after those checks.
+func TestErrorContainsNeedsABoundedWindowAndIsRefusedOnSQLite(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	now := queryDay(10)
+	ctx := models.WithClock(context.Background(), models.NewFixedClock(now))
+
+	refused := map[string]JobQuery{
+		"no_created_from":          {ErrorContains: "refused"},
+		"a_window_over_seven_days": {ErrorContains: "refused", CreatedFrom: queryDay(0), CreatedTo: queryDay(8)},
+		"an_open_end_too_far_back": {ErrorContains: "refused", CreatedFrom: now.Add(-MaxContainmentWindow - time.Minute)},
+	}
+	for name, q := range refused {
+		t.Run(name, func(t *testing.T) {
+			session, rec := recordStatements(db)
+			_, err := QueryJobs(ctx, session, q)
+			requireFieldRefusal(t, err, "error_contains")
+			_, err = CountJobs(ctx, session, q)
+			requireFieldRefusal(t, err, "error_contains")
+			assert.Empty(t, rec.stmt, "a refusal runs no statement")
+		})
+	}
+
+	for name, q := range map[string]JobQuery{
+		"a_bounded_window": {ErrorContains: "refused", CreatedFrom: queryDay(0), CreatedTo: queryDay(7)},
+		"an_open_end":      {ErrorContains: "refused", CreatedFrom: now.Add(-MaxContainmentWindow)},
+	} {
+		t.Run("sqlite_refuses_"+name, func(t *testing.T) {
+			session, rec := recordStatements(db)
+			_, err := QueryJobs(ctx, session, q)
+			require.ErrorIs(t, err, ErrUnsupportedDialect)
+			assert.NotErrorIs(t, err, ErrValidation, "the window is valid; only the dialect is refused")
+			_, err = CountJobs(ctx, session, q)
+			require.ErrorIs(t, err, ErrUnsupportedDialect)
+			assert.Empty(t, rec.stmt, "a refusal runs no statement")
+		})
+	}
+}
+
+// TestLatestRunFiltersRefuseABadRequest proves an unknown error class and a
+// fingerprint that is not 16 lowercase hex characters are refused before any
+// statement runs, each naming its field, by QueryJobs and CountJobs alike.
+func TestLatestRunFiltersRefuseABadRequest(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	ctx := context.Background()
+	for name, c := range map[string]struct {
+		q     JobQuery
+		field string
+	}{
+		"an_unknown_class":          {JobQuery{ErrorClasses: []ErrorClass{ErrorPermanent, "fatal"}}, "error_classes"},
+		"an_empty_class":            {JobQuery{ErrorClasses: []ErrorClass{""}}, "error_classes"},
+		"a_short_fingerprint":       {JobQuery{Fingerprint: "abc123"}, "fingerprint"},
+		"a_long_fingerprint":        {JobQuery{Fingerprint: latestFPOne + "0"}, "fingerprint"},
+		"an_uppercase_fingerprint":  {JobQuery{Fingerprint: strings.ToUpper(latestFPOne)}, "fingerprint"},
+		"a_fingerprint_not_in_hex":  {JobQuery{Fingerprint: "gggggggggggggggg"}, "fingerprint"},
+		"a_class_beside_valid_ones": {JobQuery{Kinds: []string{"latest"}, ErrorClasses: []ErrorClass{"Permanent"}}, "error_classes"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			session, rec := recordStatements(db)
+			_, err := QueryJobs(ctx, session, c.q)
+			requireFieldRefusal(t, err, c.field)
+			_, err = CountJobs(ctx, session, c.q)
+			requireFieldRefusal(t, err, c.field)
+			assert.Empty(t, rec.stmt, "a refusal runs no statement")
+		})
+	}
+}

@@ -84,3 +84,44 @@ func TestQueryJobsPagesNeverSkipOrRepeatTiedRowsPostgres(t *testing.T) {
 	t.Parallel()
 	queryPagingSuite(t, postgresOpener)
 }
+
+// TestLatestRunFiltersMatchOnlyTheLatestAttemptPostgres runs the latest-run
+// filters on PostgreSQL, then ErrorContains, which only PostgreSQL has: the
+// latest attempt's message holds the text in any case, within the created
+// window, with %, _, and \ each matching only itself; and CountJobs counts what
+// each filter lists.
+func TestLatestRunFiltersMatchOnlyTheLatestAttemptPostgres(t *testing.T) {
+	t.Parallel()
+	db := NewPostgresIsolatedDB(t)
+	ids := seedLatestRunFixture(t, db)
+	runQueryFilterCases(t, db, ids, latestRunFilterCases())
+
+	contains := func(text string) JobQuery {
+		return JobQuery{ErrorContains: text, CreatedFrom: queryDay(0), CreatedTo: queryDay(1)}
+	}
+	cases := []queryFilterCase{
+		{"text_as_written", func(queryIDs) JobQuery { return contains("Connection Refused") }, []string{"legacy", "a"}},
+		{"text_in_another_case", func(queryIDs) JobQuery { return contains("CONNECTION refused") }, []string{"legacy", "a"}},
+		{"text_only_an_earlier_attempt_held", func(queryIDs) JobQuery { return contains("refused by upstream") }, []string{}},
+		{"a_percent_matches_only_itself", func(queryIDs) JobQuery { return contains("100%") }, []string{"pct"}},
+		{"an_underscore_matches_only_itself", func(queryIDs) JobQuery { return contains("a_b") }, []string{"under"}},
+		{"a_backslash_matches_only_itself", func(queryIDs) JobQuery { return contains(`C:\temp`) }, []string{"slash"}},
+		{"text_and_a_class", func(queryIDs) JobQuery {
+			q := contains("refused")
+			q.ErrorClasses = []ErrorClass{ErrorTransient}
+			return q
+		}, []string{"a"}},
+		{"text_and_a_state", func(queryIDs) JobQuery {
+			q := contains("exceeded")
+			q.States = []JobState{StateDiscarded}
+			return q
+		}, []string{"b"}},
+		{"text_outside_the_window", func(queryIDs) JobQuery {
+			return JobQuery{ErrorContains: "refused", CreatedFrom: queryDay(1), CreatedTo: queryDay(2)}
+		}, []string{}},
+	}
+	runQueryFilterCases(t, db, ids, cases)
+	t.Run("counts", func(t *testing.T) {
+		requireCountsWhatItLists(t, db, ids, append(latestRunFilterCases(), cases...))
+	})
+}

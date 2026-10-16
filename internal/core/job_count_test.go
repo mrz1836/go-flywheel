@@ -137,3 +137,48 @@ func TestCountJobsIsExactToTheCapThenEstimates(t *testing.T) {
 	t.Parallel()
 	countSuite(t, sqliteOpener)
 }
+
+// listAllPages lists every job q matches, two at a time, following each
+// NextCursor, and returns their fixture keys in order.
+func listAllPages(t *testing.T, db *gorm.DB, ids queryIDs, q JobQuery) []string {
+	t.Helper()
+	out := []string{}
+	q.Limit = 2
+	for range len(ids.id) + 1 {
+		page, err := QueryJobs(context.Background(), db, q)
+		require.NoError(t, err)
+		out = append(out, ids.keys(t, page)...)
+		if page.NextCursor == "" {
+			return out
+		}
+		q.Cursor = page.NextCursor
+	}
+	t.Fatal("the pages never ended")
+	return nil
+}
+
+// requireCountsWhatItLists asserts, for each case, that QueryJobs lists the
+// case's jobs across its pages, read two at a time, and that CountJobs counts
+// exactly them.
+func requireCountsWhatItLists(t *testing.T, db *gorm.DB, ids queryIDs, cases []queryFilterCase) {
+	t.Helper()
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			q := c.q(ids)
+			listed := listAllPages(t, db, ids, q)
+			assert.Equal(t, c.want, listed)
+			n, err := CountJobs(context.Background(), db, q)
+			require.NoError(t, err)
+			assert.Equal(t, JobCount{N: int64(len(listed))}, n)
+		})
+	}
+}
+
+// TestLatestRunFiltersCountWhatTheyList proves CountJobs applies the latest-run
+// filters exactly as QueryJobs does: for every case, it counts the jobs the
+// query lists across its pages.
+func TestLatestRunFiltersCountWhatTheyList(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	requireCountsWhatItLists(t, db, seedLatestRunFixture(t, db), latestRunFilterCases())
+}

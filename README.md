@@ -1075,6 +1075,11 @@ for _, job := range page.Items { // each a JobView, its metadata, and its latest
   created, scheduled, and finalized windows. The created window is applied to the UUIDv7 id, so the
   primary key serves it. On PostgreSQL, `ArgsContains` and `MetadataContains` find jobs whose args or
   metadata contain a JSON object, within a created window of at most seven days.
+- **Filters on the latest attempt:** `ErrorClasses`, `Fingerprint`, and `ErrorContains` match a job by
+  the run of the attempt it names, so an error group opens as the list of its jobs and an earlier
+  attempt's failure never matches. `ErrorContains` is a case-insensitive text search, on PostgreSQL,
+  within a created window of at most seven days. Each probes one index per candidate, so pair them with a
+  created window, a kind, or a state.
 - **Sorts:** `JobSortNewest` (the default), `JobSortOldest`, `JobSortFinished` (terminal states, most
   recently finished first), and `JobSortScheduled` (waiting states, next to become claimable first). The
   id breaks every tie, so the opaque `jq1.` cursor never skips or repeats a row between pages.
@@ -1741,7 +1746,8 @@ flagged), `ListFinished`, `QueryJobs` and `CountJobs` (any filter, paged, with a
 time), `Stats` and `StatsSeries` (outcomes, jobs enqueued, success rate, duration and queue-wait
 percentiles per kind or per queue over any window, from hourly rollups that outlive retention),
 `ErrorGroups` (what is failing, grouped by fingerprint), `Baselines`, and `Anomalies` (a low-noise "this
-kind got slower / started failing"). Every read is bounded and indexed — tens of milliseconds at a million
+kind got slower / started failing"), `ListRunFinishes` (every finish once, in order, polled from a
+cursor), and `ListChildren` and `JobTree` (a fan-out's children and its tree, within bounds). Every read is bounded and indexed — tens of milliseconds at a million
 runs; the next guide covers the queue and failure views.
 [`docs/INTEGRATING.md`](docs/INTEGRATING.md) covers the data contract, each API's cost, recipes, direct
 SQL, and the upgrade for an existing database; [`examples/dashboard-api`](examples/dashboard-api/main.go)
@@ -1802,8 +1808,50 @@ value joins one group. `ErrorFingerprint(kind, class, message)` computes the fin
 and `JobRunView.ErrorFingerprint` reports a run's. The masking rules are versioned
 (`ErrorFingerprintVersion`): a change to any of them is a new version, after which groups restart.
 
+To open a group as its jobs, filter `QueryJobs` by its `Fingerprint` and kind (see **Finding jobs**
+above), and `flywheel errors` prints the groups of a recent window.
+
 [`docs/INTEGRATING.md`](docs/INTEGRATING.md#error-groups-what-is-failing) covers each read's cost, the
 tables behind them for direct SQL, and the upgrade.
+
+</details>
+
+<details>
+<summary><strong><code>The finish feed, children, and job trees</code></strong></summary>
+<br>
+
+**`ListRunFinishes` is the feed of what just finished.** It reads the finish log in order, a page at a
+time, and its `NextCursor` is always set: poll from it, and every finish arrives once, in order, with its
+run, job, kind, queue, attempt, outcome, error class, and duration.
+
+```go
+page, err := flywheel.ListRunFinishes(ctx, db, flywheel.ListRunFinishesParams{After: cursor})
+for _, f := range page.Finishes {
+    fmt.Println(f.FinishedAt, f.Kind, f.Outcome, f.JobID)
+}
+cursor = page.NextCursor // the next poll starts here
+```
+
+A finalize stamps its finish before it commits, so a commit can land behind a reader that has read past
+its time. The feed holds back the newest `Settle` of the log (`DefaultFeedSettle`, 5 seconds) and reports
+that horizon, so a finalize that commits within it is never skipped. A page scans at most 1,000 entries
+and its cursor moves past every one, so a `Kinds` or `Queues` filter returns a short page rather than a
+slow one.
+
+**Children and trees.** `ListChildren` pages a job's children newest first, each with its metadata and
+latest run, behind a `jc1.` cursor. `JobTree` walks a job's descendants breadth first, within
+`MaxDepth` levels (5 by default, 10 at most) and `MaxNodes` nodes (500 by default, 2,000 at most), and
+reports each node's full child count and whether a bound cut the walk:
+
+```go
+tree, err := flywheel.JobTree(ctx, db, rootID, flywheel.JobTreeParams{})
+// tree.Root.Children, tree.Root.ChildCount, tree.Nodes, tree.Truncated
+```
+
+The walk reads one level at a time with bounded statements, the same on PostgreSQL and SQLite, so a
+fan-out of any width costs what the bounds allow. `ChildOutputsWithOptions` reads the children's outputs
+in any states, so a batch's view shows what has been produced before the batch has finished.
+`flywheel jobs tree <job-id>` prints a tree.
 
 </details>
 
@@ -1923,11 +1971,12 @@ A cancelled pass reports the rows it committed alongside the context error — t
 not rolled back — so treat a non-nil error as "partial progress", not "nothing happened".
 
 The reads are bounded the same way. Every list read — `ListJobs`, `ListFinished`, `ListRunning`,
-`SlowRuns`, `RecentFailures`, `ListRuns`, and `ListAudit` — returns at most `flywheel.MaxReadLimit` (200) rows: a
+`SlowRuns`, `RecentFailures`, `ListRuns`, `ListAudit`, `ListRunFinishes`, and `ListChildren` — returns at most `flywheel.MaxReadLimit` (200) rows: a
 larger `Limit` is clamped, so a handler can pass a request's limit straight through. `ListRuns` with no
-`Limit` reads a job's newest 200 attempts; page past them with `BeforeAttempt`. `ChildOutputs` is the
-one exception: with no `Limit` it reads every terminal child, the fold a barrier continuation needs, and
-`DriverOpts.BarrierMaxChildren` bounds that generation.
+`Limit` reads a job's newest 200 attempts; page past them with `BeforeAttempt`. `ChildOutputs` and
+`ChildOutputsWithOptions` are the one exception: with no `Limit` they read every matching child, the fold
+a barrier continuation needs, and `DriverOpts.BarrierMaxChildren` bounds that generation. `JobTree` has
+bounds of its own: 10 levels and 2,000 nodes at most.
 
 ### Retention
 
