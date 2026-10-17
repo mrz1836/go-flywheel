@@ -1406,7 +1406,8 @@ work depends on the intent:
 with `WithActor`, and each control called with that context writes one entry to `job_audit` for every job
 or schedule it changes: `RetryJob`, `RetryJobWithOptions`, `CancelJob`, `PauseByParent`, `ResumeByParent`,
 `CancelByParent`, `Replay`, `ReplayByParent`, `SetPeriodicActive`, `DeletePeriodic`, `PausePeriodic`,
-`ResumePeriodic`, `TriggerPeriodic`, and the single-job controls of **Changing one job** below.
+`ResumePeriodic`, `TriggerPeriodic`, the single-job controls of **Changing one job** below, and
+`BulkJobs`.
 
 ```go
 ctx = flywheel.WithActor(ctx, flywheel.Actor{
@@ -1533,6 +1534,97 @@ old and new time (`from`, `to`, in UTC), `reprioritized` with the old and new pr
 
 **From the CLI.** `flywheel jobs reschedule <job-id> --at <RFC3339>`, `jobs priority <job-id> <priority>`,
 `jobs pause <job-id>`, `jobs resume <job-id>`, and `jobs delete <job-id>`, each with `--reason`.
+
+</details>
+
+<details>
+<summary><strong><code>Bulk controls by filter — preview, then apply in resumable batches</code></strong></summary>
+<br>
+
+**`BulkJobs` acts on every job a filter matches: cancel, retry, delete, reschedule, pause, or resume.** The
+filter is a `JobQuery`, applied exactly as `QueryJobs` applies it, the latest-run filters included, or a
+list of job ids, and each job changes the way its single-job control changes it, from the same states.
+Preview first with `DryRun`, then apply what you previewed:
+
+```go
+spec := flywheel.BulkSpec{
+    Query:  flywheel.JobQuery{Kinds: []string{"fetch_report"}, States: []flywheel.JobState{flywheel.StateDiscarded}},
+    Action: flywheel.BulkRetry,
+    Retry:  flywheel.RetryOpts{Force: true, ResetAttempts: true},
+    DryRun: true,
+}
+preview, err := flywheel.BulkJobs(ctx, db, spec)
+// preview.Matched jobs matched; preview.Changed would change; preview.Skipped by reason;
+// preview.ByState and preview.ByKind; preview.Sample, the 20 newest it would change.
+
+spec.DryRun = false
+spec.MaxJobs = int(preview.Matched) // never more than the preview counted
+spec.MaxID = preview.ResumeAfter    // never a job enqueued after the preview
+spec.OperationID = operationID      // recorded on every entry
+spec.Stagger = 10 * time.Minute     // spread the retried jobs' due times
+res, err := flywheel.BulkJobs(ctx, db, spec)
+```
+
+**A dry run changes nothing and counts what an apply would.** It walks the selection in the apply's
+batches, read-only, and classifies every job. `Changed` is how many the action would change, and `Skipped`
+counts the rest by reason: `running` (no action touches a running job), `terminal` (a finished job, which
+only a forced retry or a delete acts on), `not_terminal` (a waiting job a delete leaves alone), `state`
+(already in the action's target state: a pause of a paused job, a resume of one that isn't paused), and
+`active_key` (a finished job a forced retry leaves finished because another live job holds its
+`UniqueActiveKey`, or an earlier job in the run takes it). The `Sample` holds up to 20 of the jobs it would
+change, newest first, as `JobView`s, never their args. Its `ResumeAfter` is the newest id it matched.
+
+**Pin the apply to the preview with `MaxJobs` and `MaxID`.** An apply first counts its selection up to
+`MaxJobs` plus one, and more than `MaxJobs` returns `ErrBulkTooLarge` and changes nothing. `MaxID` leaves
+out every job whose id sorts above it, and ids are UUIDv7, so in insert order: a job enqueued after the
+preview is never matched. With both set from the preview, the apply acts on at most what the preview saw;
+if the selection grew below the ceiling since (a job moved into the filter), it refuses with
+`ErrBulkTooLarge` rather than act on a set nobody previewed, and you preview again. `MaxJobs` is 10,000 by
+default (`DefaultBulkMaxJobs`) and at most 100,000 (`MaxBulkJobs`). A spec bounded by neither a filter nor
+ids is refused with `ErrBulkUnbounded`, and an option its action doesn't read with a `*ValidationError`.
+
+**Batches, locks, and concurrent changes.** The apply walks the matches by id, `BatchSize` jobs (500 by
+default, at most 5,000) per transaction. Each batch re-reads its jobs through the filter itself under a row
+lock (`FOR UPDATE` on PostgreSQL), classifies each by the state it reads then, and changes only the rows
+still selected and in the action's source states. A job a concurrent call moved is classified by its new
+state; one that left the filter, because someone retried it to `succeeded` a moment earlier, say, is left
+alone and counted nowhere, so a forced retry never re-runs work that just finished. A batch holds its
+jobs' locks until it commits, and a finalize of one of them waits that long. A delete removes each job's
+finish-log entries, runs, and row, in retention's order, and keeps its history.
+
+**A forced retry never doubles work.** `Retry.Force` also retries finished jobs, the incident recovery,
+but never one whose attempt still runs: a running job, or a cancelled one whose cancelled attempt hasn't
+returned, counts as `running`, and `Retry.AllowRunning` is ignored. It never puts two live jobs on one
+`UniqueActiveKey` either: of the jobs that share a free key, the first by id goes live and the rest stay
+finished, as `active_key`. `Stagger`, on a retry or a reschedule, makes job *i* of the *n* matched due at
+`base + Stagger*i/n`, where `base` is now plus `Retry.Delay`, or `RescheduleAt`, as `ReplayOpts.Stagger`
+places a replay.
+
+**Resuming an interrupted run.** The context is checked between batches. An interrupted run returns what
+it did so far, `Done` false and `ResumeAfter` the last id it passed, with an error wrapping the context's;
+the batch in flight rolls back whole, and the committed ones stay. Pass `ResumeAfter` as `After`, with the
+rest of the spec as it was, to continue: no job is repeated or skipped.
+
+```go
+res, err := flywheel.BulkJobs(ctx, db, spec)
+if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+    spec.After = res.ResumeAfter // keep it: a later call with it carries on from here
+}
+```
+
+**The history and barriers.** Each changed job gets one entry in its history, in its batch's transaction,
+under the context's actor: `retried`, `cancelled`, `deleted`, `rescheduled`, `paused`, or `resumed`, with
+`via: bulk`, the spec's `operation_id`, the state the job changed from, and the details its single-job
+control records. A skipped job gets none, and a `WithAuditHook` hook runs once per batch, its error rolling
+that batch back. A bulk cancel that ends the last pending children of a parent with a fan-in barrier runs
+the barrier's continuation once, as `CancelByParent` does, and never cancels a continuation it enqueued,
+even when the filter matches it.
+
+**A preview walks its whole selection.** A dry run reads every match up to `MaxJobs`, so its cost grows
+with the selection. A filter rare along the id order walks far without its explorer index: a dry run over
+1% of a million jobs takes 1.2 s without `jobs_explore_kind` and 0.25 s with it, and an apply of 100,000
+takes 7–8 s either way ([measured](docs/BENCHMARKS.md#bulk-controls-by-filter-a-dry-run-and-an-apply-at-1000000-jobs)).
+`ErrorContains` is PostgreSQL only, as it is for `QueryJobs`.
 
 </details>
 
