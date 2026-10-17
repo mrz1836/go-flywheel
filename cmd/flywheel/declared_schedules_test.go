@@ -176,6 +176,9 @@ func TestCLIServeRecreatesADeletedSchedule(t *testing.T) {
 		return lerr == nil && strings.Contains(out, `"slug": "nightly"`)
 	}
 	require.Eventually(t, listed, 8*time.Second, 20*time.Millisecond, "serve applied the declared schedule")
+	listing, err := runRoot(context.Background(), "--config", cfg, "schedule", "ls", "--json")
+	require.NoError(t, err)
+	assert.Contains(t, listing, `"source": "declared"`, "serve records the schedule as declared")
 
 	out, err := runRoot(context.Background(), "--config", cfg, "schedule", "rm", "nightly")
 	require.NoError(t, err)
