@@ -270,6 +270,93 @@ nothing and records nothing.
 
 <br>
 
+## A large recovery
+
+When an outage discards thousands of jobs, replay them with a previewed bulk retry: count what the filter
+matches, then apply exactly that, spread over a window so the recovered dependency is not hit at once.
+
+**1. Preview.** A dry run changes nothing and reports what the retry would do:
+
+```go
+ctx = flywheel.WithActor(ctx, flywheel.Actor{Type: flywheel.ActorUser, ID: operator, Reason: "replay the payments outage"})
+spec := flywheel.BulkSpec{
+    Query: flywheel.JobQuery{
+        Kinds:         []string{"charge_card"},
+        States:        []flywheel.JobState{flywheel.StateDiscarded},
+        FinalizedFrom: outageStart,
+        FinalizedTo:   outageEnd,
+        ErrorClasses:  []flywheel.ErrorClass{flywheel.ErrorTransient},
+    },
+    Action: flywheel.BulkRetry,
+    Retry:  flywheel.RetryOpts{Force: true, ResetAttempts: true, Budget: 3},
+    DryRun: true,
+}
+preview, err := flywheel.BulkJobs(ctx, db, spec)
+```
+
+- **`Matched` and `Changed`** are how many jobs the filter matched and how many the retry would return to
+  `available`; `ByState`, `ByKind`, and the `Sample` show what they are. Check them before going on.
+- **`Skipped`** names what the retry leaves alone: `running` jobs are still in flight, a cancelled one
+  among them while its cancelled attempt still runs; `active_key` jobs share a `UniqueActiveKey` that
+  another live job holds, and run once that job finishes.
+- **`MatchedCapped`** means more jobs matched than `MaxJobs` (10,000 by default). Narrow the filter, a
+  tighter window or one kind, rather than raising `MaxJobs` toward its 100,000 ceiling: a smaller
+  operation is easier to check and to undo.
+- **A slow preview** is a filter rare along the id order. A dry run reads every match, and without the
+  explorer index for its field (`ExplorerIndexSet`; `jobs_explore_kind` for a kind) it walks the primary key
+  to find them: at a million jobs, 1.2 s without the kind index and 0.25 s with it for a 1% kind
+  ([measured](BENCHMARKS.md#bulk-controls-by-filter-a-dry-run-and-an-apply-at-1000000-jobs)).
+
+**2. Apply, pinned to the preview.**
+
+```go
+spec.DryRun = false
+spec.MaxJobs = int(preview.Matched) // never more than the preview counted
+spec.MaxID = preview.ResumeAfter    // never a job enqueued since
+spec.OperationID = incidentID       // on every entry the run writes
+spec.Stagger = 15 * time.Minute     // the cohort arrives over fifteen minutes
+res, err := flywheel.BulkJobs(ctx, db, spec)
+```
+
+- **`ErrBulkTooLarge`, nothing changed.** The selection grew since the preview: a job at or below the
+  ceiling moved into the filter. Preview again, and apply what the new preview counts.
+- **`ErrBulkTooLarge`, some changed.** The selection grew past `MaxJobs` while the run walked it. The
+  batches it committed stay, and `res.ResumeAfter` is where it stopped: preview again with `After` set to
+  it, then apply the rest the same way.
+- **Each retried job records the operation.** Its history holds a `retried` entry with `via: bulk` and the
+  `operation_id`, under the operator who ran it (`flywheel jobs history <job-id>`; `ListAudit` with
+  `Actions: []AuditAction{AuditRetried}` reads them across jobs).
+- **Locks.** Each batch locks its jobs until it commits, 30–70 ms at the default 500, and a finalize of
+  one of them waits that long. Lower `BatchSize` if that matters more than the run's length.
+
+Without `Retry.Force` a bulk retry changes only waiting jobs, and every finished job is skipped as
+`terminal`. `ReplayByParent` replays one parent's children instead, and `Replay` a kind or a failure
+window with no preview.
+
+<br>
+
+## Resuming an interrupted bulk run
+
+A `BulkJobs` call whose context ends between batches, on a deploy, a timeout, or a cancelled request,
+returns what it did so far with an error wrapping the context's:
+
+```
+flywheel: bulk retry cancelled after 3000 changed: context deadline exceeded
+```
+
+Its committed batches stay, each with its entries; the batch in flight rolled back whole, entries and all.
+`Done` is false, and `ResumeAfter` is the last job id the run passed.
+
+- **Continue with the same spec and `After` set to `ResumeAfter`.** The run picks up past that id, and no
+  job is repeated or skipped. Keep `MaxID` as it was: the resumed run counts only the jobs past `After`.
+- **Keep `ResumeAfter` where the next attempt can read it.** The call returns it only when it returns, so
+  the process running the operation records it with the operation id before it exits.
+- **Any failure returns the same partial result.** A database error or an audit hook's error ends the run
+  the same way, `Done` false and `ResumeAfter` the last committed batch's end: fix the cause, then resume.
+- **`Done` true** means the walk reached the end of the selection, and nothing is left to do.
+
+<br>
+
 ## Pausing a queue
 
 Pause a queue when what its jobs call is down — a provider outage, a downstream migration — and its jobs

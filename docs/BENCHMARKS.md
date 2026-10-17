@@ -1106,6 +1106,69 @@ report's notes list the indexes the run actually installed.
 
 <br>
 
+## Bulk controls by filter: a dry run and an apply at 1,000,000 jobs
+
+`BulkJobs` walks its selection by id in batches, and a dry run walks it the same way, read-only, so its
+counts are the apply's. Measured on **Apple M1 Max, 10 cores, 32 GB, macOS 15.7, PostgreSQL 17.10** in the
+`postgres:17-alpine` container on the same machine (its VM 10 CPUs and 7.7 GB; `shared_buffers` 128MB,
+`max_wal_size` 1GB, `work_mem` 4MB), Go 1.27.2. The plans and each run's batch times are in
+[`benchmarks/bulk-1m.txt`](benchmarks/bulk-1m.txt).
+
+`explain -query bulk` seeds a million jobs over 30 days across five kinds: two cohorts of discarded jobs,
+every 100th job (10,000) and every 10th (100,000), spread evenly across the ids, and three kinds of
+everyday jobs, 75% succeeded, 5% discarded, 10% available, 5% retryable, and 5% running; queues at 69, 30,
+and 1%. Each run is one `BulkJobs` call, a forced retry of one cohort's discarded jobs
+(`Query{Kinds: [cohort], States: [discarded]}`, `BatchSize` 500, `MaxJobs` the cohort's size), timed
+whole. A batch's time runs from its read to the next batch's read, so an apply's holds its transaction:
+the locked re-read, the update, 500 audit entries, and the commit. After an apply the cohort is reset to
+discarded, `job_audit` truncated, and `jobs` vacuumed. "With" has `jobs_explore_kind` installed from
+`ExplorerIndexSet`; "without" drops it and analyzes `jobs`.
+
+| Run | Index | Batches | Wall | p50 batch | p95 batch |
+|---|---|---|---|---|---|
+| 10,000-job cohort, dry run | with | 20 | 251 ms | 4.7 ms | 22.4 ms |
+| 10,000-job cohort, apply | with | 20 | 1.26 s | 60.6 ms | 82.1 ms |
+| 100,000-job cohort, dry run | with | 200 | 960 ms | 3.8 ms | 6.0 ms |
+| 100,000-job cohort, apply | with | 200 | 8.00 s | 36.8 ms | 55.6 ms |
+| **10,000-job cohort, dry run** | **without** | 20 | **1.18 s** | **45.0 ms** | 84.3 ms |
+| 10,000-job cohort, apply | without | 20 | 1.51 s | 69.1 ms | 83.3 ms |
+| 100,000-job cohort, dry run | without | 200 | 1.07 s | 3.9 ms | 10.4 ms |
+| 100,000-job cohort, apply | without | 200 | 6.79 s | 30.4 ms | 48.6 ms |
+
+What it says:
+
+- **A rare kind's walk needs its index.** The 1% cohort is one job in a hundred along the primary key, so
+  without `jobs_explore_kind` each batch's read walks about 50,000 rows to find its 500, a parallel scan of
+  `jobs_pkey` that takes 29–32 ms in its plans, and the dry run takes 1.18 s. With the index the read takes
+  its 500 straight off `(kind, id)` in under a millisecond, and the dry run 251 ms. The 10% cohort is dense
+  enough that the planner walks the primary key either way, about 5,000 rows a batch in 1.5–3 ms, and the
+  index changes little: 0.96 s against 1.07 s.
+- **An apply is its writes.** Each 500-job batch re-reads its rows under `FOR UPDATE`, updates them, and
+  writes 500 audit entries, in one transaction: 30–37 ms at the median for the dense cohort, whose rows
+  share heap pages, and 61–69 ms for the sparse one, whose 500 rows sit on 500 pages. A 100,000-job apply
+  takes 7–8 s with or without the index; the read is under a tenth of it. Repeated runs on this machine
+  move an apply's wall time by about 10%, which is the whole of the gap between its two rows.
+- **A preview costs a fraction of its apply.** A dry run reads the same batches with no lock and no write:
+  with the index, 0.25 s for 10,000 jobs and 0.96 s for 100,000, an eighth to a fifth of the apply. Its
+  cost follows the selection rather than the table wherever an index or the key order keeps each batch's
+  read short.
+- **A batch holds its rows' locks for its transaction.** At 500 jobs that is 30–69 ms at the median and at
+  most 94 ms here, which is how long a finalize of one of those jobs waits. A smaller `BatchSize` shortens
+  it, at the cost of more transactions.
+
+### Reproducing
+
+```bash
+export FLYWHEEL_LOADTEST_DATABASE_URL="postgres://localhost:5432/flywheel_test?sslmode=disable"
+
+# A forced-retry dry run and apply of a 10,000-job and a 100,000-job cohort of a million jobs,
+# with and without jobs_explore_kind.
+go run -tags=loadtest ./loadtest/cmd/explain -query bulk -jobs 1000000 -timeout 90m \
+  -out docs/benchmarks/bulk-1m.txt
+```
+
+<br>
+
 ## The queue-state telemetry index
 
 `jobs_state` is `(state) WHERE deleted_at IS NULL`. It serves three readers, not the two the

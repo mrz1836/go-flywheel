@@ -59,6 +59,10 @@ type (
 	BatchOpts             = core.BatchOpts
 	BatchProgress         = core.BatchProgress
 	BatchResult           = core.BatchResult
+	BulkAction            = core.BulkAction
+	BulkResult            = core.BulkResult
+	BulkSkipReason        = core.BulkSkipReason
+	BulkSpec              = core.BulkSpec
 	ChildOutput           = core.ChildOutput
 	ChildOutputsOpts      = core.ChildOutputsOpts
 	ClaimEvent            = core.ClaimEvent
@@ -218,6 +222,18 @@ const (
 	AuditTargetPeriodic      = core.AuditTargetPeriodic
 	AuditTargetQueue         = core.AuditTargetQueue
 	AuditTriggered           = core.AuditTriggered
+	BulkCancel               = core.BulkCancel
+	BulkDelete               = core.BulkDelete
+	BulkPause                = core.BulkPause
+	BulkReschedule           = core.BulkReschedule
+	BulkResume               = core.BulkResume
+	BulkRetry                = core.BulkRetry
+	BulkSkipActiveKey        = core.BulkSkipActiveKey
+	BulkSkipNotTerminal      = core.BulkSkipNotTerminal
+	BulkSkipRunning          = core.BulkSkipRunning
+	BulkSkipState            = core.BulkSkipState
+	BulkSkipTerminal         = core.BulkSkipTerminal
+	DefaultBulkMaxJobs       = core.DefaultBulkMaxJobs
 	DefaultCountCap          = core.DefaultCountCap
 	DefaultFeedSettle        = core.DefaultFeedSettle
 	DefaultTreeDepth         = core.DefaultTreeDepth
@@ -240,6 +256,7 @@ const (
 	JobSortOldest            = core.JobSortOldest
 	JobSortScheduled         = core.JobSortScheduled
 	MaxActorSourceBytes      = core.MaxActorSourceBytes
+	MaxBulkJobs              = core.MaxBulkJobs
 	MaxContainmentWindow     = core.MaxContainmentWindow
 	MaxCountCap              = core.MaxCountCap
 	MaxHistoryPoints         = core.MaxHistoryPoints
@@ -280,6 +297,8 @@ var (
 	ErrAlreadyEnqueued    = core.ErrAlreadyEnqueued
 	ErrBarrierNoChildren  = core.ErrBarrierNoChildren
 	ErrBarrierTooWide     = core.ErrBarrierTooWide
+	ErrBulkTooLarge       = core.ErrBulkTooLarge
+	ErrBulkUnbounded      = core.ErrBulkUnbounded
 	ErrDecodeArgs         = core.ErrDecodeArgs
 	ErrFollowUpLimit      = core.ErrFollowUpLimit
 	ErrIndexDrift         = core.ErrIndexDrift
@@ -317,6 +336,10 @@ func BackfillRunFinishes(ctx context.Context, db *gorm.DB) (int64, error) {
 
 func Baselines(ctx context.Context, db *gorm.DB, window time.Duration) ([]Baseline, error) {
 	return core.Baselines(ctx, db, window)
+}
+
+func BulkJobs(ctx context.Context, db *gorm.DB, spec BulkSpec) (BulkResult, error) {
+	return core.BulkJobs(ctx, db, spec)
 }
 
 func CancelByParent(ctx context.Context, db *gorm.DB, parentJobID string, opts ScopeOpts) (ScopeResult, error) {

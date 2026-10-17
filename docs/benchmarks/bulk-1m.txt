@@ -1,0 +1,206 @@
+bulk controls by filter — postgres://127.0.0.1:55493/flywheel_bench
+server: PostgreSQL 17.10 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+schema: lt_dm7ag6k4c9xs_20r5_1
+fixture: 1000000 jobs over 30 days across five kinds: cohort.small (every 100th job) and cohort.large
+  (every 10th), each discarded on its last attempt and spread evenly across the ids; and mail.send,
+  report.build, and sync.pull: succeeded 75%, discarded 5%, available 10%, retryable 5%, running 5%;
+  queues default 69%, bulk 30%, urgent 1%
+jobs: 427.2 MB total, 218.5 MB of indexes; jobs_explore_kind 68.5 MB
+
+Each run is one BulkJobs call: a forced retry (Retry.Force) of one cohort's discarded jobs,
+Query{Kinds: [cohort], States: [discarded]}, in batches of 500 with MaxJobs at the cohort's size,
+timed whole by the wall clock. A batch's time runs from the start of its read to the start of the
+next batch's read, or to the call's return for the last, so it holds the read and, for an apply, the
+batch's transaction: the locked re-read, the update, the audit entries, and the commit. After an
+apply, its cohort is reset to discarded, job_audit truncated, and jobs vacuumed, so every run starts
+from the same table. "with" runs with jobs_explore_kind installed from ExplorerIndexSet; "without"
+drops it and analyzes jobs. Each plan is one batch's read past the first batch's cursor, explained
+with EXPLAIN (ANALYZE, BUFFERS) against the cohort as the run read it.
+
+run                            index     matched  changed  batches          wall    p50 batch    p95 batch    max batch
+cohort.small (10000), dry run  with        10000    10000       20     250.724ms      4.656ms     22.384ms     28.555ms
+cohort.small (10000), apply    with        10000    10000       20    1263.527ms     60.611ms     82.112ms     88.375ms
+cohort.large (100000), dry run with       100000   100000      200     960.407ms      3.792ms      5.964ms     27.940ms
+cohort.large (100000), apply   with       100000   100000      200    8000.451ms     36.768ms     55.565ms     74.331ms
+cohort.small (10000), dry run  without     10000    10000       20    1177.514ms     44.990ms     84.305ms     87.413ms
+cohort.small (10000), apply    without     10000    10000       20    1514.446ms     69.067ms     83.345ms     94.314ms
+cohort.large (100000), dry run without    100000   100000      200    1067.398ms      3.938ms     10.381ms     20.092ms
+cohort.large (100000), apply   without    100000   100000      200    6793.002ms     30.424ms     48.621ms     66.896ms
+
+=== cohort.small (10000), dry run, with jobs_explore_kind: one batch's read ===
+
+SELECT batch.*, EXISTS (SELECT 1 FROM jobs AS holder WHERE holder.unique_active_key = batch.unique_active_key AND holder.state IN ('available', 'running', 'retryable', 'scheduled', 'paused') AND holder.id <> batch.id) AS held, (batch.state = 'cancelled' AND EXISTS (SELECT 1 FROM job_runs AS r WHERE r.job_id = batch.id AND r.attempt = batch.attempt AND r.outcome = 'started')) AS attempt_runs FROM (SELECT jobs.id,jobs.state,jobs.kind,jobs.parent_job_id,jobs.unique_key,jobs.unique_active_key,jobs.scheduled_at,jobs.attempt FROM "jobs" WHERE jobs.state = 'discarded' AND jobs.kind IN ('cohort.small') AND jobs.id > '019b7e90-3d80-7000-8000-00000000c2ec' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id LIMIT 500) AS batch ORDER BY batch.id
+
+plan:
+  Subquery Scan on batch  (cost=0.55..18968.35 rows=500 width=171) (actual time=0.038..0.605 rows=500 loops=1)
+    Buffers: shared hit=508
+    ->  Limit  (cost=0.55..10810.85 rows=500 width=169) (actual time=0.031..0.465 rows=500 loops=1)
+          Buffers: shared hit=508
+          ->  Index Scan using jobs_explore_kind on jobs  (cost=0.55..29901.85 rows=1383 width=169) (actual time=0.030..0.429 rows=500 loops=1)
+                Index Cond: ((kind = 'cohort.small'::text) AND (id > '019b7e90-3d80-7000-8000-00000000c2ec'::text))
+                Filter: (state = 'discarded'::text)
+                Buffers: shared hit=508
+    SubPlan 1
+      ->  Index Scan using jobs_unique_active_key on jobs holder  (cost=0.12..8.14 rows=1 width=0) (actual time=0.000..0.000 rows=0 loops=500)
+            Index Cond: (unique_active_key = batch.unique_active_key)
+            Filter: (id <> batch.id)
+    SubPlan 3
+      ->  Seq Scan on job_runs r  (cost=0.00..12.00 rows=1 width=40) (never executed)
+            Filter: (outcome = 'started'::text)
+  Planning:
+    Buffers: shared hit=12
+  Planning Time: 0.203 ms
+  Execution Time: 0.662 ms
+
+=== cohort.small (10000), apply, with jobs_explore_kind: one batch's read ===
+
+SELECT jobs.id,jobs.state,jobs.kind,jobs.parent_job_id,jobs.unique_key,jobs.unique_active_key,jobs.scheduled_at,jobs.attempt FROM "jobs" WHERE jobs.state = 'discarded' AND jobs.kind IN ('cohort.small') AND jobs.id > '019b7e90-3d80-7000-8000-00000000c2ec' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id LIMIT 500
+
+plan:
+  Limit  (cost=0.55..10882.39 rows=500 width=169) (actual time=0.017..0.258 rows=500 loops=1)
+    Buffers: shared hit=70 read=12
+    ->  Index Scan using jobs_explore_kind on jobs  (cost=0.55..32319.62 rows=1485 width=169) (actual time=0.015..0.221 rows=500 loops=1)
+          Index Cond: ((kind = 'cohort.small'::text) AND (id > '019b7e90-3d80-7000-8000-00000000c2ec'::text))
+          Filter: (state = 'discarded'::text)
+          Buffers: shared hit=70 read=12
+  Planning:
+    Buffers: shared hit=68 dirtied=4
+  Planning Time: 0.339 ms
+  Execution Time: 0.283 ms
+
+=== cohort.large (100000), dry run, with jobs_explore_kind: one batch's read ===
+
+SELECT batch.*, EXISTS (SELECT 1 FROM jobs AS holder WHERE holder.unique_active_key = batch.unique_active_key AND holder.state IN ('available', 'running', 'retryable', 'scheduled', 'paused') AND holder.id <> batch.id) AS held, (batch.state = 'cancelled' AND EXISTS (SELECT 1 FROM job_runs AS r WHERE r.job_id = batch.id AND r.attempt = batch.attempt AND r.outcome = 'started')) AS attempt_runs FROM (SELECT jobs.id,jobs.state,jobs.kind,jobs.parent_job_id,jobs.unique_key,jobs.unique_active_key,jobs.scheduled_at,jobs.attempt FROM "jobs" WHERE jobs.state = 'discarded' AND jobs.kind IN ('cohort.large') AND jobs.id > '019b77a0-3660-7000-8000-000000001383' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id LIMIT 500) AS batch ORDER BY batch.id
+
+plan:
+  Subquery Scan on batch  (cost=0.42..10861.20 rows=500 width=171) (actual time=0.031..1.442 rows=500 loops=1)
+    Buffers: shared hit=109 read=172
+    ->  Limit  (cost=0.42..2703.70 rows=500 width=169) (actual time=0.025..1.291 rows=500 loops=1)
+          Buffers: shared hit=109 read=172
+          ->  Index Scan using jobs_pkey on jobs  (cost=0.42..81412.39 rows=15058 width=169) (actual time=0.024..1.255 rows=500 loops=1)
+                Index Cond: (id > '019b77a0-3660-7000-8000-000000001383'::text)
+                Filter: ((deleted_at IS NULL) AND (state = 'discarded'::text) AND (kind = 'cohort.large'::text))
+                Rows Removed by Filter: 4500
+                Buffers: shared hit=109 read=172
+    SubPlan 1
+      ->  Index Scan using jobs_unique_active_key on jobs holder  (cost=0.12..8.14 rows=1 width=0) (actual time=0.000..0.000 rows=0 loops=500)
+            Index Cond: (unique_active_key = batch.unique_active_key)
+            Filter: (id <> batch.id)
+    SubPlan 3
+      ->  Seq Scan on job_runs r  (cost=0.00..12.00 rows=1 width=40) (never executed)
+            Filter: (outcome = 'started'::text)
+  Planning:
+    Buffers: shared hit=15 read=1
+  Planning Time: 0.208 ms
+  Execution Time: 1.483 ms
+
+=== cohort.large (100000), apply, with jobs_explore_kind: one batch's read ===
+
+SELECT jobs.id,jobs.state,jobs.kind,jobs.parent_job_id,jobs.unique_key,jobs.unique_active_key,jobs.scheduled_at,jobs.attempt FROM "jobs" WHERE jobs.state = 'discarded' AND jobs.kind IN ('cohort.large') AND jobs.id > '019b77a0-3660-7000-8000-000000001383' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id LIMIT 500
+
+plan:
+  Limit  (cost=0.42..3829.73 rows=500 width=169) (actual time=0.035..2.759 rows=500 loops=1)
+    Buffers: shared hit=652 read=596
+    ->  Index Scan using jobs_pkey on jobs  (cost=0.42..110223.22 rows=14392 width=169) (actual time=0.033..2.722 rows=500 loops=1)
+          Index Cond: (id > '019b77a0-3660-7000-8000-000000001383'::text)
+          Filter: ((deleted_at IS NULL) AND (state = 'discarded'::text) AND (kind = 'cohort.large'::text))
+          Rows Removed by Filter: 4500
+          Buffers: shared hit=652 read=596
+  Planning:
+    Buffers: shared hit=90 read=2 dirtied=6
+  Planning Time: 0.475 ms
+  Execution Time: 2.786 ms
+
+=== cohort.small (10000), dry run, without jobs_explore_kind: one batch's read ===
+
+SELECT batch.*, EXISTS (SELECT 1 FROM jobs AS holder WHERE holder.unique_active_key = batch.unique_active_key AND holder.state IN ('available', 'running', 'retryable', 'scheduled', 'paused') AND holder.id <> batch.id) AS held, (batch.state = 'cancelled' AND EXISTS (SELECT 1 FROM job_runs AS r WHERE r.job_id = batch.id AND r.attempt = batch.attempt AND r.outcome = 'started')) AS attempt_runs FROM (SELECT jobs.id,jobs.state,jobs.kind,jobs.parent_job_id,jobs.unique_key,jobs.unique_active_key,jobs.scheduled_at,jobs.attempt FROM "jobs" WHERE jobs.state = 'discarded' AND jobs.kind IN ('cohort.small') AND jobs.id > '019b7e90-3d80-7000-8000-00000000c2ec' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id LIMIT 500) AS batch ORDER BY batch.id
+
+plan:
+  Subquery Scan on batch  (cost=1000.45..37827.07 rows=500 width=171) (actual time=19.261..29.348 rows=500 loops=1)
+    Buffers: shared hit=13978 read=2386
+    ->  Limit  (cost=1000.45..29669.57 rows=500 width=169) (actual time=19.235..29.134 rows=500 loops=1)
+          Buffers: shared hit=13978 read=2386
+          ->  Gather Merge  (cost=1000.45..102317.12 rows=1767 width=169) (actual time=19.234..29.094 rows=500 loops=1)
+                Workers Planned: 2
+                Workers Launched: 2
+                Buffers: shared hit=13978 read=2386
+                ->  Parallel Index Scan using jobs_pkey on jobs  (cost=0.42..101113.14 rows=736 width=169) (actual time=0.056..8.938 rows=219 loops=3)
+                      Index Cond: (id > '019b7e90-3d80-7000-8000-00000000c2ec'::text)
+                      Filter: ((deleted_at IS NULL) AND (state = 'discarded'::text) AND (kind = 'cohort.small'::text))
+                      Rows Removed by Filter: 21648
+                      Buffers: shared hit=13978 read=2386
+    SubPlan 1
+      ->  Index Scan using jobs_unique_active_key on jobs holder  (cost=0.12..8.14 rows=1 width=0) (actual time=0.000..0.000 rows=0 loops=500)
+            Index Cond: (unique_active_key = batch.unique_active_key)
+            Filter: (id <> batch.id)
+    SubPlan 3
+      ->  Seq Scan on job_runs r  (cost=0.00..12.00 rows=1 width=40) (never executed)
+            Filter: (outcome = 'started'::text)
+  Planning:
+    Buffers: shared hit=12
+  Planning Time: 0.147 ms
+  Execution Time: 29.421 ms
+
+=== cohort.small (10000), apply, without jobs_explore_kind: one batch's read ===
+
+SELECT jobs.id,jobs.state,jobs.kind,jobs.parent_job_id,jobs.unique_key,jobs.unique_active_key,jobs.scheduled_at,jobs.attempt FROM "jobs" WHERE jobs.state = 'discarded' AND jobs.kind IN ('cohort.small') AND jobs.id > '019b7e90-3d80-7000-8000-00000000c2ec' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id LIMIT 500
+
+plan:
+  Limit  (cost=1000.45..33709.14 rows=500 width=169) (actual time=22.782..32.133 rows=500 loops=1)
+    Buffers: shared hit=12954 read=3424
+    ->  Gather Merge  (cost=1000.45..99061.11 rows=1499 width=169) (actual time=22.781..32.090 rows=500 loops=1)
+          Workers Planned: 2
+          Workers Launched: 2
+          Buffers: shared hit=12954 read=3424
+          ->  Parallel Index Scan using jobs_pkey on jobs  (cost=0.42..97888.07 rows=625 width=169) (actual time=0.060..10.973 rows=219 loops=3)
+                Index Cond: (id > '019b7e90-3d80-7000-8000-00000000c2ec'::text)
+                Filter: ((deleted_at IS NULL) AND (state = 'discarded'::text) AND (kind = 'cohort.small'::text))
+                Rows Removed by Filter: 21675
+                Buffers: shared hit=12954 read=3424
+  Planning:
+    Buffers: shared hit=73 dirtied=5
+  Planning Time: 0.383 ms
+  Execution Time: 32.172 ms
+
+=== cohort.large (100000), dry run, without jobs_explore_kind: one batch's read ===
+
+SELECT batch.*, EXISTS (SELECT 1 FROM jobs AS holder WHERE holder.unique_active_key = batch.unique_active_key AND holder.state IN ('available', 'running', 'retryable', 'scheduled', 'paused') AND holder.id <> batch.id) AS held, (batch.state = 'cancelled' AND EXISTS (SELECT 1 FROM job_runs AS r WHERE r.job_id = batch.id AND r.attempt = batch.attempt AND r.outcome = 'started')) AS attempt_runs FROM (SELECT jobs.id,jobs.state,jobs.kind,jobs.parent_job_id,jobs.unique_key,jobs.unique_active_key,jobs.scheduled_at,jobs.attempt FROM "jobs" WHERE jobs.state = 'discarded' AND jobs.kind IN ('cohort.large') AND jobs.id > '019b77a0-3660-7000-8000-000000001383' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id LIMIT 500) AS batch ORDER BY batch.id
+
+plan:
+  Subquery Scan on batch  (cost=0.42..11553.24 rows=500 width=171) (actual time=0.040..3.064 rows=500 loops=1)
+    Buffers: shared hit=646 read=602
+    ->  Limit  (cost=0.42..3395.74 rows=500 width=169) (actual time=0.035..2.902 rows=500 loops=1)
+          Buffers: shared hit=646 read=602
+          ->  Index Scan using jobs_pkey on jobs  (cost=0.42..109397.53 rows=16110 width=169) (actual time=0.034..2.862 rows=500 loops=1)
+                Index Cond: (id > '019b77a0-3660-7000-8000-000000001383'::text)
+                Filter: ((deleted_at IS NULL) AND (state = 'discarded'::text) AND (kind = 'cohort.large'::text))
+                Rows Removed by Filter: 4500
+                Buffers: shared hit=646 read=602
+    SubPlan 1
+      ->  Index Scan using jobs_unique_active_key on jobs holder  (cost=0.12..8.14 rows=1 width=0) (actual time=0.000..0.000 rows=0 loops=500)
+            Index Cond: (unique_active_key = batch.unique_active_key)
+            Filter: (id <> batch.id)
+    SubPlan 3
+      ->  Seq Scan on job_runs r  (cost=0.00..12.00 rows=1 width=40) (never executed)
+            Filter: (outcome = 'started'::text)
+  Planning:
+    Buffers: shared hit=14 read=2
+  Planning Time: 0.170 ms
+  Execution Time: 3.126 ms
+
+=== cohort.large (100000), apply, without jobs_explore_kind: one batch's read ===
+
+SELECT jobs.id,jobs.state,jobs.kind,jobs.parent_job_id,jobs.unique_key,jobs.unique_active_key,jobs.scheduled_at,jobs.attempt FROM "jobs" WHERE jobs.state = 'discarded' AND jobs.kind IN ('cohort.large') AND jobs.id > '019b77a0-3660-7000-8000-000000001383' AND "jobs"."deleted_at" IS NULL ORDER BY jobs.id LIMIT 500
+
+plan:
+  Limit  (cost=0.42..3814.77 rows=500 width=169) (actual time=0.034..2.179 rows=500 loops=1)
+    Buffers: shared hit=860 read=388
+    ->  Index Scan using jobs_pkey on jobs  (cost=0.42..112302.35 rows=14721 width=169) (actual time=0.033..2.143 rows=500 loops=1)
+          Index Cond: (id > '019b77a0-3660-7000-8000-000000001383'::text)
+          Filter: ((deleted_at IS NULL) AND (state = 'discarded'::text) AND (kind = 'cohort.large'::text))
+          Rows Removed by Filter: 4500
+          Buffers: shared hit=860 read=388
+  Planning:
+    Buffers: shared hit=78 read=1 dirtied=6
+  Planning Time: 0.377 ms
+  Execution Time: 2.205 ms
