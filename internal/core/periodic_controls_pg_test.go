@@ -31,3 +31,32 @@ func TestPausingAndResumingAreIdempotentPostgres(t *testing.T) {
 	t.Parallel()
 	pauseIdempotentSuite(t, NewPostgresIsolatedDB(t))
 }
+
+// TestEveryFireIsRememberedNewestFirstPostgres runs the scheduled fires'
+// history on PostgreSQL, where a fire rewrites the history under a row lock.
+func TestEveryFireIsRememberedNewestFirstPostgres(t *testing.T) {
+	t.Parallel()
+	fireHistorySuite(t, NewPostgresIsolatedDB(t))
+}
+
+// TestPeriodicHistoryReportsEachJobsOutcomePostgres runs the history's read on
+// PostgreSQL.
+func TestPeriodicHistoryReportsEachJobsOutcomePostgres(t *testing.T) {
+	t.Parallel()
+	historyOutcomeSuite(t, NewPostgresIsolatedDB(t))
+}
+
+// TestTriggerEnqueuesOnceAndRecordsTheFirePostgres runs the manual run on
+// PostgreSQL, where the job, the history, and the entry commit in one
+// transaction under the schedule's row lock.
+func TestTriggerEnqueuesOnceAndRecordsTheFirePostgres(t *testing.T) {
+	t.Parallel()
+	triggerSuite(t, NewPostgresIsolatedDB(t))
+}
+
+// TestPausingAScheduleIsAttributedAndIdempotentPostgres runs the attributed
+// pause on PostgreSQL, where the entry is written under the row lock.
+func TestPausingAScheduleIsAttributedAndIdempotentPostgres(t *testing.T) {
+	t.Parallel()
+	pauseAttributedSuite(t, NewPostgresIsolatedDB(t))
+}

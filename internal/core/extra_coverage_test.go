@@ -625,13 +625,14 @@ func TestEnqueueBucketDefaultsEmptyPayload(t *testing.T) {
 	sched := newScheduler(t, db)
 
 	def := jobPeriodicRow{Slug: "e", Kind: "cov.k", Queue: "periodic", ArgsTemplate: nil}
-	ok, err := sched.enqueueBucket(ctx, def, now)
+	_, ok, err := sched.enqueueBucket(ctx, def, now)
 	require.NoError(t, err)
 	assert.True(t, ok, "the enqueue with a defaulted empty payload succeeds")
 }
 
 // TestEnqueueBucketCollisionIsNoOp proves a bucketed unique_key collision is a
-// successful no-op (false, nil), the idempotency guarantee for a redundant tick.
+// successful no-op ("", false, nil), the idempotency guarantee for a redundant
+// tick, and that the enqueue that landed returns its job's id.
 func TestEnqueueBucketCollisionIsNoOp(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
@@ -645,13 +646,15 @@ func TestEnqueueBucketCollisionIsNoOp(t *testing.T) {
 	}
 	bucket := now.Truncate(time.Second)
 
-	ok, err := sched.enqueueBucket(ctx, def, bucket)
+	id, ok, err := sched.enqueueBucket(ctx, def, bucket)
 	require.NoError(t, err)
 	assert.True(t, ok, "the first enqueue succeeds")
+	assert.Equal(t, string(StateAvailable), jobState(t, db, id), "and returns the id of the job it enqueued")
 
-	ok, err = sched.enqueueBucket(ctx, def, bucket)
+	id, ok, err = sched.enqueueBucket(ctx, def, bucket)
 	require.NoError(t, err)
 	assert.False(t, ok, "a redundant enqueue of the same bucket is a no-op")
+	assert.Empty(t, id, "that names no job")
 }
 
 // TestEnqueueBucketSurfacesInsertError proves a non-collision insert failure from
@@ -665,7 +668,7 @@ func TestEnqueueBucketSurfacesInsertError(t *testing.T) {
 	closeDB(t, db)
 
 	def := jobPeriodicRow{Slug: "s", Kind: "cov.k", Queue: "periodic", ArgsTemplate: datatypes.JSON("{}")}
-	_, err := sched.enqueueBucket(ctx, def, now)
+	_, _, err := sched.enqueueBucket(ctx, def, now)
 	require.Error(t, err, "a non-collision insert failure is surfaced")
 }
 

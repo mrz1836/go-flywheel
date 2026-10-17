@@ -82,14 +82,20 @@ var legacyIndexNames = []string{
 // previousReleaseTableNames, previousReleaseIndexNames, and
 // previousReleaseColumns are what this release adds: the previous release's
 // schema is Models and IndexSet minus these — derived, never hand-written. This
-// release adds two tables, the node registry and the queue state, and an index
-// on the first; it adds no column to an existing table.
+// release adds five columns to job_periodics, the schedule's source, who paused
+// it and why, and its recent fires; it adds no table and no index.
 //
 //nolint:gochecknoglobals // shared fixture
 var (
-	previousReleaseTableNames = []string{"job_nodes", "job_queues"}
-	previousReleaseIndexNames = []string{"job_nodes_heartbeat"}
-	previousReleaseColumns    = []SchemaDrift{}
+	previousReleaseTableNames = []string{}
+	previousReleaseIndexNames = []string{}
+	previousReleaseColumns    = []SchemaDrift{
+		{Table: "job_periodics", Column: "source"},
+		{Table: "job_periodics", Column: "paused_by_type"},
+		{Table: "job_periodics", Column: "paused_by_id"},
+		{Table: "job_periodics", Column: "paused_reason"},
+		{Table: "job_periodics", Column: "recent_jobs"},
+	}
 )
 
 // installLegacySchema builds, on a bare database, the schema a release before
@@ -188,11 +194,25 @@ func schemaDriftNames(drift []SchemaDrift) []string {
 	return out
 }
 
+// olderSchemaGaps is what InspectSchema names on installLegacySchema's schema:
+// every column and table added since a release before the stats tables — the
+// analytics release's, the pause's, the audit history's, the kind catalog's,
+// the error groups' and queue samples', the node registry's and queue state's,
+// and the schedule columns'.
+//
+//nolint:gochecknoglobals // shared expectation fixture
+var olderSchemaGaps = []string{
+	"job_runs.kind", "job_runs.queue", "job_runs.queue_wait_ms", "job_runs.job_state",
+	"job_runs.superseded", "job_runs.error_fingerprint", "job_periodics.paused_at", "job_run_finishes (table)",
+	"job_stats_hourly (table)", "job_stats_progress (table)", "job_audit (table)", "job_kinds (table)",
+	"job_error_groups_hourly (table)", "job_queue_samples (table)", "job_nodes (table)", "job_queues (table)",
+	"job_periodics.source", "job_periodics.paused_by_type", "job_periodics.paused_by_id",
+	"job_periodics.paused_reason", "job_periodics.recent_jobs",
+}
+
 // TestInspectSchemaReportsWhatAnOlderSchemaLacks proves the parity check names
 // exactly the columns and tables added since a release before the stats
-// tables — the analytics release's, the pause's, the audit history's, the kind
-// catalog's, the error groups' and queue samples', and the node registry's and
-// queue state's — and nothing on a current schema.
+// tables, and nothing on a current schema.
 func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -201,12 +221,7 @@ func TestInspectSchemaReportsWhatAnOlderSchemaLacks(t *testing.T) {
 	installLegacySchema(t, legacy)
 	drift, err := InspectSchema(ctx, legacy)
 	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{
-		"job_runs.kind", "job_runs.queue", "job_runs.queue_wait_ms", "job_runs.job_state",
-		"job_runs.superseded", "job_runs.error_fingerprint", "job_periodics.paused_at", "job_run_finishes (table)",
-		"job_stats_hourly (table)", "job_stats_progress (table)", "job_audit (table)", "job_kinds (table)",
-		"job_error_groups_hourly (table)", "job_queue_samples (table)", "job_nodes (table)", "job_queues (table)",
-	}, schemaDriftNames(drift))
+	assert.ElementsMatch(t, olderSchemaGaps, schemaDriftNames(drift))
 
 	current, err := InspectSchema(ctx, newDB(t))
 	require.NoError(t, err)
@@ -436,7 +451,7 @@ func TestOldRowsAreAcceptedByTheNewSchemaDefaults(t *testing.T) {
 	db := newDB(t)
 	for model, columns := range map[any][]string{
 		&jobRunRow{}:         {"kind", "queue", "queue_wait_ms", "job_state", "superseded", "error_fingerprint"},
-		&jobPeriodicRow{}:    {"paused_at"},
+		&jobPeriodicRow{}:    {"paused_at", "source", "paused_by_type", "paused_by_id", "paused_reason", "recent_jobs"},
 		&jobStatsHourlyRow{}: {"enqueued"},
 	} {
 		stmt := &gorm.Statement{DB: db}

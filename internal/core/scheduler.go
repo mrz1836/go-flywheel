@@ -229,9 +229,11 @@ type SchedulerConfig struct {
 	// Active is the declaration's switch. One paused with PausePeriodic stays
 	// paused through every start until ResumePeriodic, while the start still
 	// applies its kind, queue, args, and cadence, and logs it once at info
-	// ("jobs: declared periodic is paused", with slug and paused_at). So a pause
-	// holds whatever the declaration says, and Active: false in code still turns
-	// a definition off whatever the pause says.
+	// ("jobs: declared periodic is paused", with slug, paused_at, and
+	// paused_by_type). So a pause holds whatever the declaration says, and
+	// Active: false in code still turns a definition off whatever the pause says.
+	// Each start records PeriodicDeclared as the source of every definition it
+	// applies, and never touches a definition's history.
 	//
 	// While Run runs, the reconcile activity re-creates any declared definition
 	// whose row has gone missing — a database restored from an older snapshot, one
@@ -772,8 +774,10 @@ func (s *Scheduler) prunedOnItsCeiling(n int64) bool {
 	return maxBatches > 0 && n == int64(maxBatches)*int64(s.retentionOpts.batchSize())
 }
 
-// fire enqueues one job per missed bucket of def (capped at backfillCap) and
-// advances the definition's next_run_at past now.
+// fire enqueues one job per missed bucket of def (capped at backfillCap),
+// advances the definition's next_run_at past now, and records each bucket that
+// enqueued in the definition's history. A tick whose buckets all collided
+// advances the cursor alone, with one update.
 //
 //nolint:gocognit,gocyclo // schedule selection plus a single enqueue loop
 func (s *Scheduler) fire(ctx context.Context, def jobPeriodicRow, now time.Time) (int, error) {
@@ -794,50 +798,80 @@ func (s *Scheduler) fire(ctx context.Context, def jobPeriodicRow, now time.Time)
 		return 0, fmt.Errorf("%w: %q", errPeriodicNoSchedule, def.Slug)
 	}
 
-	enqueued := 0
+	var fires []periodicFireEntry
 	for _, bucket := range buckets {
-		ok, err := s.enqueueBucket(ctx, def, bucket)
+		id, ok, err := s.enqueueBucket(ctx, def, bucket)
 		if err != nil {
-			return enqueued, err
+			return len(fires), err
 		}
 		if ok {
-			enqueued++
+			fires = append(fires, periodicFireEntry{JobID: id, FiredAt: bucket})
 		}
 	}
 
-	upd := map[string]any{"next_run_at": nextRun, "updated_at": now}
-	if enqueued > 0 {
-		upd["last_enqueued_at"] = now
+	if len(fires) == 0 {
+		if err := s.db.WithContext(ctx).Model(&jobPeriodicRow{}).Where("id = ?", def.ID).
+			Updates(map[string]any{"next_run_at": nextRun, "updated_at": now}).Error; err != nil {
+			return 0, fmt.Errorf("jobs: advance periodic %q: %w", def.Slug, err)
+		}
+		return 0, nil
 	}
-	if err := s.db.WithContext(ctx).Model(&jobPeriodicRow{}).
-		Where("id = ?", def.ID).Updates(upd).Error; err != nil {
-		return enqueued, fmt.Errorf("jobs: advance periodic %q: %w", def.Slug, err)
+	if err := s.advanceWithFires(ctx, def, fires, nextRun, now); err != nil {
+		return len(fires), fmt.Errorf("jobs: advance periodic %q: %w", def.Slug, err)
 	}
-	return enqueued, nil
+	return len(fires), nil
 }
 
-// enqueueBucket enqueues one job for a single time bucket through the Client.
-// The bucketed unique_key makes a redundant tick idempotent: a tick that fires
-// twice — a restart, a clock adjustment, a backfill overlapping the live
-// schedule — computes the same key for the same bucket, so the second insert
-// collides and is a successful no-op rather than a duplicate run. It inserts
-// through the Client's core rather than Enqueue, so a collision costs no read of
-// the job holding the key: a tick has no use for the holder's id.
-func (s *Scheduler) enqueueBucket(ctx context.Context, def jobPeriodicRow, bucket time.Time) (bool, error) {
+// advanceWithFires advances def's next_run_at to nextRun and records fires,
+// the buckets this tick enqueued, in its history, in one transaction. It reads
+// the row's history under a row lock on PostgreSQL, so a concurrent fire or
+// TriggerPeriodic rewrites the history after this one rather than over it, and
+// writes the cursor, last_enqueued_at, and the history together. A definition
+// deleted since the tick loaded it stays deleted.
+func (s *Scheduler) advanceWithFires(
+	ctx context.Context, def jobPeriodicRow, fires []periodicFireEntry, nextRun, now time.Time,
+) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		row, found, err := lockPeriodicWhere(tx, "id = ?", def.ID)
+		if err != nil || !found {
+			return err
+		}
+		history, err := prependFires(row.RecentJobs, fires)
+		if err != nil {
+			return err
+		}
+		return tx.Model(&jobPeriodicRow{}).Where("id = ?", def.ID).Updates(map[string]any{
+			"next_run_at":      nextRun,
+			"updated_at":       now,
+			"last_enqueued_at": now,
+			"recent_jobs":      history,
+		}).Error
+	})
+}
+
+// enqueueBucket enqueues one job for a single time bucket through the Client,
+// and returns its id and true, or false when the bucket collided. The bucketed
+// unique_key makes a redundant tick idempotent: a tick that fires twice — a
+// restart, a clock adjustment, a backfill overlapping the live schedule —
+// computes the same key for the same bucket, so the second insert collides and
+// is a successful no-op rather than a duplicate run. It inserts through the
+// Client's core rather than Enqueue, so a collision costs no read of the job
+// holding the key: a tick has no use for the holder's id.
+func (s *Scheduler) enqueueBucket(ctx context.Context, def jobPeriodicRow, bucket time.Time) (string, bool, error) {
 	payload := []byte(def.ArgsTemplate)
 	if len(payload) == 0 {
 		payload = []byte("{}")
 	}
 	scheduleAt := bucket
-	_, collided, err := s.client.insert(ctx, def.Kind, payload, InsertOpts{
+	id, collided, err := s.client.insert(ctx, def.Kind, payload, InsertOpts{
 		Queue:      def.Queue,
 		UniqueKey:  fmt.Sprintf("%s@%d", def.Slug, bucket.Unix()),
 		ScheduleAt: &scheduleAt,
 	}, insertOrigin{source: InsertSourcePeriodic, periodicSlug: def.Slug})
 	if err != nil {
-		return false, fmt.Errorf("jobs: enqueue periodic job: %w", err)
+		return "", false, fmt.Errorf("jobs: enqueue periodic job: %w", err)
 	}
-	return !collided, nil
+	return id, !collided, nil
 }
 
 // intervalBuckets returns the missed fire times of a fixed-interval schedule

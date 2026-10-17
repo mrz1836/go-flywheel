@@ -12,8 +12,8 @@ import (
 )
 
 // previousReleaseGapSuite proves the parity checks name exactly what this
-// release adds to a schema the previous release installed: the node registry
-// and queue state tables, and the index on the first.
+// release adds to a schema the previous release installed: the five
+// job_periodics columns, in their declared order, and no index.
 func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
@@ -21,7 +21,10 @@ func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 
 	drift, err := InspectSchema(ctx, db)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"job_nodes (table)", "job_queues (table)"}, schemaDriftNames(drift))
+	assert.Equal(t, []string{
+		"job_periodics.source", "job_periodics.paused_by_type", "job_periodics.paused_by_id",
+		"job_periodics.paused_reason", "job_periodics.recent_jobs",
+	}, schemaDriftNames(drift))
 	idx, err := InspectIndexes(ctx, db)
 	require.NoError(t, err)
 	missing := make([]string, len(idx))
@@ -29,7 +32,7 @@ func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 		missing[i] = d.Name
 		assert.Empty(t, d.Installed, "%s is absent", d.Name)
 	}
-	assert.ElementsMatch(t, previousReleaseIndexNames, missing, "the release's index is absent")
+	assert.ElementsMatch(t, previousReleaseIndexNames, missing, "the release adds no index")
 }
 
 // TestInspectSchemaReportsWhatThePreviousReleaseLacks is the parity check
@@ -70,6 +73,42 @@ func TestSchedulerRefusesToStartWithoutThePausedAtColumn(t *testing.T) {
 	schedulerRefusesWithoutPausedAtSuite(t, newDB(t))
 }
 
+// schedulerRefusesWithoutPeriodicColumnsSuite is the deploy-order guard for the
+// five schedule columns: a Scheduler's fire writes the schedule's history and
+// its start-up apply its source, so against a schema without them Run stops
+// before starting any activity, naming each column and the fix. A Runner never
+// reads job_periodics, so it runs against the same schema. db carries the
+// current schema, and the suite drops the five, as the previous release left
+// them.
+func schedulerRefusesWithoutPeriodicColumnsSuite(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, col := range previousReleaseColumns {
+		require.NoError(t, db.Exec("ALTER TABLE "+col.Table+" DROP COLUMN "+col.Column).Error, "drop %s", col)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	s := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db), Driver: driverForTest(t, db)})
+	err := s.Run(ctx)
+	require.ErrorIs(t, err, ErrSchemaOutdated)
+	for _, col := range previousReleaseColumns {
+		assert.Contains(t, err.Error(), col.String(), "the error names each missing column")
+	}
+	assert.Contains(t, err.Error(), "flywheel migrate", "and how to fix it")
+
+	r, err := NewRunner(RunnerConfig{
+		DB: db, Driver: driverForTest(t, db), Registry: NewRegistry(), Queues: []string{defaultQueue},
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.RunUntilIdle(ctx), "a Runner does not need the columns")
+}
+
+// TestSchedulerRefusesToStartWithoutThePeriodicColumns runs the guard on SQLite.
+func TestSchedulerRefusesToStartWithoutThePeriodicColumns(t *testing.T) {
+	t.Parallel()
+	schedulerRefusesWithoutPeriodicColumnsSuite(t, newDB(t))
+}
+
 // previousReleaseUpgradeSuite runs the upgrade from the previous release: a
 // schedule that release wrote is migrated in place, reads as not paused, and
 // keeps firing under this release's Scheduler; a row that release's binary
@@ -90,6 +129,9 @@ func previousReleaseUpgradeSuite(t *testing.T, db *gorm.DB, migrate func(*gorm.D
 	require.Len(t, views, 1)
 	assert.False(t, views[0].Paused, "a schedule written before the upgrade is not paused")
 	assert.Nil(t, views[0].PausedAt)
+	assert.Nil(t, views[0].PausedBy)
+	assert.Empty(t, views[0].Source, "and has no source until its next write")
+	assert.Empty(t, views[0].LastJobID, "nor any history")
 
 	s := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db), Driver: driverForTest(t, db)})
 	require.NoError(t, s.checkSchema(ctx), "this release's Scheduler starts against the upgraded schema")
@@ -97,6 +139,7 @@ func previousReleaseUpgradeSuite(t *testing.T, db *gorm.DB, migrate func(*gorm.D
 	require.NoError(t, err)
 	assert.Equal(t, 1, n, "the schedule fires on its cadence")
 	assert.EqualValues(t, 1, jobCount(t, db, "legacy.periodic"))
+	assertFireRemembered(t, db, "legacy-nightly", "legacy.periodic")
 
 	writeLegacyPeriodic(t, db, "legacy-late", "legacy.periodic", due.Add(time.Hour))
 	views, err = ListPeriodics(ctx, db)
@@ -105,6 +148,19 @@ func previousReleaseUpgradeSuite(t *testing.T, db *gorm.DB, migrate func(*gorm.D
 	for _, v := range views {
 		assert.False(t, v.Paused, "%s: an older binary's insert names no paused_at and is not paused", v.Slug)
 	}
+}
+
+// assertFireRemembered asserts slug's history holds exactly the one job of kind
+// it fired: the history column's default reads as an empty history, and the
+// fire rewrites it.
+func assertFireRemembered(t *testing.T, db *gorm.DB, slug, kind string) {
+	t.Helper()
+	var fired []string
+	require.NoError(t, db.Model(&jobRow{}).Where("kind = ?", kind).Pluck("id", &fired).Error)
+	history, err := PeriodicHistory(context.Background(), db, slug)
+	require.NoError(t, err)
+	require.Len(t, history, 1, "the fire is remembered on the migrated row")
+	assert.Equal(t, fired, []string{history[0].JobID})
 }
 
 // assertNoSchemaOrIndexDrift asserts db carries every column, table, and index

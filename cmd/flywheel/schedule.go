@@ -13,7 +13,7 @@ import (
 )
 
 // newScheduleCmd builds the `flywheel schedule` group: ls, add, rm, enable,
-// disable, pause, resume.
+// disable, pause, resume, trigger, history.
 func newScheduleCmd(configPath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "schedule", Short: "Inspect and manage periodic schedules"}
 	cmd.AddCommand(
@@ -24,6 +24,8 @@ func newScheduleCmd(configPath *string) *cobra.Command {
 		newScheduleDisableCmd(configPath),
 		newSchedulePauseCmd(configPath),
 		newScheduleResumeCmd(configPath),
+		newScheduleTriggerCmd(configPath),
+		newScheduleHistoryCmd(configPath),
 	)
 	return cmd
 }
@@ -50,24 +52,34 @@ func newScheduleLsCmd(configPath *string) *cobra.Command {
 				return writeJSON(cmd.OutOrStdout(), views)
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
-			_, _ = fmt.Fprintln(tw, "SLUG\tKIND\tSCHEDULE\tACTIVE\tPAUSED\tNEXT RUN")
+			_, _ = fmt.Fprintln(tw, "SLUG\tKIND\tSCHEDULE\tACTIVE\tPAUSED\tSOURCE\tNEXT RUN")
 			for _, v := range views {
 				schedule := v.Cron
 				if schedule == "" {
 					schedule = fmt.Sprintf("every %ds", v.IntervalSeconds)
 				}
-				paused := "-"
-				if v.Paused {
-					paused = "yes"
-				}
-				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%t\t%s\t%s\n",
-					v.Slug, v.Kind, schedule, v.Active, paused, v.NextRunAt.Format("2006-01-02 15:04:05"))
+				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%t\t%s\t%s\t%s\n", v.Slug, v.Kind, schedule, v.Active,
+					pausedLabel(v), orDash(string(v.Source)), v.NextRunAt.Format("2006-01-02 15:04:05"))
 			}
 			return tw.Flush()
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON instead of a table")
 	return cmd
+}
+
+// pausedLabel renders a schedule's pause as `schedule ls` prints it: "-" while
+// it is not paused, else "yes" with who paused it — "yes (user:alice)" — or
+// "yes" alone for a pause recorded before the actor was.
+func pausedLabel(v flywheel.PeriodicView) string {
+	switch {
+	case !v.Paused:
+		return "-"
+	case v.PausedBy == nil || v.PausedBy.Type == "":
+		return "yes"
+	default:
+		return "yes (" + actorLabel(*v.PausedBy) + ")"
+	}
 }
 
 // newScheduleAddCmd upserts a periodic schedule from the command line.
@@ -195,24 +207,29 @@ func newScheduleDisableCmd(configPath *string) *cobra.Command {
 
 // newSchedulePauseCmd holds a periodic schedule by slug until it is resumed.
 func newSchedulePauseCmd(configPath *string) *cobra.Command {
-	return &cobra.Command{
+	var reason string
+	cmd := &cobra.Command{
 		Use:   "pause <slug>",
 		Short: "Hold a schedule until it is resumed, through every restart",
 		Long: "Pause a periodic schedule: it stops firing and stays paused through every\n" +
 			"`flywheel serve` start until `flywheel schedule resume`. A start still applies\n" +
 			"the config's kind, args, and cadence to a schedule it declares, and logs that\n" +
-			"it is paused. Pausing a paused schedule changes nothing.",
+			"it is paused. The pause records who paused it and --reason, which `schedule ls`\n" +
+			"shows. Pausing a paused schedule changes nothing.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, err := mutateSchedule(cmd, *configPath, args[0], "", flywheel.PausePeriodic, "paused")
+			_, err := mutateSchedule(cmd, *configPath, args[0], reason, flywheel.PausePeriodic, "paused")
 			return err
 		},
 	}
+	addReasonFlag(cmd, &reason)
+	return cmd
 }
 
 // newScheduleResumeCmd releases a paused periodic schedule by slug.
 func newScheduleResumeCmd(configPath *string) *cobra.Command {
-	return &cobra.Command{
+	var reason string
+	cmd := &cobra.Command{
 		Use:   "resume <slug>",
 		Short: "Resume a paused schedule at its next fire time",
 		Long: "Resume a paused schedule. It fires next at its first fire time after now;\n" +
@@ -220,10 +237,87 @@ func newScheduleResumeCmd(configPath *string) *cobra.Command {
 			"disabled. Resuming a schedule that is not paused changes nothing.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, err := mutateSchedule(cmd, *configPath, args[0], "", flywheel.ResumePeriodic, "resumed")
+			_, err := mutateSchedule(cmd, *configPath, args[0], reason, flywheel.ResumePeriodic, "resumed")
 			return err
 		},
 	}
+	addReasonFlag(cmd, &reason)
+	return cmd
+}
+
+// newScheduleTriggerCmd runs a periodic schedule now, by slug.
+func newScheduleTriggerCmd(configPath *string) *cobra.Command {
+	var reason string
+	cmd := &cobra.Command{
+		Use:   "trigger <slug>",
+		Short: "Run a schedule now, paused or not",
+		Long: "Enqueue one job of the schedule's kind, args, and queue now, as a manual run,\n" +
+			"and print its id. It works on a paused or disabled schedule, and leaves its\n" +
+			"pause and its next fire as they are. The run is remembered in the schedule's\n" +
+			"history (`flywheel schedule history`) and recorded with --reason.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, db, _, err := loadAndOpen(*configPath)
+			if err != nil {
+				return err
+			}
+			defer closeDB(db)
+			ctx := flywheel.WithActor(cmd.Context(), operatorActor(reason))
+			id, err := flywheel.TriggerPeriodic(ctx, flywheel.NewClient(db), args[0])
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "triggered %s: job %s\n", args[0], id)
+			return nil
+		},
+	}
+	addReasonFlag(cmd, &reason)
+	return cmd
+}
+
+// newScheduleHistoryCmd prints a periodic schedule's latest fires, by slug.
+func newScheduleHistoryCmd(configPath *string) *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "history <slug>",
+		Short: "Show a schedule's latest fires and how each ended",
+		Long: "Print the schedule's latest fires, newest first, at most 20: each fire's job,\n" +
+			"when it fired (UTC), whether it was a manual run (`flywheel schedule trigger`),\n" +
+			"and the job's state, its latest run's outcome, and when that run finished. A\n" +
+			"job retention has removed shows no state.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, db, _, err := loadAndOpen(*configPath)
+			if err != nil {
+				return err
+			}
+			defer closeDB(db)
+
+			history, err := flywheel.PeriodicHistory(cmd.Context(), db, args[0])
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				return writeJSON(cmd.OutOrStdout(), history)
+			}
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
+			_, _ = fmt.Fprintln(tw, "JOB ID\tFIRED AT\tMANUAL\tSTATE\tOUTCOME\tFINISHED")
+			for _, f := range history {
+				manual, finished := "-", "-"
+				if f.Manual {
+					manual = "yes"
+				}
+				if f.FinishedAt != nil {
+					finished = f.FinishedAt.UTC().Format(time.RFC3339)
+				}
+				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", f.JobID, f.FiredAt.UTC().Format(time.RFC3339),
+					manual, orDash(string(f.State)), orDash(f.Outcome), finished)
+			}
+			return tw.Flush()
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON instead of a table")
+	return cmd
 }
 
 // setPeriodicActive adapts SetPeriodicActive to the slug-mutator shape so the

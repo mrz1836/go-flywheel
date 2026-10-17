@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -303,13 +304,13 @@ func assertInsertPeriodicReportsWhetherItLanded(t *testing.T, db *gorm.DB) {
 	now := time.Now().UTC().Truncate(time.Second)
 	spec := PeriodicSpec{Slug: "landed", Kind: "test.landed", Every: time.Minute, Active: true}
 
-	first, inserted, err := insertPeriodic(ctx, db, spec, now)
+	first, inserted, err := insertPeriodic(ctx, db, spec, PeriodicDeclared, now)
 	require.NoError(t, err)
 	assert.True(t, inserted, "the first insert of a slug lands")
 	assert.NotEmpty(t, first.ID)
 
 	spec.Kind = "test.second"
-	lost, inserted, err := insertPeriodic(ctx, db, spec, now)
+	lost, inserted, err := insertPeriodic(ctx, db, spec, PeriodicDeclared, now)
 	require.NoError(t, err, "a skipped insert is not an error")
 	assert.False(t, inserted, "the second insert of the slug is skipped and says so")
 	assert.Equal(t, jobPeriodicRow{}, lost, "a skipped insert returns no row: the one it built does not exist")
@@ -814,4 +815,161 @@ func TestDeletePeriodicMissingReturnsErrPeriodicNotFound(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	require.ErrorIs(t, DeletePeriodic(context.Background(), db, "nope"), ErrPeriodicNotFound)
+}
+
+// utcHours returns each time's hour in UTC.
+func utcHours(times []time.Time) []int {
+	hours := make([]int, len(times))
+	for i, at := range times {
+		hours[i] = at.UTC().Hour()
+	}
+	return hours
+}
+
+// TestNextFiresHonorCronTZ proves NextPeriodicFires lists a schedule's next
+// fires strictly after after: a CRON_TZ= cron at its zone's wall time across a
+// daylight-saving change, a cron with no zone in after's zone, an interval from
+// a NextRunAt still ahead and on its grid from one already past, paused and
+// inactive schedules as if they ran, and the refusals.
+func TestNextFiresHonorCronTZ(t *testing.T) {
+	t.Parallel()
+	ny, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+	// New York leaves daylight saving at 02:00 local time on 1 November 2026.
+	after := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+
+	zoned := PeriodicView{Cron: "CRON_TZ=America/New_York 0 6 * * *", NextRunAt: time.Date(2026, 10, 31, 10, 0, 0, 0, time.UTC)}
+	fires, err := NextPeriodicFires(zoned, after, 3)
+	require.NoError(t, err)
+	require.Len(t, fires, 3)
+	for i, at := range fires {
+		local := at.In(ny)
+		assert.Equal(t, []int{6, 0}, []int{local.Hour(), local.Minute()}, "fire %d is 06:00 in New York", i)
+		assert.Equal(t, time.Date(2026, 10, 31, 0, 0, 0, 0, ny).AddDate(0, 0, i).Day(), local.Day())
+		assert.Equal(t, time.UTC, at.Location(), "in after's zone")
+	}
+	assert.Equal(t, []int{10, 11, 11}, utcHours(fires), "06:00 in New York is 10:00 UTC before the change and 11:00 after")
+	zoned.NextRunAt = after.Add(-48 * time.Hour)
+	fires, err = NextPeriodicFires(zoned, after, 3)
+	require.NoError(t, err)
+	assert.Equal(t, []int{10, 11, 11}, utcHours(fires), "a NextRunAt already past starts at the cron's next match")
+
+	plain := PeriodicView{Cron: "0 6 * * *"}
+	fires, err = NextPeriodicFires(plain, after, 3)
+	require.NoError(t, err)
+	assert.Equal(t, []time.Time{
+		time.Date(2026, 10, 31, 6, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 6, 0, 0, 0, time.UTC),
+		time.Date(2026, 11, 2, 6, 0, 0, 0, time.UTC),
+	}, fires, "a cron with no zone is evaluated in after's zone: UTC")
+	fires, err = NextPeriodicFires(plain, after.In(ny), 3)
+	require.NoError(t, err)
+	for _, at := range fires {
+		assert.Equal(t, 6, at.In(ny).Hour(), "and in New York for an after in New York")
+	}
+	assert.Equal(t, []int{10, 11, 11}, utcHours(fires))
+	plain.NextRunAt = time.Date(2026, 10, 31, 6, 0, 0, 0, time.UTC)
+	fires, err = NextPeriodicFires(plain, plain.NextRunAt, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []time.Time{time.Date(2026, 11, 1, 6, 0, 0, 0, time.UTC)}, fires, "a fire at after is not after it")
+
+	next := after.Add(10 * time.Minute)
+	fires, err = NextPeriodicFires(PeriodicView{IntervalSeconds: 900, NextRunAt: next}, after, 3)
+	require.NoError(t, err)
+	assert.Equal(t, []time.Time{next, next.Add(15 * time.Minute), next.Add(30 * time.Minute)}, fires,
+		"an interval starts at a NextRunAt still ahead")
+	fires, err = NextPeriodicFires(PeriodicView{IntervalSeconds: 900, NextRunAt: after.Add(-40 * time.Minute)}, after, 3)
+	require.NoError(t, err)
+	assert.Equal(t, []time.Time{after.Add(5 * time.Minute), after.Add(20 * time.Minute), after.Add(35 * time.Minute)}, fires,
+		"and keeps its grid from one already past")
+	fires, err = NextPeriodicFires(PeriodicView{IntervalSeconds: 900}, after, 2)
+	require.NoError(t, err)
+	assert.Equal(t, []time.Time{after.Add(15 * time.Minute), after.Add(30 * time.Minute)}, fires, "a zero NextRunAt starts at after")
+
+	fires, err = NextPeriodicFires(PeriodicView{IntervalSeconds: 60, NextRunAt: next, Paused: true}, after, MaxNextFires)
+	require.NoError(t, err)
+	assert.Len(t, fires, MaxNextFires, "a paused, inactive schedule is listed as if it ran")
+	assert.True(t, fires[MaxNextFires-1].Equal(next.Add(time.Duration(MaxNextFires-1)*time.Minute)))
+
+	for _, n := range []int{0, -1, MaxNextFires + 1} {
+		_, err = NextPeriodicFires(plain, after, n)
+		var ve *ValidationError
+		require.ErrorAs(t, err, &ve, "n = %d", n)
+		assert.Equal(t, "n", ve.Field)
+	}
+	_, err = NextPeriodicFires(PeriodicView{Slug: "none"}, after, 1)
+	var ve *ValidationError
+	require.ErrorAs(t, err, &ve)
+	assert.Equal(t, "schedule", ve.Field, "a view with neither a cron nor an interval")
+	_, err = NextPeriodicFires(PeriodicView{Cron: "not a cron"}, after, 1)
+	require.ErrorIs(t, err, ErrValidation, "a cron that does not parse")
+	assert.Contains(t, err.Error(), "not a cron")
+	fires, err = NextPeriodicFires(PeriodicView{Cron: "0 0 30 2 *"}, after, 3)
+	require.NoError(t, err)
+	assert.Empty(t, fires, "a cron that never matches lists nothing, not zero times")
+}
+
+// TestPeriodicViewReportsPauseZoneAndLastJob proves ListPeriodics reports who
+// paused each schedule and why, its last job (the newest fire, manual or
+// scheduled), and its cron's zone, under the JSON names a dashboard reads; and
+// that a schedule not paused, not fired, or not zoned carries none of them.
+func TestPeriodicViewReportsPauseZoneAndLastJob(t *testing.T) {
+	t.Parallel()
+	db := newDB(t)
+	t0 := time.Now().UTC().Truncate(time.Minute)
+	ctx := clockCtx(context.Background(), models.NewFixedClock(t0))
+	for _, spec := range []PeriodicSpec{
+		{Slug: "zoned", Kind: "test.zoned", Cron: "CRON_TZ=America/New_York 0 6 * * *", Active: true},
+		{Slug: "tz", Kind: "test.tz", Cron: "TZ=Europe/Paris 30 7 * * *", Active: true},
+		{Slug: "plain", Kind: "test.plain", Cron: "0 6 * * *", Active: true},
+		{Slug: "every", Kind: "test.every", Every: time.Minute, Active: true},
+	} {
+		require.NoError(t, UpsertPeriodic(ctx, db, spec))
+	}
+	operator := Actor{Type: ActorUser, ID: "ops-1", Reason: "provider outage", Source: "api"}
+	require.NoError(t, PausePeriodic(WithActor(ctx, operator), db, "zoned"))
+	jobID, err := TriggerPeriodic(ctx, NewClient(db), "zoned")
+	require.NoError(t, err)
+	n, err := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db)}).Tick(clockCtx(context.Background(), models.NewFixedClock(t0.Add(time.Minute))))
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "every fires")
+
+	views, err := ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	bySlug := make(map[string]PeriodicView, len(views))
+	for _, v := range views {
+		bySlug[v.Slug] = v
+	}
+	zoned := bySlug["zoned"]
+	assert.True(t, zoned.Paused)
+	require.NotNil(t, zoned.PausedAt)
+	assert.True(t, zoned.PausedAt.Equal(t0))
+	assert.Equal(t, &Actor{Type: ActorUser, ID: "ops-1", Reason: "provider outage"}, zoned.PausedBy,
+		"who paused it and why, without the channel")
+	assert.Equal(t, jobID, zoned.LastJobID, "a manual run is the last job")
+	assert.Equal(t, "America/New_York", zoned.TimeZone)
+	assert.Equal(t, "Europe/Paris", bySlug["tz"].TimeZone, "a TZ= prefix names the zone too")
+	assert.Equal(t, firedJobID(t, db, "every", t0.Add(time.Minute)), bySlug["every"].LastJobID, "so is a scheduled fire")
+	for _, slug := range []string{"plain", "every"} {
+		assert.Empty(t, bySlug[slug].TimeZone, slug)
+		assert.Nil(t, bySlug[slug].PausedBy, slug)
+	}
+	assert.Empty(t, bySlug["plain"].LastJobID, "a schedule that has not fired has no last job")
+
+	raw, err := json.Marshal(zoned)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"paused_by":{"type":"user","id":"ops-1","reason":"provider outage"}`)
+	assert.Contains(t, string(raw), `"last_job_id":"`+jobID+`"`)
+	assert.Contains(t, string(raw), `"time_zone":"America/New_York"`)
+	raw, err = json.Marshal(bySlug["plain"])
+	require.NoError(t, err)
+	for _, key := range []string{"paused_by", "last_job_id", "time_zone"} {
+		assert.NotContains(t, string(raw), `"`+key+`"`)
+	}
+
+	require.NoError(t, ResumePeriodic(ctx, db, "zoned"))
+	views, err = ListPeriodics(ctx, db)
+	require.NoError(t, err)
+	for _, v := range views {
+		assert.Nil(t, v.PausedBy, "%s: a resumed schedule names no one", v.Slug)
+	}
 }

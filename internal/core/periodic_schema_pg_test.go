@@ -24,6 +24,13 @@ func TestSchedulerRefusesToStartWithoutThePausedAtColumnPostgres(t *testing.T) {
 	schedulerRefusesWithoutPausedAtSuite(t, NewPostgresIsolatedDB(t))
 }
 
+// TestSchedulerRefusesToStartWithoutThePeriodicColumnsPostgres is the schedule
+// columns' deploy-order guard on PostgreSQL.
+func TestSchedulerRefusesToStartWithoutThePeriodicColumnsPostgres(t *testing.T) {
+	t.Parallel()
+	schedulerRefusesWithoutPeriodicColumnsSuite(t, NewPostgresIsolatedDB(t))
+}
+
 // TestMigrateUpgradesThePreviousReleaseSchemaPostgres is the library-owned
 // upgrade from the previous release, run with the live-database options.
 func TestMigrateUpgradesThePreviousReleaseSchemaPostgres(t *testing.T) {

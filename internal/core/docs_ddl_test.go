@@ -20,10 +20,11 @@ const integratingDoc = "../../docs/INTEGRATING.md"
 // documentedUpgradeDDL extracts the statements of the SQL block that follows
 // the guide's `<!-- upgrade-ddl:<block> -->` marker, split on the semicolons
 // that end its lines. A block is named by its dialect — this release's upgrade
-// — or by its dialect and the older release it upgrades from: ":errors", a
-// release before the error groups, ":kinds", a release before the kind
-// catalog, ":audit", a release before the audit history, ":pause", a release
-// before the schedule pause, and ":stats", a release before the stats tables.
+// — or by its dialect and the older release it upgrades from: ":nodes", a
+// release before the node registry, ":errors", a release before the error
+// groups, ":kinds", a release before the kind catalog, ":audit", a release
+// before the audit history, ":pause", a release before the schedule pause, and
+// ":stats", a release before the stats tables.
 func documentedUpgradeDDL(t *testing.T, block string) []string {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Clean(integratingDoc))
@@ -63,9 +64,9 @@ func applyDocumentedUpgrade(t *testing.T, db *gorm.DB, blocks ...string) {
 // documentedUpgradeSuite applies the guide's upgrade, exactly as written, to a
 // database the previous release installed and wrote a schedule into, then the
 // deploy step the guide names, and asserts the result has no drift and works:
-// the schedule is not paused and fires, and a control on the job it fired is
-// recorded in the history. The documented upgrade is the upgrade, not a
-// description of one.
+// the schedule is not paused, fires, and remembers the fire, and a control on
+// the job it fired is recorded in the history. The documented upgrade is the
+// upgrade, not a description of one.
 func documentedUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
@@ -81,11 +82,13 @@ func documentedUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 	require.NoError(t, err)
 	require.Len(t, views, 1)
 	assert.False(t, views[0].Paused, "a schedule written before the upgrade is not paused")
+	assert.Empty(t, views[0].Source, "and has no source until its next write")
 	s := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db), Driver: driverForTest(t, db)})
 	require.NoError(t, s.checkSchema(ctx))
 	n, err := s.Tick(clockCtx(ctx, models.NewFixedClock(due.Add(time.Second))))
 	require.NoError(t, err)
 	assert.Equal(t, 1, n, "and it fires on its cadence")
+	assertFireRemembered(t, db, "doc-legacy", "doc.periodic")
 
 	// A control on the upgraded schema records its entry, and the history reads
 	// it back.
@@ -104,16 +107,17 @@ func documentedUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 // documentedStatsUpgradeSuite applies the guide's upgrade from a release
 // before the stats tables — that upgrade's block, then the schedule pause's,
 // then the audit history's, then the kind catalog's, then the error groups',
-// then this release's, oldest first — to a database such a release installed
-// and wrote history into, then the deploy step, and asserts the result has no
-// drift, runs, and reaches the old history.
+// then the node registry's, then this release's, oldest first — to a database
+// such a release installed and wrote history into, then the deploy step, and
+// asserts the result has no drift, runs, and reaches the old history.
 func documentedStatsUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 	t.Helper()
 	installLegacySchema(t, db)
 	writeLegacyHistory(t, db, "doc-legacy", "doc.kind", StateSucceeded, rollupBase)
 
 	applyDocumentedUpgrade(t, db,
-		dialect+":stats", dialect+":pause", dialect+":audit", dialect+":kinds", dialect+":errors", dialect)
+		dialect+":stats", dialect+":pause", dialect+":audit", dialect+":kinds", dialect+":errors", dialect+":nodes",
+		dialect)
 	ctx := context.Background()
 	require.NoError(t, InstallIndexesWithOptions(ctx, db, IndexOpts{Concurrently: true}))
 
