@@ -21,6 +21,9 @@
 //	go run -tags=loadtest ./loadtest/cmd/explain -query explorer -jobs 1000000 \
 //	  -out docs/benchmarks/explorer-plans-1m.txt
 //
+//	go run -tags=loadtest ./loadtest/cmd/explain -query bulk -jobs 1000000 -timeout 90m \
+//	  -out docs/benchmarks/bulk-1m.txt
+//
 // The artifact it writes carries no credentials: the DSN is redacted to host,
 // port, and database, which is what makes these files safe to commit.
 package main
@@ -95,6 +98,19 @@ func run(args []string, stdout, stderr *os.File) error {
 		}
 		if !opts.quiet {
 			printExplorerSummary(stderr, report)
+		}
+		return runErr
+	}
+
+	// The bulk query characterizes BulkJobs: a forced-retry dry run and apply of
+	// two cohorts, with and without the kind explorer index, batch by batch.
+	if opts.query == "bulk" {
+		report, runErr := loadtest.ExplainBulk(ctx, opts.cfg)
+		if writeErr := writeArtifact(report.Text(), opts.out, stdout); writeErr != nil {
+			return errors.Join(runErr, writeErr)
+		}
+		if !opts.quiet {
+			printBulkSummary(stderr, report)
 		}
 		return runErr
 	}
@@ -293,5 +309,25 @@ func printExplorerSummary(w *os.File, r loadtest.ExplorerExplainReport) {
 			without = read.Without.Median.String()
 		}
 		p("%-46s %12s %12s\n", read.Name, read.With.Median, without)
+	}
+}
+
+// printBulkSummary writes the bulk characterization's timing table to stderr:
+// each run's wall time and its batches' median and 95th percentile. Write
+// errors are ignored for the same reason printSummary ignores them.
+func printBulkSummary(w *os.File, r loadtest.BulkExplainReport) {
+	p := func(format string, args ...any) { _, _ = fmt.Fprintf(w, format, args...) }
+	if len(r.Runs) == 0 {
+		p("\nno runs measured\n")
+		return
+	}
+	p("\njobs=%d schema=%s\n", r.Jobs, r.Schema)
+	p("%-30s %-8s %8s %12s %12s %12s\n", "run", "index", "batches", "wall", "p50 batch", "p95 batch")
+	for _, run := range r.Runs {
+		index := "without"
+		if run.Index {
+			index = "with"
+		}
+		p("%-30s %-8s %8d %12s %12s %12s\n", run.Name(), index, run.Batches, run.Wall, run.P50, run.P95)
 	}
 }

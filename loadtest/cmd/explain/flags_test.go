@@ -156,10 +156,35 @@ func TestCollapseSpace(t *testing.T) {
 	}
 }
 
-// TestParseFlagsAcceptsEveryQuery pins the -query vocabulary, the stats and
-// explorer characterizations included, and the rejection of anything else.
+// TestExplainBulkConfig proves -query bulk parses, with the defaults the
+// committed bulk artifact was produced with: a million jobs across three queues,
+// under the hour-long bound a run can raise with -timeout.
+func TestExplainBulkConfig(t *testing.T) {
+	opts, err := parseFlags([]string{"-dsn", testDSN, "-query", "bulk"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	checks := []struct {
+		name      string
+		got, want any
+	}{
+		{"query", opts.query, "bulk"},
+		{"Jobs", opts.cfg.Jobs, 1_000_000},
+		{"Queues", opts.cfg.Queues, 3},
+		{"timeout", opts.timeout, 60 * time.Minute},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestParseFlagsAcceptsEveryQuery pins the -query vocabulary, the stats,
+// explorer, and bulk characterizations included, and the rejection of anything
+// else.
 func TestParseFlagsAcceptsEveryQuery(t *testing.T) {
-	for _, q := range []string{"claim", "claim-fair", "progress", "stats", "explorer"} {
+	for _, q := range []string{"claim", "claim-fair", "progress", "stats", "explorer", "bulk"} {
 		opts, err := parseFlags([]string{"-dsn", testDSN, "-query", q}, io.Discard)
 		if err != nil {
 			t.Errorf("-query %s: %v", q, err)
