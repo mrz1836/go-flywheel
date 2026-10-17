@@ -51,12 +51,7 @@ func TestInspectSchemaReportsWhatAnOlderSchemaLacksPostgres(t *testing.T) {
 	installLegacySchema(t, db)
 	drift, err := InspectSchema(context.Background(), db)
 	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{
-		"job_runs.kind", "job_runs.queue", "job_runs.queue_wait_ms", "job_runs.job_state",
-		"job_runs.superseded", "job_runs.error_fingerprint", "job_periodics.paused_at", "job_run_finishes (table)",
-		"job_stats_hourly (table)", "job_stats_progress (table)", "job_audit (table)", "job_kinds (table)",
-		"job_error_groups_hourly (table)", "job_queue_samples (table)", "job_nodes (table)", "job_queues (table)",
-	}, schemaDriftNames(drift))
+	assert.ElementsMatch(t, olderSchemaGaps, schemaDriftNames(drift))
 
 	current, err := InspectSchema(context.Background(), NewPostgresIsolatedDB(t))
 	require.NoError(t, err)

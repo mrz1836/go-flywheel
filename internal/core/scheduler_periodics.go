@@ -143,8 +143,9 @@ func (s *Scheduler) applyDeclaredPeriodics(ctx context.Context) {
 //
 // A failure is logged at error with how many declarations are still pending, and
 // the success that follows one is logged at info. A declaration that lands on a
-// definition an operator paused is logged at info, with its slug and when it was
-// paused: the apply updated its definition and left the pause, so the schedule
+// definition an operator paused is logged at info, with its slug, when it was
+// paused, and the type of the actor who paused it, read from the row the upsert
+// updated: the apply updated its definition and left the pause, so the schedule
 // does not fire. Each declaration lands once per start, so each paused one is
 // logged once per start. A clean start with nothing paused logs nothing.
 func (s *Scheduler) applyPendingPeriodics(ctx context.Context) map[string]struct{} {
@@ -165,15 +166,15 @@ func (s *Scheduler) applyPendingPeriodics(ctx context.Context) map[string]struct
 			failed = append(failed, s.pendingPeriodics[i:]...)
 			break
 		}
-		pausedAt, err := upsertPeriodic(ctx, s.db, spec)
+		prior, err := upsertPeriodic(ctx, s.db, spec, PeriodicDeclared)
 		if err != nil {
 			failed = append(failed, spec)
 			errs = append(errs, err)
 			continue
 		}
-		if pausedAt != nil {
+		if prior.PausedAt != nil {
 			s.logger.InfoContext(ctx, "jobs: declared periodic is paused",
-				"slug", spec.Slug, "paused_at", *pausedAt)
+				"slug", spec.Slug, "paused_at", *prior.PausedAt, "paused_by_type", prior.PausedByType)
 		}
 	}
 	s.pendingPeriodics = failed
@@ -273,7 +274,7 @@ func (s *Scheduler) reconcilePeriodics(ctx context.Context, skip map[string]stru
 			errs = append(errs, fmt.Errorf("jobs: reconcile periodics: %w", err))
 			break
 		}
-		row, inserted, err := insertPeriodic(ctx, s.db, spec, now)
+		row, inserted, err := insertPeriodic(ctx, s.db, spec, PeriodicDeclared, now)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("jobs: reconcile periodic %q: %w", spec.Slug, err))
 			continue

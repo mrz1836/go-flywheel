@@ -463,7 +463,7 @@ func TestEnqueueBucketCollisionReadsNothing(t *testing.T) {
 	def := jobPeriodicRow{Slug: "tick", Kind: "tick.k", Queue: "periodic", ArgsTemplate: datatypes.JSON("{}")}
 	bucket := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 
-	ok, err := sched.enqueueBucket(ctx, def, bucket)
+	_, ok, err := sched.enqueueBucket(ctx, def, bucket)
 	require.NoError(t, err)
 	require.True(t, ok, "the first fire for a bucket enqueues")
 
@@ -471,7 +471,7 @@ func TestEnqueueBucketCollisionReadsNothing(t *testing.T) {
 	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:count_reads",
 		func(*gorm.DB) { reads.Add(1) }))
 
-	ok, err = sched.enqueueBucket(ctx, def, bucket)
+	_, ok, err = sched.enqueueBucket(ctx, def, bucket)
 	require.NoError(t, err, "a redundant fire is a successful no-op")
 	assert.False(t, ok, "the redundant fire enqueued nothing")
 	assert.Zero(t, reads.Load(), "the collision issued no read")

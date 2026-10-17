@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/mrz1836/go-foundation/models"
@@ -53,6 +54,20 @@ type PeriodicSpec struct {
 	// PausePeriodic is held apart from it and never written by an upsert.
 	Active bool
 }
+
+// PeriodicSource is the path that last wrote a periodic definition, as
+// PeriodicView.Source reports it.
+type PeriodicSource string
+
+// The paths that write a periodic definition.
+const (
+	// PeriodicDeclared is a definition a Scheduler applied from
+	// SchedulerConfig.Periodics at its start, or re-created in its reconcile.
+	PeriodicDeclared PeriodicSource = "declared"
+	// PeriodicUpserted is a definition UpsertPeriodic wrote, as
+	// `flywheel schedule add` does.
+	PeriodicUpserted PeriodicSource = "upserted"
+)
 
 // validate checks the required fields and the exactly-one-of-schedule rule,
 // parsing a cron expression to reject a malformed one up front, and rejects an
@@ -124,7 +139,9 @@ func nextFireAfter(spec PeriodicSpec, now time.Time) (time.Time, error) {
 //
 // It never writes the pause. A definition paused with PausePeriodic stays paused
 // through an upsert, which still applies the spec's kind, queue, args, cadence,
-// and Active to it; only ResumePeriodic lifts the pause.
+// and Active to it; only ResumePeriodic lifts the pause. It records itself as
+// the definition's source, PeriodicUpserted, until a Scheduler declaring the
+// slug next applies it, and leaves the definition's history alone.
 //
 // It is safe to call concurrently for one slug — two hosts declaring the same new
 // schedule at once. The call whose insert loses adopts the row that landed and
@@ -136,40 +153,41 @@ func nextFireAfter(spec PeriodicSpec, now time.Time) (time.Time, error) {
 // SchedulerConfig.Periodics, which applies them this way when the Scheduler starts
 // and re-creates any that go missing while it runs.
 func UpsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) error {
-	_, err := upsertPeriodic(ctx, db, spec)
+	_, err := upsertPeriodic(ctx, db, spec, PeriodicUpserted)
 	return err
 }
 
-// upsertPeriodic is UpsertPeriodic, also returning the paused_at of the row it
-// updated: nil for a row it inserted or one that is not paused. The Scheduler's
-// start-up apply reads it to log a declaration it finds paused.
-func upsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) (*time.Time, error) {
+// upsertPeriodic is UpsertPeriodic writing source as the definition's source. It
+// also returns the row it updated, as it read it before the update, or the zero
+// row for one it inserted: the Scheduler's start-up apply reads its pause to log
+// a declaration it finds paused, with no query of its own.
+func upsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec, source PeriodicSource) (jobPeriodicRow, error) {
 	if err := spec.validate(); err != nil {
-		return nil, err
+		return jobPeriodicRow{}, err
 	}
 	now := models.ClockFrom(ctx).Now(ctx)
 
 	existing, found, err := loadPeriodic(ctx, db, spec.Slug)
 	if err != nil {
-		return nil, err
+		return jobPeriodicRow{}, err
 	}
 	if !found {
-		_, inserted, ierr := insertPeriodic(ctx, db, spec, now)
+		_, inserted, ierr := insertPeriodic(ctx, db, spec, source, now)
 		if ierr != nil || inserted {
-			return nil, ierr
+			return jobPeriodicRow{}, ierr
 		}
 		// A concurrent writer inserted the slug between the lookup and the insert.
 		// Treating that as success could leave its spec in place rather than this
 		// one — a rolling deploy that changes a cron would keep the old one — so
 		// adopt the row that landed and apply this spec to it.
 		if existing, found, err = loadPeriodic(ctx, db, spec.Slug); err != nil {
-			return nil, err
+			return jobPeriodicRow{}, err
 		}
 		if !found {
-			return nil, fmt.Errorf("flywheel: upsert periodic %q: inserted and removed concurrently", spec.Slug)
+			return jobPeriodicRow{}, fmt.Errorf("flywheel: upsert periodic %q: inserted and removed concurrently", spec.Slug)
 		}
 	}
-	return existing.PausedAt, updatePeriodic(ctx, db, existing, spec, now)
+	return existing, updatePeriodic(ctx, db, existing, spec, source, now)
 }
 
 // loadPeriodic reads the periodic definition for slug, reporting a missing one as
@@ -202,9 +220,9 @@ func periodicQueueAndArgs(spec PeriodicSpec) (string, datatypes.JSON) {
 	return queue, datatypes.JSON(args)
 }
 
-// periodicRow builds the job_periodics row spec declares, with next_run_at at its
-// first fire time after now.
-func periodicRow(spec PeriodicSpec, now time.Time) (jobPeriodicRow, error) {
+// periodicRow builds the job_periodics row spec declares, written by source, with
+// next_run_at at its first fire time after now.
+func periodicRow(spec PeriodicSpec, source PeriodicSource, now time.Time) (jobPeriodicRow, error) {
 	nextRun, err := nextFireAfter(spec, now)
 	if err != nil {
 		return jobPeriodicRow{}, err
@@ -217,6 +235,7 @@ func periodicRow(spec PeriodicSpec, now time.Time) (jobPeriodicRow, error) {
 		ArgsTemplate: args,
 		NextRunAt:    nextRun,
 		IsActive:     new(spec.Active),
+		Source:       string(source),
 	}
 	if spec.Every > 0 {
 		secs := int(spec.Every.Seconds())
@@ -228,11 +247,12 @@ func periodicRow(spec PeriodicSpec, now time.Time) (jobPeriodicRow, error) {
 	return row, nil
 }
 
-// insertPeriodic inserts spec as a new periodic row, with next_run_at at its first
-// fire time after now, and reports whether the insert landed, returning the row
-// it wrote when it did. The insert does nothing when the slug already exists: a
-// concurrent writer that inserted it first is (jobPeriodicRow{}, false, nil), not
-// an error, and the caller decides what losing means.
+// insertPeriodic inserts spec as a new periodic row written by source, with
+// next_run_at at its first fire time after now, and reports whether the insert
+// landed, returning the row it wrote when it did. The insert does nothing when
+// the slug already exists: a concurrent writer that inserted it first is
+// (jobPeriodicRow{}, false, nil), not an error, and the caller decides what
+// losing means.
 //
 // The conflict clause is targetless, as conflictInsertChunk's is. It covers
 // idx_job_periodics_slug without naming it, so a host-owned install that lacks the
@@ -244,8 +264,10 @@ func periodicRow(spec PeriodicSpec, now time.Time) (jobPeriodicRow, error) {
 // RowsAffected is exact here, unlike conflictInsertChunk's: a single-struct create
 // counts the rows its RETURNING clause yields, and a skipped insert yields none.
 // TestInsertPeriodicReportsWhetherItLanded pins it on both dialects.
-func insertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec, now time.Time) (jobPeriodicRow, bool, error) {
-	row, err := periodicRow(spec, now)
+func insertPeriodic(
+	ctx context.Context, db *gorm.DB, spec PeriodicSpec, source PeriodicSource, now time.Time,
+) (jobPeriodicRow, bool, error) {
+	row, err := periodicRow(spec, source, now)
 	if err != nil {
 		return jobPeriodicRow{}, false, err
 	}
@@ -262,15 +284,19 @@ func insertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec, now tim
 }
 
 // updatePeriodic reconciles an existing periodic row in place. It writes the
-// spec's definition and Active, and never paused_at: the pause belongs to
-// PausePeriodic and ResumePeriodic alone.
-func updatePeriodic(ctx context.Context, db *gorm.DB, existing jobPeriodicRow, spec PeriodicSpec, now time.Time) error {
+// spec's definition and Active, and source as the row's source, and never the
+// pause columns or the history: the pause belongs to PausePeriodic and
+// ResumePeriodic alone, and the history to the fires.
+func updatePeriodic(
+	ctx context.Context, db *gorm.DB, existing jobPeriodicRow, spec PeriodicSpec, source PeriodicSource, now time.Time,
+) error {
 	queue, args := periodicQueueAndArgs(spec)
 	updates := map[string]any{
 		"kind":             spec.Kind,
 		"queue":            queue,
 		"args_template":    args,
 		"is_active":        spec.Active,
+		"source":           string(source),
 		"updated_at":       now,
 		"cron_expr":        nil,
 		"interval_seconds": nil,
@@ -401,11 +427,26 @@ type PeriodicView struct {
 	NextRunAt       time.Time  `json:"next_run_at"`
 	LastEnqueuedAt  *time.Time `json:"last_enqueued_at,omitempty"`
 	Active          bool       `json:"active"`
+	// Source is the path that last wrote the definition: PeriodicDeclared or
+	// PeriodicUpserted, and empty for a row written before the source was
+	// recorded, until its next write.
+	Source PeriodicSource `json:"source,omitempty"`
 	// Paused reports an operator's PausePeriodic, which holds through every
 	// restart that re-declares the definition until ResumePeriodic.
 	Paused bool `json:"paused"`
 	// PausedAt is when the definition was paused; nil while it is not.
 	PausedAt *time.Time `json:"paused_at,omitempty"`
+	// PausedBy is the type, id, and reason of the actor who paused the
+	// definition; nil while it is not paused. Its Type is empty for a pause
+	// recorded before the actor was.
+	PausedBy *Actor `json:"paused_by,omitempty"`
+	// LastJobID is the job of the definition's newest remembered fire, scheduled
+	// or manual (see PeriodicHistory); empty until it fires.
+	LastJobID string `json:"last_job_id,omitempty"`
+	// TimeZone is the zone a cron expression names with a CRON_TZ= or TZ=
+	// prefix. It is empty for an interval, and for a cron without a zone, which
+	// runs in the zone of the Scheduler clock's time (see PeriodicSpec.Cron).
+	TimeZone string `json:"time_zone,omitempty"`
 }
 
 // ListPeriodics returns every periodic definition, ordered by slug.
@@ -430,16 +471,98 @@ func periodicViewFromRow(r jobPeriodicRow) PeriodicView {
 		NextRunAt:      r.NextRunAt,
 		LastEnqueuedAt: r.LastEnqueuedAt,
 		Active:         r.IsActive != nil && *r.IsActive,
+		Source:         PeriodicSource(r.Source),
 		Paused:         r.PausedAt != nil,
 		PausedAt:       r.PausedAt,
 	}
+	if r.PausedAt != nil {
+		v.PausedBy = &Actor{Type: ActorType(r.PausedByType), ID: r.PausedByID, Reason: r.PausedReason}
+	}
+	if history := decodeFires(r.RecentJobs); len(history) > 0 {
+		v.LastJobID = history[0].JobID
+	}
 	if r.CronExpr != nil {
 		v.Cron = *r.CronExpr
+		v.TimeZone = cronTimeZone(v.Cron)
 	}
 	if r.IntervalSeconds != nil {
 		v.IntervalSeconds = *r.IntervalSeconds
 	}
 	return v
+}
+
+// cronTimeZone returns the zone a cron expression names with a CRON_TZ= or TZ=
+// prefix — the text between the "=" and the first space, as the cron parser
+// reads it — or "" when it names none.
+func cronTimeZone(expr string) string {
+	for _, prefix := range []string{"CRON_TZ=", "TZ="} {
+		if rest, ok := strings.CutPrefix(expr, prefix); ok {
+			zone, _, _ := strings.Cut(rest, " ")
+			return zone
+		}
+	}
+	return ""
+}
+
+// MaxNextFires is the most fire times one NextPeriodicFires call lists.
+const MaxNextFires = 100
+
+// NextPeriodicFires returns the next n fire times of the schedule p describes,
+// strictly after after, earliest first, in after's location. It reads nothing:
+// p is a view ListPeriodics returned, or one a caller built.
+//
+// The first fire is p.NextRunAt when that is after after. Otherwise a cron
+// takes its next match after after, and an interval keeps its grid: the first
+// NextRunAt plus a whole number of intervals that is after after, or after plus
+// one interval when NextRunAt is zero. Each later fire is the cron's next match
+// after the one before, or the one before plus the interval. A cron with no
+// CRON_TZ= zone is evaluated in after's zone, as the Scheduler evaluates it in
+// its clock's; pass after in the zone the Scheduler runs in. A cron that
+// matches no time within five years ends the list early.
+//
+// Paused and inactive schedules are listed as if they ran: the times are when
+// the schedule would fire once active and resumed, from p.NextRunAt as it
+// stands.
+//
+// n outside 1 to MaxNextFires is a *ValidationError naming "n", and a view with
+// neither a cron nor an interval one naming "schedule"; a cron that does not
+// parse returns the parse error, which wraps ErrValidation.
+func NextPeriodicFires(p PeriodicView, after time.Time, n int) ([]time.Time, error) {
+	if n < 1 || n > MaxNextFires {
+		return nil, newValidationError("n", fmt.Sprintf("must be between 1 and %d", MaxNextFires))
+	}
+	next := p.NextRunAt.In(after.Location())
+	fires := make([]time.Time, 0, n)
+	switch {
+	case p.IntervalSeconds > 0:
+		interval := time.Duration(p.IntervalSeconds) * time.Second
+		switch {
+		case p.NextRunAt.IsZero():
+			next = after.Add(interval)
+		case !next.After(after):
+			passed := int64(after.Sub(next) / interval)
+			next = next.Add(time.Duration(passed+1) * interval)
+		}
+		for len(fires) < n {
+			fires = append(fires, next)
+			next = next.Add(interval)
+		}
+	case p.Cron != "":
+		schedule, err := cron.ParseStandard(p.Cron)
+		if err != nil {
+			return nil, &cronSpecError{err: fmt.Errorf("flywheel: parse cron %q: %w", p.Cron, err)}
+		}
+		if !next.After(after) {
+			next = schedule.Next(after)
+		}
+		for len(fires) < n && !next.IsZero() {
+			fires = append(fires, next)
+			next = schedule.Next(next)
+		}
+	default:
+		return nil, newValidationError("schedule", "the view has neither a cron expression nor an interval")
+	}
+	return fires, nil
 }
 
 // RetryOpts configures a RetryJobWithOptions call. The zero value is a plain,

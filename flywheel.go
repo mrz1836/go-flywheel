@@ -137,6 +137,8 @@ type (
 	Observer              = core.Observer
 	OutcomeCounts         = core.OutcomeCounts
 	OverviewParams        = core.OverviewParams
+	PeriodicFire          = core.PeriodicFire
+	PeriodicSource        = core.PeriodicSource
 	PeriodicSpec          = core.PeriodicSpec
 	PeriodicView          = core.PeriodicView
 	PublishKindsOpts      = core.PublishKindsOpts
@@ -215,6 +217,7 @@ const (
 	AuditTargetNode          = core.AuditTargetNode
 	AuditTargetPeriodic      = core.AuditTargetPeriodic
 	AuditTargetQueue         = core.AuditTargetQueue
+	AuditTriggered           = core.AuditTriggered
 	DefaultCountCap          = core.DefaultCountCap
 	DefaultFeedSettle        = core.DefaultFeedSettle
 	DefaultTreeDepth         = core.DefaultTreeDepth
@@ -241,6 +244,7 @@ const (
 	MaxCountCap              = core.MaxCountCap
 	MaxHistoryPoints         = core.MaxHistoryPoints
 	MaxMetadataBytes         = core.MaxMetadataBytes
+	MaxNextFires             = core.MaxNextFires
 	MaxReadLimit             = core.MaxReadLimit
 	MaxReasonBytes           = core.MaxReasonBytes
 	MaxTagBytes              = core.MaxTagBytes
@@ -254,6 +258,9 @@ const (
 	OutcomeStarted           = core.OutcomeStarted
 	OutcomeSuccess           = core.OutcomeSuccess
 	OutcomeTimeout           = core.OutcomeTimeout
+	PeriodicDeclared         = core.PeriodicDeclared
+	PeriodicHistorySize      = core.PeriodicHistorySize
+	PeriodicUpserted         = core.PeriodicUpserted
 	SignalDurationRegression = core.SignalDurationRegression
 	SignalFailureSpike       = core.SignalFailureSpike
 	StateAvailable           = core.StateAvailable
@@ -581,6 +588,10 @@ func NewTokenBucket(cfg TokenBucketConfig) *TokenBucket {
 	return core.NewTokenBucket(cfg)
 }
 
+func NextPeriodicFires(p PeriodicView, after time.Time, n int) ([]time.Time, error) {
+	return core.NextPeriodicFires(p, after, n)
+}
+
 func NonTerminalStates() []JobState {
 	return core.NonTerminalStates()
 }
@@ -611,6 +622,10 @@ func PausePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
 
 func PauseQueue(ctx context.Context, db *gorm.DB, queue string) error {
 	return core.PauseQueue(ctx, db, queue)
+}
+
+func PeriodicHistory(ctx context.Context, db *gorm.DB, slug string) ([]PeriodicFire, error) {
+	return core.PeriodicHistory(ctx, db, slug)
 }
 
 func Progress(ctx context.Context, db *gorm.DB, parentJobID string) (BatchProgress, error) {
@@ -731,6 +746,10 @@ func StorageParameters(dialect string) ([]string, error) {
 
 func TerminalStates() []JobState {
 	return core.TerminalStates()
+}
+
+func TriggerPeriodic(ctx context.Context, c *Client, slug string) (string, error) {
+	return core.TriggerPeriodic(ctx, c, slug)
 }
 
 func UpsertPeriodic(ctx context.Context, db *gorm.DB, spec PeriodicSpec) error {

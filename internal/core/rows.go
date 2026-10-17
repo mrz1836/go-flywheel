@@ -152,15 +152,28 @@ type jobPeriodicRow struct {
 	// with default:true could never be written false. A nil IsActive still takes
 	// the default. The column — NOT NULL DEFAULT true — is unchanged.
 	IsActive *bool `gorm:"column:is_active;not null;default:true"`
+	// Source is the path that last wrote the definition: a PeriodicSource, or
+	// empty on a row an older binary wrote.
+	Source string `gorm:"column:source;not null;default:''"`
 	// PausedAt is when an operator paused the definition with PausePeriodic, and
 	// nil while it is not paused. A definition fires only when it is active and
-	// not paused. Only PausePeriodic and ResumePeriodic write it: UpsertPeriodic,
-	// the Scheduler's start-up apply, and its reconcile never do, so a pause holds
-	// through every restart that re-declares the definition. Nullable, so a row an
-	// older binary inserts is valid and not paused.
-	PausedAt  *time.Time `gorm:"column:paused_at"`
-	CreatedAt time.Time  `gorm:"column:created_at;not null"`
-	UpdatedAt time.Time  `gorm:"column:updated_at;not null"`
+	// not paused. PausePeriodic and ResumePeriodic alone write it and the three
+	// columns after it: UpsertPeriodic, the Scheduler's start-up apply, and its
+	// reconcile never do, so a pause holds through every restart that re-declares
+	// the definition. Nullable, so a row an older binary inserts is valid and not
+	// paused.
+	PausedAt *time.Time `gorm:"column:paused_at"`
+	// PausedByType, PausedByID, and PausedReason are the type, id, and reason of
+	// the actor who paused the definition, while it is paused; empty otherwise.
+	PausedByType string `gorm:"column:paused_by_type;not null;default:''"`
+	PausedByID   string `gorm:"column:paused_by_id;not null;default:''"`
+	PausedReason string `gorm:"column:paused_reason;not null;default:''"`
+	// RecentJobs is the definition's latest fires, newest first, at most
+	// PeriodicHistorySize: a JSON array of periodicFireEntry, rewritten under a
+	// row lock in the transaction that records a fire.
+	RecentJobs datatypes.JSON `gorm:"column:recent_jobs;type:jsonb;not null;default:'[]'"`
+	CreatedAt  time.Time      `gorm:"column:created_at;not null"`
+	UpdatedAt  time.Time      `gorm:"column:updated_at;not null"`
 }
 
 // TableName binds jobPeriodicRow to the job_periodics table.
