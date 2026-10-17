@@ -1405,8 +1405,8 @@ work depends on the intent:
 **Every operator control records who ran it, and why.** Put the operator on the request's context once,
 with `WithActor`, and each control called with that context writes one entry to `job_audit` for every job
 or schedule it changes: `RetryJob`, `RetryJobWithOptions`, `CancelJob`, `PauseByParent`, `ResumeByParent`,
-`CancelByParent`, `Replay`, `ReplayByParent`, `SetPeriodicActive`, `DeletePeriodic`, and the single-job
-controls of **Changing one job** below.
+`CancelByParent`, `Replay`, `ReplayByParent`, `SetPeriodicActive`, `DeletePeriodic`, `PausePeriodic`,
+`ResumePeriodic`, `TriggerPeriodic`, and the single-job controls of **Changing one job** below.
 
 ```go
 ctx = flywheel.WithActor(ctx, flywheel.Actor{
@@ -2098,19 +2098,42 @@ other declared definition present meanwhile.
 
 **To stop a declared definition at run time, pause it.** `Active` is the declaration's switch; a pause is
 the operator's, and nothing that declares a definition writes it — not a start, not the reconcile, not
-`UpsertPeriodic`. `PausePeriodic(ctx, db, slug)` (`flywheel schedule pause`) holds a definition through
-every restart until `ResumePeriodic` (`flywheel schedule resume`). A start still applies a paused
-definition's kind, queue, args, and cadence, and logs `jobs: declared periodic is paused` (fields `slug`,
-`paused_at`) once, at info. A definition fires only when it is active and not paused, so a pause holds
-whatever the declaration says, and `Active: false` in code turns a definition off whatever the pause says.
-A resume moves `next_run_at` to the first fire after now on the definition's own schedule: the fires the
-pause skipped are not backfilled, and an inactive definition stays inactive. Pausing a paused definition,
-or resuming one that is not paused, changes nothing; an unknown slug is `ErrPeriodicNotFound`.
-`ListPeriodics` reports `Paused` and `PausedAt`. The pause lives on the row, in the nullable
-`job_periodics.paused_at` column, so `DeletePeriodic` removes it with the row. A scheduler refuses to start
-without that column (`ErrSchemaOutdated`): `Migrate` adds it to an existing database, and
-[From a release before the schedule pause](docs/INTEGRATING.md#from-a-release-before-the-schedule-pause)
-has the statement for a host-owned schema on each dialect.
+`UpsertPeriodic`. `PausePeriodic(ctx, db, slug)` (`flywheel schedule pause --reason`) holds a definition
+through every restart until `ResumePeriodic` (`flywheel schedule resume`). Each records who ran it and why
+— the context's actor (`WithActor`; the system when there is none) — on the row while the definition is
+paused, and in one `paused` or `resumed` entry in the control history, in the same transaction. A start
+still applies a paused definition's kind, queue, args, and cadence, and logs `jobs: declared periodic is
+paused` (fields `slug`, `paused_at`, `paused_by_type`) once, at info. A definition fires only when it is
+active and not paused, so a pause holds whatever the declaration says, and `Active: false` in code turns a
+definition off whatever the pause says. A resume moves `next_run_at` to the first fire after now on the
+definition's own schedule: the fires the pause skipped are not backfilled, and an inactive definition
+stays inactive. Pausing a paused definition, or resuming one that is not paused, changes nothing and
+records nothing; an unknown slug is `ErrPeriodicNotFound`. The pause lives on the row, so `DeletePeriodic`
+removes it with the row.
+
+**To run a definition now, trigger it.** `TriggerPeriodic(ctx, client, slug)` (`flywheel schedule
+trigger`) enqueues one job of the definition's kind, args, and queue, due now, and returns its id — on a
+paused or inactive definition too, which is how an operator re-runs a fire the schedule missed. It sets
+no unique key, so two triggers enqueue two jobs; it inserts through the client, so the client's
+`InsertHook` sees `InsertSourcePeriodic` and the slug, as for a scheduled fire; and it leaves the pause
+and the next fire alone. The job, its history entry, and one `triggered` entry in the control history,
+naming the job, commit together.
+
+**Every fire is remembered.** Each definition keeps its latest 20 fires (`PeriodicHistorySize`), newest
+first, on its row: a scheduled fire at its bucket's time, each bucket of a backfill on its own, and a
+trigger marked manual; a bucket that collided with a job already enqueued for it is not remembered again.
+`PeriodicHistory(ctx, db, slug)` (`flywheel schedule history`) returns them with each job's state, its
+latest run's outcome, and that run's finish time; a job retention removed keeps its id and fire time, with
+no state. `ListPeriodics` reports each definition's `Paused`, `PausedAt`, and `PausedBy`; its
+`LastJobID`, the newest fire's job; its cron's `TimeZone`; and its `Source`, `declared` when a
+scheduler's start or reconcile last wrote it and `upserted` when `UpsertPeriodic` (`flywheel schedule
+add`) did. `NextPeriodicFires(view, after, n)` lists a definition's next `n` fires, at most
+`MaxNextFires` (100), with a cron that names no zone evaluated in `after`'s zone.
+
+The pause, who made it, the source, and the history are columns of `job_periodics`, and a scheduler
+refuses to start without them (`ErrSchemaOutdated`): `Migrate` adds them to an existing database, and
+[Upgrading an existing database](docs/INTEGRATING.md#upgrading-an-existing-database) has the statements
+for a host-owned schema on each dialect.
 
 **While it runs, the reconcile only inserts.** A definition that exists — deactivated, paused, or edited by
 hand — is left exactly as it is until the next start, and one this host does not declare is never

@@ -109,11 +109,13 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel jobs pause <id>` | Hold an available, retryable, or scheduled job so no runner claims it until it is resumed; a paused job is left as it is (`--reason`, recorded in its history). Refused for a running or finished job, as `reschedule` is |
 | `flywheel jobs resume <id>` | Return a paused job to available, keeping its scheduled time; any other waiting job is left as it is (`--reason`, recorded in its history). Refused for a running or finished job, as `reschedule` is |
 | `flywheel jobs delete <id>` | Delete a finished job (succeeded, cancelled, or discarded) with its runs, as `prune` deletes them; its history stays, with the delete in it (`--reason`). A job that hasn't finished is refused (`flywheel: job has not reached a terminal state`): cancel it first |
-| `flywheel schedule ls` | List periodic schedules, with whether each is active and paused (`--json`) |
+| `flywheel schedule ls` | List periodic schedules, with whether each is active, whether it is paused and by whom (`yes (user:alice)`), and its source: `declared` when `serve` applied it from the file, `upserted` when `schedule add` wrote it (`--json`, which adds the pause's reason, the last job, and the cron's zone) |
 | `flywheel schedule add <slug> <kind>` | Add/update a schedule (`--cron \| --every`, `--args`). A `--cron` that names no zone runs in the zone the scheduler evaluates it in: the daemon's local zone, as the database driver returns its times. Prefix it with `CRON_TZ=<zone>` to pin one, for example `--cron "CRON_TZ=UTC 0 9 * * *"` |
 | `flywheel schedule rm <slug>` | Remove a schedule (warns when the config declares it: `serve` re-creates it; `--reason`, recorded in its history) |
 | `flywheel schedule enable <slug>` / `disable <slug>` | Reactivate or deactivate a schedule, keeping its row (`--reason`, recorded in its history). This is the config's own switch: for a schedule the file declares, the next `serve` start re-applies the file's setting |
-| `flywheel schedule pause <slug>` / `resume <slug>` | Hold a schedule through every `serve` start until it is resumed; a resume fires it next at its first fire time after now, without running the fires it missed |
+| `flywheel schedule pause <slug>` / `resume <slug>` | Hold a schedule through every `serve` start until it is resumed; a resume fires it next at its first fire time after now, without running the fires it missed (`--reason`, recorded with the pause and in its history). Pausing a paused schedule, or resuming one that isn't paused, changes nothing |
+| `flywheel schedule trigger <slug>` | Run a schedule now, paused or disabled too, and print `triggered <slug>: job <id>`: one job of its kind, args, and queue, due at once, as a manual run. Its pause and next fire stay as they are (`--reason`, recorded in its history) |
+| `flywheel schedule history <slug>` | List a schedule's latest fires, newest first, at most 20: each fire's job, when it fired (UTC), whether it was a manual run, and the job's state, its latest run's outcome, and when that run finished (`--json`) |
 | `flywheel kinds` | List the kind catalog a host's processes published with `PublishKinds`, sorted by kind: each kind's default queue, priority, attempts, and timeout (`-` for none), and when it was last published (`--json` prints the records, with each kind's description, args schema and example, and publisher). The CLI publishes no catalog of its own |
 | `flywheel queues` | List every queue that holds an unfinished job or was ever paused: its ready, scheduled-ahead, running, and paused jobs, and whether the queue itself is paused, by whom, and why (`--json`) |
 | `flywheel queues pause <queue>` / `resume <queue>` | Stop every runner from claiming a queue's jobs, or let them claim again, within one `QueueStateRefresh` (five seconds by default); jobs already running finish, and a queue no job has used can be paused (`--reason`, recorded in its history). Pausing a paused queue, or resuming one that isn't paused, changes nothing |
@@ -130,8 +132,9 @@ All commands take `--config <path>` (default `./flywheel.yaml`, else
 `$XDG_CONFIG_HOME/flywheel/flywheel.yaml`).
 
 The control commands — `jobs retry`, `cancel`, `reschedule`, `priority`, `pause`, `resume`, and `delete`,
-and `schedule rm`, `enable`, and `disable` — run as the operating-system user (its name, else `$USER`) with the source `cli`, so `flywheel jobs history` and
-`ListAudit` show who ran each one and the `--reason` they gave.
+`schedule rm`, `enable`, `disable`, `pause`, `resume`, and `trigger`, `queues pause` and `resume`, and
+`nodes drain` — run as the operating-system user (its name, else `$USER`) with the source `cli`, so
+`flywheel jobs history` and `ListAudit` show who ran each one and the `--reason` they gave.
 
 ## Replacing cron
 
