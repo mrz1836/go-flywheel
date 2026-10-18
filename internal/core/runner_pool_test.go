@@ -165,10 +165,22 @@ func runInBackground(t *testing.T, r *Runner) func() {
 	return func() {
 		cancel()
 		select {
-		case <-done:
+		case err := <-done:
+			assertRunExitedCleanly(t, err)
 		case <-time.After(5 * time.Second):
 			t.Error("Run did not return after cancel")
 		}
+	}
+}
+
+// assertRunExitedCleanly checks what Run returned once a test is done with it.
+// A Stop or Drain ends Run with nil and a cancelled context ends it with
+// context.Canceled; anything else is a real failure that would otherwise be
+// dropped.
+func assertRunExitedCleanly(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		assert.ErrorIs(t, err, context.Canceled, "Run ended on a failure, not on the stop")
 	}
 }
 

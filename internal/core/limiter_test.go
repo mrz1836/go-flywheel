@@ -318,12 +318,12 @@ func TestGatedRunnerLimiterErrorDoesNotStopTheRunner(t *testing.T) {
 		require.Eventually(t, func() bool { return fd.dequeueCalls() > 0 },
 			2*time.Second, 5*time.Millisecond, "fail-open claims despite the limiter error")
 		select {
-		case <-done:
-			t.Fatal("a limiter error stopped the runner")
+		case err := <-done:
+			t.Fatalf("a limiter error stopped the runner: %v", err)
 		case <-time.After(50 * time.Millisecond):
 		}
 		cancel()
-		<-done
+		assert.ErrorIs(t, <-done, context.Canceled)
 		assert.True(t, rec.has("jobs: limiter failed; admitting anyway"), "fail-open logs a warning")
 	})
 
@@ -345,13 +345,13 @@ func TestGatedRunnerLimiterErrorDoesNotStopTheRunner(t *testing.T) {
 		require.Eventually(t, func() bool { return lim.acquireCount() > 2 },
 			2*time.Second, 5*time.Millisecond, "the gate keeps consulting the failed limiter")
 		select {
-		case <-done:
-			t.Fatal("a limiter error stopped the runner")
+		case err := <-done:
+			t.Fatalf("a limiter error stopped the runner: %v", err)
 		case <-time.After(50 * time.Millisecond):
 		}
 		assert.Zero(t, fd.dequeueCalls(), "fail-closed never issues a Dequeue on a limiter error")
 		cancel()
-		<-done
+		assert.ErrorIs(t, <-done, context.Canceled)
 	})
 }
 
