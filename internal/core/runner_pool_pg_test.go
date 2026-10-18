@@ -168,7 +168,7 @@ func TestRunnerPGKeepsClaimingAroundAStragglerPostgres(t *testing.T) {
 	assert.Zero(t, unfinished, "every job reached a terminal success")
 
 	cancelRun()
-	<-runErr
+	assertRunExitedCleanly(t, <-runErr)
 }
 
 // TestRunnerPGDrainStrandsNothingTheSweepCannotReclaim is A7's durability half
