@@ -84,6 +84,7 @@ func TestParseFlagsMapsEveryFlag(t *testing.T) {
 		"-rate", "10",
 		"-burst", "20",
 		"-max-concurrent", "5",
+		"-progress", "250ms",
 		"-out", "/tmp/report.json",
 		"-quiet",
 	}, io.Discard)
@@ -112,6 +113,7 @@ func TestParseFlagsMapsEveryFlag(t *testing.T) {
 		{"Rate", opts.cfg.Rate, 10},
 		{"Burst", opts.cfg.Burst, 20},
 		{"MaxConcurrent", opts.cfg.MaxConcurrent, 5},
+		{"Progress", opts.cfg.Progress, 250 * time.Millisecond},
 		{"out", opts.out, "/tmp/report.json"},
 		{"quiet", opts.quiet, true},
 	}
@@ -168,6 +170,7 @@ func TestParseFlagsRejects(t *testing.T) {
 		{"unknown flag", []string{"-dsn", testDSN, "-nope"}, "nope"},
 		{"stray argument", []string{"-dsn", testDSN, "extra"}, "unexpected argument"},
 		{"bad duration", []string{"-dsn", testDSN, "-work", "soon"}, "work"},
+		{"negative progress", []string{"-dsn", testDSN, "-progress", "-1s"}, "-progress"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

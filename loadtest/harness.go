@@ -378,6 +378,7 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 	flywheel.Register(h.registry, loadWorker{
 		track: h.exec, seed: cfg.Seed, failFraction: cfg.FailFraction,
 		retryBackoff: retryBackoff, snooze: snooze, outage: h.outage, fairness: h.fairness,
+		progress: cfg.Progress,
 	})
 
 	if err = h.buildLimiter(scoped); err != nil {

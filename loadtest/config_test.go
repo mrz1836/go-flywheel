@@ -74,6 +74,7 @@ func TestValidateRejects(t *testing.T) {
 		{"connection budget", Config{DSN: testDSN, Jobs: 1, Runners: 16, Workers: 16}, ErrTooManyConnections},
 		{"unknown limiter", Config{DSN: testDSN, Jobs: 1, Limiter: "leaky"}, ErrInvalidConfig},
 		{"negative rate", Config{DSN: testDSN, Jobs: 1, Rate: -1}, ErrInvalidConfig},
+		{"negative progress", Config{DSN: testDSN, Jobs: 1, Progress: -time.Second}, ErrInvalidConfig},
 		{
 			"limiter and worker-snooze together",
 			Config{DSN: testDSN, Jobs: 1, Limiter: LimiterTokenBucket, Rate: 10, WorkerSnooze: 10},
