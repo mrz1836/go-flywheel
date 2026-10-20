@@ -1606,6 +1606,59 @@ go test -tags=loadtest -run='^$' -bench=BenchmarkDrainWithHeartbeat -benchtime=1
 
 <br/>
 
+## Progress on the heartbeat
+
+`Job.SetProgress` adds a write to `job_runs`, the table every attempt updates once already, so the question
+is whether that write stays a heap-only (HOT) update — no index touched, the new tuple on the same page —
+and whether a drain pays for it. The write is one `UPDATE` of `progress` and `progress_at` by the run's id,
+at most once per heartbeat, and neither column is indexed.
+
+**The measurement.** Four runs of one command, interleaved off, on, off, on, each after a `CHECKPOINT`,
+the on runs adding `-progress 250ms`: every job reports its share done four times a second, far faster
+than the one-second heartbeat a 3 s lease derives, so the heartbeat's throttle is what is measured. A
+10,000-job drain on one runner of 80 slots, 3 s ± 1 s of work per job, so each attempt sees two to three
+renewals. The report names its arm in the file name; the `job_runs` update counts show it too.
+
+| | Off | On (`-progress 250ms`) |
+|---|---|---|
+| Reports | `progress-off-1.json`, `progress-off-2.json` | `progress-on-1.json`, `progress-on-2.json` |
+| Drain throughput | 26.42, 26.32 jobs/s | 26.40, 26.37 jobs/s |
+| Wall clock | 378.5 s, 380.0 s | 378.8 s, 379.3 s |
+| `job_runs` updates | 9,972, 9,977 | 34,919, 35,021 |
+| of them HOT | 8,921, 8,900 | 32,747, 33,024 |
+| **`job_runs` HOT share** | **89.5 %, 89.2 %** | **93.8 %, 94.3 %** |
+
+**Read it as two results.** First, the cost: throughput is the same within the runs' own spread — the
+drain is bound by its 80 slots and 3 s of work, and about 2.5 more `UPDATE`s per job, one per renewal
+that found the report changed, did not move it. Second, the shape of the write: the 25,000 progress
+writes each run added were 95.5 % and 96.3 % HOT (23,826 of 24,947, and 24,124 of 25,044), so they took
+the table's share *up*, from 89 % to 94 %. A progress write is HOT-eligible, since it sets no indexed
+column, and the few that were not HOT found their row's page full. The off arm's 89 % is the finalize's
+share in this workload, below the 94–99 % the [job analytics A/B](#job-analytics) measured on a 25 ms
+drain; `job_runs` keeps the default fillfactor, as [the storage parameters](#storage-parameters-measured-then-adopted)
+explain.
+
+**Environment.** Measured on a different machine from the rest of this file: Apple M1 Max (10 threads),
+macOS 15.7.9, go1.27.2, PostgreSQL 17.10 (`postgres:17-alpine`) in Docker Desktop on the same machine,
+reached over a published loopback port; the tree was `a489344` with this change. The relative result is
+what transfers.
+
+```bash
+docker exec <container> psql -U flywheel -d flywheel_bench -c CHECKPOINT   # before each run
+go run -tags=loadtest ./loadtest/cmd/scenario -dsn "$FLYWHEEL_LOADTEST_DATABASE_URL" \
+  -jobs 10000 -runners 1 -workers 80 -mix drain -work 3s -jitter 1s -lease 3s -storage-tuning \
+  -timeout 60m -out docs/benchmarks/progress-off-1.json
+go run -tags=loadtest ./loadtest/cmd/scenario -dsn "$FLYWHEEL_LOADTEST_DATABASE_URL" \
+  -jobs 10000 -runners 1 -workers 80 -mix drain -work 3s -jitter 1s -lease 3s -storage-tuning \
+  -progress 250ms -timeout 60m -out docs/benchmarks/progress-on-1.json
+```
+
+The PostgreSQL suite pins the property on its own: `TestProgressWritesKeepTheRunUpdateHOTPostgres` drives
+fifty progress writes and the finalize through one run and requires every one of the 51 updates to be
+HOT, and fails (1 of 51) once an index on `job_runs (progress_at)` is added.
+
+<br/>
+
 ## Replaying a failed cohort: re-convergence, and the one-more-try defect it replaces
 
 "Replay the failures" is the common operator action after an incident, and the runtime used to support
@@ -1720,6 +1773,36 @@ Both runs retire the same 2,000 jobs, so the gate is not throttling throughput b
 removing the wasted claims that reach the budget the expensive way. Its `drain_throughput_per_sec`
 reads ~51, tracking the 50/s budget rather than the poll rate; the baseline's reads in the thousands
 because a snooze counts as a decided attempt, which is the poll rate the gate exists to stop chasing.
+
+<br/>
+
+## Limiter overrides
+
+`SetLimiterBudget` stores a `DBLimiter`'s overrides on the bucket row `Acquire` already locks, so applying
+them costs no statement: the question is only whether reading and applying them slows `Acquire`. A
+same-binary benchmark, one `Acquire` and its `Release` per iteration on a limiter capped at 16 concurrent
+holds, on a resource with no override and on one whose cap an override lowers to 8, `-count 6`
+(`docs/benchmarks/limiter-overrides.txt`):
+
+| | Without overrides | With overrides |
+|---|---|---|
+| Six runs, ms per `Acquire` + `Release` | 4.44, 4.25, 3.70, 3.61, 3.92, 4.07 | 3.86, 3.63, 3.65, 3.98, 3.82, 3.83 |
+| **Median** | **3.99 ms** | **3.82 ms** |
+
+**No resolvable difference.** The run with an override in force is inside the other's spread (3.61–4.44
+ms), and its median is the lower of the two, which is noise, not a speed-up: both read the same row with
+the same statement, and the override changes only which number the grant is compared against. The
+absolute figure is round trips, not computation — an `Acquire` is a transaction of six statements and a
+`Release` one of two — and here each round trip crosses Docker Desktop's network, so it reads several
+times slower than against a local server; the comparison is what transfers.
+
+**Environment.** As for the progress A/B above: Apple M1 Max, PostgreSQL 17.10 in Docker Desktop, the
+tree at `a489344` with this change.
+
+```bash
+FLYWHEEL_TEST_DATABASE_URL=postgres://… \
+  go test -tags=integration -count=1 -run '^$' -bench BenchmarkDBLimiterAcquirePostgres -count 6 ./internal/core/
+```
 
 <br/>
 

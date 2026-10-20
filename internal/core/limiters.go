@@ -11,15 +11,19 @@ import (
 
 // LimiterInfo is one shared limiter resource's state, read from the tables a
 // DBLimiter writes: its rate bucket's tokens as last stored, the permits its
-// live concurrency holds take, and when the soonest of those holds lapses. A
-// resource's configured budget is the host's DBLimiterConfig, so it carries
-// none.
+// live concurrency holds take, when the soonest of those holds lapses, and the
+// overrides SetLimiterBudget set on it. A resource's configured budget is the
+// host's DBLimiterConfig, so it carries none.
 type LimiterInfo struct {
 	Resource       string     `json:"resource"`
 	Tokens         int        `json:"tokens"`                     // a rate limiter's tokens as last stored; Acquire refills before it grants
 	Held           int64      `json:"held"`                       // permits held by live concurrency holds
 	NextHoldExpiry *time.Time `json:"next_hold_expiry,omitempty"` // the soonest live hold's expiry; nil when nothing is held
 	UpdatedAt      time.Time  `json:"updated_at"`
+	// Overrides are the overrides set on the resource's bucket row, whether or
+	// not a given process's limiter can apply them (a Rate override needs a
+	// positive Interval, a MaxConcurrent override a positive HoldTTL).
+	Overrides LimiterBudget `json:"overrides"`
 }
 
 // ListLimiters returns the state of each resource a DBLimiter has admitted
@@ -28,10 +32,13 @@ type LimiterInfo struct {
 // expires_at has not passed by the context clock, as Acquire counts them, and
 // NextHoldExpiry is the earliest of those. Tokens and UpdatedAt are as stored,
 // so a rate bucket's tokens are those of its last grant, before any refill since.
+// Overrides are as SetLimiterBudget last set them. The resources listed are
+// exactly those SetLimiterBudget can override.
 //
 // It only reads: it takes no lock, opens no transaction, and leaves expired
-// holds in place for Acquire or the sweeper to reclaim. A limiter with neither
-// cap admits without a round trip and writes no bucket, so it is not listed.
+// holds in place for Acquire or the sweeper to reclaim. A limiter with no cap
+// and neither an Interval nor a HoldTTL admits without a round trip and writes
+// no bucket, so it is not listed.
 // It costs three reads: the buckets, one grouped sum of their live holds, and
 // one ordered single-row read per held resource for its soonest expiry.
 func ListLimiters(ctx context.Context, db *gorm.DB) ([]LimiterInfo, error) {
@@ -41,7 +48,8 @@ func ListLimiters(ctx context.Context, db *gorm.DB) ([]LimiterInfo, error) {
 	now := models.ClockFrom(ctx).Now(ctx)
 
 	var buckets []limiterBucketRow
-	if err := db.WithContext(ctx).Model(&limiterBucketRow{}).Select("resource, tokens, updated_at").
+	if err := db.WithContext(ctx).Model(&limiterBucketRow{}).
+		Select("resource, tokens, updated_at, max_concurrent_override, rate_override, burst_override").
 		Order("resource").Limit(MaxReadLimit).Find(&buckets).Error; err != nil {
 		return nil, fmt.Errorf("flywheel: ListLimiters: read buckets: %w", models.WrapDBError(err))
 	}
@@ -52,7 +60,7 @@ func ListLimiters(ctx context.Context, db *gorm.DB) ([]LimiterInfo, error) {
 	resources := make([]string, len(buckets))
 	for i, b := range buckets {
 		resources[i] = b.Resource
-		out[i] = LimiterInfo{Resource: b.Resource, Tokens: b.Tokens, UpdatedAt: b.UpdatedAt}
+		out[i] = LimiterInfo{Resource: b.Resource, Tokens: b.Tokens, UpdatedAt: b.UpdatedAt, Overrides: b.overrides()}
 	}
 
 	// Live holds are the complement of Acquire's reclaim (expires_at < now).

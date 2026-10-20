@@ -76,12 +76,15 @@ default — and changes and removes nothing, so:
 
 **So the order is always: migrate the database, then deploy the binaries.**
 
-This section is the upgrade from the previous release: five columns on `job_periodics`, which record
-where each schedule was declared, who paused it and why, and its latest fires. A Scheduler refuses to
-start without them, since its fires write the history and its start-up apply writes the source; the
-refusal is `ErrSchemaOutdated`, naming each missing column. `UpsertPeriodic`, `PausePeriodic`,
-`ResumePeriodic`, and `TriggerPeriodic` write them too, so against a database without them each fails
-naming the missing column. A Runner does not read `job_periodics` and starts either way.
+This section is the upgrade from the previous release: six nullable columns, which carry a running
+attempt's progress, a shared limiter's overrides, and a queue's concurrency cap. A Runner and a
+Scheduler refuse to start without the two `job_runs` columns, since each checks every column of the run
+tables at startup and a Runner's heartbeat writes them; a Runner whose `QueueStateRefresh` is not
+negative refuses without `job_queues.max_concurrency`, which its queue-state read selects; and a Runner
+whose `Limiter` is a `DBLimiter` refuses without the three `limiter_buckets` columns, which every
+`Acquire` reads. Each refusal is `ErrSchemaOutdated`, naming each missing column. `SetLimiterBudget`,
+`SetQueueConcurrency`, `ListLimiters`, `ListQueues`, and the run reads read or write them too, so
+against a database without them each fails naming the missing column.
 
 A database several releases behind applies each older upgrade first, oldest first —
 [from a release before the stats tables](#from-a-release-before-the-stats-tables), then
@@ -89,21 +92,23 @@ A database several releases behind applies each older upgrade first, oldest firs
 [from a release before the audit history](#from-a-release-before-the-audit-history), then
 [from a release before the kind catalog](#from-a-release-before-the-kind-catalog), then
 [from a release before the error groups](#from-a-release-before-the-error-groups), then
-[from a release before the node registry](#from-a-release-before-the-node-registry) — and then this
-one. `InspectSchema` names every gap, whichever release left it, and `Migrate` closes them all in one
-call.
+[from a release before the node registry](#from-a-release-before-the-node-registry), then
+[from a release before the schedule columns](#from-a-release-before-the-schedule-columns) — and then
+this one. `InspectSchema` names every gap, whichever release left it, and `Migrate` closes them all in
+one call.
 
 ### What the release adds
 
 | Object | Kind | Purpose |
 |---|---|---|
-| `job_periodics.source` | column, `text NOT NULL DEFAULT ''` | the path that last wrote the schedule's definition: `declared`, the Scheduler's start-up apply of `SchedulerConfig.Periodics` or its reconcile, or `upserted`, `UpsertPeriodic` (`flywheel schedule add`) |
-| `job_periodics.paused_by_type`, `paused_by_id`, `paused_reason` | columns, `text NOT NULL DEFAULT ''` | the type, id, and reason of the actor who paused the schedule with `PausePeriodic`, while it is paused |
-| `job_periodics.recent_jobs` | column, `jsonb NOT NULL DEFAULT '[]'` | the schedule's latest fires, newest first, at most 20: each fire's job id and time, and whether it was a manual run |
+| `job_runs.progress` | column, `jsonb`, nullable | the attempt's latest progress, as its worker set it with `Job.SetProgress` and its heartbeat last wrote it: a percentage, a message, and up to eight counters |
+| `job_runs.progress_at` | column, `timestamptz`, nullable | when the heartbeat wrote that progress |
+| `limiter_buckets.max_concurrent_override`, `rate_override`, `burst_override` | columns, `bigint`, nullable | a `DBLimiter`'s overrides for the resource, set with `SetLimiterBudget`: each one set replaces its configured value on every `Acquire` |
+| `job_queues.max_concurrency` | column, `bigint`, nullable | the most jobs a Runner serving the queue runs at once, set with `SetQueueConcurrency` |
 
-Nothing is backfilled, and the release adds no table and no index. A schedule written before the
-migration reports no source until its next upsert or declaration and no history until it next fires, and
-one paused before it reports no one as having paused it.
+Nothing is backfilled, and the release adds no table and no index. Every new column reads NULL until
+something writes it: an attempt has no progress until its worker reports and a heartbeat writes it, and
+a limiter or a queue has no override until an operator sets one.
 
 ### Library-owned install (`Migrate`, `flywheel migrate`)
 
@@ -122,7 +127,7 @@ err := flywheel.MigrateWithOptions(db, flywheel.MigrateOpts{
 })
 ```
 
-`flywheel migrate` prints each addition (`added: job_periodics.source`, …), and a re-run prints
+`flywheel migrate` prints each addition (`added: job_runs.progress`, …), and a re-run prints
 nothing new — an up-to-date schema issues no DDL at all. Both options are no-ops on SQLite. Each step
 commits on its own, so a lock timeout fails only the statement that could not get its lock: everything
 before it is applied, and a re-run completes the rest. Two migrations of one schema run one after the
@@ -143,28 +148,31 @@ exactly the statements below. To write it by hand, use these — they are the st
 `Models()`, and a test runs this file's blocks against the previous release's schema to prove they produce
 one with no drift.
 
-PostgreSQL — each `ADD COLUMN` is a catalog-only change on PostgreSQL 11+ (a constant default rewrites no
-rows), but each takes a brief `ACCESS EXCLUSIVE` lock on `job_periodics`, so run them with a lock timeout:
+PostgreSQL — each `ADD COLUMN` adds a nullable column with no default, a catalog-only change that rewrites
+no rows, but each takes a brief `ACCESS EXCLUSIVE` lock on its table, and `job_runs` is written by every
+attempt, so run them with a lock timeout:
 
 <!-- upgrade-ddl:postgres -->
 ```sql
 SET lock_timeout = '5s';
-ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
-ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS paused_by_type text NOT NULL DEFAULT '';
-ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS paused_by_id text NOT NULL DEFAULT '';
-ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS paused_reason text NOT NULL DEFAULT '';
-ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS recent_jobs jsonb NOT NULL DEFAULT '[]';
+ALTER TABLE job_runs ADD COLUMN IF NOT EXISTS progress jsonb;
+ALTER TABLE job_runs ADD COLUMN IF NOT EXISTS progress_at timestamptz;
+ALTER TABLE limiter_buckets ADD COLUMN IF NOT EXISTS max_concurrent_override bigint;
+ALTER TABLE limiter_buckets ADD COLUMN IF NOT EXISTS rate_override bigint;
+ALTER TABLE limiter_buckets ADD COLUMN IF NOT EXISTS burst_override bigint;
+ALTER TABLE job_queues ADD COLUMN IF NOT EXISTS max_concurrency bigint;
 ```
 
 SQLite — `ADD COLUMN` has no `IF NOT EXISTS` there, so this block is for a migration tool that runs it once:
 
 <!-- upgrade-ddl:sqlite -->
 ```sql
-ALTER TABLE job_periodics ADD COLUMN source text NOT NULL DEFAULT '';
-ALTER TABLE job_periodics ADD COLUMN paused_by_type text NOT NULL DEFAULT '';
-ALTER TABLE job_periodics ADD COLUMN paused_by_id text NOT NULL DEFAULT '';
-ALTER TABLE job_periodics ADD COLUMN paused_reason text NOT NULL DEFAULT '';
-ALTER TABLE job_periodics ADD COLUMN recent_jobs JSON NOT NULL DEFAULT '[]';
+ALTER TABLE job_runs ADD COLUMN progress JSON;
+ALTER TABLE job_runs ADD COLUMN progress_at datetime;
+ALTER TABLE limiter_buckets ADD COLUMN max_concurrent_override integer;
+ALTER TABLE limiter_buckets ADD COLUMN rate_override integer;
+ALTER TABLE limiter_buckets ADD COLUMN burst_override integer;
+ALTER TABLE job_queues ADD COLUMN max_concurrency integer;
 ```
 
 **2. Install the indexes at deploy, the way you already do.** This release adds none, so the step has
@@ -193,26 +201,24 @@ indexDrift, _ := flywheel.InspectIndexes(ctx, db) // missing, drifted, or invali
 
 ### After the deploy
 
-Nothing needs to run. From the first fire after the deploy, each schedule records its fires in its
-history, which `PeriodicHistory` (`flywheel schedule history`) reads with each job's state and outcome;
-from its next upsert or start, each schedule carries its source; and from then on every pause records
-who paused it and why, and every pause, resume, and manual run (`TriggerPeriodic`, `flywheel schedule
-trigger`) writes an entry to the control history. [The read APIs](#live-what-is-happening-now) describe
-what `ListPeriodics` reports.
+Nothing needs to run. A worker that calls `Job.SetProgress` has its progress written by its attempt's
+next heartbeat, at most once an interval, and read back by `ListRunning`, `ListRuns`, `LatestRun`, and
+`GetJob`. A limiter and a queue run on their configured values until an operator sets an override with
+`SetLimiterBudget` (`flywheel limits set`) or a cap with `SetQueueConcurrency` (`flywheel queues
+concurrency`), each recorded in the control history as `limits_set`. [The read APIs](#live-what-is-happening-now)
+describe what each read reports.
 
 ### Rolling deploys
 
 During a rolling deploy both releases run against the migrated database. A process of the previous
-release never reads or writes the new columns: its Scheduler fires schedules without recording them in
-their history, its start-up apply leaves each schedule's source as it was, and its `PausePeriodic` and
-`ResumePeriodic` record no actor and no entry. Pause, resume, and trigger schedules through this release
-once the deploy has replaced the previous release's Scheduler; one Scheduler runs per database (see
-[`CONTRACT.md`](CONTRACT.md)).
+release never reads or writes the new columns: its workers report no progress, its `DBLimiter` admits on
+its configured values whatever override is set, and its Runners ignore a queue's cap. Set overrides and
+caps once the deploy has replaced the previous release's Runners.
 
 Right after the migration, a process of the previous release on PostgreSQL may fail one statement on
-`job_periodics` with `cached plan must not change result type` (SQLSTATE `0A000`): its driver cached a
-`SELECT *` plan before the columns were added. The driver drops the plan and the retry succeeds; the
-error is a one-off per connection, not a sign the migration went wrong.
+`job_runs`, `limiter_buckets`, or `job_queues` with `cached plan must not change result type` (SQLSTATE
+`0A000`): its driver cached a `SELECT *` plan before the columns were added. The driver drops the plan
+and the retry succeeds; the error is a one-off per connection, not a sign the migration went wrong.
 
 A deploy that adds a job kind has its own overlap to plan for: a runner of the previous release can claim
 a job of the new kind. See **Rolling deploys and new job kinds** in the [README](../README.md).
@@ -220,24 +226,100 @@ a job of the new kind. See **Rolling deploys and new job kinds** in the [README]
 ### Verifying
 
 ```bash
-flywheel doctor                  # schema: up to date · indexes: in sync · …
-flywheel schedule ls             # every schedule, with its source and who paused it
-flywheel schedule history <slug> # a schedule's latest fires, once it has fired
+flywheel doctor        # schema: up to date · indexes: in sync · …
+flywheel limits        # every shared limiter's tokens, holds, and overrides
+flywheel queues --json # every queue, with its pause and its concurrency cap (max_concurrency)
 ```
 
 ### Rolling back
 
 Deploy the previous release's binaries: they run unchanged against the migrated schema, and never read
-or write what this release added. A pause holds under them as it does under this release, but records no
-actor. Nothing needs to be dropped. If you want the schema back as it was, drop the five
-`job_periodics` columns — but only after no Scheduler of this release is running, since it refuses to
-start without them.
+or write what this release added. An override or a cap set under this release has no effect under them:
+their limiters and Runners run on their configured values. Nothing needs to be dropped. If you want the
+schema back as it was, drop the six columns — but only after no Runner or Scheduler of this release is
+running, since each refuses to start without the columns it checks.
+
+### From a release before the schedule columns
+
+A database a release before the schedule columns installed lacks five columns on `job_periodics` more
+than the later releases add, which record where each schedule was declared, who paused it and why, and
+its latest fires. `Migrate` adds all of it in one call. A hand-written migration applies the statements
+below first, then [this release's](#host-owned-install-your-migration-tool).
+
+| Object | Kind | Purpose |
+|---|---|---|
+| `job_periodics.source` | column, `text NOT NULL DEFAULT ''` | the path that last wrote the schedule's definition: `declared`, the Scheduler's start-up apply of `SchedulerConfig.Periodics` or its reconcile, or `upserted`, `UpsertPeriodic` (`flywheel schedule add`) |
+| `job_periodics.paused_by_type`, `paused_by_id`, `paused_reason` | columns, `text NOT NULL DEFAULT ''` | the type, id, and reason of the actor who paused the schedule with `PausePeriodic`, while it is paused |
+| `job_periodics.recent_jobs` | column, `jsonb NOT NULL DEFAULT '[]'` | the schedule's latest fires, newest first, at most 20: each fire's job id and time, and whether it was a manual run |
+
+Nothing is backfilled, and the columns bring no index. A schedule written before the migration reports
+no source until its next upsert or declaration and no history until it next fires, and one paused before
+it reports no one as having paused it.
+
+A Scheduler refuses to start without them, since its fires write the history and its start-up apply
+writes the source; the refusal is `ErrSchemaOutdated`, naming each missing column. `UpsertPeriodic`,
+`PausePeriodic`, `ResumePeriodic`, and `TriggerPeriodic` write them too, so against a database without
+them each fails naming the missing column. A Runner does not read `job_periodics` and starts either way.
+
+PostgreSQL — each `ADD COLUMN` is a catalog-only change on PostgreSQL 11+ (a constant default rewrites no
+rows), but each takes a brief `ACCESS EXCLUSIVE` lock on `job_periodics`, so run them with a lock timeout:
+
+<!-- upgrade-ddl:postgres:schedules -->
+```sql
+SET lock_timeout = '5s';
+ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '';
+ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS paused_by_type text NOT NULL DEFAULT '';
+ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS paused_by_id text NOT NULL DEFAULT '';
+ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS paused_reason text NOT NULL DEFAULT '';
+ALTER TABLE job_periodics ADD COLUMN IF NOT EXISTS recent_jobs jsonb NOT NULL DEFAULT '[]';
+```
+
+SQLite:
+
+<!-- upgrade-ddl:sqlite:schedules -->
+```sql
+ALTER TABLE job_periodics ADD COLUMN source text NOT NULL DEFAULT '';
+ALTER TABLE job_periodics ADD COLUMN paused_by_type text NOT NULL DEFAULT '';
+ALTER TABLE job_periodics ADD COLUMN paused_by_id text NOT NULL DEFAULT '';
+ALTER TABLE job_periodics ADD COLUMN paused_reason text NOT NULL DEFAULT '';
+ALTER TABLE job_periodics ADD COLUMN recent_jobs JSON NOT NULL DEFAULT '[]';
+```
+
+**After the deploy**, nothing needs to run. From the first fire after the deploy, each schedule records
+its fires in its history, which `PeriodicHistory` (`flywheel schedule history`) reads with each job's
+state and outcome; from its next upsert or start, each schedule carries its source; and from then on
+every pause records who paused it and why, and every pause, resume, and manual run (`TriggerPeriodic`,
+`flywheel schedule trigger`) writes an entry to the control history. [The read
+APIs](#live-what-is-happening-now) describe what `ListPeriodics` reports.
+
+**During a rolling deploy** both releases run against the migrated database. A process of the older
+release never reads or writes the new columns: its Scheduler fires schedules without recording them in
+their history, its start-up apply leaves each schedule's source as it was, and its `PausePeriodic` and
+`ResumePeriodic` record no actor and no entry. Pause, resume, and trigger schedules through a newer
+release once the deploy has replaced the older release's Scheduler; one Scheduler runs per database (see
+[`CONTRACT.md`](CONTRACT.md)). Right after the migration, a process of the older release on PostgreSQL
+may fail one statement on `job_periodics` with `cached plan must not change result type`, once per
+connection, as [this release's rolling deploy](#rolling-deploys) describes.
+
+**To verify:**
+
+```bash
+flywheel schedule ls             # every schedule, with its source and who paused it
+flywheel schedule history <slug> # a schedule's latest fires, once it has fired
+```
+
+**To roll back** to the older release, deploy its binaries: they run unchanged against the migrated
+schema, and never read or write what the later releases added. A pause holds under them as it does under
+a newer release, but records no actor. Nothing needs to be dropped. If you want the schema back as it
+was, drop the five `job_periodics` columns and what the later releases added — but only after no
+Scheduler of a newer release is running, since it refuses to start without them.
 
 ### From a release before the node registry
 
 A database a release before the node registry installed lacks two tables more than the later releases add,
 with an index on the first. `Migrate` adds all of it in one call. A hand-written migration applies the
-statements below first, then [this release's](#host-owned-install-your-migration-tool).
+statements below first, then [the schedule columns'](#from-a-release-before-the-schedule-columns), then
+[this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
 |---|---|---|
@@ -354,6 +436,7 @@ A database a release before the error groups installed lacks two columns and two
 later releases add, with an index on each table. `Migrate` adds all of it in one call. A hand-written
 migration applies the statements below first, then
 [the node registry's](#from-a-release-before-the-node-registry), then
+[the schedule columns'](#from-a-release-before-the-schedule-columns), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -487,6 +570,7 @@ A database a release before the kind catalog installed lacks one table more than
 `Migrate` adds all of it in one call. A hand-written migration applies the statements below first, then
 [the error groups'](#from-a-release-before-the-error-groups), then
 [the node registry's](#from-a-release-before-the-node-registry), then
+[the schedule columns'](#from-a-release-before-the-schedule-columns), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -574,6 +658,7 @@ with its two indexes. `Migrate` adds all of it in one call. A hand-written migra
 statements below first, then [the kind catalog's](#from-a-release-before-the-kind-catalog), then
 [the error groups'](#from-a-release-before-the-error-groups), then
 [the node registry's](#from-a-release-before-the-node-registry), then
+[the schedule columns'](#from-a-release-before-the-schedule-columns), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -660,6 +745,7 @@ first, then [the audit history's](#from-a-release-before-the-audit-history), the
 [the kind catalog's](#from-a-release-before-the-kind-catalog), then
 [the error groups'](#from-a-release-before-the-error-groups), then
 [the node registry's](#from-a-release-before-the-node-registry), then
+[the schedule columns'](#from-a-release-before-the-schedule-columns), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -718,6 +804,7 @@ later releases' additions, in one call. A hand-written migration applies the sta
 [the kind catalog's](#from-a-release-before-the-kind-catalog), then
 [the error groups'](#from-a-release-before-the-error-groups), then
 [the node registry's](#from-a-release-before-the-node-registry), then
+[the schedule columns'](#from-a-release-before-the-schedule-columns), then
 [this release's](#host-owned-install-your-migration-tool).
 
 | Object | Kind | Purpose |
@@ -963,6 +1050,7 @@ once when it ends (by its finalize, or by the lease sweep if its process died).
 | `cost_micros`, `enqueued_children`, `output` | what the worker reported. An `output` whose JSON was larger than `DriverOpts.MaxOutputBytes` (64 KiB by default) holds the marker `{"$truncated": true, "$bytes": <its marshaled size>, "$head": "<its first 1,024 bytes>"}` instead — exactly those three keys — and `JobRunView.OutputTruncated` is true |
 | `error_fingerprint` | for an attempt whose outcome is `error` or `timeout`: its error group, 16 lowercase hex characters (see [error groups](#error-groups-what-is-failing)); NULL for every other outcome, and on a run written before the column existed, for which `JobRunView.ErrorFingerprint` computes it on read |
 | `error_payload` | for a failed attempt, `{"message": …}`, the stored message; plus `"truncated": true` and `"message_bytes"` (its length before the cut) when the message was cut at 4,096 bytes (`JobRunView.ErrorTruncated`); plus `"stack"`, at most 16 KiB, when the worker panicked (`JobRunView.ErrorStack`). `JobRunView.ErrorPayload` returns it as stored, nil when the run has none |
+| `progress`, `progress_at` | the last `RunProgress` the attempt's heartbeat wrote, as JSON (`{"percent": …, "message": …, "counters": {…}}`, each key optional), and when it wrote it, in UTC; NULL for an attempt that never reported or finished within one heartbeat. Written by an `UPDATE` of these two columns by `id`, at most once a heartbeat and only when the report changed, never after the claim is lost; a finished attempt keeps its last one. `JobRunView.Progress` and `ProgressAt`, and `RunningJob.Progress`, read them; a value that does not decode reads as nil |
 
 **`job_run_finishes`** — the finish log: one `(finished_at, run_id)` per finished run, written in the same
 transaction that sets `job_runs.finished_at`. It exists because `job_runs.finished_at` is deliberately not
@@ -1088,15 +1176,25 @@ Stable for SQL; `ListNodes` reads it:
 | `runners` | a JSON array, one object per runner: its `queues`, `executor_class`, `concurrency`, and `in_flight` at the last heartbeat |
 | `kinds` | a JSON array: every kind the node's runners' registries register, sorted |
 
-**`job_queues`** — the queue state: one row per queue an operator has paused, created by `PauseQueue` and
-kept after `ResumeQueue`. Stable for SQL; `ListQueues` reads it:
+**`job_queues`** — the queue state: one row per queue an operator has paused or capped, created by
+`PauseQueue` or `SetQueueConcurrency` and kept after `ResumeQueue`. Stable for SQL; `ListQueues` reads it:
 
 | Column | Meaning |
 |---|---|
 | `queue` | the queue; the primary key |
 | `paused_at` | when the queue was paused, in UTC; NULL while it is not paused |
 | `paused_by_type`, `paused_by_id`, `paused_reason` | the type, id, and reason of the actor who paused it; `''` while it is not paused |
-| `updated_at` | when a pause or a resume last changed the row, in UTC |
+| `max_concurrency` | the most of the queue's jobs a Runner serving it runs at once, set by `SetQueueConcurrency`; NULL with no cap |
+| `updated_at` | when a pause, a resume, or a cap last changed the row, in UTC |
+
+**`limiter_buckets`** — a `DBLimiter`'s state for one resource, one row per resource it has admitted
+against. Its tokens and refill time are internal; the key and the overrides are stable for SQL, and
+`ListLimiters` reads them:
+
+| Column | Meaning |
+|---|---|
+| `resource` | the resource; the primary key |
+| `max_concurrent_override`, `rate_override`, `burst_override` | the overrides `SetLimiterBudget` set, each replacing the limiter's configured `MaxConcurrent`, `Rate`, or `Burst` on every `Acquire` (`rate_override` only with a positive `Interval`, `max_concurrent_override` only with a positive `HoldTTL`); NULL keeps the configured value |
 
 ### Time and zones
 
@@ -1119,7 +1217,7 @@ Every read takes a `context.Context` and the `*gorm.DB` to read through — a re
 
 Every list read returns at most `MaxReadLimit` (200) rows: `QueryJobs`, `ListChildren`, `ListRunFinishes`,
 `ListJobs`, `ListFinished`, `ListRunning`, `SlowRuns`, `RecentFailures`, `ListRuns`, `ListAudit`,
-`ListLimiters`, and `ListNodes`. A larger `Limit` is clamped rather than refused, so a handler
+`ListLimiters`, `ListNodes`, and `ListNodeStarts`. A larger `Limit` is clamped rather than refused, so a handler
 can pass a request's limit through; one that asks for a row more than its page, to learn whether another
 follows, keeps its page below 200. `ListKinds` and `ListQueues` return every row: they list your kinds
 and queues, which your code and configuration bound, and a cut list would hide one.
@@ -1132,7 +1230,11 @@ process stopped renewing — usually because it died; the next lease sweep will 
 moment ago whose attempt row has not landed yet is reported as `Starting` rather than dropped. With
 `WithBaseline`, each run is compared to its kind's baseline p99 and flagged `Slow` past
 `max(3 × p99, p99 + 1m)` — only for a kind with at least 200 baseline samples. Served by
-`jobs_running_leased`, joined to each attempt by the `job_runs_job_attempt` unique index.
+`jobs_running_leased`, joined to each attempt by the `job_runs_job_attempt` unique index. Each running job
+also carries `Progress`, the last report its worker set with `Job.SetProgress` that a heartbeat wrote: a
+percent, a message, and up to eight counters, or nil until the first write. It is at most one heartbeat
+behind the worker, and a run that ends keeps its last one, which `ListRuns`, `LatestRun`, and `GetJob`
+return as `JobRunView.Progress` with `ProgressAt`.
 
 **`QueueDepths(ctx, db)`** — per queue: ready now, scheduled ahead, running, paused, and the oldest ready
 job's age (the lag). The same access paths as `SampleQueueHealth`, the whole-queue gauge snapshot behind
@@ -1498,9 +1600,11 @@ any refill since), `Held`, the permits its live concurrency holds take, counted 
 and `NextHoldExpiry`, the soonest of those holds' expiries, nil when nothing is held. It costs three
 reads: the buckets by primary key, one grouped sum over those resources' live holds (served by
 `limiter_holds_resource`), and one single-row read per held resource for its soonest expiry. It takes no
-lock and leaves an expired hold for `Acquire` or the sweeper to reclaim. A limiter with neither a rate nor
-a concurrency cap admits without a round trip and writes no bucket, so it is not listed. A resource's
-configured budget is your `DBLimiterConfig`, so the result carries none.
+lock and leaves an expired hold for `Acquire` or the sweeper to reclaim. A limiter with no cap and neither
+an `Interval` nor a `HoldTTL` admits without a round trip and writes no bucket, so it is not listed. A
+resource's configured budget is your `DBLimiterConfig`, so the result carries none; `Overrides` carries the
+`LimiterBudget` that `SetLimiterBudget` set on the resource at runtime (`MaxConcurrent`, `Rate`, and
+`Burst`, each nil when not overridden), whether or not a given process's limiter can apply it.
 
 ### Nodes and queue state
 
@@ -1523,13 +1627,24 @@ executor identity alone can match several nodes; the span picks one. The rule ho
 Node per process. To take a node out of service, `RequestDrain(ctx, db, nodeID)` asks it to stop claiming,
 recording who asked and why in the control history; the node reports `Draining`, then `Drained`.
 
-**`ListQueues(ctx, db)`** — every queue that holds an unfinished job or has ever been paused, sorted by
-name: `QueueDepths`' figures (ready, scheduled ahead, running, paused jobs, and the oldest ready job's
-age), zero for a queue no job holds, and the queue's own pause: `IsPaused`, `PausedAt`, and `PausedBy`, the
-type, id, and reason of the actor who paused it. It costs what `QueueDepths` costs, plus one read of
-`job_queues`, a row per queue ever paused. `PauseQueue` and `ResumeQueue` change the pause, each recorded
-in the control history; every Runner reads it once per `RunnerConfig.QueueStateRefresh` and leaves a
-paused queue out of its claims.
+**`ListQueues(ctx, db)`** — every queue that holds an unfinished job or has ever been paused or capped,
+sorted by name: `QueueDepths`' figures (ready, scheduled ahead, running, paused jobs, and the oldest ready
+job's age), zero for a queue no job holds, the queue's own pause — `IsPaused`, `PausedAt`, and `PausedBy`,
+the type, id, and reason of the actor who paused it — and `MaxConcurrency`, its concurrency cap, nil with
+none. It costs what `QueueDepths` costs, plus one read of `job_queues`, a row per queue ever paused or
+capped. `PauseQueue` and `ResumeQueue` change the pause and `SetQueueConcurrency` the cap, each recorded in
+the control history; every Runner reads both once per `RunnerConfig.QueueStateRefresh`, leaves a paused
+queue out of its claims, and runs at most the smallest cap among its queues.
+
+**`ListNodeStarts(ctx, db, NodeStartsParams{Since, Until, After, Limit})`** — every node start in
+`[Since, Until)`, live or stopped, oldest first by `(started_at, id)`: each `NodeStart`'s node id,
+`Version`, `Commit`, its first runner's `ExecutorClass`, and `StartedAt`. It is the read for deploy markers
+over a long window: a process start is a deploy event, and `ListNodes` returns one page of the newest. A
+zero `Since` reads from the oldest row kept and a zero `Until` to now; a page holds 100 by default and
+`MaxReadLimit` at most, and `NextCursor`, an opaque `ns1.` cursor passed back as `After`, reads the next
+until it is empty. A walk sees each row present when it began exactly once, never skipping or repeating
+one. It reads `job_nodes` by `started_at`, one row past the page, with no index of its own: the table
+holds a row per process lifetime, pruned at `NodeRetention`, which is also how far back a window reaches.
 
 ### Maintenance
 

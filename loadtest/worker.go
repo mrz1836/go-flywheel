@@ -168,6 +168,9 @@ type loadWorker struct {
 	// order, so the report can measure interleaving and non-starvation. Nil on every
 	// run but the fairness mix.
 	fairness *fairnessRecorder
+	// progress, when positive, is how often a job reports its progress while it
+	// works (Config.Progress). Zero reports none.
+	progress time.Duration
 }
 
 // Kind names the job kind this worker serves.
@@ -178,6 +181,31 @@ func (loadWorker) Kind() string { return loadKind }
 // which is what every non-replay run gets — those runs never fail a job, so this is
 // never called for them.
 func (w loadWorker) NextRetry(error, int) time.Duration { return w.retryBackoff }
+
+// work simulates d of work, honoring ctx, and with progress set reports the
+// share of it done every progress, as a worker walking a long list would.
+func (w loadWorker) work(ctx context.Context, job *flywheel.Job[loadArgs], d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	var tick <-chan time.Time
+	if w.progress > 0 {
+		ticker := time.NewTicker(w.progress)
+		defer ticker.Stop()
+		tick = ticker.C
+	}
+	start := time.Now()
+	for {
+		select {
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick:
+			done := min(100*float64(time.Since(start))/float64(d), 100)
+			job.SetProgress(flywheel.RunProgress{Percent: &done})
+		}
+	}
+}
 
 // Work simulates the job's cost and returns.
 //
@@ -228,12 +256,8 @@ func (w loadWorker) Work(ctx context.Context, job *flywheel.Job[loadArgs]) (flyw
 	}
 
 	if d := time.Duration(job.Args.WorkNanos); d > 0 {
-		timer := time.NewTimer(d)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			return flywheel.Result{}, ctx.Err()
+		if err := w.work(ctx, job, d); err != nil {
+			return flywheel.Result{}, err
 		}
 	}
 

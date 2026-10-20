@@ -277,6 +277,12 @@ type Config struct {
 	// what makes a with/without comparison of the heartbeat's write cost a
 	// same-binary A/B rather than a comparison across two builds.
 	Heartbeat time.Duration
+	// Progress, when positive, has each job report its progress (Job.SetProgress)
+	// every Progress while it works, with the share of its work done as the
+	// percent; the heartbeat writes it at most once an interval. Zero reports
+	// none, so a with/without comparison of the progress write is a same-binary
+	// A/B. Negative is refused.
+	Progress time.Duration
 	// SampleInterval is the cadence of the storage and OS sampler.
 	SampleInterval time.Duration
 	// Timeout bounds the whole run. A drain that cannot finish — a fault that
@@ -517,6 +523,11 @@ func (c Config) validate() (Config, error) {
 	if c.Lease < 0 {
 		return Config{}, fmt.Errorf(
 			"loadtest: Lease must not be negative, got %s: %w", c.Lease, ErrInvalidConfig,
+		)
+	}
+	if c.Progress < 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: Progress must not be negative, got %s: %w", c.Progress, ErrInvalidConfig,
 		)
 	}
 	if c.SampleInterval <= 0 {

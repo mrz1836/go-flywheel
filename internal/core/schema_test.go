@@ -67,6 +67,20 @@ type legacyJobPeriodicRow struct {
 // TableName binds legacyJobPeriodicRow to the job_periodics table.
 func (legacyJobPeriodicRow) TableName() string { return "job_periodics" }
 
+// legacyLimiterBucketRow is limiter_buckets exactly as every release before the
+// limiter overrides declared it. Like legacyJobRunRow it stands in for both a
+// database an older release installed and that release's binary still writing
+// to it after the migration.
+type legacyLimiterBucketRow struct {
+	Resource   string    `gorm:"column:resource;primaryKey"`
+	Tokens     int       `gorm:"column:tokens;not null"`
+	RefilledAt time.Time `gorm:"column:refilled_at;not null"`
+	UpdatedAt  time.Time `gorm:"column:updated_at;not null"`
+}
+
+// TableName binds legacyLimiterBucketRow to the limiter_buckets table.
+func (legacyLimiterBucketRow) TableName() string { return "limiter_buckets" }
+
 // legacyIndexNames are the indexes added since a release before the stats
 // tables: the analytics release's, the two on the audit history's table, the
 // two on the error-group and queue-sample tables, and the one on the node
@@ -82,30 +96,40 @@ var legacyIndexNames = []string{
 // previousReleaseTableNames, previousReleaseIndexNames, and
 // previousReleaseColumns are what this release adds: the previous release's
 // schema is Models and IndexSet minus these — derived, never hand-written. This
-// release adds five columns to job_periodics, the schedule's source, who paused
-// it and why, and its recent fires; it adds no table and no index.
+// release adds six columns, an attempt's progress and when it was written on
+// job_runs, a limiter's three overrides on limiter_buckets, and a queue's
+// concurrency cap on job_queues; it adds no table and no index.
 //
 //nolint:gochecknoglobals // shared fixture
 var (
 	previousReleaseTableNames = []string{}
 	previousReleaseIndexNames = []string{}
-	previousReleaseColumns    = []SchemaDrift{
-		{Table: "job_periodics", Column: "source"},
-		{Table: "job_periodics", Column: "paused_by_type"},
-		{Table: "job_periodics", Column: "paused_by_id"},
-		{Table: "job_periodics", Column: "paused_reason"},
-		{Table: "job_periodics", Column: "recent_jobs"},
-	}
+	previousReleaseColumns    = progressAndLimitColumns
 )
+
+// scheduleColumns are the five job_periodics columns the release before this
+// one added: the schedule's source, who paused it and why, and its recent
+// fires. A test that proves a schedule upgrade drops them after the previous
+// release's fixture, as a release before them left the table.
+//
+//nolint:gochecknoglobals // shared fixture
+var scheduleColumns = []SchemaDrift{
+	{Table: "job_periodics", Column: "source"},
+	{Table: "job_periodics", Column: "paused_by_type"},
+	{Table: "job_periodics", Column: "paused_by_id"},
+	{Table: "job_periodics", Column: "paused_reason"},
+	{Table: "job_periodics", Column: "recent_jobs"},
+}
 
 // installLegacySchema builds, on a bare database, the schema a release before
 // the stats tables installed: its tables (no job_run_finishes or
-// job_stats_hourly, job_runs without the analytics columns, job_periodics
-// without paused_at) and its indexes.
+// job_stats_hourly, job_runs without the analytics or progress columns,
+// job_periodics without paused_at, limiter_buckets without the overrides) and
+// its indexes.
 func installLegacySchema(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	require.NoError(t, db.AutoMigrate(
-		&jobRow{}, &legacyJobRunRow{}, &legacyJobPeriodicRow{}, &limiterBucketRow{}, &limiterHoldRow{},
+		&jobRow{}, &legacyJobRunRow{}, &legacyJobPeriodicRow{}, &legacyLimiterBucketRow{}, &limiterHoldRow{},
 	))
 	set, err := IndexSet(db.Name())
 	require.NoError(t, err)
@@ -198,7 +222,8 @@ func schemaDriftNames(drift []SchemaDrift) []string {
 // every column and table added since a release before the stats tables — the
 // analytics release's, the pause's, the audit history's, the kind catalog's,
 // the error groups' and queue samples', the node registry's and queue state's,
-// and the schedule columns'.
+// the schedule columns', and the progress and limit columns' (job_queues is
+// absent whole, so its cap is not named apart).
 //
 //nolint:gochecknoglobals // shared expectation fixture
 var olderSchemaGaps = []string{
@@ -208,6 +233,8 @@ var olderSchemaGaps = []string{
 	"job_error_groups_hourly (table)", "job_queue_samples (table)", "job_nodes (table)", "job_queues (table)",
 	"job_periodics.source", "job_periodics.paused_by_type", "job_periodics.paused_by_id",
 	"job_periodics.paused_reason", "job_periodics.recent_jobs",
+	"job_runs.progress", "job_runs.progress_at", "limiter_buckets.max_concurrent_override",
+	"limiter_buckets.rate_override", "limiter_buckets.burst_override",
 }
 
 // TestInspectSchemaReportsWhatAnOlderSchemaLacks proves the parity check names
@@ -450,9 +477,13 @@ func TestOldRowsAreAcceptedByTheNewSchemaDefaults(t *testing.T) {
 	t.Parallel()
 	db := newDB(t)
 	for model, columns := range map[any][]string{
-		&jobRunRow{}:         {"kind", "queue", "queue_wait_ms", "job_state", "superseded", "error_fingerprint"},
+		&jobRunRow{}: {
+			"kind", "queue", "queue_wait_ms", "job_state", "superseded", "error_fingerprint", "progress", "progress_at",
+		},
 		&jobPeriodicRow{}:    {"paused_at", "source", "paused_by_type", "paused_by_id", "paused_reason", "recent_jobs"},
 		&jobStatsHourlyRow{}: {"enqueued"},
+		&limiterBucketRow{}:  {"max_concurrent_override", "rate_override", "burst_override"},
+		&jobQueueRow{}:       {"max_concurrency"},
 	} {
 		stmt := &gorm.Statement{DB: db}
 		require.NoError(t, stmt.Parse(model))

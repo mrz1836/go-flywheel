@@ -148,6 +148,12 @@ const (
 	// AuditTriggered is a periodic definition TriggerPeriodic ran on demand. Its
 	// details carry the id of the job the run enqueued, as job_id.
 	AuditTriggered AuditAction = "triggered"
+	// AuditLimitsSet is a limit changed at runtime: a limiter's overrides set by
+	// SetLimiterBudget, or a queue's concurrency cap set by SetQueueConcurrency.
+	// Its details carry the limit before and after, as from and to: for a
+	// limiter, a LimiterBudget object ({} with no override); for a queue, the
+	// cap, or null with none.
+	AuditLimitsSet AuditAction = "limits_set"
 )
 
 // AuditEntry is one entry of the control history: one change one control made

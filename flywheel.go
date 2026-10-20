@@ -124,6 +124,7 @@ type (
 	KindStats             = core.KindStats
 	LeaseRenewal          = core.LeaseRenewal
 	Limiter               = core.Limiter
+	LimiterBudget         = core.LimiterBudget
 	LimiterInfo           = core.LimiterInfo
 	ListAuditParams       = core.ListAuditParams
 	ListChildrenParams    = core.ListChildrenParams
@@ -138,6 +139,9 @@ type (
 	NodeConfig            = node.NodeConfig
 	NodeInfo              = core.NodeInfo
 	NodeRunner            = core.NodeRunner
+	NodeStart             = core.NodeStart
+	NodeStartsPage        = core.NodeStartsPage
+	NodeStartsParams      = core.NodeStartsParams
 	Observer              = core.Observer
 	OutcomeCounts         = core.OutcomeCounts
 	OverviewParams        = core.OverviewParams
@@ -166,6 +170,7 @@ type (
 	RunFinish             = core.RunFinish
 	RunFinishPage         = core.RunFinishPage
 	RunOutcome            = core.RunOutcome
+	RunProgress           = core.RunProgress
 	RunSummary            = core.RunSummary
 	RunSeed               = core.RunSeed
 	Runner                = core.Runner
@@ -208,6 +213,7 @@ const (
 	AuditDeactivated         = core.AuditDeactivated
 	AuditDeleted             = core.AuditDeleted
 	AuditDrainRequested      = core.AuditDrainRequested
+	AuditLimitsSet           = core.AuditLimitsSet
 	AuditNewest              = core.AuditNewest
 	AuditOldest              = core.AuditOldest
 	AuditPaused              = core.AuditPaused
@@ -262,6 +268,8 @@ const (
 	MaxHistoryPoints         = core.MaxHistoryPoints
 	MaxMetadataBytes         = core.MaxMetadataBytes
 	MaxNextFires             = core.MaxNextFires
+	MaxProgressCounters      = core.MaxProgressCounters
+	MaxProgressMessageBytes  = core.MaxProgressMessageBytes
 	MaxReadLimit             = core.MaxReadLimit
 	MaxReasonBytes           = core.MaxReasonBytes
 	MaxTagBytes              = core.MaxTagBytes
@@ -519,6 +527,10 @@ func ListLimiters(ctx context.Context, db *gorm.DB) ([]LimiterInfo, error) {
 	return core.ListLimiters(ctx, db)
 }
 
+func ListNodeStarts(ctx context.Context, db *gorm.DB, p NodeStartsParams) (NodeStartsPage, error) {
+	return core.ListNodeStarts(ctx, db, p)
+}
+
 func ListNodes(ctx context.Context, db *gorm.DB, p ListNodesParams) ([]NodeInfo, error) {
 	return core.ListNodes(ctx, db, p)
 }
@@ -743,8 +755,16 @@ func SetJobPriority(ctx context.Context, db *gorm.DB, id string, priority int) e
 	return core.SetJobPriority(ctx, db, id, priority)
 }
 
+func SetLimiterBudget(ctx context.Context, db *gorm.DB, resource string, b LimiterBudget) error {
+	return core.SetLimiterBudget(ctx, db, resource, b)
+}
+
 func SetPeriodicActive(ctx context.Context, db *gorm.DB, slug string, active bool) error {
 	return core.SetPeriodicActive(ctx, db, slug, active)
+}
+
+func SetQueueConcurrency(ctx context.Context, db *gorm.DB, queue string, n *int) error {
+	return core.SetQueueConcurrency(ctx, db, queue, n)
 }
 
 func SlowRuns(ctx context.Context, db *gorm.DB, p SlowRunsParams) ([]JobRunView, error) {

@@ -62,6 +62,9 @@ type RunningJob struct {
 	BaselineP99 *time.Duration `json:"baseline_p99,omitempty"`
 	// Slow is true when Elapsed exceeds max(3 × BaselineP99, BaselineP99 + 1m).
 	Slow bool `json:"slow"`
+	// Progress is the last progress the attempt's heartbeat wrote (see
+	// Job.SetProgress): nil until its worker reports and a heartbeat writes it.
+	Progress *RunProgress `json:"progress,omitempty"`
 }
 
 // ListRunningParams scopes a ListRunning page. The zero value lists the 100
@@ -136,7 +139,7 @@ func listRunning(
 	}
 	query := db.WithContext(ctx).Table("jobs AS j").
 		Select(`j.id AS job_id, j.kind, j.queue, j.attempt, j.max_attempts, j.parent_job_id, j.leased_until, `+
-			`r.id AS run_id, r.executor_class, r.executor_id, r.started_at`).
+			`r.id AS run_id, r.executor_class, r.executor_id, r.started_at, r.progress`).
 		Joins(`LEFT JOIN job_runs r ON r.job_id = j.id AND r.attempt = j.attempt`).
 		Where("j.state = ? AND j.deleted_at IS NULL", string(StateRunning))
 	if p.Kind != "" {
@@ -157,6 +160,7 @@ func listRunning(
 		ExecutorClass *string
 		ExecutorID    *string
 		StartedAt     *time.Time
+		Progress      []byte
 	}
 	// Longest-running first, starting jobs last: the CASE spells NULLS LAST
 	// portably, since the two dialects default to opposite ends.
@@ -174,6 +178,7 @@ func listRunning(
 			Attempt: r.Attempt, MaxAttempts: r.MaxAttempts,
 			LeasedUntil: r.LeasedUntil, StartedAt: r.StartedAt,
 			Starting: r.RunID == nil,
+			Progress: decodeProgress(r.Progress),
 		}
 		if r.ParentJobID != nil {
 			rj.ParentJobID = *r.ParentJobID

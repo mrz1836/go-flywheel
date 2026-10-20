@@ -11,14 +11,15 @@ import (
 )
 
 // newQueuesCmd builds `flywheel queues`, which lists every queue with its depth
-// and pause, and its pause and resume subcommands.
+// and pause, and its pause, resume, and concurrency subcommands.
 func newQueuesCmd(configPath *string) *cobra.Command {
 	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "queues",
-		Short: "List queues with their depth and pause; pause or resume one",
-		Long: "List every queue that holds an unfinished job or was ever paused: its ready, scheduled-ahead,\n" +
-			"running, and paused jobs, and whether the queue itself is paused, by whom, and why.",
+		Short: "List queues with their depth and pause; pause, resume, or cap one",
+		Long: "List every queue that holds an unfinished job or was ever paused or capped: its ready,\n" +
+			"scheduled-ahead, running, and paused jobs, and whether the queue itself is paused, by whom, and\n" +
+			"why. --json also reports each queue's concurrency cap, as max_concurrency.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			_, db, _, err := loadAndOpen(*configPath)
@@ -51,7 +52,42 @@ func newQueuesCmd(configPath *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON instead of a table")
-	cmd.AddCommand(newQueuesPauseCmd(configPath), newQueuesResumeCmd(configPath))
+	cmd.AddCommand(newQueuesPauseCmd(configPath), newQueuesResumeCmd(configPath), newQueuesConcurrencyCmd(configPath))
+	return cmd
+}
+
+// newQueuesConcurrencyCmd builds `flywheel queues concurrency <queue> <n>`.
+func newQueuesConcurrencyCmd(configPath *string) *cobra.Command {
+	var reason string
+	cmd := &cobra.Command{
+		Use:   "concurrency <queue> <n>",
+		Short: "Cap how many of a queue's jobs each runner runs at once",
+		Long: "Cap a queue's concurrency: every runner serving the queue runs at most n of its jobs at once,\n" +
+			"from its next QueueStateRefresh (five seconds by default). n is a positive integer, or none to\n" +
+			"clear the cap. Running jobs finish; a lower cap only holds back claims. The cap is per runner,\n" +
+			"not fleet-wide, and a runner serving several queues runs at most the smallest of their caps.",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			queue := args[0]
+			n, err := parseLimit("n", args[1])
+			if err != nil {
+				return err
+			}
+			_, db, _, err := loadAndOpen(*configPath)
+			if err != nil {
+				return err
+			}
+			defer closeDB(db)
+			if err := flywheel.SetQueueConcurrency(
+				flywheel.WithActor(cmd.Context(), operatorActor(reason)), db, queue, n,
+			); err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "concurrency %s: %s\n", queue, limitCell(n, limitNone))
+			return nil
+		},
+	}
+	addReasonFlag(cmd, &reason)
 	return cmd
 }
 

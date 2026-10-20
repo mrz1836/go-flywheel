@@ -8,13 +8,38 @@ import (
 	"time"
 
 	"github.com/mrz1836/go-foundation/models"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
+// attemptHooks are what one attempt hands its heartbeat beside the claim.
+type attemptHooks struct {
+	// cancel is the attempt's cooperative cancel (RunnerConfig.CooperativeCancel),
+	// nil without it: after a lost claim the heartbeat reads the job's state and
+	// fires it for a cancelled job.
+	cancel context.CancelCauseFunc
+	// progress is the sink the worker's SetProgress reports into: after each
+	// renewal that held the claim, the heartbeat writes what changed.
+	progress *progressSink
+}
+
+// renewal is what one renewal attempt found.
+type renewal int
+
+const (
+	// renewalHeld means the lease was extended: the attempt still holds its claim.
+	renewalHeld renewal = iota
+	// renewalFailed means the renewal itself failed; the next tick retries it.
+	renewalFailed
+	// renewalLost means the claim is gone: nothing is left to renew.
+	renewalLost
+)
+
 // startHeartbeat renews one attempt's lease until the returned stop is called or
-// the claim is lost, and returns the stop. cancelWork, when not nil, is the
-// attempt's cooperative cancel (RunnerConfig.CooperativeCancel): after a lost
-// claim the heartbeat reads the job's state and fires it for a cancelled job.
+// the claim is lost, and returns the stop. After each renewal that holds the
+// claim it writes the attempt's progress, when it changed; with a cancel hook,
+// after a lost claim it reads the job's state and fires the cancel for a
+// cancelled job.
 //
 // # Why the context is detached
 //
@@ -42,8 +67,18 @@ import (
 // nothing, for the reasons above. A read that fails is retried at each
 // following tick, so one failed statement cannot lose the cancel; renewal never
 // resumes.
+//
+// # Why progress rides the renewal
+//
+// A worker may report progress on every item it handles, and the heartbeat
+// already wakes once an interval to touch the database for this attempt, so it
+// writes the latest report then: at most one more statement an interval, and
+// none when the report has not changed. Writing only after a renewal that held
+// the claim means no write follows a lost claim, so the write needs no fence
+// of its own and stays one UPDATE of the run's two progress columns by id,
+// which no index covers.
 func (r *Runner) startHeartbeat(
-	ctx context.Context, raw RawJob, runID string, cancelWork context.CancelCauseFunc,
+	ctx context.Context, raw RawJob, runID string, hooks attemptHooks,
 ) (stop func()) {
 	interval := r.heartbeatInterval()
 	// A driver that does not fence its claims has no token to renew against, so
@@ -70,15 +105,20 @@ func (r *Runner) startHeartbeat(
 			case <-ticker.C:
 			}
 			if !claimLost {
-				if r.renewOnce(hbCtx, raw, runID) {
+				switch verdict, renewedAt := r.renewOnce(hbCtx, raw, runID); verdict {
+				case renewalHeld:
+					r.writeProgress(hbCtx, raw, runID, hooks.progress, renewedAt)
 					continue
+				case renewalFailed:
+					continue
+				case renewalLost:
 				}
-				if cancelWork == nil {
+				if hooks.cancel == nil {
 					return
 				}
 				claimLost = true
 			}
-			if r.cancelIfJobCancelled(hbCtx, raw, runID, cancelWork, !readFailed) {
+			if r.cancelIfJobCancelled(hbCtx, raw, runID, hooks.cancel, !readFailed) {
 				return
 			}
 			readFailed = true
@@ -103,13 +143,14 @@ func (r *Runner) startHeartbeat(
 	}
 }
 
-// renewOnce extends the lease once and reports whether renewal should continue.
+// renewOnce extends the lease once and reports what it found, with the clock
+// reading the renewal was stamped at.
 //
-// A failed renewal continues: the lease still has two intervals to run, so the
-// next tick is the retry, and giving up on one transient error would strand a
-// job whose worker is perfectly healthy. A *lost* claim does not continue —
-// there is nothing left to renew, and retrying would only repeat the warning.
-func (r *Runner) renewOnce(ctx context.Context, raw RawJob, runID string) bool {
+// A failed renewal is not the end: the lease still has two intervals to run, so
+// the next tick is the retry, and giving up on one transient error would strand
+// a job whose worker is perfectly healthy. A *lost* claim is — there is nothing
+// left to renew, and retrying would only repeat the warning.
+func (r *Runner) renewOnce(ctx context.Context, raw RawJob, runID string) (renewal, time.Time) {
 	renewedAt := models.ClockFrom(ctx).Now(ctx)
 	// Renew to now+lease rather than leased_until+lease: a heartbeat that stalled
 	// and then caught up must not be able to bank a lease far into the future.
@@ -121,12 +162,12 @@ func (r *Runner) renewOnce(ctx context.Context, raw RawJob, runID string) bool {
 		r.cfg.Logger.WarnContext(ctx, "jobs: lease renewal failed",
 			slog.String("job_id", raw.ID), slog.String("run_id", runID),
 			slog.String("kind", raw.Kind), slog.String("error", err.Error()))
-		return true
+		return renewalFailed, renewedAt
 	case !held:
 		r.cfg.Logger.WarnContext(ctx, "jobs: lease claim lost; this attempt's result will be discarded",
 			slog.String("job_id", raw.ID), slog.String("run_id", runID),
 			slog.String("kind", raw.Kind), slog.Int("attempt", raw.Attempt))
-		return false
+		return renewalLost, renewedAt
 	}
 
 	if r.cfg.OnLeaseRenewed != nil {
@@ -142,7 +183,30 @@ func (r *Runner) renewOnce(ctx context.Context, raw RawJob, runID string) bool {
 				slog.String("error", cbErr.Error()))
 		}
 	}
-	return true
+	return renewalHeld, renewedAt
+}
+
+// writeProgress writes the attempt's progress when it changed since the last
+// write: one UPDATE of the run's progress and progress_at by its id, stamped
+// with the renewal's clock reading in UTC. The caller runs it only after a
+// renewal that held the claim. A failed write is logged and left for the next
+// tick, which writes whatever is latest then.
+func (r *Runner) writeProgress(ctx context.Context, raw RawJob, runID string, sink *progressSink, at time.Time) {
+	if sink == nil {
+		return
+	}
+	value, version, ok := sink.pending()
+	if !ok {
+		return
+	}
+	err := r.cfg.DB.WithContext(ctx).Model(&jobRunRow{}).Where("id = ?", runID).
+		Updates(map[string]any{"progress": datatypes.JSON(value), "progress_at": at.UTC()}).Error
+	if err != nil {
+		r.cfg.Logger.WarnContext(ctx, "jobs: progress write failed",
+			slog.String("job_id", raw.ID), slog.String("run_id", runID), slog.String("error", err.Error()))
+		return
+	}
+	sink.wrote(value, version)
 }
 
 // cancelIfJobCancelled reads the state of a job whose claim this attempt lost

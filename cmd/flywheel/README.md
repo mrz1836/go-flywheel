@@ -117,8 +117,11 @@ flywheel serve                        # run the runtime until Ctrl+C
 | `flywheel schedule trigger <slug>` | Run a schedule now, paused or disabled too, and print `triggered <slug>: job <id>`: one job of its kind, args, and queue, due at once, as a manual run. Its pause and next fire stay as they are (`--reason`, recorded in its history) |
 | `flywheel schedule history <slug>` | List a schedule's latest fires, newest first, at most 20: each fire's job, when it fired (UTC), whether it was a manual run, and the job's state, its latest run's outcome, and when that run finished (`--json`) |
 | `flywheel kinds` | List the kind catalog a host's processes published with `PublishKinds`, sorted by kind: each kind's default queue, priority, attempts, and timeout (`-` for none), and when it was last published (`--json` prints the records, with each kind's description, args schema and example, and publisher). The CLI publishes no catalog of its own |
-| `flywheel queues` | List every queue that holds an unfinished job or was ever paused: its ready, scheduled-ahead, running, and paused jobs, and whether the queue itself is paused, by whom, and why (`--json`) |
+| `flywheel queues` | List every queue that holds an unfinished job or was ever paused or capped: its ready, scheduled-ahead, running, and paused jobs, and whether the queue itself is paused, by whom, and why (`--json`) |
 | `flywheel queues pause <queue>` / `resume <queue>` | Stop every runner from claiming a queue's jobs, or let them claim again, within one `QueueStateRefresh` (five seconds by default); jobs already running finish, and a queue no job has used can be paused (`--reason`, recorded in its history). Pausing a paused queue, or resuming one that isn't paused, changes nothing |
+| `flywheel queues concurrency <queue> <n>` | Cap how many of a queue's jobs each runner serving it runs at once, from its next `QueueStateRefresh`; `n` is a positive integer, or `none` to clear the cap (`--reason`, recorded in its history). Running jobs finish; the cap is per runner, and a runner serving several queues runs at most the smallest of their caps. `queues --json` reports each queue's cap as `max_concurrency` |
+| `flywheel limits` | List every resource a shared database limiter has admitted against: its rate tokens as last stored, the permits its live holds take, when the soonest hold lapses, and its runtime overrides (`MAX-CONCURRENT`, `RATE`, `BURST`; `-` where none is set; `--json`) |
+| `flywheel limits set <resource>` | Override a shared limiter's budget without a deploy: `--max-concurrent`, `--rate`, and `--burst`, each a positive integer or `none` to clear, at least one; a flag left out keeps its override (`--reason`, recorded in its history). The override binds each limiter's next acquire, in every process sharing the database, and revokes no permit already held. The resource must be one `flywheel limits` lists |
 | `flywheel nodes` | List the nodes a host's processes registered (`RegistryInterval`), those that have not stopped first, newest first: each node's id, host, version, start, last heartbeat, state (`live`, `stale`, `draining`, `drained`, or `stopped`), and runners, each as its queues and its jobs in flight of its slots (`--stopped-since 24h` also lists those that stopped within that long; `--json`). The CLI registers no node of its own |
 | `flywheel nodes drain <id>` | Ask a node to stop taking work: within one heartbeat it stops its runners' claims and reports `draining`, then `drained` once its jobs in flight finish, and keeps running until it is stopped (`--reason`, recorded in its history). A stopped or unknown node is refused (`flywheel: node not found`) |
 | `flywheel prune` | Delete finished jobs and their runs older than a cutoff, holding for the stats rollup when it is on (`--older-than 14d --ignore-stats-rollup`) |
@@ -132,9 +135,10 @@ All commands take `--config <path>` (default `./flywheel.yaml`, else
 `$XDG_CONFIG_HOME/flywheel/flywheel.yaml`).
 
 The control commands — `jobs retry`, `cancel`, `reschedule`, `priority`, `pause`, `resume`, and `delete`,
-`schedule rm`, `enable`, `disable`, `pause`, `resume`, and `trigger`, `queues pause` and `resume`, and
-`nodes drain` — run as the operating-system user (its name, else `$USER`) with the source `cli`, so
-`flywheel jobs history` and `ListAudit` show who ran each one and the `--reason` they gave.
+`schedule rm`, `enable`, `disable`, `pause`, `resume`, and `trigger`, `queues pause`, `resume`, and
+`concurrency`, `limits set`, and `nodes drain` — run as the operating-system user (its name, else `$USER`)
+with the source `cli`, so `flywheel jobs history` and `ListAudit` show who ran each one and the
+`--reason` they gave.
 
 ## Replacing cron
 

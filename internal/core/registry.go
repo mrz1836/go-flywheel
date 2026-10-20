@@ -24,6 +24,9 @@ type dispatchInput struct {
 	Tags        []string
 	Logger      *slog.Logger
 	RunID       string
+	// Progress is the attempt's progress sink, which the Job carries for
+	// SetProgress and the heartbeat writes from.
+	Progress *progressSink
 }
 
 // dispatchFunc decodes args and runs a worker; the worker's type parameter is
@@ -149,6 +152,7 @@ func Register[A Args](reg *Registry, w Worker[A]) {
 				Tags:        in.Tags,
 				Logger:      in.Logger,
 				RunID:       in.RunID,
+				progress:    in.Progress,
 			}
 			return w.Work(ctx, job)
 		},

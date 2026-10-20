@@ -116,6 +116,12 @@ cause `ErrJobCancelled`, as long as the database answers the state read that fol
 discards whatever the worker returns. A claim lost to anything but a cancel (the sweep's reclaim, a retry)
 never cancels a worker.
 
+**A lowered limit holds back new work; it never revokes work already admitted.** A `SetLimiterBudget`
+override below what a limiter has granted grants nothing new until enough permits are released or expire,
+and a `SetQueueConcurrency` cap below what a runner runs only holds back its claims while its running jobs
+finish. Each lands on the next `Acquire` or within one queue-state refresh, not at the instant it commits,
+and a queue's cap binds each runner on its own: it is not a fleet-wide count.
+
 **The scheduler is a singleton by deployment, not by election.** The runtime holds no lock guaranteeing
 only one scheduler runs. Running two doubles the sweep and retention load (periodic ticks collapse
 harmlessly on the bucketed unique key, the stats rollup replaces whole hours idempotently, and the
