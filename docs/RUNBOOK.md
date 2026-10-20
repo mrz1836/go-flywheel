@@ -178,7 +178,8 @@ flywheel.ErrDecodeArgs)`.
 `CancelJob` (and `flywheel jobs cancel`) makes a job `cancelled` at once, but by default a worker already
 running keeps going until it returns: the cancel fences the attempt's result and leaves its worker running.
 Until it returns, the job reads `cancelled` while its run at the job's attempt still reads outcome `started`
-(`flywheel jobs inspect <id>`, or `FindJob` with `LatestRun`). That is a cancel still waiting on its attempt.
+(`flywheel jobs inspect <id>`, or `FindJob` with `LatestRun`), and `GetJob` reports `CancelPending`. That is a
+cancel still waiting on its attempt.
 
 - **To have a cancel stop such workers, set `RunnerConfig.CooperativeCancel`** on the runners that run them.
   The first renewal after a cancel then cancels the attempt's context with the cause `ErrJobCancelled`, and
@@ -392,6 +393,41 @@ paused, and stays paused for the jobs that arrive.
   it.
 - **During a rolling deploy** a runner of a release without queue pause still claims a paused queue's
   jobs. Pause a queue once the deploy has replaced those runners.
+
+<br>
+
+## Lowering a limit during an incident
+
+When a vendor throttles you or a downstream is drowning, lower the limit rather than stopping the work. A
+shared `DBLimiter`'s budget and a queue's concurrency both change at runtime, with no deploy:
+
+```bash
+flywheel limits                                                    # each limiter's tokens, holds, and overrides
+flywheel limits set provider:x --max-concurrent 2 --reason "vendor throttling"
+flywheel queues concurrency exports 3 --reason "downstream drowning"
+```
+
+In code they are `SetLimiterBudget` and `SetQueueConcurrency`; each change records one `limits_set` entry in
+the history (`ListAudit` with `AuditTargetLimiter` and the resource, or `AuditTargetQueue` and the queue),
+with the limit before and after.
+
+- **Which lever.** The limiter is the fleet-wide gate: an override applies to every process sharing the
+  database, on its next `Acquire`. A queue's cap applies to each runner serving the queue on its own, so ten
+  runners at a cap of 2 still run twenty jobs; reach for it when one runner's slots are the problem.
+- **How fast each lands.** An override binds the next `Acquire` against the resource. A queue cap binds
+  each runner within one `RunnerConfig.QueueStateRefresh` (five seconds by default), even while every slot
+  is busy. A runner with `QueueStateRefresh` negative never reads a cap.
+- **Why nothing running stops.** A lower limit holds back new work only. A `--max-concurrent` below what
+  is held grants nothing until enough holds are released or expire; a queue cap below what a runner runs
+  claims nothing until its running jobs finish. To stop a job, cancel it; to stop a queue, pause it. An
+  override is 1 or more: zero is refused, since in a limiter's config zero means "no cap".
+- **What can be overridden.** `--rate` applies only to a limiter configured with an `Interval`, and
+  `--max-concurrent` only to one configured with a `HoldTTL`; `--burst` always applies. The resource must
+  appear in `flywheel limits`: a limiter creates its row on its first `Acquire`.
+- **Clear it when the incident ends.** An override outlives the incident until someone clears it:
+  `flywheel limits set provider:x --max-concurrent none` (each flag left out keeps its override), and
+  `flywheel queues concurrency exports none`. `flywheel limits` and `flywheel queues --json`
+  (`max_concurrency`) show what is still set, and the history shows who set it.
 
 <br>
 

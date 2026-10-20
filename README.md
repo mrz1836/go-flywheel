@@ -832,8 +832,9 @@ finalize.
 reaches a worker only through `ctx`. Its latency is the heartbeat interval. A `Driver` that issues no lease
 token runs no heartbeat, so under one nothing is cancelled.
 
-**Seeing a cancel that is still waiting.** From the cancel until the attempt returns, the job reads
-`cancelled` while its run at the job's attempt still reads outcome `started`:
+**Seeing a cancel that is still waiting.** `GetJob` reports it directly: `JobDetail.CancelPending` is true
+from the cancel until the attempt returns. Through the other reads, the job reads `cancelled` while its run
+at the job's attempt still reads outcome `started`:
 
 ```go
 job, err := flywheel.FindJob(ctx, db, id)
@@ -939,6 +940,55 @@ runID, err := flywheel.SeedRun(ctx, db, flywheel.RunSeed{
 > duplicates most of the `jobs` row, it drifts from the real outcome the moment a retry happens, and
 > nothing can answer "which attempt wrote this?". If you have domain columns to store, keep the table
 > and give it a `job_run_id` — the lifecycle columns belong to `job_runs`.
+
+</details>
+
+<details>
+<summary><strong><code>Reporting progress from a running job</code></strong></summary>
+<br>
+
+A job that runs for minutes with nothing to show reads as stuck. `Job.SetProgress` lets a worker say how far
+along it is, as often as it likes, and costs the database at most one small write per heartbeat:
+
+```go
+func (w CopyWorker) Work(ctx context.Context, job *flywheel.Job[CopyArgs]) (flywheel.Result, error) {
+    total := w.count(job.Args)
+    for i, row := range w.rows(job.Args) {
+        if err := w.copy(ctx, row); err != nil {
+            return flywheel.Result{}, err
+        }
+        done := 100 * float64(i+1) / float64(total)
+        job.SetProgress(flywheel.RunProgress{
+            Percent:  &done,
+            Message:  "copying rows",
+            Counters: map[string]int64{"copied": int64(i + 1), "total": int64(total)},
+        })
+    }
+    return flywheel.Result{}, nil
+}
+```
+
+**What a report holds.** Every field is optional. `Percent` is clamped to 0–100, and NaN is dropped.
+`Message` is cut at `MaxProgressMessageBytes` (256) on a rune boundary. `Counters` keeps at most
+`MaxProgressCounters` (8) keys of 1 to 32 bytes; past that, the keys that sort first are kept, so which ones
+survive does not depend on the order you added them. `SetProgress` keeps a normalized copy, so reusing your
+map is safe, and it is safe to call from several goroutines.
+
+**When it reaches the database.** `SetProgress` only stores the report in memory. The attempt's heartbeat,
+right after each renewal that keeps the claim, writes the latest report to the attempt's `job_runs` row with
+one `UPDATE` of `progress` and `progress_at` by its id: at most once per `RunnerConfig.HeartbeatInterval`,
+and not at all when the report has not changed since the last write. No index covers either column, so on
+PostgreSQL the write stays a heap-only update, like the finalize's. A write that fails is logged at warn
+(`jobs: progress write failed`) and retried at the next heartbeat. A worker reporting a thousand times a
+second costs the same one write per interval as one reporting once.
+
+**Where it is read.** `ListRunning` returns each running job's `Progress`; `ListRuns`, `LatestRun`, and
+`GetJob`'s `LatestRun` return each run's `Progress` and `ProgressAt`. A finished run keeps its last report.
+
+**What writes nothing.** An attempt shorter than one heartbeat (its outcome says what happened), an attempt
+whose Runner renews no lease (a negative `HeartbeatInterval`, or a `Driver` that issues no lease token), an
+attempt whose claim is gone, and a `Job` your own code built rather than the Runner. Progress is a report on
+a running attempt, not a record: put what an attempt produced in `Result.Output`.
 
 </details>
 
@@ -1697,6 +1747,74 @@ and logs, by default. A host guarding a hard external quota sets `LimiterFailClo
 </details>
 
 <details>
+<summary><strong><code>Changing limits at runtime</code></strong></summary>
+<br>
+
+Two limits can change while the fleet runs, with no deploy: a shared limiter's budget, and how many jobs
+a queue's runners run at once. Lowering one is the first lever in an incident, when a vendor throttles or a
+downstream drowns, and neither interrupts work already running.
+
+**A shared limiter's budget.** `SetLimiterBudget` overrides a `DBLimiter`'s configured `MaxConcurrent`,
+`Rate`, and `Burst` for one resource, in every process sharing the database, from each limiter's next
+`Acquire`:
+
+```go
+two := 2
+ctx = flywheel.WithActor(ctx, flywheel.Actor{Type: flywheel.ActorUser, ID: "alice", Reason: "provider x throttling"})
+err := flywheel.SetLimiterBudget(ctx, db, "provider:x", flywheel.LimiterBudget{MaxConcurrent: &two})
+// Later, when the incident is over: the zero budget clears every override.
+err = flywheel.SetLimiterBudget(ctx, db, "provider:x", flywheel.LimiterBudget{})
+```
+
+- Each field set replaces its configured value; a nil field keeps it, and the call replaces all three, so
+  set every override you mean to keep. Values are 1 or more: zero would read as "no cap", the opposite of
+  what lowering means, so to stop a resource, pause its queues.
+- `Rate` applies only to a limiter configured with a positive `Interval`, and `MaxConcurrent` only to one
+  configured with a positive `HoldTTL`; `Burst` always applies. An override can turn a cap on where those
+  hold: a limiter built with a `HoldTTL` and no cap starts capping concurrency when you set one. A limiter
+  with no cap and neither an `Interval` nor a `HoldTTL` admits without a round trip and reads no override.
+- **Nothing is revoked.** A `MaxConcurrent` below what is held grants nothing new until enough holds are
+  released or expire. A lower `Burst` clamps the stored tokens at once.
+- The resource must be one `ListLimiters` lists: a `DBLimiter` creates its row on its first `Acquire`, and
+  a resource no limiter has used is refused, since it is almost always a misspelling.
+
+**A queue's concurrency.** `SetQueueConcurrency` caps how many of a queue's jobs each runner serving it runs
+at once; `nil` clears the cap:
+
+```go
+three := 3
+err := flywheel.SetQueueConcurrency(ctx, db, "exports", &three)
+err = flywheel.SetQueueConcurrency(ctx, db, "exports", nil) // clear
+```
+
+- Each runner applies it at its next queue-state refresh (`RunnerConfig.QueueStateRefresh`, 5 seconds by
+  default), even with every slot busy. Running jobs finish; a lower cap only holds back claims until fewer
+  jobs run than the cap. A runner with `QueueStateRefresh` negative never reads it.
+- **The cap is per runner, not fleet-wide.** Ten runners serving a queue capped at 2 run up to twenty of its
+  jobs, and a runner serving several queues runs at most the smallest of their caps, in total. A cap above a
+  runner's `Concurrency` changes nothing. When a queue needs a cap of its own, give it a runner of its own;
+  when the limit is a downstream's, the shared `DBLimiter` is the fleet-wide gate.
+
+**Reading them back, and who set them.** `ListLimiters` reports each resource's `Overrides`, and
+`ListQueues` each queue's `MaxConcurrency`. Every change is one `limits_set` entry in the control history
+(`ListAudit` with `AuditTargetLimiter` or `AuditTargetQueue`), attributed to the context's actor, with the
+limit before and after as `from` and `to`; a call that changes nothing records nothing. From the command
+line:
+
+```bash
+flywheel limits                                              # each limiter's tokens, holds, and overrides
+flywheel limits set provider:x --max-concurrent 2 --reason "provider x throttling"
+flywheel limits set provider:x --max-concurrent none         # clear one override; the others stay
+flywheel queues concurrency exports 3 --reason "downstream drowning"
+flywheel queues concurrency exports none
+```
+
+Overrides outlive the incident that set them until someone clears them, so check `flywheel limits` and
+`flywheel queues --json` when it ends.
+
+</details>
+
+<details>
 <summary><strong><code>Running one registry across two executors</code></strong></summary>
 <br>
 
@@ -1975,6 +2093,11 @@ runs a Scheduler deletes the rows of nodes silent for longer than `SchedulerConf
 start and hourly. With `RegistryInterval` set, `Run` refuses to start, with `ErrSchemaOutdated`, until
 `job_nodes` exists; keep the interval well below `StaleAfter`.
 
+**Node starts, for deploy markers.** Each process start is a node row, so the registry is also a record of
+deploys. `ListNodeStarts` pages through every start in a window, live or stopped, oldest first, behind an
+opaque `ns1.` cursor that never skips or repeats a row, with each start's version, commit, and first
+runner's executor class — as far back as `NodeRetention` keeps rows.
+
 **Draining a node.** `RequestDrain(ctx, db, nodeID)` asks one node to stop taking work, and records the
 request, with its actor and reason, in the control history. Within one heartbeat the node stops every
 runner's claims and reports `Draining`, then `Drained` once its jobs in flight finish. It keeps running —
@@ -2000,6 +2123,8 @@ holds jobs, and returns once nothing is pending anywhere. A Runner that cannot r
 the set it last read, with a warning; one that has never read it claims every queue. A Runner refuses to
 start, with `ErrSchemaOutdated`, until `job_queues` exists — unless `QueueStateRefresh` is negative, which
 turns the check off and claims every queue.
+
+A queue can also be capped rather than paused: see **Changing limits at runtime**.
 
 `flywheel nodes`, `flywheel nodes drain`, `flywheel queues`, and `flywheel queues pause|resume` do the same
 from the [CLI](cmd/flywheel/README.md). [`docs/INTEGRATING.md`](docs/INTEGRATING.md#nodes-and-queue-state)

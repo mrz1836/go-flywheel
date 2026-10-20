@@ -32,6 +32,12 @@ never reclaimed, because each renewal pushes `leased_until` ahead of the sweep's
 - **With `RunnerConfig.CooperativeCancel`, `HeartbeatInterval` is also how long a cancel takes to reach a
   running worker.** It adds no statement while nothing is cancelled: the state read runs only after a
   renewal finds its claim gone.
+- **A worker that reports progress adds at most one `UPDATE` per interval.** The heartbeat writes an
+  attempt's latest `Job.SetProgress` report after each renewal that holds the claim, and only when it
+  changed, so the cost is the renewal arithmetic again for the attempts that report, whatever their
+  reporting rate. The write sets two unindexed `job_runs` columns, so it stays a heap-only update
+  ([`BENCHMARKS.md`](BENCHMARKS.md#progress-on-the-heartbeat)). A shorter interval shows progress sooner at
+  one more write per interval per reporting attempt.
 
 <br>
 
@@ -52,6 +58,12 @@ independently, so a slow job occupies one slot rather than stalling the batch be
   count, because a claimed job the runner cannot immediately start is a job leased and not running.
 - **SQLite requires `Concurrency: 1`** and a single-writer pool (`SetMaxOpenConns(1)`). This is enforced
   with `ErrSQLiteConcurrency`; see [`RUNBOOK.md`](RUNBOOK.md).
+- **A queue's cap lowers the pool at runtime, never past `Concurrency`.** `SetQueueConcurrency` caps how
+  many of a queue's jobs each runner serving it runs; the runner reads it with the paused set, once per
+  `QueueStateRefresh`, and applies the smallest cap among its queues. While every slot is busy the runner
+  waits for a free one no longer than the next refresh, so a cap lands within one refresh: one more
+  primary-key read per refresh, and only while the pool is full. Size `Concurrency` for the normal case and
+  lower it with a cap during an incident, rather than the reverse.
 
 <br>
 
@@ -81,11 +93,12 @@ the claim's shape.
 Neither has a benchmark: each is one small read or write per interval, against a table that holds a row
 per paused queue or per node, so the levers are how fast each takes hold.
 
-- **`RunnerConfig.QueueStateRefresh` (5 s): how fast a pause holds.** Each runner reads the paused set
-  once per refresh, before it claims: one primary-key read of `job_queues` over its queues. A pause or a
-  resume takes hold on every runner within one refresh. Lowering it buys a faster pause at one read per
-  runner per refresh — fifty runners at one second are fifty reads a second. A negative value turns the
-  check off: the runner reads nothing, claims every queue, needs no `job_queues`, and ignores a pause.
+- **`RunnerConfig.QueueStateRefresh` (5 s): how fast a pause or a cap holds.** Each runner reads the
+  paused set and the concurrency caps once per refresh, before it claims: one primary-key read of
+  `job_queues` over its queues. A pause, a resume, or a cap takes hold on every runner within one refresh.
+  Lowering it buys a faster pause at one read per runner per refresh — fifty runners at one second are
+  fifty reads a second. A negative value turns the check off: the runner reads nothing, claims every
+  queue, needs no `job_queues`, and ignores a pause and a cap.
 - **`NodeConfig.RegistryInterval`: the heartbeat.** A registering node writes one update of its row per
   interval, after one read of whether a drain was requested, plus an insert at start and an update at
   stop. It bounds how fast a drain takes hold (one heartbeat) and how fresh the in-flight counts are. Keep
