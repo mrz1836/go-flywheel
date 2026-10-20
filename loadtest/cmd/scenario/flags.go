@@ -75,6 +75,10 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		"runner lease duration (default: derived from -work; set it below the work time to exercise renewal)")
 	fs.DurationVar(&opts.cfg.Progress, "progress", 0,
 		"have each job report its progress at this interval while it works (zero reports none)")
+	fs.BoolVar(&opts.cfg.CaptureLogs, "capture-logs", false,
+		"have the runners capture the lines each job logs (RunnerConfig.CaptureLogs)")
+	fs.IntVar(&opts.cfg.LogLines, "log-lines", 0,
+		"have each job log this many lines before it works (zero logs none, or 10 with -capture-logs)")
 	fs.StringVar(&fault, "fault", faultNone,
 		"fault to inject, as name[@fraction][:duration]; one of "+strings.Join(faultNames(), ", "))
 	fs.DurationVar(&opts.cfg.SampleInterval, "sample-interval", time.Second, "storage sampling cadence")
@@ -165,6 +169,9 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	}
 	if !opts.cfg.Limiter.Valid() {
 		return options{}, fmt.Errorf("scenario: -limiter %q is not one of none, token-bucket, db", limiter)
+	}
+	if opts.cfg.LogLines < 0 {
+		return options{}, fmt.Errorf("scenario: -log-lines must not be negative, got %d", opts.cfg.LogLines)
 	}
 	if opts.cfg.Progress < 0 {
 		return options{}, fmt.Errorf("scenario: -progress must not be negative, got %s", opts.cfg.Progress)

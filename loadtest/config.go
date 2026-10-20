@@ -283,6 +283,16 @@ type Config struct {
 	// none, so a with/without comparison of the progress write is a same-binary
 	// A/B. Negative is refused.
 	Progress time.Duration
+	// CaptureLogs turns on the runners' run-log capture (RunnerConfig.CaptureLogs)
+	// at its defaults, so a with/without comparison of the capture's cost is a
+	// same-binary A/B.
+	CaptureLogs bool
+	// LogLines is how many lines each job logs at info before it works. Zero
+	// logs none, except with CaptureLogs set, when it selects
+	// defaultLogLines, so a capture run has something to capture; an A/B gives
+	// both halves the same LogLines, so they differ only in the capture.
+	// Negative is refused.
+	LogLines int
 	// SampleInterval is the cadence of the storage and OS sampler.
 	SampleInterval time.Duration
 	// Timeout bounds the whole run. A drain that cannot finish — a fault that
@@ -530,6 +540,11 @@ func (c Config) validate() (Config, error) {
 			"loadtest: Progress must not be negative, got %s: %w", c.Progress, ErrInvalidConfig,
 		)
 	}
+	if c.LogLines < 0 {
+		return Config{}, fmt.Errorf(
+			"loadtest: LogLines must not be negative, got %d: %w", c.LogLines, ErrInvalidConfig,
+		)
+	}
 	if c.SampleInterval <= 0 {
 		c.SampleInterval = defaultSampleInterval
 	}
@@ -704,4 +719,17 @@ func (c Config) validate() (Config, error) {
 		)
 	}
 	return c, nil
+}
+
+// defaultLogLines is how many lines a job logs on a capture run that left
+// LogLines zero.
+const defaultLogLines = 10
+
+// logLines resolves how many lines each job logs: LogLines when set, else
+// defaultLogLines on a capture run, else none.
+func (c Config) logLines() int {
+	if c.LogLines == 0 && c.CaptureLogs {
+		return defaultLogLines
+	}
+	return c.LogLines
 }
