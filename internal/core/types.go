@@ -219,6 +219,10 @@ type Job[A Args] struct {
 	// RunID is the pre-allocated job_runs.id for this attempt. A side-effect
 	// row may set its job_run_id to RunID safely — the run row already exists.
 	RunID string
+
+	// progress carries SetProgress's reports to the attempt's heartbeat. It is
+	// nil on a Job the Runner did not build, which makes SetProgress a no-op.
+	progress *progressSink
 }
 
 // RawJob is a claimed jobs row as the Driver returns it, before the Runner

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -11,7 +12,8 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// QueueInfo is one queue's depth and whether an operator has paused it.
+// QueueInfo is one queue's depth, whether an operator has paused it, and its
+// concurrency cap.
 type QueueInfo struct {
 	// QueueDepth is the queue's point-in-time depth, as QueueDepths reads it.
 	// Its Paused field counts the queue's paused jobs; IsPaused is the queue's
@@ -25,6 +27,9 @@ type QueueInfo struct {
 	// PausedBy is the type, id, and reason of the actor who paused the queue;
 	// nil while it is not paused.
 	PausedBy *Actor `json:"paused_by,omitempty"`
+	// MaxConcurrency is the cap SetQueueConcurrency set: the most jobs a Runner
+	// serving the queue runs at once. nil is no cap.
+	MaxConcurrency *int `json:"max_concurrency,omitempty"`
 }
 
 // PauseQueue pauses queue for every Runner that claims from it: each leaves the
@@ -129,11 +134,89 @@ func ResumeQueue(ctx context.Context, db *gorm.DB, queue string) error {
 	return nil
 }
 
+// SetQueueConcurrency caps how many of queue's jobs a Runner serving it runs at
+// once, or clears the cap when n is nil. Every Runner serving the queue applies
+// it within one RunnerConfig.QueueStateRefresh, even with every slot busy, and
+// a Runner with QueueStateRefresh negative never reads it. A lowered cap
+// interrupts nothing: running jobs finish, and the Runner claims nothing more
+// until fewer of them run than the cap. A cap above a Runner's Concurrency
+// changes nothing there.
+//
+// The cap is per Runner, not fleet-wide: ten Runners serving a queue capped at
+// 2 run up to twenty of its jobs, and a Runner serving several queues runs at
+// most the smallest of their caps, in total. A shared DBLimiter is the
+// fleet-wide gate (see SetLimiterBudget); a queue that needs a cap of its own
+// gets a Runner of its own.
+//
+// It writes the cap into the queue's job_queues row, creating it when absent
+// (clearing a queue that has no row writes nothing), and keeps any pause. In
+// the same transaction — a savepoint when db is a caller's transaction — it
+// writes one AuditLimitsSet entry for the queue (AuditTargetQueue) to the
+// control history, with the cap before and after as "from" and "to" (null for
+// none), attributed to the context's actor (WithActor; the system when there
+// is none), and runs the context's audit hook. Setting the cap already set
+// changes nothing and records nothing.
+//
+// An empty queue name is refused with a *ValidationError naming "queue", an n
+// below 1 with one naming "max_concurrency", and an actor the history can't
+// record with one naming its field, each before anything is written.
+func SetQueueConcurrency(ctx context.Context, db *gorm.DB, queue string, n *int) error {
+	if db == nil {
+		return fmt.Errorf("flywheel: SetQueueConcurrency: db is nil")
+	}
+	actor, err := resolveActor(ctx)
+	if err != nil {
+		return err
+	}
+	if queue == "" {
+		return newValidationError("queue", "is required")
+	}
+	if n != nil && *n < 1 {
+		return newValidationError("max_concurrency", "must be at least 1")
+	}
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := models.ClockFrom(ctx).Now(ctx).UTC()
+		if n != nil {
+			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "queue"}}, DoNothing: true}).
+				Create(&jobQueueRow{Queue: queue, UpdatedAt: now}).Error; err != nil {
+				return err
+			}
+		}
+		q := quietMissing(tx).Model(&jobQueueRow{}).Select("queue", "max_concurrency").Where("queue = ?", queue)
+		if tx.Name() == "postgres" {
+			q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		var row jobQueueRow
+		if err := q.Take(&row).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil // no row and no cap to set: nothing to clear
+			}
+			return err
+		}
+		before := row.MaxConcurrency
+		if (before == nil) == (n == nil) && (n == nil || *before == *n) {
+			return nil
+		}
+		if err := tx.Model(&jobQueueRow{}).Where("queue = ?", queue).
+			Updates(map[string]any{"max_concurrency": n, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		return recordAudit(ctx, tx, actor, now, []auditChange{{
+			target: AuditTargetQueue, targetID: queue, action: AuditLimitsSet,
+			details: map[string]any{"from": before, "to": n},
+		}})
+	})
+	if err != nil {
+		return fmt.Errorf("flywheel: set queue concurrency %q: %w", queue, err)
+	}
+	return nil
+}
+
 // ListQueues returns every queue that holds a non-terminal job or has a
-// job_queues row (a queue an operator has paused, now or before), sorted by
-// name: each with QueueDepths' figures, zero for a queue no job holds, and its
-// pause. It returns every such queue, uncapped: a host's queues are bounded by
-// its configuration, not by its data.
+// job_queues row (a queue an operator has paused or capped, now or before),
+// sorted by name: each with QueueDepths' figures, zero for a queue no job
+// holds, its pause, and its concurrency cap. It returns every such queue,
+// uncapped: a host's queues are bounded by its configuration, not by its data.
 //
 // It costs what QueueDepths costs, plus one read of job_queues, which holds a
 // row per queue ever paused. Like QueueDepths it is a sample, not a
@@ -161,6 +244,7 @@ func ListQueues(ctx context.Context, db *gorm.DB) ([]QueueInfo, error) {
 			info = &QueueInfo{QueueDepth: QueueDepth{Queue: row.Queue}}
 			byName[row.Queue] = info
 		}
+		info.MaxConcurrency = row.MaxConcurrency
 		if row.PausedAt == nil {
 			continue
 		}

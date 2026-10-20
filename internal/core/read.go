@@ -118,6 +118,13 @@ type JobRunView struct {
 	// this keeps it whole, so a host can show all of it. It is nil when the run
 	// stored no payload.
 	ErrorPayload json.RawMessage `json:"error_payload,omitempty"`
+	// Progress is the last progress the attempt's heartbeat wrote (see
+	// Job.SetProgress), and ProgressAt when it wrote it. A finished attempt keeps
+	// its last one. Both are nil for an attempt that never reported, or that
+	// finished within one heartbeat; Progress is also nil for a stored value that
+	// does not decode.
+	Progress   *RunProgress `json:"progress,omitempty"`
+	ProgressAt *time.Time   `json:"progress_at,omitempty"`
 }
 
 // JobsOverview is the aggregate job-state report: a count per state plus the
@@ -543,6 +550,8 @@ func jobRunViewFromRow(r jobRunRow) JobRunView {
 		CostMicros:       r.CostMicros,
 		EnqueuedChildren: r.EnqueuedChildren,
 		Superseded:       r.Superseded,
+		Progress:         decodeProgress(r.Progress),
+		ProgressAt:       r.ProgressAt,
 	}
 	if r.ErrorClass != nil {
 		v.ErrorClass = *r.ErrorClass

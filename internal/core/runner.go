@@ -117,14 +117,17 @@ type RunnerConfig struct {
 	// Queues are the logical queues this Runner claims from.
 	Queues []string
 	// QueueStateRefresh is how often the Runner reads which of its queues an
-	// operator paused (PauseQueue): one primary-key read of job_queues, at most
-	// once per refresh, before it reserves a slot or asks its Limiter. It leaves
-	// a paused queue out of its claims, so a pause takes hold within one refresh
-	// on every Runner, and with every queue paused it claims nothing, holds no
-	// slot, and waits for the next refresh. An attempt already running on a
-	// paused queue finishes. A read that fails keeps the paused set the last one
-	// returned, with a warning; until a read succeeds, the Runner claims every
-	// queue.
+	// operator paused (PauseQueue) and their concurrency caps
+	// (SetQueueConcurrency): one primary-key read of job_queues, at most once per
+	// refresh, before it reserves a slot or asks its Limiter. It leaves a paused
+	// queue out of its claims, so a pause takes hold within one refresh on every
+	// Runner, and with every queue paused it claims nothing, holds no slot, and
+	// waits for the next refresh. It runs at most the smallest cap among its
+	// queues, never more than Concurrency; with every slot busy it waits for one
+	// no longer than the next refresh, so a cap also lands within one. An attempt
+	// already running finishes either way. A read that fails keeps the paused
+	// set and the cap the last one left, with a warning; until a read succeeds,
+	// the Runner claims every queue, uncapped.
 	//
 	// Zero selects five seconds. A negative value turns the check off: the
 	// Runner claims every queue, reads nothing, and does not need job_queues.
@@ -148,7 +151,10 @@ type RunnerConfig struct {
 	LeaseDuration time.Duration
 	// HeartbeatInterval is how often a running job's lease is renewed. Zero (the
 	// default) derives it from LeaseDuration, renewing at one third of it, so two
-	// renewals may fail before the lease can expire.
+	// renewals may fail before the lease can expire. After each renewal that
+	// holds the claim, the heartbeat also writes the attempt's progress
+	// (Job.SetProgress) when it changed, so it is how often progress reaches the
+	// database too.
 	//
 	// Set it negative to disable renewal entirely, restoring the fixed-lease
 	// behavior in which a job slower than its lease is reclaimed and
@@ -523,12 +529,15 @@ func (r *Runner) ended(ctx context.Context, untilIdle bool) error {
 // releases any number of concurrent waiters from one close, under the same
 // mutex that decrements the counter.
 type pool struct {
-	// limit is the pool size. inline is set when limit is 1, which makes start
-	// run its function on the caller's goroutine.
-	limit  int
+	// size is the pool's configured size. inline is set when size is 1, which
+	// makes start run its function on the caller's goroutine.
+	size   int
 	inline bool
 
 	mu sync.Mutex
+	// limit is how many slots the pool lends: size, or less while a queue's
+	// concurrency cap is in force (setLimit).
+	limit int
 	// held counts outstanding reservations: the claim window plus the running
 	// jobs. running counts the dispatches actually executing.
 	held    int
@@ -557,13 +566,34 @@ func newPool(limit int) *pool {
 		limit = 1
 	}
 	p := &pool{
-		limit:  limit,
+		size:   limit,
 		inline: limit == 1,
+		limit:  limit,
 		idle:   make(chan struct{}),
 		freed:  make(chan struct{}),
 	}
 	close(p.idle)
 	return p
+}
+
+// setLimit sets how many slots the pool lends from now, clamped to between 1
+// and its size, so a cap never raises it past the configured Concurrency. It
+// changes no reservation: lowered, reserve takes no slot until fewer are held
+// than the new limit, so running jobs finish; raised, it wakes every waiter in
+// reserve, as a release does.
+func (p *pool) setLimit(n int) {
+	n = min(max(n, 1), p.size)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n == p.limit {
+		return
+	}
+	raised := n > p.limit
+	p.limit = n
+	if raised {
+		close(p.freed)
+		p.freed = make(chan struct{})
+	}
 }
 
 // reserve takes between 1 and want slots, blocking until at least one is free or
@@ -791,9 +821,14 @@ func (r *Runner) run(ctx context.Context, untilIdle bool) error {
 			continue
 		}
 
-		reserved, err := r.pool.reserve(loopCtx, r.claimLimit())
+		reserved, err := r.reserveSlots(loopCtx)
 		if err != nil {
 			return r.ended(ctx, untilIdle)
+		}
+		if reserved == 0 {
+			// Every slot stayed busy until the queue state was due: read it before
+			// waiting again, so a cap set meanwhile applies before the next claim.
+			continue
 		}
 		// Stop may have landed while the reservation waited for a slot. Checking
 		// again here is what keeps "Stop bounds when the next claim is issued" true
@@ -911,12 +946,16 @@ func (r *Runner) idle(ctx, loopCtx context.Context, backoff *pollBackoff, untilI
 // checkSchema runs the startup schema probe over the tables the run path writes,
 // once per Runner: jobs and job_runs, which the claim, the stub insert, and the
 // finalize update write, and job_run_finishes, which every finalize logs to in
-// the same transaction; and, unless QueueStateRefresh is negative, job_queues,
-// whose paused set every iteration reads before it claims. A database missing
-// any of them fails the run before anything is claimed: claiming first would
-// lease a job, fail its stub insert or its finalize, and leave the lease sweep
-// to reclaim the same jobs forever. A probe that cannot reach the database is
-// not a verdict and is retried on the next run — see probeSchema.
+// the same transaction; unless QueueStateRefresh is negative, job_queues, whose
+// paused set and concurrency caps every iteration reads before it claims; and,
+// when the Limiter is a DBLimiter, limiter_buckets with its overrides, on the
+// limiter's own handle, since every Acquire reads them. A database missing any
+// of them fails the run before anything is claimed: claiming first would lease
+// a job, fail its stub insert or its finalize, and leave the lease sweep to
+// reclaim the same jobs forever; and a limiter whose every Acquire fails would
+// either claim nothing or, failing open, claim past its limit. A probe that
+// cannot reach the database is not a verdict and is retried on the next run —
+// see probeSchema.
 func (r *Runner) checkSchema(ctx context.Context) error {
 	if r.schemaChecked.Load() {
 		return nil
@@ -928,6 +967,13 @@ func (r *Runner) checkSchema(ctx context.Context) error {
 	checked, err := probeSchema(ctx, r.cfg.DB, models...)
 	if err != nil {
 		return fmt.Errorf("jobs: runner schema check: %w", err)
+	}
+	if limiter, ok := r.cfg.Limiter.(*DBLimiter); ok {
+		limiterChecked, err := probeSchema(ctx, limiter.db, &limiterBucketRow{})
+		if err != nil {
+			return fmt.Errorf("jobs: runner schema check: %w", err)
+		}
+		checked = checked && limiterChecked
 	}
 	if checked {
 		r.schemaChecked.Store(true)
@@ -1132,6 +1178,26 @@ func (r *Runner) pendingCount(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("jobs: count pending: %w", err)
 	}
 	return count, nil
+}
+
+// reserveSlots takes the slots the loop's next claim may fill, waiting for a
+// free one. With the queue-state refresh on, it waits no longer than until the
+// next refresh is due and then reports zero slots and no error, so the loop
+// reads the queue state again: without the bound, a Runner whose every slot is
+// busy would read a cap set meanwhile only after its next job finished, and
+// claim once more before it did. A free slot is taken at once, whatever the
+// bound. With the refresh off it waits as long as it takes.
+func (r *Runner) reserveSlots(ctx context.Context) (int, error) {
+	if r.queueStateRefresh() <= 0 {
+		return r.pool.reserve(ctx, r.claimLimit())
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, r.untilQueueStateRefresh())
+	defer cancel()
+	n, err := r.pool.reserve(waitCtx, r.claimLimit())
+	if err != nil && ctx.Err() == nil {
+		return 0, nil
+	}
+	return n, err
 }
 
 // claimLimit is the largest batch one Dequeue may ask for, before the free-slot
@@ -1388,6 +1454,9 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 		logger = logger.With("request_id", reqID)
 	}
 
+	// The worker's progress reports reach the heartbeat through the sink, which
+	// the Job carries for SetProgress.
+	hooks := attemptHooks{progress: newProgressSink()}
 	in := dispatchInput{
 		ID:          raw.ID,
 		Kind:        raw.Kind,
@@ -1400,6 +1469,7 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 		Tags:        raw.Tags,
 		Logger:      logger,
 		RunID:       runID,
+		Progress:    hooks.progress,
 	}
 
 	r.cfg.Observer.OnStart(ctx, jobEv)
@@ -1409,16 +1479,17 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 	// job cancelled. The execution timeout derives from it, so context.Cause
 	// reports the cancel through both.
 	workCtx := ctx
-	var cancelWork context.CancelCauseFunc
 	if r.cfg.CooperativeCancel {
+		var cancelWork context.CancelCauseFunc
 		workCtx, cancelWork = context.WithCancelCause(ctx)
 		defer cancelWork(nil)
+		hooks.cancel = cancelWork
 	}
 
 	// Renewal runs for the whole attempt, finalize included. The deferred stop is
 	// what stops renewal on every exit path — normal return, recovered panic,
 	// and execution timeout alike.
-	defer r.startHeartbeat(ctx, raw, runID, cancelWork)()
+	defer r.startHeartbeat(ctx, raw, runID, hooks)()
 
 	if d := r.resolveTimeout(entry, raw); d > 0 {
 		var cancel context.CancelFunc

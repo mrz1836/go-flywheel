@@ -832,9 +832,10 @@ func applyRetryBudget(upd map[string]any, opts RetryOpts) {
 // its result is discarded when it returns. That attempt is not interrupted
 // unless its Runner sets RunnerConfig.CooperativeCancel, in which case its
 // context is cancelled with the cause ErrJobCancelled within one heartbeat, for
-// its worker to stop on. Until the attempt returns, the job reads cancelled
-// (FindJob) while its run at the job's attempt still reads outcome started
-// (LatestRun, ListRuns): that is a cancel still waiting on a running attempt.
+// its worker to stop on. Until the attempt returns, GetJob reports
+// JobDetail.CancelPending, and the job reads cancelled (FindJob) while its run
+// at the job's attempt still reads outcome started (LatestRun, ListRuns): that
+// is a cancel still waiting on a running attempt.
 //
 // When the job is a child whose parent declared a Barrier and it was the last of
 // its generation still pending, the cancel enqueues the barrier's continuation, in

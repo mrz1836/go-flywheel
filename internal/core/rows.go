@@ -127,8 +127,15 @@ type jobRunRow struct {
 	// job was cancelled or reclaimed underneath it — so the outcome on this row
 	// was never applied to the job. It is the durable form of SupersedeEvent: a
 	// double-execution signal a host can count after the fact.
-	Superseded bool      `gorm:"column:superseded;not null;default:false"`
-	CreatedAt  time.Time `gorm:"column:created_at;not null"`
+	Superseded bool `gorm:"column:superseded;not null;default:false"`
+	// Progress is the last RunProgress the attempt's heartbeat wrote, as JSON,
+	// and ProgressAt the renewal it rode on, in UTC. Both are NULL for an
+	// attempt that never reported, or finished within one heartbeat. The write
+	// is an UPDATE by id of these two columns alone, and neither is indexed, so
+	// it stays HOT-eligible like the finalize's.
+	Progress   datatypes.JSON `gorm:"column:progress;type:jsonb"`
+	ProgressAt *time.Time     `gorm:"column:progress_at"`
+	CreatedAt  time.Time      `gorm:"column:created_at;not null"`
 }
 
 // TableName binds jobRunRow to the job_runs table.
@@ -447,11 +454,12 @@ type jobNodeRow struct {
 // TableName binds jobNodeRow to the job_nodes table.
 func (jobNodeRow) TableName() string { return "job_nodes" }
 
-// jobQueueRow is the state of one queue an operator has paused: when it was
-// paused, and the type, id, and reason of the actor who paused it, while it is
-// paused. PauseQueue creates it; ResumeQueue clears its pause columns and keeps
-// it, so a queue once paused stays listed. Every Runner reads the paused set
-// from it once per RunnerConfig.QueueStateRefresh. The times are UTC.
+// jobQueueRow is the state of one queue an operator has paused or capped: when
+// it was paused, and the type, id, and reason of the actor who paused it, while
+// it is paused, and its concurrency cap. PauseQueue or SetQueueConcurrency
+// creates it; ResumeQueue clears its pause columns and keeps it, so a queue
+// once paused stays listed. Every Runner reads the paused set and the caps from
+// it once per RunnerConfig.QueueStateRefresh. The times are UTC.
 type jobQueueRow struct {
 	Queue        string     `gorm:"column:queue;primaryKey"`
 	PausedAt     *time.Time `gorm:"column:paused_at"`
@@ -459,6 +467,9 @@ type jobQueueRow struct {
 	PausedByID   string     `gorm:"column:paused_by_id;not null;default:''"`
 	PausedReason string     `gorm:"column:paused_reason;not null;default:''"`
 	UpdatedAt    time.Time  `gorm:"column:updated_at;not null"`
+	// MaxConcurrency, when set, is the most jobs a Runner serving the queue runs
+	// at once (SetQueueConcurrency); NULL is no cap.
+	MaxConcurrency *int `gorm:"column:max_concurrency"`
 }
 
 // TableName binds jobQueueRow to the job_queues table.
@@ -474,6 +485,12 @@ type limiterBucketRow struct {
 	Tokens     int       `gorm:"column:tokens;not null"`
 	RefilledAt time.Time `gorm:"column:refilled_at;not null"`
 	UpdatedAt  time.Time `gorm:"column:updated_at;not null"`
+	// The overrides SetLimiterBudget writes: each one set replaces its
+	// configured value on every Acquire against the resource; NULL keeps the
+	// configured value. Acquire reads them on the row it already locks.
+	MaxConcurrentOverride *int `gorm:"column:max_concurrent_override"`
+	RateOverride          *int `gorm:"column:rate_override"`
+	BurstOverride         *int `gorm:"column:burst_override"`
 }
 
 // TableName binds limiterBucketRow to the limiter_buckets table.

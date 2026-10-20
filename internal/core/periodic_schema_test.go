@@ -12,8 +12,8 @@ import (
 )
 
 // previousReleaseGapSuite proves the parity checks name exactly what this
-// release adds to a schema the previous release installed: the five
-// job_periodics columns, in their declared order, and no index.
+// release adds to a schema the previous release installed: the progress and
+// limit columns, in their declared order, and no index.
 func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
@@ -22,8 +22,8 @@ func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 	drift, err := InspectSchema(ctx, db)
 	require.NoError(t, err)
 	assert.Equal(t, []string{
-		"job_periodics.source", "job_periodics.paused_by_type", "job_periodics.paused_by_id",
-		"job_periodics.paused_reason", "job_periodics.recent_jobs",
+		"job_runs.progress", "job_runs.progress_at", "limiter_buckets.max_concurrent_override",
+		"limiter_buckets.rate_override", "limiter_buckets.burst_override", "job_queues.max_concurrency",
 	}, schemaDriftNames(drift))
 	idx, err := InspectIndexes(ctx, db)
 	require.NoError(t, err)
@@ -78,11 +78,11 @@ func TestSchedulerRefusesToStartWithoutThePausedAtColumn(t *testing.T) {
 // its start-up apply its source, so against a schema without them Run stops
 // before starting any activity, naming each column and the fix. A Runner never
 // reads job_periodics, so it runs against the same schema. db carries the
-// current schema, and the suite drops the five, as the previous release left
+// current schema, and the suite drops the five, as a release before them left
 // them.
 func schedulerRefusesWithoutPeriodicColumnsSuite(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	for _, col := range previousReleaseColumns {
+	for _, col := range scheduleColumns {
 		require.NoError(t, db.Exec("ALTER TABLE "+col.Table+" DROP COLUMN "+col.Column).Error, "drop %s", col)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -91,7 +91,7 @@ func schedulerRefusesWithoutPeriodicColumnsSuite(t *testing.T, db *gorm.DB) {
 	s := newSchedulerCfg(t, SchedulerConfig{DB: db, Client: NewClient(db), Driver: driverForTest(t, db)})
 	err := s.Run(ctx)
 	require.ErrorIs(t, err, ErrSchemaOutdated)
-	for _, col := range previousReleaseColumns {
+	for _, col := range scheduleColumns {
 		assert.Contains(t, err.Error(), col.String(), "the error names each missing column")
 	}
 	assert.Contains(t, err.Error(), "flywheel migrate", "and how to fix it")
@@ -109,14 +109,16 @@ func TestSchedulerRefusesToStartWithoutThePeriodicColumns(t *testing.T) {
 	schedulerRefusesWithoutPeriodicColumnsSuite(t, newDB(t))
 }
 
-// previousReleaseUpgradeSuite runs the upgrade from the previous release: a
-// schedule that release wrote is migrated in place, reads as not paused, and
-// keeps firing under this release's Scheduler; a row that release's binary
-// writes after the migration, as a rolling deploy would, is valid and not
-// paused either.
+// previousReleaseUpgradeSuite runs the upgrade from an older release: a
+// schedule a release before the schedule columns wrote is migrated in place,
+// reads as not paused, and keeps firing under this release's Scheduler; a row
+// that release's binary writes after the migration, as a rolling deploy would,
+// is valid and not paused either. The schema is the previous release's without
+// the schedule columns, so the upgrade adds them as well as this release's.
 func previousReleaseUpgradeSuite(t *testing.T, db *gorm.DB, migrate func(*gorm.DB) error) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
+	dropColumns(t, db, scheduleColumns...)
 	due := time.Now().UTC().Truncate(time.Second).Add(-30 * time.Second)
 	writeLegacyPeriodic(t, db, "legacy-nightly", "legacy.periodic", due)
 

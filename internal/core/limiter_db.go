@@ -108,21 +108,29 @@ func NewDBLimiter(db *gorm.DB, cfg DBLimiterConfig) (*DBLimiter, error) {
 // ensure DBLimiter satisfies Limiter.
 var _ Limiter = (*DBLimiter)(nil)
 
-// Acquire grants up to n permits against resource in one transaction. When both
-// caps are off it short-circuits with no round trip. Otherwise it locks the
-// resource's bucket row (the per-resource mutex), refills the integer token count
-// carrying the sub-token remainder forward in refilled_at, reclaims the resource's
-// expired holds inline, counts the live holds, grants the minimum of the ask, the
-// tokens, and the concurrency headroom, and — when a concurrency cap is set and
-// the grant is positive — records one hold row carrying the whole grant under a
-// minted token.
+// Acquire grants up to n permits against resource in one transaction. A limiter
+// configured with no cap and neither a positive Interval nor a positive HoldTTL
+// short-circuits with no round trip: no override could apply to it. Otherwise
+// it locks the resource's bucket row (the per-resource mutex) and reads the
+// overrides SetLimiterBudget set on it, each one set replacing its configured
+// value for this Acquire: a Rate override when the limiter has a positive
+// Interval, a MaxConcurrent override when it has a positive HoldTTL, and a
+// Burst override always. With no cap in force it grants the ask. With one, it
+// refills the integer token count carrying the sub-token remainder forward in
+// refilled_at, clamps the tokens to the burst in force, reclaims the resource's
+// expired holds inline, counts the live holds, grants the minimum of the ask,
+// the tokens, and the concurrency headroom, and — when a concurrency cap is in
+// force and the grant is positive — records one hold row carrying the whole
+// grant under a minted token. A concurrency cap lowered below what is held
+// grants nothing until enough holds are released or expire; it never revokes
+// one.
 //
 //nolint:gocognit,gocyclo // one transaction with the cohesive refill/reclaim/grant steps
 func (l *DBLimiter) Acquire(ctx context.Context, resource string, n int) (Grant, error) {
 	if n <= 0 {
 		return Grant{Resource: resource}, nil
 	}
-	if l.rate <= 0 && l.maxConcurrent <= 0 {
+	if !l.readsBucket() {
 		return Grant{Resource: resource, N: n}, nil
 	}
 	now := models.ClockFrom(ctx).Now(ctx)
@@ -139,14 +147,23 @@ func (l *DBLimiter) Acquire(ctx context.Context, resource string, n int) (Grant,
 		if err != nil {
 			return err
 		}
+		c := l.capsFor(locked)
+		if c.rate <= 0 && c.maxConcurrent <= 0 {
+			g = Grant{Resource: resource, N: n}
+			return nil
+		}
 
-		// (2) Refill, carrying the fraction forward in refilled_at.
+		// (2) Refill, carrying the fraction forward in refilled_at, and hold the
+		// tokens to the burst in force, so a lowered burst applies at once.
 		l.refill(&locked, now)
+		if c.rate > 0 && locked.Tokens > c.burst {
+			locked.Tokens = c.burst
+		}
 
 		// (3) Reclaim this resource's expired holds inline, before counting, so
 		// self-healing does not depend on the sweeper running.
 		held := 0
-		if l.maxConcurrent > 0 {
+		if c.maxConcurrent > 0 {
 			if err := tx.Where("resource = ? AND expires_at < ?", resource, now).
 				Delete(&limiterHoldRow{}).Error; err != nil {
 				return fmt.Errorf("reclaim expired holds: %w", err)
@@ -162,11 +179,11 @@ func (l *DBLimiter) Acquire(ctx context.Context, resource string, n int) (Grant,
 
 		// (5) granted = min(ask, tokens, headroom), floored at zero.
 		granted := n
-		if l.rate > 0 && granted > locked.Tokens {
+		if c.rate > 0 && granted > locked.Tokens {
 			granted = locked.Tokens
 		}
-		if l.maxConcurrent > 0 {
-			if room := l.maxConcurrent - held; granted > room {
+		if c.maxConcurrent > 0 {
+			if room := c.maxConcurrent - held; granted > room {
 				granted = room
 			}
 		}
@@ -176,7 +193,7 @@ func (l *DBLimiter) Acquire(ctx context.Context, resource string, n int) (Grant,
 
 		// Persist the refill even on a zero grant: the tokens accrued and the
 		// carried refilled_at must not be lost to a denial.
-		if l.rate > 0 {
+		if c.rate > 0 {
 			locked.Tokens -= granted
 		}
 		if err := tx.Model(&limiterBucketRow{}).Where("resource = ?", resource).
@@ -187,10 +204,10 @@ func (l *DBLimiter) Acquire(ctx context.Context, resource string, n int) (Grant,
 
 		g = Grant{Resource: resource, N: granted}
 		if granted == 0 {
-			g.RetryAfter = l.retryAfter(locked.Tokens, now, locked.RefilledAt)
+			g.RetryAfter = l.retryAfter(locked.Tokens, now, locked.RefilledAt, c)
 			return nil
 		}
-		if l.maxConcurrent > 0 {
+		if c.maxConcurrent > 0 {
 			token := models.NewID()
 			expiresAt := now.Add(l.holdTTL)
 			hold := limiterHoldRow{Token: token, Resource: resource, N: granted, ExpiresAt: expiresAt}
@@ -201,7 +218,7 @@ func (l *DBLimiter) Acquire(ctx context.Context, resource string, n int) (Grant,
 			g.ExpiresAt = expiresAt
 		}
 		if granted < n {
-			g.RetryAfter = l.retryAfter(locked.Tokens, now, locked.RefilledAt)
+			g.RetryAfter = l.retryAfter(locked.Tokens, now, locked.RefilledAt, c)
 		}
 		return nil
 	})
@@ -252,13 +269,56 @@ func (l *DBLimiter) Release(ctx context.Context, g Grant) {
 	}
 }
 
-// refill adds the whole tokens accrued since refilled_at, capped at Burst, and
-// advances refilled_at by exactly the time those tokens cost — carrying the
-// sub-token remainder forward rather than discarding it, which is what keeps the
-// integer bucket's long-run rate exact. When the bucket fills, refilled_at snaps
-// to now (a full bucket has no fraction to keep).
+// limiterCaps is the budget one Acquire applies: the configured values, with
+// each override set on the bucket row in place of its own where the limiter
+// can apply it (see capsFor).
+type limiterCaps struct {
+	rate          int
+	burst         int
+	maxConcurrent int
+}
+
+// readsBucket reports whether Acquire reads the bucket row: whenever a cap is
+// configured, and whenever an override could turn one on — a rate override
+// needs a positive Interval to refill against, and a concurrency override a
+// positive HoldTTL to bound its holds. A limiter with none of them admits with
+// no round trip.
+func (l *DBLimiter) readsBucket() bool {
+	return l.rate > 0 || l.maxConcurrent > 0 || l.interval > 0 || l.holdTTL > 0
+}
+
+// capsFor resolves the budget to apply from the configured values and the
+// overrides on b. A Rate override applies only with a positive Interval, and a
+// MaxConcurrent override only with a positive HoldTTL: without the first there
+// is nothing to refill against, and without the second a hold would lapse at
+// once and over-admit. A Burst override always applies; without one the burst
+// is the configured one, or the rate in force when that is zero.
+func (l *DBLimiter) capsFor(b limiterBucketRow) limiterCaps {
+	c := limiterCaps{rate: l.rate, burst: l.burst, maxConcurrent: l.maxConcurrent}
+	if b.RateOverride != nil && l.interval > 0 {
+		c.rate = *b.RateOverride
+	}
+	if b.MaxConcurrentOverride != nil && l.holdTTL > 0 {
+		c.maxConcurrent = *b.MaxConcurrentOverride
+	}
+	switch {
+	case b.BurstOverride != nil:
+		c.burst = *b.BurstOverride
+	case c.burst <= 0:
+		c.burst = c.rate
+	}
+	return c
+}
+
+// refill adds the whole tokens accrued since refilled_at, capped at the burst
+// in force, and advances refilled_at by exactly the time those tokens cost —
+// carrying the sub-token remainder forward rather than discarding it, which is
+// what keeps the integer bucket's long-run rate exact. When the bucket fills,
+// refilled_at snaps to now (a full bucket has no fraction to keep). The rate
+// and burst in force are b's, after its overrides (capsFor).
 func (l *DBLimiter) refill(b *limiterBucketRow, now time.Time) {
-	if l.rate <= 0 {
+	c := l.capsFor(*b)
+	if c.rate <= 0 {
 		return
 	}
 	elapsed := now.Sub(b.RefilledAt)
@@ -268,33 +328,33 @@ func (l *DBLimiter) refill(b *limiterBucketRow, now time.Time) {
 	// Time to fill the whole bucket from empty. It is also the overflow guard: past
 	// it the bucket is full regardless, so the elapsed*rate multiply below stays
 	// bounded by burst*interval.
-	burstTime := time.Duration(int64(l.burst) * int64(l.interval) / int64(l.rate))
+	burstTime := time.Duration(int64(c.burst) * int64(l.interval) / int64(c.rate))
 	if elapsed >= burstTime {
-		b.Tokens = l.burst
+		b.Tokens = c.burst
 		b.RefilledAt = now
 		return
 	}
-	add := int(int64(elapsed) * int64(l.rate) / int64(l.interval))
+	add := int(int64(elapsed) * int64(c.rate) / int64(l.interval))
 	if add <= 0 {
 		return // less than one token's worth elapsed; keep refilled_at so the fraction carries
 	}
-	b.Tokens = min(l.burst, b.Tokens+add)
-	if b.Tokens >= l.burst {
+	b.Tokens = min(c.burst, b.Tokens+add)
+	if b.Tokens >= c.burst {
 		b.RefilledAt = now
 		return
 	}
-	b.RefilledAt = b.RefilledAt.Add(time.Duration(int64(add) * int64(l.interval) / int64(l.rate)))
+	b.RefilledAt = b.RefilledAt.Add(time.Duration(int64(add) * int64(l.interval) / int64(c.rate)))
 }
 
 // retryAfter is the exact wait to the next whole token, given the post-refill
 // token count and refilled_at. It returns zero when rate limiting is disabled or a
 // whole token is already available — a concurrency-bound denial, which the caller
 // cannot time and so falls back to its poll interval.
-func (l *DBLimiter) retryAfter(tokens int, now, refilledAt time.Time) time.Duration {
-	if l.rate <= 0 || tokens >= 1 {
+func (l *DBLimiter) retryAfter(tokens int, now, refilledAt time.Time, c limiterCaps) time.Duration {
+	if c.rate <= 0 || tokens >= 1 {
 		return 0
 	}
-	perToken := time.Duration(int64(l.interval) / int64(l.rate))
+	perToken := time.Duration(int64(l.interval) / int64(c.rate))
 	if wait := refilledAt.Add(perToken).Sub(now); wait > 0 {
 		return wait
 	}
@@ -374,4 +434,111 @@ func (l *DBLimiter) RunSweeper(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// LimiterBudget is a shared limiter resource's overrides: each field set
+// replaces the DBLimiter's configured value of the same name on every Acquire
+// against the resource, in every process sharing the database; a nil field
+// keeps the configured value. A Rate override applies only to a limiter
+// configured with a positive Interval, and a MaxConcurrent override only to one
+// configured with a positive HoldTTL.
+type LimiterBudget struct {
+	MaxConcurrent *int `json:"max_concurrent,omitempty"`
+	Rate          *int `json:"rate,omitempty"`
+	Burst         *int `json:"burst,omitempty"`
+}
+
+// equal reports whether b and o set the same overrides to the same values.
+func (b LimiterBudget) equal(o LimiterBudget) bool {
+	same := func(x, y *int) bool { return (x == nil) == (y == nil) && (x == nil || *x == *y) }
+	return same(b.MaxConcurrent, o.MaxConcurrent) && same(b.Rate, o.Rate) && same(b.Burst, o.Burst)
+}
+
+// overrides is the budget a bucket row stores.
+func (b limiterBucketRow) overrides() LimiterBudget {
+	return LimiterBudget{MaxConcurrent: b.MaxConcurrentOverride, Rate: b.RateOverride, Burst: b.BurstOverride}
+}
+
+// SetLimiterBudget sets resource's overrides to b, replacing all three: a field
+// set overrides its configured value from the next Acquire on, in every process
+// sharing db, with no deploy, and a nil field clears its override, so the zero
+// LimiterBudget clears them all. It changes caps, never holds: a MaxConcurrent
+// lowered below what is held grants nothing new until enough holds are released
+// or expire, and revokes none. Overrides are values from 1 up; to stop a
+// resource, pause the queues that use it.
+//
+// The resource must have limiter state — a limiter_buckets row, which a
+// DBLimiter writes on its first Acquire, and which ListLimiters lists — since
+// only the limiter knows what a new bucket starts with, and a resource no
+// limiter uses is almost always a misspelling.
+//
+// It locks the resource's bucket row (on PostgreSQL; SQLite serializes
+// writers) and writes the three override columns. In the same transaction — a
+// savepoint when db is a caller's transaction — it writes one AuditLimitsSet
+// entry for the resource (AuditTargetLimiter) to the control history, with the
+// overrides before and after as "from" and "to", attributed to the context's
+// actor (WithActor; the system when there is none), and runs the context's
+// audit hook; a hook that fails rolls the change back. A call that sets the
+// overrides already set changes nothing and records nothing.
+//
+// An empty resource is refused with a *ValidationError naming "resource", a
+// field set below 1 with one naming "max_concurrent", "rate", or "burst", and
+// an actor the history can't record with one naming its field, each before
+// anything is read or written; a resource with no limiter state is refused with
+// one naming "resource", and nothing is written.
+func SetLimiterBudget(ctx context.Context, db *gorm.DB, resource string, b LimiterBudget) error {
+	if db == nil {
+		return errors.New("flywheel: SetLimiterBudget: db is nil")
+	}
+	actor, err := resolveActor(ctx)
+	if err != nil {
+		return err
+	}
+	if resource == "" {
+		return newValidationError("resource", "is required")
+	}
+	for _, f := range []struct {
+		field string
+		value *int
+	}{{"max_concurrent", b.MaxConcurrent}, {"rate", b.Rate}, {"burst", b.Burst}} {
+		if f.value != nil && *f.value < 1 {
+			return newValidationError(f.field, "must be at least 1")
+		}
+	}
+
+	var refused error
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		q := quietMissing(tx).Model(&limiterBucketRow{}).Where("resource = ?", resource)
+		if tx.Name() == "postgres" {
+			q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		var row limiterBucketRow
+		if err := q.Take(&row).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				refused = newValidationError("resource", "has no limiter state: a DBLimiter creates it on its first Acquire")
+				return nil
+			}
+			return err
+		}
+		before := row.overrides()
+		if before.equal(b) {
+			return nil
+		}
+		if err := tx.Model(&limiterBucketRow{}).Where("resource = ?", resource).Updates(map[string]any{
+			"max_concurrent_override": b.MaxConcurrent,
+			"rate_override":           b.Rate,
+			"burst_override":          b.Burst,
+		}).Error; err != nil {
+			return err
+		}
+		now := models.ClockFrom(ctx).Now(ctx)
+		return recordAudit(ctx, tx, actor, now, []auditChange{{
+			target: AuditTargetLimiter, targetID: resource, action: AuditLimitsSet,
+			details: map[string]any{"from": before, "to": b},
+		}})
+	})
+	if err != nil {
+		return fmt.Errorf("flywheel: set limiter budget %q: %w", resource, err)
+	}
+	return refused
 }

@@ -14,8 +14,8 @@ const defaultQueueStateRefresh = 5 * time.Second
 
 // queueState is a Runner's view of which of its queues an operator has paused:
 // the set it last read from job_queues, when it last tried to read it, and
-// whether a read has succeeded yet. Its zero value is ready: nothing paused,
-// nothing read.
+// whether a read has succeeded yet. The caps the same read returns go straight
+// to the pool's limit. Its zero value is ready: nothing paused, nothing read.
 type queueState struct {
 	mu sync.Mutex
 	// paused is the paused set the last successful read returned.
@@ -46,11 +46,14 @@ func (r *Runner) queueStateRefresh() time.Duration {
 
 // claimable returns the queues the Runner claims from now: its configured
 // queues without the ones an operator paused, in configuration order. It reads
-// the paused set at most once per refresh, when one has passed since its last
-// attempt — one primary-key read of job_queues over the Runner's queues. A read
-// that fails keeps the set the last successful one returned, and warns once
-// for the streak; until a read succeeds, every configured queue is claimable.
-// With the refresh off it returns every configured queue and reads nothing.
+// the queue state at most once per refresh, when one has passed since its last
+// attempt — one primary-key read of job_queues over the Runner's queues, which
+// returns the paused set and the concurrency caps — and applies the smallest
+// cap among its queues as the pool's limit, or Concurrency with none. A read
+// that fails keeps the set and the limit the last successful one left, and
+// warns once for the streak; until a read succeeds, every configured queue is
+// claimable and no cap applies. With the refresh off it returns every
+// configured queue and reads nothing.
 func (r *Runner) claimable(ctx context.Context) []string {
 	refresh := r.queueStateRefresh()
 	if refresh <= 0 {
@@ -61,10 +64,9 @@ func (r *Runner) claimable(ctx context.Context) []string {
 	defer s.mu.Unlock()
 	if now := time.Now(); s.lastTry.IsZero() || now.Sub(s.lastTry) >= refresh {
 		s.lastTry = now
-		var paused []string
-		err := r.cfg.DB.WithContext(ctx).Model(&jobQueueRow{}).
-			Where("queue IN ? AND paused_at IS NOT NULL", r.cfg.Queues).
-			Pluck("queue", &paused).Error
+		var rows []jobQueueRow
+		err := r.cfg.DB.WithContext(ctx).Model(&jobQueueRow{}).Select("queue", "paused_at", "max_concurrency").
+			Where("queue IN ?", r.cfg.Queues).Find(&rows).Error
 		switch {
 		case err != nil && ctx.Err() == nil:
 			if !s.failing {
@@ -75,10 +77,23 @@ func (r *Runner) claimable(ctx context.Context) []string {
 		case err == nil:
 			s.failing = false
 			s.read = true
-			s.paused = make(map[string]bool, len(paused))
-			for _, q := range paused {
-				s.paused[q] = true
+			s.paused = make(map[string]bool, len(rows))
+			var capped *int
+			for _, row := range rows {
+				if row.PausedAt != nil {
+					s.paused[row.Queue] = true
+				}
+				if row.MaxConcurrency != nil && (capped == nil || *row.MaxConcurrency < *capped) {
+					capped = row.MaxConcurrency
+				}
 			}
+			// The pool clamps the limit to its size, so a cap above Concurrency
+			// changes nothing.
+			limit := r.cfg.Concurrency
+			if capped != nil {
+				limit = *capped
+			}
+			r.pool.setLimit(limit)
 		}
 	}
 	if !s.read || len(s.paused) == 0 {
@@ -87,8 +102,9 @@ func (r *Runner) claimable(ctx context.Context) []string {
 	return slices.DeleteFunc(slices.Clone(r.cfg.Queues), func(q string) bool { return s.paused[q] })
 }
 
-// untilQueueStateRefresh is how long until the Runner reads the paused set
-// again: how long a Runner whose every queue is paused waits before it looks.
+// untilQueueStateRefresh is how long until the Runner reads the queue state
+// again: how long a Runner whose every queue is paused waits before it looks,
+// and the longest a Runner whose every slot is busy waits for one.
 func (r *Runner) untilQueueStateRefresh() time.Duration {
 	s := &r.queueState
 	s.mu.Lock()
