@@ -1659,6 +1659,65 @@ HOT, and fails (1 of 51) once an index on `job_runs (progress_at)` is added.
 
 <br/>
 
+## Run-log capture
+
+With `RunnerConfig.CaptureLogs` set, each line a worker logs is encoded once and kept in memory, and an
+attempt's lines are written to `job_run_logs`: on the heartbeat while it runs, and in one insert after its
+finalize, while the attempt still holds its slot. The question is what that costs a drain.
+
+**The shape is the worst case, on purpose.** The heartbeat A/B's drain — 100,000 jobs on 4 runners × 8
+slots, 25 ms of work, a 1 s lease — with every job logging 10 lines at info before it works. A 25 ms job
+ends inside one heartbeat interval, so each attempt's lines are one insert after its finalize: one more
+statement per job, and ten rows in a table that otherwise gets nothing. Both halves log the same lines to
+the same discarding handler; only `CaptureLogs` differs.
+
+**The measurement.** Six off/on pairs of `BenchmarkDrainWithLogCaptureOff` and `…On`, alternating,
+`-count 1` each, a `CHECKPOINT` before each run
+([`run-logs-ab.txt`](benchmarks/run-logs-ab.txt)), and the scenario at scale, four runs off, on, off, on
+([`run-logs-off-1.json`](benchmarks/run-logs-off-1.json) to
+[`run-logs-on-2.json`](benchmarks/run-logs-on-2.json)):
+
+| | Off | On (`CaptureLogs`) |
+|---|---|---|
+| Benchmark, six pairs in order, jobs/s | 521.7, 890.8, 576.9, 1,005, 985.1, 1,023 | 801.5, 775.1, 911.1, 909.0, 917.4, 941.1 |
+| Benchmark median | 938.0 jobs/s | 910.1 jobs/s (−3.0 %) |
+| Scenario, two runs, jobs/s | 1,033.5, 1,017.7 | 945.6 (−8.5 %), 947.8 (−6.9 %) |
+| `job_run_logs` after the scenario run | — | 993,777 lines: 252 MiB of table, 86 MiB of index |
+
+**Read it as 7–10 % on this shape.** The benchmark medians differ by 3 %, but two of the off runs drained
+a database still working through the previous run's writes (claim p99 39–77 ms against 3–8 ms for the
+rest); the three settled pairs read −9.6 %, −6.9 %, and −8.0 %, and the scenario −8.5 % and −6.9 %. The
+cost is the insert, not the capture: in a diagnostic variant of the harness that captured at a `MinLevel`
+above every line logged, so nothing was kept or written, 20,000-job drains ran as fast as capture off
+(987 and 952 jobs/s against 975 and 952). The insert is one per attempt
+and its size is per line, so a job that runs for seconds, or logs a line or two, pays proportionally less;
+a line here costs about 350 bytes of table and index.
+
+**What the measurement taught.** Run the halves interleaved: a `-count 6` run of the off half and then the
+on half read −52 %, because the on half's six million rows piled up on a slow disk until its last two runs
+drained at 237 jobs/s, and a run that wrote no line at all, straight after, drained at 467. And keep the
+attempt's last write to one statement: wrapped in its own transaction it took three round trips while the
+attempt held its slot, and the same interleaved method read −13 %. The insert skips any line already
+written, so a write that fails half done is safe to repeat without the transaction.
+
+**Environment.** As for the progress A/B above: Apple M1 Max (10 cores, 32 GB), macOS 15.7.9, go1.27.2,
+PostgreSQL 17.10 (`postgres:17-alpine`) in Docker Desktop (10 CPUs, 8 GB), reached over a published loopback
+port; the tree was `683cc8f` with this change.
+
+```bash
+docker exec <container> psql -U flywheel -d flywheel_bench -c CHECKPOINT   # before each run
+go test -tags=loadtest -run '^$' -bench '^BenchmarkDrainWithLogCaptureOff$' -count 1 -timeout 60m ./loadtest/
+go test -tags=loadtest -run '^$' -bench '^BenchmarkDrainWithLogCaptureOn$' -count 1 -timeout 60m ./loadtest/
+go run -tags=loadtest ./loadtest/cmd/scenario -dsn "$FLYWHEEL_LOADTEST_DATABASE_URL" \
+  -jobs 100000 -runners 4 -workers 8 -mix drain -work 25ms -lease 1s -storage-tuning -log-lines 10 \
+  -timeout 60m -out docs/benchmarks/run-logs-off-1.json
+go run -tags=loadtest ./loadtest/cmd/scenario -dsn "$FLYWHEEL_LOADTEST_DATABASE_URL" \
+  -jobs 100000 -runners 4 -workers 8 -mix drain -work 25ms -lease 1s -storage-tuning -log-lines 10 \
+  -capture-logs -timeout 60m -out docs/benchmarks/run-logs-on-1.json
+```
+
+<br/>
+
 ## Replaying a failed cohort: re-convergence, and the one-more-try defect it replaces
 
 "Replay the failures" is the common operator action after an incident, and the runtime used to support
@@ -1802,6 +1861,39 @@ tree at `a489344` with this change.
 ```bash
 FLYWHEEL_TEST_DATABASE_URL=postgres://… \
   go test -tags=integration -count=1 -run '^$' -bench BenchmarkDBLimiterAcquirePostgres -count 6 ./internal/core/
+```
+
+<br/>
+
+## Retention rules at a million jobs
+
+`RetentionOpts.Rules` turn the retention batch's one `finalized_at < ?` into a `CASE` over each job's kind
+and state, and `RetentionStatus` reads, for each rule and the default, the oldest job it keeps and the jobs
+it has due. The stats characterization above — a million runs over 30 days across twenty kinds — measures
+both, with two rules, discarded jobs kept 90 days and `kind-7` kept 7, over a 14-day default; the report,
+[`retention-rules-1m.txt`](benchmarks/retention-rules-1m.txt), holds every read of the characterization,
+these two last:
+
+| Read | Median | Min–max | `SELECT`s |
+|---|---|---|---|
+| `RetentionStatus`, two rules and the default | 79.6 ms | 70.2–90.5 ms | 11 |
+| A retention pass with the two rules, 3 batches of 1,000, rolled back | 105.9 ms | 88.4–119.0 ms | 6 |
+
+- **The batch stays a primary-key walk.** With the `CASE` in place, each batch's selection is the same
+  `jobs_pkey` index scan the single cutoff uses, 1,000 rows in 0.38–0.41 ms. The pass's time is its
+  deletes, in their order — finish-log entries, run-log lines (none in this fixture), runs, then jobs — for
+  3,000 jobs.
+- **`RetentionStatus` reads two ways.** A row's oldest job is one `jobs_finished` range per terminal state
+  it can decide: under 0.05 ms when the range's first entry is the row's, up to 14 ms when the row decides
+  none of that state's jobs and the read walks the range to its end. A due count stops at 10,001 rows; for
+  the rows whose cutoff most jobs pass, the planner reads `jobs` with a parallel scan the stop bounds, 14 and
+  29 ms here. At 80 ms for the whole report, it is an operator's read, not one to poll.
+
+**Environment.** As for the run-log capture A/B above, the tree at `683cc8f` with this change.
+
+```bash
+go run -tags=loadtest ./loadtest/cmd/explain -dsn "$FLYWHEEL_LOADTEST_DATABASE_URL" -query stats \
+  -jobs 1000000 -timeout 90m -out docs/benchmarks/retention-rules-1m.txt
 ```
 
 <br/>

@@ -556,6 +556,25 @@ month of history; a 2-minute window (used in load tests) keeps almost nothing. T
 insert with that key runs the work again. A key that must refuse duplicates for longer than the window
 has to be held where retention does not prune (see [`COOKBOOK.md`](COOKBOOK.md), recipe 1).
 
+**Keeping some kinds or states longer.** One window for everything keeps every job as long as the longest
+need. `SchedulerConfig.RetentionRules` keep the jobs a rule matches — a kind, a terminal state, or both —
+for the rule's own `MaxAge`; `RetentionMaxAge` still applies to every job no rule matches, and the most
+specific matching rule decides (kind and state, then kind, then state). A common pair: discarded jobs kept
+90 days, because they are the ones an operator investigates, and a noisy kind kept a week. Rules need
+`RetentionMaxAge` set; the Scheduler refuses them otherwise, and refuses a malformed rule, before it
+starts. `flywheel prune --rule kind=<kind>,state=<state>,keep=<duration>` (repeatable) applies the same
+rules once from the CLI.
+
+**Before you change a window, look.** `flywheel retention --older-than 30d --rule state=discarded,keep=90d`
+prints, for each rule and the default, the cutoff a prune would use now, the oldest finished job it keeps,
+and how many jobs are due (`10000+` past ten thousand); `RetentionStatus` returns the same rows. Each job
+counts once, under the rule that decides it. It reads a range per terminal state, so run it when you need
+it rather than on a timer.
+
+**Captured log lines go with their runs.** A job's run-log lines (`RunnerConfig.CaptureLogs`) are deleted
+with its runs, before them, so a Scheduler with `RetentionMaxAge` set refuses to start without
+`job_run_logs`, and lines never outlive the attempts they describe.
+
 **Enabling it safely on an old database.** The *first* prune against a long-lived database that has
 never had retention deletes its entire backlog of aged terminal jobs. The batching bounds each
 transaction, so it will not take a table-wide lock or exhaust the bind-parameter ceiling — but it can

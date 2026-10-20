@@ -260,7 +260,7 @@ Each section below is self-contained; open the ones you need.
 <summary><strong><code>Schema setup — pick exactly one install path</code></strong></summary>
 <br>
 
-`go-flywheel` owns fourteen tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
+`go-flywheel` owns fifteen tables, the ones `Models()` returns — `jobs`, `job_runs`, and `job_periodics`;
 `limiter_buckets` and `limiter_holds` for the shared database-backed limiter (additive: empty unless you
 construct a `DBLimiter`); `job_run_finishes`, `job_stats_hourly`, and `job_stats_progress`, the finish
 log every finalize writes and the stats rollup's tables; `job_audit`, the history every control
@@ -268,9 +268,10 @@ writes; `job_kinds`, the kind catalog `PublishKinds` writes (empty unless you pu
 `job_error_groups_hourly`, the error groups the stats rollup writes beside its hours;
 `job_queue_samples`, each queue's depth over time (empty unless a Scheduler samples queues);
 `job_nodes`, one row per process lifetime of a registering Node (empty unless a Node sets
-`RegistryInterval`); and `job_queues`, the queues an operator paused, by whom, and why — and there
-are **two ways to install them. Pick exactly one.** They are not layers; running both means two
-migration authorities against one database.
+`RegistryInterval`); `job_queues`, the queues an operator paused, by whom, and why; and
+`job_run_logs`, the lines workers logged during each attempt (empty unless a Runner sets
+`CaptureLogs`) — and there are **two ways to install them. Pick exactly one.** They are not layers;
+running both means two migration authorities against one database.
 
 | Question | **Library-owned** | **Host-owned** |
 |---|---|---|
@@ -279,11 +280,11 @@ migration authorities against one database.
 | Who sets the storage parameters? | `Migrate(db)` | you, from `InstallStorageParameters` |
 | Who owns migration history? | nobody — `AutoMigrate` is declarative | your migration tool |
 | Does the runtime run DDL at startup? | yes, every start | no |
-| Is a co-located host schema safe? | only if the host's tooling excludes all fourteen tables | yes — the tables are in your loader |
+| Is a co-located host schema safe? | only if the host's tooling excludes all fifteen tables | yes — the tables are in your loader |
 | **Pick this when** | the database is the runtime's alone: a dedicated queue database, a CLI, a local SQLite file | the runtime's tables share a database with an application schema |
 
 **The last row is the rule: a shared database means host-owned.** If your app's own tables live in the
-same database, your migration tool must know about all fourteen — a tool that cannot see them will happily
+same database, your migration tool must know about all fifteen — a tool that cannot see them will happily
 propose dropping them. A tool told to leave the runtime's tables alone by name needs every name above.
 
 **Library-owned** — one call, no external tooling:
@@ -304,7 +305,7 @@ up-to-date schema — a re-run creates nothing and changes nothing — so it is 
 
 ```go
 // 1. In your schema loader (Atlas / atlas-provider-gorm, or any GORM-based generator),
-//    so your migration tool knows all fourteen tables exist and never proposes dropping them.
+//    so your migration tool knows all fifteen tables exist and never proposes dropping them.
 stmts, err := gormschema.New("postgres").Load(
     append(myapp.AllModels(), flywheel.Models()...)...,
 )
@@ -320,7 +321,7 @@ if err := flywheel.InstallStorageParameters(ctx, db); err != nil {
 
 Step 2 is **not optional and not an optimization.** `Models()` gives your loader the tables and columns;
 it does not give it the indexes, because every one of them has a `WHERE` predicate or spans columns a
-GORM struct tag cannot express. `IndexSet` declares seventeen indexes, and four of them are
+GORM struct tag cannot express. `IndexSet` declares eighteen indexes, and four of them are
 correctness-bearing: `jobs_unique_key`, `jobs_unique_active_key`, `job_runs_job_attempt`, and
 `idx_job_periodics_slug`. Without `jobs_unique_key` and `jobs_unique_active_key` the database accepts
 duplicate enqueues and **`ErrAlreadyEnqueued` is never returned.** Use `flywheel.IndexSet(dialect)` when
@@ -989,6 +990,69 @@ second costs the same one write per interval as one reporting once.
 whose Runner renews no lease (a negative `HeartbeatInterval`, or a `Driver` that issues no lease token), an
 attempt whose claim is gone, and a `Job` your own code built rather than the Runner. Progress is a report on
 a running attempt, not a record: put what an attempt produced in `Result.Output`.
+
+</details>
+
+<details>
+<summary><strong><code>Capturing a run's log lines</code></strong></summary>
+<br>
+
+An operator reading a failed attempt wants what its worker logged, beside its outcome, without a trip to
+your log store. Set `RunnerConfig.CaptureLogs` and the Runner keeps the lines each worker logs through
+`job.Logger`, per attempt, in `job_run_logs`; `ListRunLogs` reads them back:
+
+```go
+cfg := flywheel.RunnerConfig{
+    DB: db, Driver: driver, Registry: reg, Queues: []string{"default"},
+    CaptureLogs: &flywheel.RunLogCapture{}, // info and up, within the default bounds
+}
+
+// Later, for one attempt: its run id comes from ListRuns, LatestRun, or GetJob.
+lines, err := flywheel.ListRunLogs(ctx, db, runID, flywheel.ListRunLogsParams{})
+for _, l := range lines {
+    fmt.Println(l.Seq, l.LoggedAt.Format(time.RFC3339), l.Level, l.Message, string(l.Attrs))
+}
+```
+
+**What is captured.** Every record `job.Logger` handles at or above `MinLevel` (zero is info): its message,
+level, and time, and the attributes the worker gave it or added with `With` and `WithGroup`, nested by group
+as slog's JSON handler writes them (`{"tenant":"t1","req":{"status":200}}`). The attributes the Runner binds
+onto `job.Logger` — `job_id`, `kind`, `queue`, `run_id`, `attempt`, `max_attempts`, and `request_id` — are
+left out, since each line is already keyed by its attempt; a worker's own attribute with one of those names
+is kept as written. Your handler receives exactly the records it receives without capture: `MinLevel` filters
+only what is kept. Lines hold whatever your workers log, so keep secrets and personal data out of them, as
+you would out of any log.
+
+**The bounds.** An attempt keeps at most `MaxLines` lines (zero selects `DefaultRunLogLines`, 1,000; at most
+`MaxRunLogLines`, 10,000) and `MaxBytes` bytes (zero selects `DefaultRunLogBytes`, 256 KiB; at most
+`MaxRunLogBytes`, 1 MiB), a line counting its message plus its attributes as JSON. Once a line would pass
+either bound, it and every later line are dropped and counted, and the attempt's last write adds one more
+line, `jobs: run log truncated`, at warn, with `{"dropped_lines": n}`. A worker in a tight loop cannot fill
+the database.
+
+**When lines reach the database.** On the lease heartbeat — after each renewal that keeps the claim, in
+batched inserts of what was logged since the last write — and once after the attempt's finalize. A running
+attempt's lines are readable within one `HeartbeatInterval` of being logged, and a short attempt's are
+written in one insert after it ends. With renewal off (a negative `HeartbeatInterval`, or a `Driver` that
+issues no lease token), every line is written after the attempt ends. A write that fails is retried by the
+next one; the last write's failure is logged at warn (`jobs: run log write failed`), and its lines are lost,
+as are the lines a process held when it died. An attempt whose claim was lost still writes its lines: they
+describe work that happened.
+
+**Reading them.** `ListRunLogs` reads one attempt's lines in sequence order, after `AfterSeq`, at or above
+`MinLevel` when you set it, at most `Limit` a page (zero reads 200, which is also `MaxReadLimit`), by the
+table's primary key. Page on with `AfterSeq` set to the last `Seq` read. `flywheel jobs logs <run-id>` is the
+same read from the CLI.
+
+**Pruning.** A job's lines are deleted with its runs — by retention, `DeleteJob`, and a `BulkJobs` delete —
+after the runs' finish-log entries and before the runs, by `job_id` (the `job_run_logs_job` index), so a
+foreign key of yours from the lines to `job_runs` holds. Lines never outlive the runs they describe.
+
+**The cost.** Capture is off unless you set it. With it on, each line is encoded once and kept in memory
+until the next write, and a write is one insert per 500 lines, so a worker that logs ten lines a job costs
+one insert per attempt. [docs/BENCHMARKS.md](docs/BENCHMARKS.md#run-log-capture) measures it, and
+[docs/TUNING.md](docs/TUNING.md#run-log-capture) covers the bounds. A Runner with `CaptureLogs` set refuses
+to start, with `ErrSchemaOutdated`, until `job_run_logs` exists.
 
 </details>
 
@@ -2225,15 +2289,46 @@ deleted, err := flywheel.DeleteFinishedJobsWithOptions(ctx, db, cutoff,
 it — set `HoldForStatsRollup` in `RetentionOpts` for a pass of your own — so no run is deleted before the
 rollup has counted it.
 
+**Keeping some jobs longer, or shorter.** One window for every finished job forces the longest need on all
+of them. `RetentionRules` keep the jobs a rule matches — a kind, a terminal state, or both — for the rule's
+own `MaxAge`, and `RetentionMaxAge` still applies to every job no rule matches:
+
+```go
+cfg := flywheel.SchedulerConfig{
+    RetentionMaxAge: 30 * 24 * time.Hour,
+    RetentionRules: []flywheel.RetentionRule{
+        {State: flywheel.StateDiscarded, MaxAge: 90 * 24 * time.Hour}, // the jobs an operator investigates
+        {Kind: "metrics.flush", MaxAge: 7 * 24 * time.Hour},           // a noisy kind nobody reads back
+    },
+}
+```
+
+The most specific rule that matches a job decides its cutoff — one naming its kind and state, then one
+naming its kind, then one naming its state — whatever order you list them in, so a discarded
+`metrics.flush` job above goes after 7 days. The stats-rollup hold caps every rule's cutoff as it caps the
+default's, so a short rule never deletes a run the rollup has yet to count. The Scheduler checks the rules
+when it is built and refuses rules without `RetentionMaxAge`, a rule naming a state that is not terminal or
+naming neither a kind nor a state, two rules with the same kind and state, and, with the stats rollup on, a
+rule shorter than one hour plus `StatsRollupGrace`. `RetentionOpts.Rules` applies rules to a pass of your
+own, and `flywheel prune --rule kind=metrics.flush,keep=7d` from the CLI.
+
+**Before you change a window.** `RetentionStatus` reports, for each rule and the default, the cutoff a pass
+would use now, the oldest finished job it keeps, and how many jobs are due (exact to 10,000, then capped,
+with the planner's estimate on PostgreSQL). Each job counts once, under the rule that decides it.
+`flywheel retention --rule …` prints the same. It reads the `jobs_finished` range of every terminal state a
+row needs: an operator's read, not one to poll.
+
 **If your schema references `job_runs`.** The library declares no foreign key between `jobs` and
 `job_runs`, but your schema may. A row of yours pointing at `job_runs.id` must be `ON DELETE SET NULL`
 — or retention has to stay off, because a prune becomes a foreign-key event in a table the runtime
-does not own. Within each batch the audit rows are deleted before their jobs, which is contractual
-rather than incidental: under an `ON DELETE CASCADE` the reverse order lets the cascade do the work
-silently.
+does not own. Within each batch the runs' finish-log entries and captured log lines are deleted before
+the runs, and the runs before their jobs, which is contractual rather than incidental: under an
+`ON DELETE CASCADE` the reverse order lets the cascade do the work silently.
 
 Only terminal jobs are ever removed — succeeded, cancelled, discarded, and only those finalized before
-the cutoff. Pending and running work is never touched, whatever its age.
+the cutoff. Pending and running work is never touched, whatever its age. A job's runs go with it, and so
+do their captured log lines, so a Scheduler with `RetentionMaxAge` set refuses to start without
+`job_run_logs` (`ErrSchemaOutdated`).
 
 **Retention frees `UniqueKey`s.** A `UniqueKey` collides only with a job whose row exists, so deleting a
 job frees its key, and an `Insert` with that key afterwards runs the work again. If a key must keep
