@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -16,8 +17,8 @@ import (
 )
 
 // newJobsCmd builds the `flywheel jobs` command group: ls, count, running,
-// inspect, tree, history, retry, cancel, reschedule, priority, pause, resume,
-// delete.
+// inspect, tree, history, logs, retry, cancel, reschedule, priority, pause,
+// resume, delete.
 func newJobsCmd(configPath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "jobs", Short: "Inspect and operate jobs"}
 	cmd.AddCommand(
@@ -27,6 +28,7 @@ func newJobsCmd(configPath *string) *cobra.Command {
 		newJobsInspectCmd(configPath),
 		newJobsTreeCmd(configPath),
 		newJobsHistoryCmd(configPath),
+		newJobsLogsCmd(configPath),
 		newJobsRetryCmd(configPath),
 		newJobsCancelCmd(configPath),
 		newJobsRescheduleCmd(configPath),
@@ -404,6 +406,67 @@ which source, and the reason they gave. The history outlives the job.`,
 	cmd.Flags().StringVar(&cursor, "cursor", "", "read the next page: the cursor printed under the previous one")
 	cmd.Flags().IntVar(&limit, "limit", 50, "maximum entries (at most 200)")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the page as JSON (entries, next_cursor) instead of a table")
+	return cmd
+}
+
+// newJobsLogsCmd builds `flywheel jobs logs <run-id>`: the lines one attempt's
+// worker logged, as a Runner with CaptureLogs kept them.
+func newJobsLogsCmd(configPath *string) *cobra.Command {
+	var (
+		after  int
+		level  string
+		limit  int
+		asJSON bool
+	)
+	cmd := &cobra.Command{
+		Use:   "logs <run-id>",
+		Short: "Show the lines a worker logged during one attempt",
+		Long: `Print the lines one attempt's worker logged through its job's logger, in order:
+its sequence number, when it was logged (UTC), its level, its message, and its
+attributes as JSON. Lines are kept only by a Runner with CaptureLogs set, and
+reach the database on the attempt's heartbeat and once after it ends. The run
+id is a run's id, as jobs inspect lists it. Page on with --after set to the last
+sequence number printed.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			p := flywheel.ListRunLogsParams{AfterSeq: after, Limit: limit}
+			if level != "" {
+				var floor slog.Level
+				if err := floor.UnmarshalText([]byte(level)); err != nil {
+					return fmt.Errorf("--level wants debug, info, warn, or error, got %q", level)
+				}
+				p.MinLevel = &floor
+			}
+			_, db, _, err := loadAndOpen(*configPath)
+			if err != nil {
+				return err
+			}
+			defer closeDB(db)
+
+			lines, err := flywheel.ListRunLogs(cmd.Context(), db, args[0], p)
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				return writeJSON(cmd.OutOrStdout(), lines)
+			}
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
+			_, _ = fmt.Fprintln(tw, "SEQ\tTIME\tLEVEL\tMESSAGE\tATTRS")
+			for _, l := range lines {
+				attrs := "-"
+				if len(l.Attrs) > 0 {
+					attrs = string(l.Attrs)
+				}
+				_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", l.Seq, l.LoggedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+					l.Level, l.Message, attrs)
+			}
+			return tw.Flush()
+		},
+	}
+	cmd.Flags().IntVar(&after, "after", 0, "print the lines after this sequence number")
+	cmd.Flags().StringVar(&level, "level", "", "print only lines at or above this level: debug, info, warn, or error")
+	cmd.Flags().IntVar(&limit, "limit", flywheel.MaxReadLimit, "maximum lines (at most 200)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the lines as JSON instead of a table")
 	return cmd
 }
 
