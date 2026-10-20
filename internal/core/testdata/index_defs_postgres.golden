@@ -5,6 +5,7 @@ job_audit_target	CREATE INDEX job_audit_target ON <schema>.job_audit USING btree
 job_error_groups_fingerprint	CREATE INDEX job_error_groups_fingerprint ON <schema>.job_error_groups_hourly USING btree (kind, fingerprint, bucket_start_unix)
 job_nodes_heartbeat	CREATE INDEX job_nodes_heartbeat ON <schema>.job_nodes USING btree (heartbeat_at)
 job_queue_samples_time	CREATE INDEX job_queue_samples_time ON <schema>.job_queue_samples USING btree (sampled_at)
+job_run_logs_job	CREATE INDEX job_run_logs_job ON <schema>.job_run_logs USING btree (job_id)
 job_runs_job_attempt	CREATE UNIQUE INDEX job_runs_job_attempt ON <schema>.job_runs USING btree (job_id, attempt)
 jobs_finished	CREATE INDEX jobs_finished ON <schema>.jobs USING btree (state, finalized_at, id) WHERE (finalized_at IS NOT NULL)
 jobs_parent_state	CREATE INDEX jobs_parent_state ON <schema>.jobs USING btree (parent_job_id, state) WHERE ((parent_job_id IS NOT NULL) AND (deleted_at IS NULL))

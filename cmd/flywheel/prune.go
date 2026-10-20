@@ -13,8 +13,11 @@ import (
 const defaultPruneAge = "14d"
 
 // newPruneCmd builds `flywheel prune`: hard-delete terminal jobs (and their run
-// rows) finalized before the cutoff, reclaiming storage on a long-lived database.
-// It is the one-shot complement to the daemon's optional retention sweep.
+// rows and captured run-log lines) finalized before the cutoff, reclaiming
+// storage on a long-lived database. It is the one-shot complement to the
+// daemon's optional retention sweep. Each --rule keeps the finished jobs it
+// matches for its own age instead; `flywheel retention` shows what a set of
+// rules would keep and delete.
 //
 // With the stats rollup on in the config (runtime.stats_rollup, on by default)
 // it holds for the rollup exactly as the daemon's own retention does: no run the
@@ -24,6 +27,7 @@ func newPruneCmd(configPath *string) *cobra.Command {
 	var (
 		olderThan    string
 		ignoreRollup bool
+		ruleSpecs    []string
 	)
 	cmd := &cobra.Command{
 		Use:   "prune",
@@ -33,6 +37,10 @@ func newPruneCmd(configPath *string) *cobra.Command {
 			age, err := parseHumanDuration(olderThan)
 			if err != nil {
 				return fmt.Errorf("invalid --older-than %q: %w", olderThan, err)
+			}
+			rules, err := parseRetentionRules(ruleSpecs)
+			if err != nil {
+				return err
 			}
 
 			cfg, db, _, err := loadAndOpen(*configPath)
@@ -44,11 +52,11 @@ func newPruneCmd(configPath *string) *cobra.Command {
 			cutoff := time.Now().Add(-age)
 			hold := cfg.Runtime.statsRollupInterval() > 0 && !ignoreRollup
 			deleted, err := flywheel.DeleteFinishedJobsWithOptions(cmd.Context(), db, cutoff,
-				flywheel.RetentionOpts{HoldForStatsRollup: hold})
+				flywheel.RetentionOpts{HoldForStatsRollup: hold, Rules: rules})
 			if err != nil {
 				return err
 			}
-			reportPrune(cmd.OutOrStdout(), deleted, cutoff, hold)
+			reportPrune(cmd.OutOrStdout(), deleted, cutoff, hold, rules)
 			return nil
 		},
 	}
@@ -56,13 +64,18 @@ func newPruneCmd(configPath *string) *cobra.Command {
 		"delete terminal jobs finalized before now minus this duration (e.g. 14d, 2w, 720h)")
 	cmd.Flags().BoolVar(&ignoreRollup, "ignore-stats-rollup", false,
 		"prune runs the hourly stats rollup has not counted yet (their hours are then lost to `flywheel stats`)")
+	addRuleFlag(cmd, &ruleSpecs)
 	return cmd
 }
 
-// reportPrune writes what a prune did, and — when it held for the stats rollup
-// — that it may have stopped short of the cutoff, and why.
-func reportPrune(w io.Writer, deleted int64, cutoff time.Time, held bool) {
+// reportPrune writes what a prune did, the rules it applied, and — when it held
+// for the stats rollup — that it may have stopped short of the cutoff, and why.
+func reportPrune(w io.Writer, deleted int64, cutoff time.Time, held bool, rules []flywheel.RetentionRule) {
 	_, _ = fmt.Fprintf(w, "pruned %d finished job(s) finalized before %s\n", deleted, cutoff.Format(time.RFC3339))
+	for _, rule := range rules {
+		_, _ = fmt.Fprintf(w, "rule %s applied in place of the cutoff to the jobs it matches\n",
+			formatRetentionRule(rule))
+	}
 	if held {
 		_, _ = fmt.Fprintln(w, "held for the stats rollup: jobs whose runs it has not counted yet are kept "+
 			"(--ignore-stats-rollup prunes them anyway)")

@@ -5,6 +5,7 @@ job_audit_target	CREATE INDEX job_audit_target ON job_audit (target_type, target
 job_error_groups_fingerprint	CREATE INDEX job_error_groups_fingerprint ON job_error_groups_hourly (kind, fingerprint, bucket_start_unix)
 job_nodes_heartbeat	CREATE INDEX job_nodes_heartbeat ON job_nodes (heartbeat_at)
 job_queue_samples_time	CREATE INDEX job_queue_samples_time ON job_queue_samples (sampled_at)
+job_run_logs_job	CREATE INDEX job_run_logs_job ON job_run_logs (job_id)
 job_runs_job_attempt	CREATE UNIQUE INDEX job_runs_job_attempt ON job_runs (job_id, attempt)
 jobs_finished	CREATE INDEX jobs_finished ON jobs (state, finalized_at, id) WHERE finalized_at IS NOT NULL
 jobs_parent_state	CREATE INDEX jobs_parent_state ON jobs (parent_job_id, state) WHERE parent_job_id IS NOT NULL AND deleted_at IS NULL

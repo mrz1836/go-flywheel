@@ -36,7 +36,19 @@ const (
 	// statsTimingRuns is how many timed calls each read gets after one warm-up;
 	// the report publishes the median.
 	statsTimingRuns = 7
+	// statsExplainRetention is the default age the retention reads use, for
+	// the jobs no rule matches: `flywheel prune`'s.
+	statsExplainRetention = 14 * 24 * time.Hour
 )
+
+// statsExplainRetentionRules are the retention reads' rules: discarded jobs
+// kept 90 days, longer than the seeded history, and one kind kept 7.
+func statsExplainRetentionRules() []flywheel.RetentionRule {
+	return []flywheel.RetentionRule{
+		{State: flywheel.StateDiscarded, MaxAge: 90 * 24 * time.Hour},
+		{Kind: "kind-7", MaxAge: 7 * 24 * time.Hour},
+	}
+}
 
 // StatsExplainReport is one stats characterization: the database it ran
 // against, how each read API performed, and the plan of every statement each
@@ -361,6 +373,22 @@ func statsReads(now, typicalHour, denseHour time.Time, treeRoot string, sched *f
 			_, err := flywheel.QueryJobs(ctx, db, flywheel.JobQuery{
 				ErrorContains: "connection refused", CreatedFrom: now.Add(-7 * day), Kinds: []string{failingKind},
 			})
+			return err
+		}},
+		{"RetentionStatus, two rules", func(ctx context.Context, db *gorm.DB) error {
+			_, err := flywheel.RetentionStatus(ctx, db, statsExplainRetention, statsExplainRetentionRules())
+			return err
+		}},
+		{"Retention pass with two rules, 3 batches (rolled back)", func(ctx context.Context, db *gorm.DB) error {
+			// The pass runs inside a transaction the read rolls back, so every timed
+			// call deletes the same three batches from the same history.
+			tx := db.WithContext(ctx).Begin()
+			if tx.Error != nil {
+				return tx.Error
+			}
+			defer tx.Rollback()
+			_, err := flywheel.DeleteFinishedJobsWithOptions(ctx, tx, now.Add(-statsExplainRetention),
+				flywheel.RetentionOpts{MaxBatches: 3, Rules: statsExplainRetentionRules()})
 			return err
 		}},
 		{"Rollup pass, caught up", func(ctx context.Context, _ *gorm.DB) error {

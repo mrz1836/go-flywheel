@@ -21,6 +21,10 @@ type attemptHooks struct {
 	// progress is the sink the worker's SetProgress reports into: after each
 	// renewal that held the claim, the heartbeat writes what changed.
 	progress *progressSink
+	// logs is the attempt's captured run log (RunnerConfig.CaptureLogs), nil
+	// without it: after each renewal that held the claim, the heartbeat writes
+	// the lines captured since its last write.
+	logs *runLogBuffer
 }
 
 // renewal is what one renewal attempt found.
@@ -37,9 +41,9 @@ const (
 
 // startHeartbeat renews one attempt's lease until the returned stop is called or
 // the claim is lost, and returns the stop. After each renewal that holds the
-// claim it writes the attempt's progress, when it changed; with a cancel hook,
-// after a lost claim it reads the job's state and fires the cancel for a
-// cancelled job.
+// claim it writes the attempt's progress, when it changed, and the run-log
+// lines captured since its last write; with a cancel hook, after a lost claim it
+// reads the job's state and fires the cancel for a cancelled job.
 //
 // # Why the context is detached
 //
@@ -77,6 +81,14 @@ const (
 // the claim means no write follows a lost claim, so the write needs no fence
 // of its own and stays one UPDATE of the run's two progress columns by id,
 // which no index covers.
+//
+// # Why captured lines ride it too
+//
+// For the same reason: a worker that logs is written once an interval, in
+// batched inserts, rather than once a line, and an operator reads a running
+// attempt's lines no later than one interval after they were logged. After a
+// lost claim the heartbeat stops, and the attempt's last write, after its
+// finalize, writes what is left.
 func (r *Runner) startHeartbeat(
 	ctx context.Context, raw RawJob, runID string, hooks attemptHooks,
 ) (stop func()) {
@@ -108,6 +120,7 @@ func (r *Runner) startHeartbeat(
 				switch verdict, renewedAt := r.renewOnce(hbCtx, raw, runID); verdict {
 				case renewalHeld:
 					r.writeProgress(hbCtx, raw, runID, hooks.progress, renewedAt)
+					hooks.logs.flush(hbCtx, r.cfg.DB, r.cfg.Logger, false)
 					continue
 				case renewalFailed:
 					continue

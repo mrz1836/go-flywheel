@@ -41,6 +41,32 @@ never reclaimed, because each renewal pushes `leased_until` ahead of the sweep's
 
 <br>
 
+## Run-log capture
+
+`RunnerConfig.CaptureLogs` costs nothing to the workers that log nothing at or above its `MinLevel`; what
+it costs is the inserts. Each attempt's lines are written on its heartbeat, in one insert of what was
+logged since the last write, and once after its finalize, in one insert of the rest, while the attempt
+holds its slot. A line counts its message plus its attributes as JSON against the bounds, and takes about
+350 bytes of table and index.
+
+- **The bounds cap one attempt, not the table.** `MaxLines` (1,000) and `MaxBytes` (256 KiB) stop a worker
+  in a tight loop from writing millions of rows; past either, the attempt keeps what it had and adds one
+  truncation line. Raise them, up to 10,000 lines and 1 MiB, for a job whose whole log you need; the table
+  grows by what your jobs log times how long retention keeps them.
+- **`MinLevel` is the cheapest lever.** A record below it is neither encoded nor written, so capturing at
+  warn keeps the lines an operator reads a failure by and costs a drain almost nothing when jobs succeed
+  quietly. The host's own handler still receives every record its level allows.
+- **The cost is per attempt, so short jobs pay the most.** On the worst case measured — 25 ms jobs, ten
+  lines each, 32 in flight — capture cost 7–10 % of drain throughput: one ten-row insert per attempt
+  ([`BENCHMARKS.md`](BENCHMARKS.md#run-log-capture)). A job that runs for seconds pays the same insert over
+  a far longer attempt.
+- **The heartbeat is the flush cadence.** A running attempt's lines reach the database at most one
+  `HeartbeatInterval` after they were logged; a shorter interval shows them sooner at one more insert per
+  interval for each attempt that logged since the last one. With renewal off, every line waits for the end
+  of its attempt.
+
+<br>
+
 ## Concurrency (pool size) and the connection pool
 
 `Concurrency` is the worker-pool size: the runner claims to fill its free slots and dispatches each job

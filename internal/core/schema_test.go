@@ -83,34 +83,33 @@ func (legacyLimiterBucketRow) TableName() string { return "limiter_buckets" }
 
 // legacyIndexNames are the indexes added since a release before the stats
 // tables: the analytics release's, the two on the audit history's table, the
-// two on the error-group and queue-sample tables, and the one on the node
-// registry's. A legacy schema is the current IndexSet minus these — derived,
-// never hand-written.
+// two on the error-group and queue-sample tables, the one on the node
+// registry's, and the one on the run-log table. A legacy schema is the current
+// IndexSet minus these — derived, never hand-written.
 //
 //nolint:gochecknoglobals // shared fixture
 var legacyIndexNames = []string{
 	"jobs_finished", "job_audit_target", "job_audit_created", "job_error_groups_fingerprint", "job_queue_samples_time",
-	"job_nodes_heartbeat",
+	"job_nodes_heartbeat", "job_run_logs_job",
 }
 
 // previousReleaseTableNames, previousReleaseIndexNames, and
 // previousReleaseColumns are what this release adds: the previous release's
 // schema is Models and IndexSet minus these — derived, never hand-written. This
-// release adds six columns, an attempt's progress and when it was written on
-// job_runs, a limiter's three overrides on limiter_buckets, and a queue's
-// concurrency cap on job_queues; it adds no table and no index.
+// release adds one table, job_run_logs, the lines a captured attempt logged,
+// and its one index; it adds no column to a table the previous release had.
 //
 //nolint:gochecknoglobals // shared fixture
 var (
-	previousReleaseTableNames = []string{}
-	previousReleaseIndexNames = []string{}
-	previousReleaseColumns    = progressAndLimitColumns
+	previousReleaseTableNames = []string{"job_run_logs"}
+	previousReleaseIndexNames = []string{"job_run_logs_job"}
+	previousReleaseColumns    = []SchemaDrift{}
 )
 
-// scheduleColumns are the five job_periodics columns the release before this
-// one added: the schedule's source, who paused it and why, and its recent
-// fires. A test that proves a schedule upgrade drops them after the previous
-// release's fixture, as a release before them left the table.
+// scheduleColumns are the five job_periodics columns an earlier release added:
+// the schedule's source, who paused it and why, and its recent fires. A test
+// that proves a schedule upgrade drops them after the previous release's
+// fixture, as a release before them left the table.
 //
 //nolint:gochecknoglobals // shared fixture
 var scheduleColumns = []SchemaDrift{
@@ -124,8 +123,8 @@ var scheduleColumns = []SchemaDrift{
 // installLegacySchema builds, on a bare database, the schema a release before
 // the stats tables installed: its tables (no job_run_finishes or
 // job_stats_hourly, job_runs without the analytics or progress columns,
-// job_periodics without paused_at, limiter_buckets without the overrides) and
-// its indexes.
+// job_periodics without paused_at, limiter_buckets without the overrides, no
+// job_run_logs) and its indexes.
 func installLegacySchema(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	require.NoError(t, db.AutoMigrate(
@@ -222,8 +221,8 @@ func schemaDriftNames(drift []SchemaDrift) []string {
 // every column and table added since a release before the stats tables — the
 // analytics release's, the pause's, the audit history's, the kind catalog's,
 // the error groups' and queue samples', the node registry's and queue state's,
-// the schedule columns', and the progress and limit columns' (job_queues is
-// absent whole, so its cap is not named apart).
+// the schedule columns', the progress and limit columns' (job_queues is absent
+// whole, so its cap is not named apart), and the run-log table.
 //
 //nolint:gochecknoglobals // shared expectation fixture
 var olderSchemaGaps = []string{
@@ -234,7 +233,7 @@ var olderSchemaGaps = []string{
 	"job_periodics.source", "job_periodics.paused_by_type", "job_periodics.paused_by_id",
 	"job_periodics.paused_reason", "job_periodics.recent_jobs",
 	"job_runs.progress", "job_runs.progress_at", "limiter_buckets.max_concurrent_override",
-	"limiter_buckets.rate_override", "limiter_buckets.burst_override",
+	"limiter_buckets.rate_override", "limiter_buckets.burst_override", "job_run_logs (table)",
 }
 
 // TestInspectSchemaReportsWhatAnOlderSchemaLacks proves the parity check names

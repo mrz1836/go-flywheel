@@ -1,0 +1,16 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrz1836/go-flywheel/loadtest
+cpu: Apple M1 Max
+BenchmarkDrainWithLogCaptureOff-10    	       1	191673783625 ns/op	  77490642 claim-p99-ns	 245046925 finalize-p99-ns	       521.7 jobs/s
+BenchmarkDrainWithLogCaptureOn-10    	       1	124758521416 ns/op	   9686330 claim-p99-ns	  25009997 finalize-p99-ns	       801.5 jobs/s
+BenchmarkDrainWithLogCaptureOff-10    	       1	112257192375 ns/op	   7657717 claim-p99-ns	  30630866 finalize-p99-ns	       890.8 jobs/s
+BenchmarkDrainWithLogCaptureOn-10    	       1	129008356500 ns/op	   9686330 claim-p99-ns	  61261731 finalize-p99-ns	       775.1 jobs/s
+BenchmarkDrainWithLogCaptureOff-10    	       1	173334448500 ns/op	  38745321 claim-p99-ns	 154981283 finalize-p99-ns	       576.9 jobs/s
+BenchmarkDrainWithLogCaptureOn-10    	       1	109757574042 ns/op	   3828859 claim-p99-ns	   9686330 finalize-p99-ns	       911.1 jobs/s
+BenchmarkDrainWithLogCaptureOff-10    	       1	99508525249 ns/op	   3126250 claim-p99-ns	   7657717 finalize-p99-ns	      1005 jobs/s
+BenchmarkDrainWithLogCaptureOn-10    	       1	110009718833 ns/op	   4843165 claim-p99-ns	   9686330 finalize-p99-ns	       909.0 jobs/s
+BenchmarkDrainWithLogCaptureOff-10    	       1	101510013708 ns/op	   3828859 claim-p99-ns	   9686330 finalize-p99-ns	       985.1 jobs/s
+BenchmarkDrainWithLogCaptureOn-10    	       1	109008285082 ns/op	   3828859 claim-p99-ns	   9686330 finalize-p99-ns	       917.4 jobs/s
+BenchmarkDrainWithLogCaptureOff-10    	       1	97759617708 ns/op	   3126250 claim-p99-ns	   7657717 finalize-p99-ns	      1023 jobs/s
+BenchmarkDrainWithLogCaptureOn-10    	       1	106257277043 ns/op	   3126250 claim-p99-ns	   9686330 finalize-p99-ns	       941.1 jobs/s

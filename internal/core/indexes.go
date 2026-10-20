@@ -609,7 +609,7 @@ func readInstalledIndexDefs(ctx context.Context, db *gorm.DB, extraNames []strin
 		}
 		tables := `i.tablename IN ('jobs', 'job_runs', 'job_periodics', 'limiter_buckets', 'limiter_holds',
 			                      'job_run_finishes', 'job_stats_hourly', 'job_audit', 'job_error_groups_hourly',
-			                      'job_queue_samples', 'job_nodes')`
+			                      'job_queue_samples', 'job_nodes', 'job_run_logs')`
 		var args []any
 		if len(extraNames) > 0 {
 			tables = "(" + tables + " OR i.indexname IN ?)"
@@ -899,6 +899,13 @@ func runtimeIndexes() []Index {
 			// of which the table's key, the node id, can serve.
 			Name: "job_nodes_heartbeat", Kind: IndexPerformance, Table: "job_nodes",
 			DDL: `CREATE INDEX IF NOT EXISTS job_nodes_heartbeat ON job_nodes (heartbeat_at)`,
+		},
+		{
+			// Performance: deleting a job's run-log lines with its runs, by job_id,
+			// which the table's key, led by the run id, cannot serve. Retention,
+			// DeleteJob, and a bulk delete all run it.
+			Name: "job_run_logs_job", Kind: IndexPerformance, Table: "job_run_logs",
+			DDL: `CREATE INDEX IF NOT EXISTS job_run_logs_job ON job_run_logs (job_id)`,
 		},
 	}
 }

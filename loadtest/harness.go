@@ -378,7 +378,7 @@ func newHarness(ctx context.Context, cfg Config) (*Harness, error) {
 	flywheel.Register(h.registry, loadWorker{
 		track: h.exec, seed: cfg.Seed, failFraction: cfg.FailFraction,
 		retryBackoff: retryBackoff, snooze: snooze, outage: h.outage, fairness: h.fairness,
-		progress: cfg.Progress,
+		progress: cfg.Progress, logLines: cfg.logLines(),
 	})
 
 	if err = h.buildLimiter(scoped); err != nil {
@@ -645,6 +645,7 @@ func (h *Harness) startRunners(ctx context.Context) error {
 			MaxRetryBackoff: h.cfg.MaxRetryBackoff,
 			Observer:        h.runnerObserver(),
 			Logger:          discardLogger(),
+			CaptureLogs:     captureFor(h.cfg),
 			// Every runner shares one limiter keyed on one resource, so the run's
 			// combined claim rate tracks a single budget. Nil on an ungated run.
 			Limiter:  h.limiter,
@@ -933,4 +934,13 @@ func (h *Harness) blockedClaims() int64 {
 		n += g.blockedClaims.Load()
 	}
 	return n
+}
+
+// captureFor returns the runners' run-log capture: the defaults on a capture
+// run, and nil, which captures nothing, otherwise.
+func captureFor(cfg Config) *flywheel.RunLogCapture {
+	if !cfg.CaptureLogs {
+		return nil
+	}
+	return &flywheel.RunLogCapture{}
 }

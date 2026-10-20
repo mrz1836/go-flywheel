@@ -171,6 +171,9 @@ type loadWorker struct {
 	// progress, when positive, is how often a job reports its progress while it
 	// works (Config.Progress). Zero reports none.
 	progress time.Duration
+	// logLines is how many lines a job logs at info before it works
+	// (Config.LogLines), for the run-log capture to keep. Zero logs none.
+	logLines int
 }
 
 // Kind names the job kind this worker serves.
@@ -253,6 +256,12 @@ func (w loadWorker) Work(ctx context.Context, job *flywheel.Job[loadArgs]) (flyw
 	// one starves the other.
 	if w.fairness != nil {
 		w.fairness.record(job.Args.Group)
+	}
+
+	// The lines a worker logs as it goes, which a capture run keeps: each with
+	// one attribute, as a worker reports a step.
+	for i := range w.logLines {
+		job.Logger.InfoContext(ctx, "loadtest: step", "step", i+1)
 	}
 
 	if d := time.Duration(job.Args.WorkNanos); d > 0 {

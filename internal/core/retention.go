@@ -3,8 +3,10 @@ package core
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/mrz1836/go-foundation/models"
 	"gorm.io/gorm"
 )
 
@@ -42,8 +44,143 @@ type RetentionOpts struct {
 	// StatsRetention — at the oldest hour it keeps. Nothing is deleted while
 	// nothing has been rolled up. A Scheduler with StatsRollupInterval set holds
 	// on its own; set this for any other pass against a database the rollup runs
-	// on, such as `flywheel prune`'s.
+	// on, such as `flywheel prune`'s. The hold caps every rule's cutoff too.
 	HoldForStatsRollup bool
+	// Rules keep the finished jobs they match for their own MaxAge instead of
+	// the pass's default (DeleteFinishedJobsWithOptions' olderThan): longer, such
+	// as discarded jobs an operator investigates, or shorter, such as a noisy
+	// kind. The most specific rule that matches a job decides its cutoff — one
+	// naming its kind and state, then one naming its kind, then one naming its
+	// state — whatever order they are given in; a job no rule matches uses the
+	// default. Nil applies the default to every job, as a pass always has.
+	//
+	// A rule's cutoff is the clock's now (from the context, as
+	// models.ClockFrom reads it) minus its MaxAge, in olderThan's zone. The rules
+	// are validated before any statement runs: a rule naming a state that is not
+	// terminal, a MaxAge of zero or less, a rule naming neither a kind nor a
+	// state, or a second rule with the same kind and state is a
+	// *ValidationError naming rules[i].state, rules[i].max_age, or rules[i].
+	Rules []RetentionRule
+}
+
+// RetentionRule keeps the finished jobs it matches for MaxAge after they
+// finalized, in place of a retention pass's default age (RetentionOpts.Rules,
+// SchedulerConfig.RetentionRules). It names a kind, a terminal state, or both.
+type RetentionRule struct {
+	// Kind is the job kind the rule matches; empty matches every kind.
+	Kind string
+	// State is the terminal state the rule matches (succeeded, cancelled, or
+	// discarded); empty matches every terminal state. A live state is a
+	// *ValidationError.
+	State JobState
+	// MaxAge is how long the jobs the rule matches are kept after finalizing.
+	MaxAge time.Duration
+}
+
+// validateRetentionRules checks rules before any statement runs. It is the one
+// check DeleteFinishedJobsWithOptions, NewSchedulerWithConfig, and
+// RetentionStatus share, naming the rule it refuses by its index.
+func validateRetentionRules(rules []RetentionRule) error {
+	type key struct {
+		kind  string
+		state JobState
+	}
+	seen := make(map[key]int, len(rules))
+	for i, r := range rules {
+		field := fmt.Sprintf("rules[%d]", i)
+		switch {
+		case r.State != "" && !isTerminalStateString(string(r.State)):
+			return newValidationError(field+".state", "must be succeeded, cancelled, or discarded")
+		case r.MaxAge <= 0:
+			return newValidationError(field+".max_age", "must be positive")
+		case r.Kind == "" && r.State == "":
+			return newValidationError(field, "names neither a kind nor a state")
+		}
+		k := key{kind: r.Kind, state: r.State}
+		if j, repeated := seen[k]; repeated {
+			return newValidationError(field, fmt.Sprintf("repeats rule %d", j))
+		}
+		seen[k] = i
+	}
+	return nil
+}
+
+// retentionRuleOrder returns the indexes of rules in the order a job is
+// matched against them: the rules naming a kind and a state, then those naming
+// only a kind, then those naming only a state, each group in the order given.
+// Validated rules never let two rules of one group match the same job, so the
+// first match is the most specific.
+func retentionRuleOrder(rules []RetentionRule) []int {
+	out := make([]int, 0, len(rules))
+	for _, group := range []func(RetentionRule) bool{
+		func(r RetentionRule) bool { return r.Kind != "" && r.State != "" },
+		func(r RetentionRule) bool { return r.Kind != "" && r.State == "" },
+		func(r RetentionRule) bool { return r.Kind == "" && r.State != "" },
+	} {
+		for i, r := range rules {
+			if group(r) {
+				out = append(out, i)
+			}
+		}
+	}
+	return out
+}
+
+// retentionCase builds a CASE over a job's kind and state that yields then(i)
+// for the most specific rule i matching the job (retentionRuleOrder), and
+// otherwise for a job no rule matches. Each branch is SQL with its bound
+// values. Without rules it is otherwise alone, since a CASE needs a WHEN.
+func retentionCase(
+	rules []RetentionRule, then func(i int) (string, []any), otherwise string, otherwiseArgs ...any,
+) (string, []any) {
+	if len(rules) == 0 {
+		return otherwise, otherwiseArgs
+	}
+	var (
+		b    strings.Builder
+		args []any
+	)
+	b.WriteString("CASE")
+	for _, i := range retentionRuleOrder(rules) {
+		r := rules[i]
+		switch {
+		case r.Kind != "" && r.State != "":
+			b.WriteString(" WHEN kind = ? AND state = ?")
+			args = append(args, r.Kind, string(r.State))
+		case r.Kind != "":
+			b.WriteString(" WHEN kind = ?")
+			args = append(args, r.Kind)
+		default:
+			b.WriteString(" WHEN state = ?")
+			args = append(args, string(r.State))
+		}
+		sql, thenArgs := then(i)
+		b.WriteString(" THEN " + sql)
+		args = append(args, thenArgs...)
+	}
+	b.WriteString(" ELSE " + otherwise + " END")
+	return b.String(), append(args, otherwiseArgs...)
+}
+
+// retentionCutoff returns the predicate a retention batch selects terminal
+// jobs with: finalized before olderThan, or, with rules, before the cutoff the
+// most specific matching rule gives, each rule's cutoff now minus its MaxAge
+// and capped by capAt. Without rules it is exactly the single comparison.
+//
+// With rules, each branch of the CASE compares finalized_at itself rather than
+// the CASE yielding a time to compare once: PostgreSQL resolves a CASE whose
+// every branch is a bound value as text, which no timestamptz compares with,
+// while a bound value compared with the column takes the column's type on
+// either dialect.
+func retentionCutoff(
+	now, olderThan time.Time, rules []RetentionRule, capAt func(time.Time) time.Time,
+) (string, []any) {
+	if len(rules) == 0 {
+		return "finalized_at < ?", []any{olderThan}
+	}
+	return retentionCase(rules, func(i int) (string, []any) {
+		return "finalized_at < ?", []any{capAt(now.Add(-rules[i].MaxAge))}
+	}, "finalized_at < ?", olderThan)
 }
 
 // batchSize resolves the configured batch size, applying the default for a
@@ -57,7 +194,7 @@ func (o RetentionOpts) batchSize() int {
 
 // DeleteFinishedJobs hard-deletes terminal jobs (succeeded, cancelled,
 // discarded) finalized before olderThan, together with their job_runs audit
-// rows, and reports how many jobs were removed. It is DeleteFinishedJobsWithOptions
+// rows and their runs' captured lines, and reports how many jobs were removed. It is DeleteFinishedJobsWithOptions
 // with default options.
 //
 // It is the retention primitive behind `flywheel prune` and the Scheduler's
@@ -80,11 +217,13 @@ func DeleteFinishedJobs(ctx context.Context, db *gorm.DB, olderThan time.Time) (
 //
 // # Delete order is contractual
 //
-// Within each batch the job_runs rows are deleted before their jobs rows, and
-// each run's job_run_finishes entry before the run. The library declares no
-// foreign key between the tables, so on its own schema the order is
-// unobservable — but a host may declare one, and under an ON DELETE CASCADE the
-// order is visible in the reported counts: reversed, the runs delete would match
+// Within each batch, rows go in this order: each run's job_run_finishes entry,
+// then the run-log lines of the batch's runs (job_run_logs), then the job_runs
+// rows, then the jobs rows. The library declares no foreign key between the
+// tables, so on its own schema the order is unobservable — but a host may
+// declare one, from the lines or the runs to what they describe, and the order
+// is what lets each delete succeed under it; under an ON DELETE CASCADE it is
+// visible in the reported counts too: reversed, the runs delete would match
 // nothing and the cascade would do the work silently. It is part of the contract
 // rather than an implementation detail.
 //
@@ -115,6 +254,10 @@ func DeleteFinishedJobs(ctx context.Context, db *gorm.DB, olderThan time.Time) (
 func DeleteFinishedJobsWithOptions(
 	ctx context.Context, db *gorm.DB, olderThan time.Time, opts RetentionOpts,
 ) (int64, error) {
+	if err := validateRetentionRules(opts.Rules); err != nil {
+		return 0, err
+	}
+	capAt := func(t time.Time) time.Time { return t }
 	if opts.HoldForStatsRollup {
 		held, ok, err := statsRetentionCap(ctx, db)
 		if err != nil {
@@ -123,12 +266,22 @@ func DeleteFinishedJobsWithOptions(
 		if !ok {
 			return 0, nil
 		}
-		if held.Before(olderThan) {
-			// In the caller's zone: jobs timestamps are compared in it, which on
-			// SQLite is the zone their text was written in.
-			olderThan = held.In(olderThan.Location())
+		// In the caller's zone: jobs timestamps are compared in it, which on
+		// SQLite is the zone their text was written in.
+		held = held.In(olderThan.Location())
+		capAt = func(t time.Time) time.Time {
+			if held.Before(t) {
+				return held
+			}
+			return t
 		}
 	}
+	olderThan = capAt(olderThan)
+	var now time.Time
+	if len(opts.Rules) > 0 {
+		now = models.ClockFrom(ctx).Now(ctx).In(olderThan.Location())
+	}
+	cutoff, cutoffArgs := retentionCutoff(now, olderThan, opts.Rules, capAt)
 	batchSize := opts.batchSize()
 	var (
 		deleted int64
@@ -143,7 +296,7 @@ func DeleteFinishedJobsWithOptions(
 				"flywheel: delete finished jobs cancelled after %d deleted: %w", deleted, err,
 			)
 		}
-		n, last, err := deleteFinishedBatch(ctx, db, olderThan, cursor, batchSize)
+		n, last, err := deleteFinishedBatch(ctx, db, cutoff, cutoffArgs, cursor, batchSize)
 		deleted += n
 		if err != nil {
 			return deleted, err
@@ -159,7 +312,8 @@ func DeleteFinishedJobsWithOptions(
 
 // deleteFinishedBatch removes one bounded batch inside a single transaction,
 // reporting how many jobs it deleted and the last id it saw — the cursor for the
-// next batch.
+// next batch. cutoff, with its bound values, is the finalized_at predicate
+// retentionCutoff built.
 //
 // An empty last id means the batch selected no rows, which is how the caller
 // detects exhaustion. It is distinct from a zero count: a batch can select rows
@@ -172,7 +326,7 @@ func DeleteFinishedJobsWithOptions(
 // create it as text, so a sentinel comparison would work everywhere the library
 // tests itself and fail on a schema it never builds.
 func deleteFinishedBatch(
-	ctx context.Context, db *gorm.DB, olderThan time.Time, cursor string, limit int,
+	ctx context.Context, db *gorm.DB, cutoff string, cutoffArgs []any, cursor string, limit int,
 ) (int64, string, error) {
 	var (
 		deleted int64
@@ -181,8 +335,8 @@ func deleteFinishedBatch(
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		query := tx.Unscoped().Model(&jobRow{}).
 			Where(
-				"state IN ? AND finalized_at IS NOT NULL AND finalized_at < ?",
-				terminalStateStrings(), olderThan,
+				"state IN ? AND finalized_at IS NOT NULL AND "+cutoff,
+				append([]any{terminalStateStrings()}, cutoffArgs...)...,
 			)
 		if cursor != "" {
 			query = query.Where("id > ?", cursor)
@@ -213,13 +367,17 @@ func deleteFinishedBatch(
 
 // deleteJobRows hard-deletes the jobs in ids with their runs, on tx, in the
 // order DeleteFinishedJobsWithOptions' doc comment makes contractual: the runs'
-// job_run_finishes entries first, then the job_runs rows, then the jobs rows,
+// job_run_finishes entries first, then the runs' captured lines, by job_id
+// (which job_run_logs_job serves), then the job_runs rows, then the jobs rows,
 // past the soft-delete scope (Unscoped). It reports how many jobs it deleted.
-// Retention and DeleteJob both delete through it, so the order lives in one
-// place.
+// Retention, DeleteJob, and a BulkJobs delete all delete through it, so the
+// order lives in one place.
 func deleteJobRows(tx *gorm.DB, ids []string) (int64, error) {
 	if err := deleteRunFinishes(tx, ids); err != nil {
 		return 0, err
+	}
+	if err := tx.Where("job_id IN ?", ids).Delete(&jobRunLogRow{}).Error; err != nil {
+		return 0, fmt.Errorf("flywheel: delete finished job run logs: %w", err)
 	}
 	if err := tx.Where("job_id IN ?", ids).Delete(&jobRunRow{}).Error; err != nil {
 		return 0, fmt.Errorf("flywheel: delete finished job runs: %w", err)

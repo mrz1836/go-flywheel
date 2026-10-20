@@ -64,7 +64,7 @@ func readCatalogIndexDefs(t *testing.T, db *gorm.DB) map[string]string {
 			WHERE schemaname = current_schema()
 			  AND tablename IN ('jobs', 'job_runs', 'job_periodics', 'limiter_buckets', 'limiter_holds',
 			                    'job_run_finishes', 'job_stats_hourly', 'job_audit', 'job_error_groups_hourly',
-			                    'job_queue_samples', 'job_nodes')`).Scan(&rows).Error)
+			                    'job_queue_samples', 'job_nodes', 'job_run_logs')`).Scan(&rows).Error)
 		for _, r := range rows {
 			if !want[r.Indexname] {
 				continue

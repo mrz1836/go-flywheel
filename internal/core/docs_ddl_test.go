@@ -20,8 +20,9 @@ const integratingDoc = "../../docs/INTEGRATING.md"
 // documentedUpgradeDDL extracts the statements of the SQL block that follows
 // the guide's `<!-- upgrade-ddl:<block> -->` marker, split on the semicolons
 // that end its lines. A block is named by its dialect — this release's upgrade
-// — or by its dialect and the older release it upgrades from: ":schedules", a
-// release before the schedule columns, ":nodes", a release before the node
+// — or by its dialect and the older release it upgrades from: ":progress", a
+// release before the progress and limit columns, ":schedules", a release
+// before the schedule columns, ":nodes", a release before the node
 // registry, ":errors", a release before the error
 // groups, ":kinds", a release before the kind catalog, ":audit", a release
 // before the audit history, ":pause", a release before the schedule pause, and
@@ -64,19 +65,22 @@ func applyDocumentedUpgrade(t *testing.T, db *gorm.DB, blocks ...string) {
 
 // documentedUpgradeSuite applies the guide's upgrade, exactly as written, to a
 // database a release before the schedule columns installed and wrote a
-// schedule into — the previous release's schema without them — then the deploy
-// step the guide names, and asserts the result has no drift and works: the
-// schedule is not paused, fires, and remembers the fire, and a control on the
-// job it fired is recorded in the history. The documented upgrade is the
-// upgrade, not a description of one.
+// schedule into — the previous release's schema without them and without the
+// progress and limit columns that came after them — that upgrade's block, then
+// the progress and limit columns', then this release's, then the deploy step
+// the guide names, and asserts the result has no drift and works: the schedule
+// is not paused, fires, and remembers the fire, and a control on the job it
+// fired is recorded in the history. The documented upgrade is the upgrade, not
+// a description of one.
 func documentedUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
 	dropColumns(t, db, scheduleColumns...)
+	dropColumns(t, db, progressAndLimitColumns...)
 	due := time.Now().UTC().Truncate(time.Second).Add(-30 * time.Second)
 	writeLegacyPeriodic(t, db, "doc-legacy", "doc.periodic", due)
 
-	applyDocumentedUpgrade(t, db, dialect+":schedules", dialect)
+	applyDocumentedUpgrade(t, db, dialect+":schedules", dialect+":progress", dialect)
 	ctx := context.Background()
 	require.NoError(t, InstallIndexesWithOptions(ctx, db, IndexOpts{Concurrently: true}))
 	assertNoSchemaOrIndexDrift(t, db)
@@ -110,10 +114,10 @@ func documentedUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 // documentedStatsUpgradeSuite applies the guide's upgrade from a release
 // before the stats tables — that upgrade's block, then the schedule pause's,
 // then the audit history's, then the kind catalog's, then the error groups',
-// then the node registry's, then the schedule columns', then this release's,
-// oldest first — to a database such a release installed and wrote history
-// into, then the deploy step, and asserts the result has no drift, runs, and
-// reaches the old history.
+// then the node registry's, then the schedule columns', then the progress and
+// limit columns', then this release's, oldest first — to a database such a
+// release installed and wrote history into, then the deploy step, and asserts
+// the result has no drift, runs, and reaches the old history.
 func documentedStatsUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 	t.Helper()
 	installLegacySchema(t, db)
@@ -121,7 +125,7 @@ func documentedStatsUpgradeSuite(t *testing.T, db *gorm.DB, dialect string) {
 
 	applyDocumentedUpgrade(t, db,
 		dialect+":stats", dialect+":pause", dialect+":audit", dialect+":kinds", dialect+":errors", dialect+":nodes",
-		dialect+":schedules", dialect)
+		dialect+":schedules", dialect+":progress", dialect)
 	ctx := context.Background()
 	require.NoError(t, InstallIndexesWithOptions(ctx, db, IndexOpts{Concurrently: true}))
 

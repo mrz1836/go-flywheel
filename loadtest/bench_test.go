@@ -371,6 +371,33 @@ func BenchmarkDrainWithHeartbeatOn(b *testing.B) {
 	runBenchmark(b, heartbeatBenchConfig(benchDSN(b)))
 }
 
+// logCaptureBenchConfig is the shape both halves of the run-log capture A/B
+// derive from: the heartbeat A/B's drain, each job logging defaultLogLines
+// lines at info before it works. Both halves log the same lines to the same
+// discarding handler, so the only field that differs is CaptureLogs.
+func logCaptureBenchConfig(dsn string) Config {
+	cfg := heartbeatBenchConfig(dsn)
+	cfg.LogLines = defaultLogLines
+	return cfg
+}
+
+// BenchmarkDrainWithLogCaptureOff and BenchmarkDrainWithLogCaptureOn are the two
+// halves of the run-log capture's cost (run them together with -bench
+// 'BenchmarkDrainWithLogCapture' and compare with benchstat). With capture on,
+// every attempt's lines are encoded and kept in memory and written in one
+// batched insert after its finalize, since a 25 ms job ends inside one
+// heartbeat interval. See docs/BENCHMARKS.md.
+func BenchmarkDrainWithLogCaptureOff(b *testing.B) {
+	runBenchmark(b, logCaptureBenchConfig(benchDSN(b)))
+}
+
+// BenchmarkDrainWithLogCaptureOn is the other half; see the Off half's comment.
+func BenchmarkDrainWithLogCaptureOn(b *testing.B) {
+	cfg := logCaptureBenchConfig(benchDSN(b))
+	cfg.CaptureLogs = true
+	runBenchmark(b, cfg)
+}
+
 // BenchmarkSweep100k measures a sweep that reclaims nothing.
 //
 // That is deliberate and the doc comment has to say so, because "sweep with
