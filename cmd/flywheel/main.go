@@ -74,6 +74,7 @@ func newRootCmd() *cobra.Command {
 		newScheduleCmd(&configPath),
 		newKindsCmd(&configPath),
 		newQueuesCmd(&configPath),
+		newLimitsCmd(&configPath),
 		newNodesCmd(&configPath),
 		newPruneCmd(&configPath),
 		newStatusCmd(&configPath),
