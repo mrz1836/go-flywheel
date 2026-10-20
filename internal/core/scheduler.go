@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -122,7 +123,23 @@ type SchedulerConfig struct {
 	// has run once. See RetentionOpts.HoldForStatsRollup.
 	// A RetentionMaxAge shorter than one hour plus StatsRollupGrace is rejected,
 	// because no run would live long enough to be rolled up.
+	//
+	// With it set, Run refuses to start, with ErrSchemaOutdated, on a database
+	// without job_run_logs: the pass deletes each job's captured lines with its
+	// runs.
 	RetentionMaxAge time.Duration
+	// RetentionRules keep the finished jobs they match for their own MaxAge in
+	// place of RetentionMaxAge, which still applies to every job no rule
+	// matches: discarded jobs kept longer than the rest, say, or a noisy kind
+	// kept less. The most specific rule decides (see RetentionOpts.Rules), and
+	// the stats-rollup hold caps every rule's cutoff as it caps the default.
+	//
+	// NewSchedulerWithConfig refuses rules without RetentionMaxAge, which is what
+	// turns retention on, a rule RetentionOpts.Rules refuses, and, with the stats
+	// rollup on, a rule shorter than one hour plus StatsRollupGrace, as it
+	// refuses such a RetentionMaxAge. RetentionStatus reports what each rule
+	// keeps and what is due.
+	RetentionRules []RetentionRule
 	// RetentionInterval is the cadence of the retention sweep. It applies only
 	// when RetentionMaxAge or AuditRetention is set; left zero, it defaults to one
 	// hour.
@@ -372,6 +389,9 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 	if s.retentionEnabled() && s.retentionInterval <= 0 {
 		s.retentionInterval = defaultRetentionInterval
 	}
+	if err := s.configureRetentionRules(cfg); err != nil {
+		return nil, err
+	}
 	if err := s.configurePeriodics(cfg); err != nil {
 		return nil, err
 	}
@@ -379,6 +399,24 @@ func NewSchedulerWithConfig(cfg SchedulerConfig) (*Scheduler, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// configureRetentionRules validates cfg's RetentionRules and keeps a copy of
+// them on the retention pass's options. Rules need RetentionMaxAge, so a host
+// never has jobs deleted by rules it thought were off.
+func (s *Scheduler) configureRetentionRules(cfg SchedulerConfig) error {
+	if len(cfg.RetentionRules) == 0 {
+		return nil
+	}
+	if cfg.RetentionMaxAge <= 0 {
+		return fmt.Errorf("jobs: scheduler config: RetentionRules need RetentionMaxAge, which turns retention on: %w",
+			ErrValidation)
+	}
+	if err := validateRetentionRules(cfg.RetentionRules); err != nil {
+		return fmt.Errorf("jobs: scheduler config: %w", err)
+	}
+	s.retentionOpts.Rules = slices.Clone(cfg.RetentionRules)
+	return nil
 }
 
 // activity is one maintenance loop: a name, a cadence, the work, and a guard
@@ -737,10 +775,12 @@ func (s *Scheduler) Sweep(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// PruneRetention hard-deletes terminal jobs (and their job_runs) finalized
-// longer ago than RetentionMaxAge, in bounded batches, reporting how many jobs
-// were removed. It is a no-op returning (0, nil) when retention is disabled, so
-// calling it on a retention-less Scheduler can never delete anything.
+// PruneRetention hard-deletes terminal jobs (and their job_runs and captured
+// run-log lines) finalized longer ago than RetentionMaxAge, or than the MaxAge
+// of the most specific of RetentionRules that matches them, in bounded batches,
+// reporting how many jobs were removed. It is a no-op returning (0, nil) when
+// retention is disabled, so calling it on a retention-less Scheduler can never
+// delete anything.
 //
 // The returned count is meaningful alongside a non-nil error: committed batches
 // are not rolled back by a later batch's failure.

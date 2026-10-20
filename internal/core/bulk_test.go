@@ -1057,8 +1057,8 @@ func TestBulkAppliesEveryJobQueryFilter(t *testing.T) {
 		res, err := BulkJobs(ctx, db, BulkSpec{Query: byKind, Action: BulkDelete})
 		require.NoError(t, err)
 		assert.EqualValues(t, 2, res.Changed)
-		assert.Equal(t, []string{"job_run_finishes", "job_runs", "jobs"}, tables,
-			"finish-log entries, then runs, then the jobs")
+		assert.Equal(t, []string{"job_run_finishes", "job_run_logs", "job_runs", "jobs"}, tables,
+			"finish-log entries, then run-log lines, then runs, then the jobs")
 		for _, id := range targets {
 			var left int64
 			require.NoError(t, db.Unscoped().Model(&jobRow{}).Where("id = ?", id).Count(&left).Error)

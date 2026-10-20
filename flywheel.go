@@ -132,6 +132,7 @@ type (
 	ListJobsParams        = core.ListJobsParams
 	ListNodesParams       = core.ListNodesParams
 	ListRunFinishesParams = core.ListRunFinishesParams
+	ListRunLogsParams     = core.ListRunLogsParams
 	ListRunningParams     = core.ListRunningParams
 	ListRunsParams        = core.ListRunsParams
 	MigrateOpts           = core.MigrateOpts
@@ -163,12 +164,16 @@ type (
 	ReplayOpts            = core.ReplayOpts
 	Result                = core.Result
 	RetentionOpts         = core.RetentionOpts
+	RetentionRule         = core.RetentionRule
+	RetentionStatusRow    = core.RetentionStatusRow
 	RetryEvent            = core.RetryEvent
 	RetryOpts             = core.RetryOpts
 	Retryable             = core.Retryable
 	RollupResult          = core.RollupResult
 	RunFinish             = core.RunFinish
 	RunFinishPage         = core.RunFinishPage
+	RunLogCapture         = core.RunLogCapture
+	RunLogLine            = core.RunLogLine
 	RunOutcome            = core.RunOutcome
 	RunProgress           = core.RunProgress
 	RunSummary            = core.RunSummary
@@ -242,6 +247,8 @@ const (
 	DefaultBulkMaxJobs       = core.DefaultBulkMaxJobs
 	DefaultCountCap          = core.DefaultCountCap
 	DefaultFeedSettle        = core.DefaultFeedSettle
+	DefaultRunLogBytes       = core.DefaultRunLogBytes
+	DefaultRunLogLines       = core.DefaultRunLogLines
 	DefaultTreeDepth         = core.DefaultTreeDepth
 	DefaultTreeNodes         = core.DefaultTreeNodes
 	ErrorFingerprintVersion  = core.ErrorFingerprintVersion
@@ -272,6 +279,8 @@ const (
 	MaxProgressMessageBytes  = core.MaxProgressMessageBytes
 	MaxReadLimit             = core.MaxReadLimit
 	MaxReasonBytes           = core.MaxReasonBytes
+	MaxRunLogBytes           = core.MaxRunLogBytes
+	MaxRunLogLines           = core.MaxRunLogLines
 	MaxTagBytes              = core.MaxTagBytes
 	MaxTags                  = core.MaxTags
 	MaxTreeDepth             = core.MaxTreeDepth
@@ -547,6 +556,10 @@ func ListRunFinishes(ctx context.Context, db *gorm.DB, p ListRunFinishesParams) 
 	return core.ListRunFinishes(ctx, db, p)
 }
 
+func ListRunLogs(ctx context.Context, db *gorm.DB, runID string, p ListRunLogsParams) ([]RunLogLine, error) {
+	return core.ListRunLogs(ctx, db, runID, p)
+}
+
 func ListRunning(ctx context.Context, db *gorm.DB, p ListRunningParams) ([]RunningJob, error) {
 	return core.ListRunning(ctx, db, p)
 }
@@ -733,6 +746,10 @@ func ResumePeriodic(ctx context.Context, db *gorm.DB, slug string) error {
 
 func ResumeQueue(ctx context.Context, db *gorm.DB, queue string) error {
 	return core.ResumeQueue(ctx, db, queue)
+}
+
+func RetentionStatus(ctx context.Context, db *gorm.DB, maxAge time.Duration, rules []RetentionRule) ([]RetentionStatusRow, error) {
+	return core.RetentionStatus(ctx, db, maxAge, rules)
 }
 
 func RetryJob(ctx context.Context, db *gorm.DB, id string) error {

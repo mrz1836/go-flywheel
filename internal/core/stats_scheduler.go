@@ -47,8 +47,8 @@ type statsState struct {
 }
 
 // configureStats resolves the stats fields of cfg onto s, applying defaults, and
-// rejects a retention window too short for the rollup to count a run before
-// retention deletes it.
+// rejects a retention window, RetentionMaxAge or a rule's, too short for the
+// rollup to count a run before retention deletes it.
 func (s *Scheduler) configureStats(cfg SchedulerConfig) error {
 	if cfg.StatsRollupInterval <= 0 {
 		return nil
@@ -76,6 +76,15 @@ func (s *Scheduler) configureStats(cfg SchedulerConfig) error {
 			s.retentionMaxAge, s.statsCfg.grace, ErrValidation,
 		)
 	}
+	for i, rule := range s.retentionOpts.Rules {
+		if rule.MaxAge < time.Hour+s.statsCfg.grace {
+			return fmt.Errorf(
+				"jobs: scheduler config: RetentionRules[%d]'s MaxAge %s is shorter than one hour plus "+
+					"StatsRollupGrace (%s), so retention would delete runs before the stats rollup could count them: %w",
+				i, rule.MaxAge, s.statsCfg.grace, ErrValidation,
+			)
+		}
+	}
 	s.stats.warned = map[string]struct{}{}
 	return nil
 }
@@ -94,9 +103,10 @@ func runPathModels() []any {
 // tick reads job_periodics, filtering on paused_at, so that table must carry
 // every column too; with the rollup enabled, so must the two rollup tables and
 // job_error_groups_hourly, which the rollup writes with each hour; with
-// AuditRetention set, the retention pass prunes job_audit, so it must exist; and
-// with QueueSampleInterval set, so must job_queue_samples, which the sampling
-// activity writes.
+// RetentionMaxAge set, the retention pass deletes each job's run-log lines with
+// its runs, so job_run_logs must exist; with AuditRetention set, the retention
+// pass prunes job_audit, so it must exist; and with QueueSampleInterval set, so
+// must job_queue_samples, which the sampling activity writes.
 // A gap fails Run before any activity starts, rather than logging the same
 // failure every tick. See probeSchema for why an unreachable database is not a
 // failure here.
@@ -104,6 +114,9 @@ func (s *Scheduler) checkSchema(ctx context.Context) error {
 	models := append(runPathModels(), &jobPeriodicRow{})
 	if s.statsInterval > 0 {
 		models = append(models, &jobStatsHourlyRow{}, &jobStatsProgressRow{}, &jobErrorGroupHourlyRow{})
+	}
+	if s.retentionMaxAge > 0 {
+		models = append(models, &jobRunLogRow{})
 	}
 	if s.auditRetention > 0 {
 		models = append(models, &jobAuditRow{})

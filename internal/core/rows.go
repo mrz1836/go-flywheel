@@ -475,6 +475,25 @@ type jobQueueRow struct {
 // TableName binds jobQueueRow to the job_queues table.
 func (jobQueueRow) TableName() string { return "job_queues" }
 
+// jobRunLogRow is one line a worker logged during one attempt, captured with
+// RunnerConfig.CaptureLogs: its sequence number within the attempt, the job it
+// belongs to, when it was logged (UTC), its slog level, its message, and its
+// attributes as a JSON object. The Runner inserts it, by the heartbeat and once
+// after the finalize, and never updates it; it is deleted with its job's runs
+// (see deleteJobRows), by job_id, which job_run_logs_job serves.
+type jobRunLogRow struct {
+	RunID    string         `gorm:"column:run_id;primaryKey"`
+	Seq      int64          `gorm:"column:seq;primaryKey;autoIncrement:false"`
+	JobID    string         `gorm:"column:job_id;not null"`
+	LoggedAt time.Time      `gorm:"column:logged_at;not null"`
+	Level    int64          `gorm:"column:level;not null"`
+	Message  string         `gorm:"column:message;not null"`
+	Attrs    datatypes.JSON `gorm:"column:attrs;type:jsonb;not null;default:'{}'"`
+}
+
+// TableName binds jobRunLogRow to the job_run_logs table.
+func (jobRunLogRow) TableName() string { return "job_run_logs" }
+
 // limiterBucketRow is the DBLimiter's per-resource rate reservoir. The resource
 // string is the primary key — one bucket per protected dependency — and the row
 // doubles as the per-resource mutex a shared Acquire locks. It carries no

@@ -276,6 +276,33 @@ type RunnerConfig struct {
 	Observer Observer
 	// Logger is the base logger bound onto each Job. Optional.
 	Logger *slog.Logger
+	// CaptureLogs, when set, keeps the lines each worker logs through Job.Logger
+	// in job_run_logs, per attempt, for ListRunLogs to read back. Nil captures
+	// nothing.
+	//
+	// A line is captured when its level is at or above MinLevel: its message,
+	// level, time, and the attributes the worker gave it or added with With and
+	// WithGroup, encoded as slog's JSON handler encodes them. The attributes the
+	// Runner binds onto Job.Logger (job_id, kind, queue, run_id, attempt,
+	// max_attempts, and request_id) are left out, since the line is already
+	// keyed by its attempt. The host's handler receives exactly the records it
+	// receives without capture.
+	//
+	// An attempt keeps at most MaxLines lines and MaxBytes bytes. Once a line
+	// would pass either bound, it and every later line are dropped and counted,
+	// and the attempt's last write adds one line, "jobs: run log truncated", at
+	// warn, with the attribute dropped_lines. Lines reach the database on the
+	// lease heartbeat, after each renewal that holds the claim, and once after
+	// the finalize; with HeartbeatInterval negative, or a Driver that issues no
+	// lease token, they are all written after the finalize. A write that fails
+	// is retried by the next one; the last one's failure is logged, and the
+	// lines it held are lost. Lines a process held when it died are lost too.
+	// They are deleted with their job's runs (DeleteFinishedJobsWithOptions,
+	// DeleteJob, BulkJobs).
+	//
+	// Run refuses to start, with ErrSchemaOutdated, on a database without
+	// job_run_logs.
+	CaptureLogs *RunLogCapture
 }
 
 // LeaseRenewal describes one successful lease extension. It is what
@@ -947,9 +974,11 @@ func (r *Runner) idle(ctx, loopCtx context.Context, backoff *pollBackoff, untilI
 // once per Runner: jobs and job_runs, which the claim, the stub insert, and the
 // finalize update write, and job_run_finishes, which every finalize logs to in
 // the same transaction; unless QueueStateRefresh is negative, job_queues, whose
-// paused set and concurrency caps every iteration reads before it claims; and,
-// when the Limiter is a DBLimiter, limiter_buckets with its overrides, on the
-// limiter's own handle, since every Acquire reads them. A database missing any
+// paused set and concurrency caps every iteration reads before it claims; with
+// CaptureLogs set, job_run_logs, which every attempt's captured lines are
+// written to; and, when the Limiter is a DBLimiter, limiter_buckets with its
+// overrides, on the limiter's own handle, since every Acquire reads them. A
+// database missing any
 // of them fails the run before anything is claimed: claiming first would lease
 // a job, fail its stub insert or its finalize, and leave the lease sweep to
 // reclaim the same jobs forever; and a limiter whose every Acquire fails would
@@ -963,6 +992,9 @@ func (r *Runner) checkSchema(ctx context.Context) error {
 	models := runPathModels()
 	if r.cfg.QueueStateRefresh >= 0 {
 		models = append(models, &jobQueueRow{})
+	}
+	if r.cfg.CaptureLogs != nil {
+		models = append(models, &jobRunLogRow{})
 	}
 	checked, err := probeSchema(ctx, r.cfg.DB, models...)
 	if err != nil {
@@ -1454,9 +1486,18 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 		logger = logger.With("request_id", reqID)
 	}
 
+	// With CaptureLogs, the worker's logger also copies its lines into the
+	// attempt's buffer. The capture is installed beneath the attributes above,
+	// so it keeps only what the worker adds.
+	var runLogs *runLogBuffer
+	if r.cfg.CaptureLogs != nil {
+		runLogs = newRunLogBuffer(ctx, *r.cfg.CaptureLogs, raw.ID, runID)
+		logger = slog.New(newRunLogHandler(logger.Handler(), runLogs))
+	}
+
 	// The worker's progress reports reach the heartbeat through the sink, which
-	// the Job carries for SetProgress.
-	hooks := attemptHooks{progress: newProgressSink()}
+	// the Job carries for SetProgress, and its captured lines through the buffer.
+	hooks := attemptHooks{progress: newProgressSink(), logs: runLogs}
 	in := dispatchInput{
 		ID:          raw.ID,
 		Kind:        raw.Kind,
@@ -1484,6 +1525,14 @@ func (r *Runner) dispatch(ctx context.Context, raw RawJob, releasePermit func())
 		workCtx, cancelWork = context.WithCancelCause(ctx)
 		defer cancelWork(nil)
 		hooks.cancel = cancelWork
+	}
+
+	// The attempt's last run-log write. It is registered before the heartbeat's
+	// stop so it runs after it, once the finalize has returned and no heartbeat
+	// write is in flight, and on a context detached from cancellation, as the
+	// finalize's transaction is, so a drain does not lose the lines.
+	if runLogs != nil {
+		defer runLogs.flush(context.WithoutCancel(ctx), r.cfg.DB, r.cfg.Logger, true)
 	}
 
 	// Renewal runs for the whole attempt, finalize included. The deferred stop is

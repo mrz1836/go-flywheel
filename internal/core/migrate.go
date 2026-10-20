@@ -30,6 +30,7 @@ func Models() []any {
 		&jobAuditRow{}, &jobKindRow{},
 		&jobErrorGroupHourlyRow{}, &jobQueueSampleRow{},
 		&jobNodeRow{}, &jobQueueRow{},
+		&jobRunLogRow{},
 	}
 }
 
@@ -41,15 +42,16 @@ func Models() []any {
 // history every control writes, job_kinds, the kind catalog PublishKinds
 // writes, job_error_groups_hourly, the error groups the stats rollup writes,
 // job_queue_samples, the queue depths a Scheduler samples, job_nodes, the rows a
-// registering Node heartbeats, and job_queues, the queues an operator paused —
-// with their NOT-NULL constraints, column defaults, and the jobs soft-delete
+// registering Node heartbeats, job_queues, the queues an operator paused, and
+// job_run_logs, the lines a Runner with CaptureLogs captures — with their
+// NOT-NULL constraints, column defaults, and the jobs soft-delete
 // column, plus the partial/unique indexes GORM AutoMigrate cannot express. A
 // host in this mode calls Migrate(db) and nothing else. The limiter tables are
 // additive: a host that never constructs a DBLimiter simply leaves them empty.
 //
 // # Choosing an install mode
 //
-// The runtime owns fourteen tables and there are two ways to install them. They are
+// The runtime owns fifteen tables and there are two ways to install them. They are
 // not layers. A host picks exactly one; running both means two migration
 // authorities against one database.
 //

@@ -12,8 +12,8 @@ import (
 )
 
 // previousReleaseGapSuite proves the parity checks name exactly what this
-// release adds to a schema the previous release installed: the progress and
-// limit columns, in their declared order, and no index.
+// release adds to a schema the previous release installed: the run-log table,
+// and its one index.
 func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
@@ -21,10 +21,7 @@ func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 
 	drift, err := InspectSchema(ctx, db)
 	require.NoError(t, err)
-	assert.Equal(t, []string{
-		"job_runs.progress", "job_runs.progress_at", "limiter_buckets.max_concurrent_override",
-		"limiter_buckets.rate_override", "limiter_buckets.burst_override", "job_queues.max_concurrency",
-	}, schemaDriftNames(drift))
+	assert.Equal(t, []string{"job_run_logs (table)"}, schemaDriftNames(drift))
 	idx, err := InspectIndexes(ctx, db)
 	require.NoError(t, err)
 	missing := make([]string, len(idx))
@@ -32,7 +29,7 @@ func previousReleaseGapSuite(t *testing.T, db *gorm.DB) {
 		missing[i] = d.Name
 		assert.Empty(t, d.Installed, "%s is absent", d.Name)
 	}
-	assert.ElementsMatch(t, previousReleaseIndexNames, missing, "the release adds no index")
+	assert.ElementsMatch(t, previousReleaseIndexNames, missing, "the release adds the table's one index")
 }
 
 // TestInspectSchemaReportsWhatThePreviousReleaseLacks is the parity check
@@ -114,11 +111,13 @@ func TestSchedulerRefusesToStartWithoutThePeriodicColumns(t *testing.T) {
 // reads as not paused, and keeps firing under this release's Scheduler; a row
 // that release's binary writes after the migration, as a rolling deploy would,
 // is valid and not paused either. The schema is the previous release's without
-// the schedule columns, so the upgrade adds them as well as this release's.
+// the schedule columns and the progress and limit columns, which came after
+// them, so the upgrade adds those as well as this release's.
 func previousReleaseUpgradeSuite(t *testing.T, db *gorm.DB, migrate func(*gorm.DB) error) {
 	t.Helper()
 	installPreviousReleaseSchema(t, db)
 	dropColumns(t, db, scheduleColumns...)
+	dropColumns(t, db, progressAndLimitColumns...)
 	due := time.Now().UTC().Truncate(time.Second).Add(-30 * time.Second)
 	writeLegacyPeriodic(t, db, "legacy-nightly", "legacy.periodic", due)
 
