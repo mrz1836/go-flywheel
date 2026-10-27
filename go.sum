@@ -51,8 +51,8 @@ github.com/mrz1836/go-foundation v0.13.1 h1:2RE6pUUDGOsCA2ojktAO+7LRF4ZSb1c+8+24
 github.com/mrz1836/go-foundation v0.13.1/go.mod h1:9kHr3tXzgAd5bngqdDVWt0Y3rmFlw66lw+JgRFDuxkg=
 github.com/mrz1836/go-sanitize v1.6.0 h1:LPBKj0776BP7FnXHOdoV95pEv+j6ihriWUwz1nlfVE4=
 github.com/mrz1836/go-sanitize v1.6.0/go.mod h1:dJMz2bAJXH7/zR7t1gh+07+1VMD5exMOWvrU1P4txFk=
-github.com/mrz1836/go-selfupdate v0.1.4 h1:WXlZShndYe7GROnVufKJOeFPvnQrNyU5fTTdUQFGGpQ=
-github.com/mrz1836/go-selfupdate v0.1.4/go.mod h1:yREEv9yuDdiZ/inozWcfD39dNATgtEr7wpcszmbxupw=
+github.com/mrz1836/go-selfupdate v0.1.5 h1:mM4I7GtWuqTn/SlwUc1n1iY0SFUHgxmv/s4Sz1JFxl4=
+github.com/mrz1836/go-selfupdate v0.1.5/go.mod h1:yREEv9yuDdiZ/inozWcfD39dNATgtEr7wpcszmbxupw=
 github.com/ncruces/go-strftime v1.1.0 h1:vtPmPWMkb539RGV9WpWT9EwJGvrOCKvMNI4obWL47Hk=
 github.com/ncruces/go-strftime v1.1.0/go.mod h1:yVaq7iwCN09vHRrKBrrflXT0M9tTMG2KmZ9Fj7xeG/g=
 github.com/nyaruka/phonenumbers v1.8.1 h1:2K9YMQuv1dCGqjjzB1DwmdCe89khT4KPBQb2CxAMMlU=
