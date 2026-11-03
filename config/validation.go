@@ -15,7 +15,9 @@ var (
 )
 
 // Validate validates the JobsConfig. The job runtime requires at least one
-// queue, a positive concurrency, and a positive lease duration. Validation is
+// queue, a positive concurrency, and a positive lease duration, and a retention
+// block, when set, needs ages that aren't negative and rules the Scheduler
+// accepts (RetentionConfig). Validation is
 // strict: callers that host the job runtime invoke it directly to fail fast on
 // a missing setting. An outer config should only invoke it when
 // JobsConfig.Configured reports the block is in use.
@@ -29,5 +31,5 @@ func (j *JobsConfig) Validate() error {
 	if j.LeaseDuration <= 0 {
 		return fmt.Errorf("%w: got %s", errInvalidJobLeaseDuration, j.LeaseDuration)
 	}
-	return nil
+	return j.Retention.validate()
 }
