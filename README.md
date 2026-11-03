@@ -2350,6 +2350,40 @@ entries older than the window, oldest first, in the same bounded batches (`Reten
 `RetentionMaxBatches`), logging `jobs: retention sweep pruned audit entries`. A scheduler with it set
 refuses to start without the table (`ErrSchemaOutdated`). `DeleteAuditEntries` prunes on demand.
 
+**From configuration.** A host that loads `config.JobsConfig` can keep every window there instead of in
+code: its `retention` block holds the default age, the rules, and the windows of the control history, the
+queue samples, the node rows, and the stats rollups, and `SchedulerConfig.SetRetention` applies it.
+
+```json
+{
+  "queues": ["default"],
+  "concurrency": 5,
+  "lease_duration": 60000000000,
+  "retention": {
+    "jobs": 2592000000000000,
+    "rules": [
+      {"state": "discarded", "max_age": 7776000000000000},
+      {"kind": "metrics.flush", "state": "succeeded", "max_age": 86400000000000}
+    ],
+    "audit": 34560000000000000
+  }
+}
+```
+
+```go
+cfg := flywheel.SchedulerConfig{DB: db, Client: client}
+cfg.SetRetention(jobs.Retention) // jobs is the host's validated config.JobsConfig
+```
+
+Ages are nanoseconds in JSON, as every duration in `JobsConfig` is, so the block above keeps finished jobs
+30 days, discarded ones 90, `metrics.flush` successes one, and the control history 400.
+`JOB_RETENTION_JOBS`, `JOB_RETENTION_AUDIT`, `JOB_RETENTION_QUEUE_SAMPLES`, `JOB_RETENTION_NODES`, and
+`JOB_RETENTION_STATS` take Go duration strings (`720h`) for a loader that reads `env` tags; the rules come
+from the file alone. `JobsConfig.Validate` refuses a negative age, rules without `jobs`, and each rule the
+Scheduler would refuse, naming it (`Retention.Rules[1]`); a rule shorter than the stats rollup's grace is
+still the Scheduler's to refuse, as it alone knows the grace. Each zero means what its `SchedulerConfig`
+field's zero means, so an empty block leaves retention off.
+
 ### The queue-health heartbeat
 
 The heartbeat is **off by default**. Set `HealthSampleInterval` and the scheduler samples queue health

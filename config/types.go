@@ -25,10 +25,17 @@ type JobsConfig struct {
 
 	// PollInterval is the optional pause between empty polls.
 	PollInterval time.Duration `json:"poll_interval" env:"JOB_POLL_INTERVAL"`
+
+	// Retention is how long the host's Scheduler keeps what it prunes: finished
+	// jobs, by default and by kind or state, and the control history, queue
+	// samples, node rows, and stats rollups. Optional; its zero leaves the
+	// runtime's defaults. SchedulerConfig.SetRetention applies it.
+	Retention RetentionConfig `json:"retention"`
 }
 
 // Configured reports whether any job-runtime setting is present. A zero-value
 // JobsConfig (no host running the job runtime) reports false.
 func (j *JobsConfig) Configured() bool {
-	return len(j.Queues) > 0 || j.LeaseDuration != 0 || j.Concurrency != 0 || j.PollInterval != 0
+	return len(j.Queues) > 0 || j.LeaseDuration != 0 || j.Concurrency != 0 || j.PollInterval != 0 ||
+		j.Retention.configured()
 }
