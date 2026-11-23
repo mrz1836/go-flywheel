@@ -76,8 +76,9 @@ func TestCLIJobsRetryHelpExplainsBothFlags(t *testing.T) {
 		"A cancelled job whose attempt still runs is refused until that attempt returns.",
 		"A running job is refused: cancel it first, or pass --allow-running to re-queue it while its current " +
 			"attempt keeps running; that attempt's result is then discarded, and the work runs twice.",
-		"--force retry a job that reached a terminal state",
-		"--allow-running re-queue a running job; its current attempt keeps running and its result is discarded",
+		// pflag (v1.1.0+) renders a bool flag as --name[=true|false] in help.
+		"--force[=true|false] retry a job that reached a terminal state",
+		"--allow-running[=true|false] re-queue a running job; its current attempt keeps running and its result is discarded",
 	} {
 		assert.Contains(t, help, want)
 	}
